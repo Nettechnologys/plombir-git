@@ -9,7 +9,14 @@
     $props();
 
   const PLATFORMS: Record<string, string> = { github: 'GitHub', gitlab: 'GitLab' };
-  const platform = $derived(service ? (PLATFORMS[service] ?? service) : '');
+  // `github` / `gitlab` is github.com / gitlab.com; any other server is
+  // `github:ghe.example.com`, and its host is worth showing.
+  const platform = $derived.by(() => {
+    if (!service) return '';
+    const [kind, ...host] = service.split(':');
+    const name = PLATFORMS[kind] ?? kind;
+    return host.length ? `${name} · ${host.join(':')}` : name;
+  });
 </script>
 
 {#if login && service}

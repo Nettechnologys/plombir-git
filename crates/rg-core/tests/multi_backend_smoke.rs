@@ -3649,7 +3649,8 @@ async fn assert_free_text_columns_are_wide(db: &DatabaseConnection) {
 /// tick is claimed: the ledger keys a unique index on them, which MySQL cannot
 /// build over `TEXT`. An imported object's `original_author` is a source login,
 /// refused past 255 characters before the write, and `original_service` is
-/// `github` or `gitlab` (card_04088376105b). A column joins this list only with
+/// `github`, `gitlab` or `<platform>:<host>`, held to 255 bytes by
+/// `SourceOrigin` (card_04088376105b). A column joins this list only with
 /// the same answer.
 const NARROW_MYSQL_COLUMNS: &[(&str, &[&str])] = &[
     ("access_tokens", &["name", "scopes", "token_hash"]),

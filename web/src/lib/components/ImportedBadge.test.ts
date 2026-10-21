@@ -22,6 +22,14 @@ describe('imported badge', () => {
 		expect(rendered.container.querySelector('a')).toBeNull();
 	});
 
+	it('names the server an import came from when it is not the public one', async () => {
+		rendered = await renderComponent(ImportedBadge, {
+			login: 'alice',
+			service: 'gitlab:git.example.com:8443',
+		});
+		expect(rendered.container.textContent).toContain('GitLab · git.example.com:8443');
+	});
+
 	it('renders nothing for what was written on this instance', async () => {
 		rendered = await renderComponent(ImportedBadge, { login: null, service: null });
 		expect(rendered.container.textContent?.trim()).toBe('');

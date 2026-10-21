@@ -19,7 +19,9 @@ pub struct Model {
     /// The source platform's numeric id for [`Self::original_author`], which a
     /// rename cannot reassign.
     pub original_author_id: Option<i64>,
-    /// The platform that issued [`Self::original_author_id`]: `github` / `gitlab`.
+    /// The platform instance that issued [`Self::original_author_id`]: `github`
+    /// (github.com), `gitlab` (gitlab.com), or `github:<host>` / `gitlab:<host>`
+    /// for any other server, whose ids are never matched to a sign-in.
     pub original_service: Option<String>,
     pub body: String,
     pub created_at: DateTimeUtc,

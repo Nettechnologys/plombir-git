@@ -14,8 +14,9 @@
 //! * `original_author_id` — the source's numeric account id. A login can be
 //!   renamed and taken by someone else; this cannot, and it is what a later
 //!   re-attribution to whoever signs in with that source account is keyed on.
-//! * `original_service` — `github` or `gitlab`: the id means nothing without
-//!   the platform that issued it.
+//! * `original_service` — the platform instance that issued the id: `github`
+//!   (github.com), `gitlab` (gitlab.com), or `github:<host>` / `gitlab:<host>`
+//!   for any other server. The id means nothing without it.
 //!
 //! `NULL` in all three is "written here": every row that exists when this
 //! migration runs and everything not brought by an import.

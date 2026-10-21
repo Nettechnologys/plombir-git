@@ -156,7 +156,7 @@ pub struct ImportStats {
 struct OriginalAuthor {
     login: Option<String>,
     id: Option<i64>,
-    service: Option<&'static str>,
+    service: Option<String>,
 }
 
 impl OriginalAuthor {
@@ -164,27 +164,97 @@ impl OriginalAuthor {
     /// platforms cap logins far below it; a longer one is not a login.
     const MAX_LOGIN_CHARS: usize = 255;
 
-    fn github(user: Option<&crate::import::github_client::GitHubUser>) -> Self {
+    fn github(
+        origin: &SourceOrigin,
+        user: Option<&crate::import::github_client::GitHubUser>,
+    ) -> Self {
         user.map_or_else(Self::default, |user| {
-            Self::named("github", &user.login, user.id)
+            Self::named(origin, &user.login, user.id)
         })
     }
 
-    fn gitlab(user: Option<&crate::import::gitlab_client::GitLabUser>) -> Self {
+    fn gitlab(
+        origin: &SourceOrigin,
+        user: Option<&crate::import::gitlab_client::GitLabUser>,
+    ) -> Self {
         user.map_or_else(Self::default, |user| {
-            Self::named("gitlab", &user.username, user.id)
+            Self::named(origin, &user.username, user.id)
         })
     }
 
-    fn named(service: &'static str, login: &str, id: i64) -> Self {
+    fn named(origin: &SourceOrigin, login: &str, id: i64) -> Self {
         if login.is_empty() || login.chars().count() > Self::MAX_LOGIN_CHARS {
             return Self::default();
         }
         Self {
             login: Some(login.to_string()),
             id: Some(id),
-            service: Some(service),
+            service: Some(origin.service.clone()),
         }
+    }
+}
+
+/// Which platform an import's source is, and which instance of it — what an
+/// imported byline's `original_service` records.
+///
+/// An account id means something only on the instance that issued it: user 42
+/// on github.com and user 42 on a GitHub Enterprise server are two people. Sign-
+/// in through GitHub and GitLab is github.com and gitlab.com only, so those two
+/// get the bare `github` / `gitlab`, and every other host is spelled out —
+/// `github:ghe.example.com` — so a later re-attribution by account id
+/// (card_2a006cf365f6) can never hand somebody the history of a namesake on
+/// another server. The host comes from the address the importer chose, not
+/// from anything the source says about its users.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceOrigin {
+    service: String,
+}
+
+impl SourceOrigin {
+    const MAX_SERVICE_BYTES: usize = 255;
+
+    /// From the GitHub API base [`parse_github_url`] derived: `api.github.com`
+    /// is github.com.
+    fn github(api_base_url: &str) -> Result<Self> {
+        Self::from_api(api_base_url, "github", "api.github.com")
+    }
+
+    /// From the GitLab API base [`parse_gitlab_url`] derived.
+    fn gitlab(api_base_url: &str) -> Result<Self> {
+        Self::from_api(api_base_url, "gitlab", "gitlab.com")
+    }
+
+    fn from_api(api_base_url: &str, platform: &str, public_host: &str) -> Result<Self> {
+        let url = reqwest::Url::parse(api_base_url)
+            .with_context(|| format!("the {platform} API address {api_base_url} does not parse"))?;
+        let host = url
+            .host_str()
+            .with_context(|| format!("the {platform} API address {api_base_url} names no host"))?
+            .to_ascii_lowercase();
+        let service = match url.port() {
+            None if host == public_host => platform.to_string(),
+            None => format!("{platform}:{host}"),
+            Some(port) => format!("{platform}:{host}:{port}"),
+        };
+        // The column is `varchar(255)` on MySQL and a DNS name may be 253
+        // characters before its port. Such a host is named no more precisely,
+        // which costs nothing: only the bare forms are ever re-attributed.
+        if service.len() > Self::MAX_SERVICE_BYTES {
+            return Ok(Self {
+                service: format!("{platform}:other"),
+            });
+        }
+        Ok(Self { service })
+    }
+
+    #[cfg(test)]
+    fn github_com() -> Self {
+        Self::github("https://api.github.com").expect("github.com parses")
+    }
+
+    #[cfg(test)]
+    fn gitlab_com() -> Self {
+        Self::gitlab("https://gitlab.com/api/v4").expect("gitlab.com parses")
     }
 }
 
@@ -341,6 +411,7 @@ mod release_import_tests {
             &db,
             1,
             2,
+            &SourceOrigin::github_com(),
             &[
                 GitHubRelease {
                     author: Some(crate::import::github_client::GitHubUser {
@@ -399,6 +470,7 @@ mod release_import_tests {
             &db,
             1,
             2,
+            &SourceOrigin::gitlab_com(),
             &[gitlab_release("v2"), gitlab_release("v2")],
             Path::new("unused"),
             &mut stats,
@@ -1420,6 +1492,7 @@ async fn run_github_import(
         repo: gh_repo,
         api_base_url,
     } = parse_github_url(&task.source_url)?;
+    let origin = SourceOrigin::github(&api_base_url)?;
     let api_destination = trusted_origins.api_destination(&api_base_url)?;
     let client = GitHubClient::new(token.to_string(), api_destination)?;
 
@@ -1514,6 +1587,7 @@ async fn run_github_import(
                 issue,
                 &comments,
                 task.user_id,
+                &origin,
                 &milestone_map,
                 label_map.as_ref(),
                 stats,
@@ -1552,6 +1626,7 @@ async fn run_github_import(
                 &comments,
                 &reviews,
                 task.user_id,
+                &origin,
                 &milestone_map,
                 stats,
             )
@@ -1573,8 +1648,16 @@ async fn run_github_import(
     if task.import_releases {
         update_stage(db, task.id, "importing", 80, "Importing releases...").await?;
         let releases = client.list_releases(&gh_owner, &gh_repo).await?;
-        stats.releases_imported =
-            import_github_releases(db, repo_id, task.user_id, &releases, repo_root, stats).await?;
+        stats.releases_imported = import_github_releases(
+            db,
+            repo_id,
+            task.user_id,
+            &origin,
+            &releases,
+            repo_root,
+            stats,
+        )
+        .await?;
         update_stage(
             db,
             task.id,
@@ -1631,6 +1714,7 @@ async fn run_gitlab_import(
         project_path,
         api_base_url,
     } = parse_gitlab_url(&task.source_url)?;
+    let origin = SourceOrigin::gitlab(&api_base_url)?;
     let api_destination = trusted_origins.api_destination(&api_base_url)?;
     let client = GitLabClient::new(token.to_string(), api_destination)?;
 
@@ -1731,6 +1815,7 @@ async fn run_gitlab_import(
                 issue,
                 &notes,
                 task.user_id,
+                &origin,
                 &milestone_map,
                 label_map.as_ref(),
                 stats,
@@ -1757,7 +1842,17 @@ async fn run_gitlab_import(
 
         for (i, mr) in mrs.iter().enumerate() {
             let notes = client.list_mr_notes(&project_path, mr.iid).await?;
-            import_gitlab_mr(db, repo_id, mr, &notes, task.user_id, &milestone_map, stats).await?;
+            import_gitlab_mr(
+                db,
+                repo_id,
+                mr,
+                &notes,
+                task.user_id,
+                &origin,
+                &milestone_map,
+                stats,
+            )
+            .await?;
 
             let pct = 60 + (i as f64 / total.max(1) as f64 * 15.0) as i32;
             update_stage(
@@ -1775,8 +1870,16 @@ async fn run_gitlab_import(
     if task.import_releases {
         update_stage(db, task.id, "importing", 80, "Importing releases...").await?;
         let releases = client.list_releases(&project_path).await?;
-        stats.releases_imported =
-            import_gitlab_releases(db, repo_id, task.user_id, &releases, repo_root, stats).await?;
+        stats.releases_imported = import_gitlab_releases(
+            db,
+            repo_id,
+            task.user_id,
+            &origin,
+            &releases,
+            repo_root,
+            stats,
+        )
+        .await?;
         update_stage(
             db,
             task.id,
@@ -3192,6 +3295,33 @@ fn api_base_url(mut source: reqwest::Url, path: &str, platform: &str) -> Result<
 mod import_source_url_tests {
     use super::*;
 
+    /// An account id names a person only on the instance that issued it, so
+    /// the byline's service says which instance: the bare platform for
+    /// github.com and gitlab.com — the two that sign-in can vouch for — and the
+    /// host for every other (card_2a006cf365f6).
+    #[test]
+    fn a_source_origin_names_the_instance_its_ids_belong_to() {
+        let service = |source: &str, github: bool| {
+            if github {
+                let api = parse_github_url(source).unwrap().api_base_url;
+                SourceOrigin::github(&api).unwrap().service
+            } else {
+                let api = parse_gitlab_url(source).unwrap().api_base_url;
+                SourceOrigin::gitlab(&api).unwrap().service
+            }
+        };
+        assert_eq!(service("https://github.com/acme/widgets", true), "github");
+        assert_eq!(
+            service("https://GHE.Example.com/acme/widgets", true),
+            "github:ghe.example.com"
+        );
+        assert_eq!(service("https://gitlab.com/acme/widgets", false), "gitlab");
+        assert_eq!(
+            service("https://git.example.com:8443/acme/widgets", false),
+            "gitlab:git.example.com:8443"
+        );
+    }
+
     #[test]
     fn github_com_uses_the_public_api_host() {
         let source = parse_github_url("https://github.com/acme/widgets.git/")
@@ -3481,6 +3611,7 @@ async fn import_github_issue(
     issue: &GitHubIssue,
     comments: &[GitHubComment],
     author_id: i64,
+    origin: &SourceOrigin,
     milestone_map: &HashMap<String, i64>,
     label_map: Option<&HashMap<String, i64>>,
     stats: &mut ImportStats,
@@ -3544,6 +3675,7 @@ async fn import_github_issue(
         "open"
     };
 
+    let byline = OriginalAuthor::github(origin, issue.user.as_ref());
     let model = issue::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: Set(repo_id),
@@ -3559,11 +3691,9 @@ async fn import_github_issue(
         updated_at: Set(updated_at),
         closed_at: Set(closed_at),
         deleted_at: Set(None),
-        original_author: Set(OriginalAuthor::github(issue.user.as_ref()).login.clone()),
-        original_author_id: Set(OriginalAuthor::github(issue.user.as_ref()).id),
-        original_service: Set(OriginalAuthor::github(issue.user.as_ref())
-            .service
-            .map(str::to_string)),
+        original_author: Set(byline.login.clone()),
+        original_author_id: Set(byline.id),
+        original_service: Set(byline.service.clone()),
     };
 
     let Some(saved) = skip_taken_number(
@@ -3579,6 +3709,7 @@ async fn import_github_issue(
 
     // Import comments
     for (comment, (created_at, updated_at)) in comments.iter().zip(comment_timestamps) {
+        let byline = OriginalAuthor::github(origin, comment.user.as_ref());
         let cm = rg_db::entities::issue_comment::ActiveModel {
             id: sea_orm::NotSet,
             issue_id: Set(saved.id),
@@ -3586,11 +3717,9 @@ async fn import_github_issue(
             body: Set(comment.body.clone().unwrap_or_default()),
             created_at: Set(created_at),
             updated_at: Set(updated_at),
-            original_author: Set(OriginalAuthor::github(comment.user.as_ref()).login.clone()),
-            original_author_id: Set(OriginalAuthor::github(comment.user.as_ref()).id),
-            original_service: Set(OriginalAuthor::github(comment.user.as_ref())
-                .service
-                .map(str::to_string)),
+            original_author: Set(byline.login.clone()),
+            original_author_id: Set(byline.id),
+            original_service: Set(byline.service.clone()),
         };
 
         match issue_comment_ops::create(db, cm).await {
@@ -3616,6 +3745,7 @@ async fn import_github_pr(
     comments: &[GitHubComment],
     reviews: &[GitHubReview],
     author_id: i64,
+    origin: &SourceOrigin,
     milestone_map: &HashMap<String, i64>,
     stats: &mut ImportStats,
 ) -> Result<()> {
@@ -3724,6 +3854,7 @@ async fn import_github_pr(
         })
         .collect();
 
+    let byline = OriginalAuthor::github(origin, pr.user.as_ref());
     let model = rg_db::entities::pull_request::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: Set(repo_id),
@@ -3762,11 +3893,9 @@ async fn import_github_pr(
         updated_at: Set(updated_at),
         closed_at: Set(closed_at),
         merged_at: Set(merged_at),
-        original_author: Set(OriginalAuthor::github(pr.user.as_ref()).login.clone()),
-        original_author_id: Set(OriginalAuthor::github(pr.user.as_ref()).id),
-        original_service: Set(OriginalAuthor::github(pr.user.as_ref())
-            .service
-            .map(str::to_string)),
+        original_author: Set(byline.login.clone()),
+        original_author_id: Set(byline.id),
+        original_service: Set(byline.service.clone()),
     };
 
     let Some(saved) = skip_taken_number(
@@ -3792,7 +3921,7 @@ async fn import_github_pr(
             repo_id,
             saved.id,
             author_id,
-            &OriginalAuthor::github(comment.user.as_ref()),
+            &OriginalAuthor::github(origin, comment.user.as_ref()),
             comment.body.clone().unwrap_or_default(),
             created_at,
             format!("pull request #{} comment {}", pr.number, comment.id),
@@ -3822,6 +3951,7 @@ async fn import_github_pr(
         // (card_dc0f5d58e5f4).
         let dismissed_at = (action == "dismiss").then_some(submitted_at);
 
+        let byline = OriginalAuthor::github(origin, review.user.as_ref());
         let rv = rg_db::entities::pr_review::ActiveModel {
             id: sea_orm::NotSet,
             pr_id: Set(saved.id),
@@ -3833,11 +3963,9 @@ async fn import_github_pr(
             created_at: Set(submitted_at),
             dismissed_at: Set(dismissed_at),
             dismissed_by: Set(None),
-            original_author: Set(OriginalAuthor::github(review.user.as_ref()).login.clone()),
-            original_author_id: Set(OriginalAuthor::github(review.user.as_ref()).id),
-            original_service: Set(OriginalAuthor::github(review.user.as_ref())
-                .service
-                .map(str::to_string)),
+            original_author: Set(byline.login.clone()),
+            original_author_id: Set(byline.id),
+            original_service: Set(byline.service.clone()),
         };
 
         match pr_review_ops::create(db, rv).await {
@@ -3882,7 +4010,7 @@ async fn import_pr_conversation_comment(
         dismissed_by: Set(None),
         original_author: Set(original.login.clone()),
         original_author_id: Set(original.id),
-        original_service: Set(original.service.map(str::to_string)),
+        original_service: Set(original.service.clone()),
     };
     match pr_review_ops::create(db, row).await {
         Ok(_) => stats.pr_comments_imported += 1,
@@ -3916,7 +4044,7 @@ async fn record_release_byline(
     let mut active: rg_db::entities::release::ActiveModel = created.into();
     active.original_author = Set(original.login);
     active.original_author_id = Set(original.id);
-    active.original_service = Set(original.service.map(str::to_string));
+    active.original_service = Set(original.service);
     if let Err(error) = active.update(db).await {
         tracing::warn!(
             tag = %tag,
@@ -3930,6 +4058,7 @@ async fn import_github_releases(
     db: &DatabaseConnection,
     repo_id: i64,
     importer_id: i64,
+    origin: &SourceOrigin,
     releases: &[GitHubRelease],
     repo_root: &Path,
     stats: &mut ImportStats,
@@ -3960,8 +4089,12 @@ async fn import_github_releases(
         {
             Ok(created) => {
                 count += 1;
-                record_release_byline(db, created, OriginalAuthor::github(release.author.as_ref()))
-                    .await;
+                record_release_byline(
+                    db,
+                    created,
+                    OriginalAuthor::github(origin, release.author.as_ref()),
+                )
+                .await;
             }
             Err(e) => {
                 tracing::warn!(tag = %release.tag_name, error = %format!("{e:#}"), "failed to import release");
@@ -4095,6 +4228,7 @@ async fn import_gitlab_issue(
     issue: &GitLabIssue,
     notes: &[GitLabNote],
     author_id: i64,
+    origin: &SourceOrigin,
     milestone_map: &HashMap<String, i64>,
     label_map: Option<&HashMap<String, i64>>,
     stats: &mut ImportStats,
@@ -4148,6 +4282,7 @@ async fn import_gitlab_issue(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let byline = OriginalAuthor::gitlab(origin, issue.author.as_ref());
     let model = issue::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: Set(repo_id),
@@ -4163,11 +4298,9 @@ async fn import_gitlab_issue(
         updated_at: Set(updated_at),
         closed_at: Set(closed_at),
         deleted_at: Set(None),
-        original_author: Set(OriginalAuthor::gitlab(issue.author.as_ref()).login.clone()),
-        original_author_id: Set(OriginalAuthor::gitlab(issue.author.as_ref()).id),
-        original_service: Set(OriginalAuthor::gitlab(issue.author.as_ref())
-            .service
-            .map(str::to_string)),
+        original_author: Set(byline.login.clone()),
+        original_author_id: Set(byline.id),
+        original_service: Set(byline.service.clone()),
     };
 
     let Some(saved) = skip_taken_number(
@@ -4187,6 +4320,7 @@ async fn import_gitlab_issue(
         .filter(|note| !note.system)
         .zip(note_timestamps)
     {
+        let byline = OriginalAuthor::gitlab(origin, note.author.as_ref());
         let cm = rg_db::entities::issue_comment::ActiveModel {
             id: sea_orm::NotSet,
             issue_id: Set(saved.id),
@@ -4194,11 +4328,9 @@ async fn import_gitlab_issue(
             body: Set(note.body.clone().unwrap_or_default()),
             created_at: Set(created_at),
             updated_at: Set(updated_at),
-            original_author: Set(OriginalAuthor::gitlab(note.author.as_ref()).login.clone()),
-            original_author_id: Set(OriginalAuthor::gitlab(note.author.as_ref()).id),
-            original_service: Set(OriginalAuthor::gitlab(note.author.as_ref())
-                .service
-                .map(str::to_string)),
+            original_author: Set(byline.login.clone()),
+            original_author_id: Set(byline.id),
+            original_service: Set(byline.service.clone()),
         };
 
         match issue_comment_ops::create(db, cm).await {
@@ -4217,12 +4349,14 @@ async fn import_gitlab_issue(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn import_gitlab_mr(
     db: &DatabaseConnection,
     repo_id: i64,
     mr: &GitLabMR,
     notes: &[GitLabNote],
     author_id: i64,
+    origin: &SourceOrigin,
     milestone_map: &HashMap<String, i64>,
     stats: &mut ImportStats,
 ) -> Result<()> {
@@ -4297,6 +4431,7 @@ async fn import_gitlab_mr(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let byline = OriginalAuthor::gitlab(origin, mr.author.as_ref());
     let model = rg_db::entities::pull_request::ActiveModel {
         id: sea_orm::NotSet,
         repo_id: Set(repo_id),
@@ -4336,11 +4471,9 @@ async fn import_gitlab_mr(
         updated_at: Set(updated_at),
         closed_at: Set(closed_at),
         merged_at: Set(merged_at),
-        original_author: Set(OriginalAuthor::gitlab(mr.author.as_ref()).login.clone()),
-        original_author_id: Set(OriginalAuthor::gitlab(mr.author.as_ref()).id),
-        original_service: Set(OriginalAuthor::gitlab(mr.author.as_ref())
-            .service
-            .map(str::to_string)),
+        original_author: Set(byline.login.clone()),
+        original_author_id: Set(byline.id),
+        original_service: Set(byline.service.clone()),
     };
 
     let Some(saved) = skip_taken_number(
@@ -4366,7 +4499,7 @@ async fn import_gitlab_mr(
             repo_id,
             saved.id,
             author_id,
-            &OriginalAuthor::gitlab(note.author.as_ref()),
+            &OriginalAuthor::gitlab(origin, note.author.as_ref()),
             note.body.clone().unwrap_or_default(),
             created_at,
             format!("merge request !{} note {}", mr.iid, note.id),
@@ -4383,6 +4516,7 @@ async fn import_gitlab_releases(
     db: &DatabaseConnection,
     repo_id: i64,
     importer_id: i64,
+    origin: &SourceOrigin,
     releases: &[GitLabRelease],
     repo_root: &Path,
     stats: &mut ImportStats,
@@ -4411,8 +4545,12 @@ async fn import_gitlab_releases(
         {
             Ok(created) => {
                 count += 1;
-                record_release_byline(db, created, OriginalAuthor::gitlab(release.author.as_ref()))
-                    .await;
+                record_release_byline(
+                    db,
+                    created,
+                    OriginalAuthor::gitlab(origin, release.author.as_ref()),
+                )
+                .await;
             }
             Err(e) => {
                 tracing::warn!(tag = %release.tag_name, error = %format!("{e:#}"), "failed to import release");
@@ -4949,6 +5087,7 @@ mod imported_issue_label_tests {
             &issue,
             &[],
             IMPORTER_ID,
+            &SourceOrigin::github_com(),
             &HashMap::new(),
             None,
             &mut ImportStats::default(),
@@ -4974,6 +5113,7 @@ mod imported_issue_label_tests {
             &issue,
             &[comment],
             IMPORTER_ID,
+            &SourceOrigin::github_com(),
             &HashMap::new(),
             None,
             &mut ImportStats::default(),
@@ -5019,6 +5159,7 @@ mod imported_issue_label_tests {
                 &issue,
                 &[],
                 IMPORTER_ID,
+                &SourceOrigin::github_com(),
                 &HashMap::new(),
                 None,
                 &mut stats,
@@ -5035,6 +5176,7 @@ mod imported_issue_label_tests {
             &[],
             &[],
             IMPORTER_ID,
+            &SourceOrigin::github_com(),
             &HashMap::new(),
             &mut stats,
         )
@@ -5116,6 +5258,7 @@ mod imported_issue_label_tests {
                 issue,
                 &[github_comment(901)],
                 IMPORTER_ID,
+                &SourceOrigin::github_com(),
                 &HashMap::new(),
                 None,
                 stats,
@@ -5167,6 +5310,7 @@ mod imported_issue_label_tests {
                 &[],
                 &[],
                 IMPORTER_ID,
+                &SourceOrigin::github_com(),
                 &HashMap::new(),
                 &mut pr_stats,
             )
@@ -5206,6 +5350,7 @@ mod imported_issue_label_tests {
                 &[],
                 &[],
                 IMPORTER_ID,
+                &SourceOrigin::github_com(),
                 &HashMap::new(),
                 &mut stats,
             )
@@ -5250,6 +5395,7 @@ mod imported_issue_label_tests {
             &[],
             &[],
             IMPORTER_ID,
+            &SourceOrigin::github_com(),
             &HashMap::new(),
             &mut ImportStats::default(),
         )
@@ -5297,6 +5443,7 @@ mod imported_issue_label_tests {
             &[],
             &reviews,
             IMPORTER_ID,
+            &SourceOrigin::github_com(),
             &HashMap::new(),
             &mut stats,
         )
@@ -5354,6 +5501,7 @@ mod imported_issue_label_tests {
             &issue,
             &[],
             IMPORTER_ID,
+            &SourceOrigin::gitlab_com(),
             &HashMap::new(),
             None,
             &mut ImportStats::default(),
@@ -5376,6 +5524,7 @@ mod imported_issue_label_tests {
             &issue,
             &[note],
             IMPORTER_ID,
+            &SourceOrigin::gitlab_com(),
             &HashMap::new(),
             None,
             &mut ImportStats::default(),
@@ -5403,6 +5552,7 @@ mod imported_issue_label_tests {
             &mr,
             &[],
             IMPORTER_ID,
+            &SourceOrigin::gitlab_com(),
             &HashMap::new(),
             &mut ImportStats::default(),
         )
@@ -5540,6 +5690,7 @@ mod imported_issue_label_tests {
             &issue,
             &comments,
             7,
+            &SourceOrigin::github_com(),
             &HashMap::new(),
             None,
             &mut ImportStats::default(),
@@ -5616,6 +5767,7 @@ mod imported_issue_label_tests {
             &[comment],
             &[review],
             IMPORTER_ID,
+            &SourceOrigin::github_com(),
             &HashMap::new(),
             &mut stats,
         )
@@ -5637,6 +5789,7 @@ mod imported_issue_label_tests {
             &issue,
             &[note],
             IMPORTER_ID,
+            &SourceOrigin::gitlab_com(),
             &HashMap::new(),
             None,
             &mut stats,
@@ -5645,9 +5798,18 @@ mod imported_issue_label_tests {
         .unwrap();
         let mut mr = gitlab_mr();
         mr.author = None;
-        import_gitlab_mr(&db, 1, &mr, &[], IMPORTER_ID, &HashMap::new(), &mut stats)
-            .await
-            .unwrap();
+        import_gitlab_mr(
+            &db,
+            1,
+            &mr,
+            &[],
+            IMPORTER_ID,
+            &SourceOrigin::gitlab_com(),
+            &HashMap::new(),
+            &mut stats,
+        )
+        .await
+        .unwrap();
 
         let bylines = |rows: Vec<(Option<String>, Option<i64>, Option<String>)>| {
             let mut rows: Vec<(Option<String>, Option<i64>, Option<String>)> = rows;
@@ -5827,6 +5989,7 @@ mod tests {
             }),
             &[],
             IMPORTER_ID,
+            &SourceOrigin::github_com(),
             &empty_milestones,
             Some(&label_map),
             &mut ImportStats::default(),
@@ -5841,6 +6004,7 @@ mod tests {
             &gitlab_issue(&triage.name),
             &[],
             IMPORTER_ID,
+            &SourceOrigin::gitlab_com(),
             &empty_milestones,
             Some(&label_map),
             &mut ImportStats::default(),
@@ -6101,6 +6265,7 @@ mod tests {
             }),
             &[github_comment(501), refused],
             IMPORTER_ID,
+            &SourceOrigin::github_com(),
             &HashMap::new(),
             None,
             &mut stats,
@@ -6122,6 +6287,7 @@ mod tests {
             &gitlab_issue("bug"),
             &[gitlab_note(901), system, refused],
             IMPORTER_ID,
+            &SourceOrigin::gitlab_com(),
             &HashMap::new(),
             None,
             &mut stats,
@@ -6205,6 +6371,7 @@ mod tests {
                 review(703, "PENDING", None),
             ],
             IMPORTER_ID,
+            &SourceOrigin::github_com(),
             &HashMap::new(),
             &mut stats,
         )
@@ -6221,6 +6388,7 @@ mod tests {
             &gitlab_mr(),
             &[gitlab_note(911), system, refused],
             IMPORTER_ID,
+            &SourceOrigin::gitlab_com(),
             &HashMap::new(),
             &mut stats,
         )
@@ -6297,6 +6465,7 @@ mod tests {
             }),
             &[],
             IMPORTER_ID,
+            &SourceOrigin::github_com(),
             &HashMap::new(),
             None,
             &mut ImportStats::default(),
