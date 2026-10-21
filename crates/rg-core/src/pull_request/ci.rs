@@ -268,6 +268,9 @@ pub async fn trigger_pull_request_ci(
             // The `branches:` filter of `on: pull_request` applies to the branch
             // the PR targets, which nothing but this call knows.
             base_branch: Some(&pr.base_branch),
+            // `github.head_ref`: the branch the PR comes from, which the ref
+            // (`refs/pull/<n>/head`) does not name.
+            head_branch: Some(&pr.head_branch),
             previous_sha: None,
             inputs: None,
             triggered_by: actor_id,
@@ -342,6 +345,7 @@ pub async fn trigger_pull_request_ci_best_effort(
                         // judged against the default branch, which for a PR
                         // into any other branch selects a different graph.
                         base_branch: Some(&pr.base_branch),
+                        head_branch: Some(&pr.head_branch),
                         previous_sha: None,
                         schedule: None,
                     },
@@ -634,6 +638,12 @@ mod configuration_failure_tests {
             Some("develop"),
             "the diagnostic row did not record the branch the PR targets, so its retry is \
              judged against whatever this repository defaults to today"
+        );
+        assert_eq!(
+            pipelines[0].head_branch.as_deref(),
+            Some("feature"),
+            "the diagnostic row did not record the branch the PR comes from, so its retry \
+             reads `github.head_ref` as ''"
         );
         assert_eq!(
             pipelines[0].previous_sha, None,

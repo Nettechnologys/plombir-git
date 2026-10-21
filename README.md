@@ -136,7 +136,8 @@ cited in the row added it. Plombir Git's side is specified in full in
 | `jobs.<id>.continue-on-error` | ✅ | ✅ with Runner 2.0 and Gitea ≥ 1.27 |
 | `jobs.<id>.environment` | ✅ an existing environment; a protected one waits for a person's approval | ⚠️ ignored |
 | `needs`, `if`, `env`, `defaults.run.working-directory` | ✅ | ✅ |
-| `inputs.*` / `github.event.inputs.*` in `if:` | ✅ typed as on GitHub (a boolean is `true` / `false`); an undeclared name refused | ✅ |
+| `inputs.*` / `github.event.inputs.*` in `if:`, `run:`, `env:`, `with:` | ✅ typed as on GitHub (a boolean is `true` / `false`); an undeclared name refused | ✅ |
+| `github.head_ref` / `github.base_ref` | ✅ the pull request's branches, `''` for other events — `${{ github.head_ref \|\| github.ref }}` groups work | ✅ |
 | `always()` / `failure()` in a job's `if:` | ✅ answer for every job it needs, transitively; the pipeline stays failed; `cancelled()` refused — a canceled pipeline runs nothing more | ✅ |
 | `strategy.matrix` | ✅ static and dynamic (`fromJSON(needs.<job>.outputs.<name>)`), `include` / `exclude` | ✅ static and dynamic |
 | `strategy.fail-fast`, `strategy.max-parallel` | ✅ | ✅ |

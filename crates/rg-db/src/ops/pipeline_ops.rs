@@ -36,6 +36,7 @@ pub async fn create_pipeline(
             concurrency_group: None,
             dispatch_inputs: None,
             base_branch: None,
+            head_branch: None,
             previous_sha: None,
             schedule: None,
         },
@@ -70,6 +71,9 @@ pub struct NewPipeline<'a> {
     /// that has to be filtered the same way. See
     /// [`pipeline::Model::base_branch`].
     pub base_branch: Option<&'a str>,
+    /// The branch a `pull_request` run's pull request comes from. See
+    /// [`pipeline::Model::head_branch`].
+    pub head_branch: Option<&'a str>,
     /// Where the ref stood before the event that produced this run, for the
     /// retry whose `paths:` filters have to see the same diff. See
     /// [`pipeline::Model::previous_sha`].
@@ -98,6 +102,7 @@ pub async fn create_pipeline_row(
         concurrency_group: Set(new.concurrency_group.map(str::to_string)),
         dispatch_inputs: Set(new.dispatch_inputs.map(str::to_string)),
         base_branch: Set(new.base_branch.map(str::to_string)),
+        head_branch: Set(new.head_branch.map(str::to_string)),
         previous_sha: Set(new.previous_sha.map(str::to_string)),
         schedule_workflow: Set(new.schedule.map(|(workflow, _)| workflow.to_string())),
         schedule_cron: Set(new.schedule.map(|(_, cron)| cron.to_string())),

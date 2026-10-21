@@ -379,6 +379,7 @@ async fn finished_pipeline(
             concurrency_group: None,
             dispatch_inputs: None,
             base_branch: None,
+            head_branch: None,
             previous_sha: None,
             schedule: None,
         },

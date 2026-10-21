@@ -880,6 +880,7 @@ pub async fn trigger_pipeline(
             // `rg_core::ci::WORKFLOW_DISPATCH_EVENT`.
             trigger_type: rg_core::ci::WORKFLOW_DISPATCH_EVENT,
             base_branch: None,
+            head_branch: None,
             // A manual run has no previous revision of its own; a `paths:`
             // filter falls back to the diff of the commit it is asked to build.
             previous_sha: None,
@@ -1034,6 +1035,7 @@ pub async fn retry_pipeline(
             // being replayed against a branch nobody recorded.
             previous_sha: pipeline.previous_sha.as_deref(),
             base_branch: pipeline.base_branch.as_deref(),
+            head_branch: pipeline.head_branch.as_deref(),
             inputs: dispatch_inputs.as_ref(),
             triggered_by: Some(actor_id),
             docker_enabled: state.docker_enabled,

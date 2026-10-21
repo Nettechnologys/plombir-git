@@ -272,6 +272,8 @@ pub(crate) enum ActionExpression {
     GithubRepositoryOwner,
     Matrix(String),
     Input(String),
+    /// `github.event.inputs.<name>`: the `workflow_dispatch` input of the run.
+    EventInput(String),
     Unsupported(String),
 }
 
@@ -285,6 +287,7 @@ impl ActionExpression {
             Self::GithubRepositoryOwner => "github.repository_owner".into(),
             Self::Matrix(name) => format!("matrix.{name}"),
             Self::Input(name) => format!("inputs.{name}"),
+            Self::EventInput(name) => format!("github.event.inputs.{name}"),
             Self::Unsupported(name) => name.clone(),
         }
     }

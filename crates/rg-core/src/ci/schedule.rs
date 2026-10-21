@@ -322,6 +322,7 @@ async fn trigger(
             // A scheduled run targets the branch it runs on, and has no
             // previous revision: `paths:` does not apply to it.
             base_branch: None,
+            head_branch: None,
             previous_sha: None,
             inputs: None,
             schedule: Some(run),
@@ -368,6 +369,7 @@ async fn trigger(
                     trigger_type: SCHEDULE_EVENT,
                     triggered_by: None,
                     base_branch: None,
+                    head_branch: None,
                     previous_sha: None,
                     schedule: Some(run),
                 },

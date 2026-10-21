@@ -32,6 +32,8 @@ struct RecordingCiEngine {
     /// the answer that has to survive too: `Some(default branch)` would be the
     /// engine inventing one.
     base_branches: Mutex<Vec<Option<String>>>,
+    /// The pull request's source branch, `github.head_ref` (card_af3833480552).
+    head_branches: Mutex<Vec<Option<String>>>,
     previous_shas: Mutex<Vec<Option<String>>>,
     dispatch_schema: Mutex<rg_core::ci::WorkflowDispatchSchema>,
     schema_queries: Mutex<Vec<(PathBuf, String)>>,
@@ -103,6 +105,7 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
         let ref_name = params.ref_name.to_string();
         let inputs = params.inputs.cloned().unwrap_or_default();
         let base_branch = params.base_branch.map(str::to_string);
+        let head_branch = params.head_branch.map(str::to_string);
         let previous_sha = params.previous_sha.map(str::to_string);
         let gate = self.gate.lock().unwrap().take();
         let no_match_ref = self.no_match_ref.lock().unwrap().take();
@@ -127,6 +130,7 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
                 .transpose()?;
             self.dispatch_inputs.lock().unwrap().push(inputs);
             self.base_branches.lock().unwrap().push(base_branch.clone());
+            self.head_branches.lock().unwrap().push(head_branch.clone());
             self.previous_shas
                 .lock()
                 .unwrap()
@@ -142,6 +146,7 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
                     concurrency_group: None,
                     dispatch_inputs: stored_inputs.as_deref(),
                     base_branch: base_branch.as_deref(),
+                    head_branch: head_branch.as_deref(),
                     previous_sha: previous_sha.as_deref(),
                     schedule: None,
                 },
@@ -213,6 +218,7 @@ impl Harness {
         self.engine.refs.lock().unwrap().clear();
         self.engine.dispatch_inputs.lock().unwrap().clear();
         self.engine.base_branches.lock().unwrap().clear();
+        self.engine.head_branches.lock().unwrap().clear();
         self.engine.previous_shas.lock().unwrap().clear();
         self.engine.schema_queries.lock().unwrap().clear();
         self.engine.pipeline_ids.lock().unwrap().clear();
@@ -1044,6 +1050,7 @@ async fn a_retry_replays_the_event_context_of_the_run_it_repeats() {
             concurrency_group: None,
             dispatch_inputs: None,
             base_branch: Some("develop"),
+            head_branch: Some("feature"),
             previous_sha: Some(previous_sha),
             schedule: None,
         },
@@ -1068,6 +1075,12 @@ async fn a_retry_replays_the_event_context_of_the_run_it_repeats() {
          it is judged against whatever this repository defaults to today"
     );
     assert_eq!(
+        h.engine.head_branches.lock().unwrap().as_slice(),
+        [Some("feature".to_string())],
+        "the retry reached the engine without the branch the pull request comes from, so its \
+         jobs read `github.head_ref` as ''"
+    );
+    assert_eq!(
         h.engine.previous_shas.lock().unwrap().as_slice(),
         [Some(previous_sha.to_string())],
         "the retry reached the engine without the revision the original diff was taken from, \
@@ -1087,6 +1100,7 @@ async fn a_retry_replays_the_event_context_of_the_run_it_repeats() {
     .await
     .expect("seed a manual run");
     h.engine.base_branches.lock().unwrap().clear();
+    h.engine.head_branches.lock().unwrap().clear();
     h.engine.previous_shas.lock().unwrap().clear();
 
     let retried_manual = client
@@ -1107,6 +1121,11 @@ async fn a_retry_replays_the_event_context_of_the_run_it_repeats() {
         h.engine.base_branches.lock().unwrap().as_slice(),
         [None],
         "the retry of a run that targeted no branch arrived carrying one"
+    );
+    assert_eq!(
+        h.engine.head_branches.lock().unwrap().as_slice(),
+        [None],
+        "the retry of a run that came from no pull request arrived carrying a head branch"
     );
     assert_eq!(
         h.engine.previous_shas.lock().unwrap().as_slice(),

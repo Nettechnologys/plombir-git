@@ -332,6 +332,18 @@ async fn poll_keeps_the_wire_contract_for_decodable_and_null_job_columns() {
             ))
             .await
             .expect("make the pipeline a scheduled run");
+        } else {
+            // The other is a pull request: its branches reach the runner as
+            // `CI_HEAD_REF` / `CI_BASE_REF`, and the scheduled run reads both
+            // as `''` (card_af3833480552).
+            db.execute_unprepared(&format!(
+                "UPDATE pipelines SET trigger_type = 'pull_request', \
+                 ref_name = 'refs/pull/1/head', head_branch = 'feature', base_branch = 'main' \
+                 WHERE id = {}",
+                seeded.pipeline_id
+            ))
+            .await
+            .expect("make the pipeline a pull request run");
         }
 
         let response = reqwest::Client::new()
@@ -386,6 +398,21 @@ async fn poll_keeps_the_wire_contract_for_decodable_and_null_job_columns() {
                 "{body}"
             );
         }
+        let (head_ref, base_ref) = if suffix == "decodable" {
+            ("", "")
+        } else {
+            ("feature", "main")
+        };
+        assert_eq!(
+            body["variables"]["CI_HEAD_REF"],
+            serde_json::json!(head_ref),
+            "{body}"
+        );
+        assert_eq!(
+            body["variables"]["CI_BASE_REF"],
+            serde_json::json!(base_ref),
+            "{body}"
+        );
 
         let persisted = rg_db::ops::pipeline_ops::get_job(&db, seeded.job_id)
             .await

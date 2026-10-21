@@ -1105,6 +1105,14 @@ async fn add_server_variables(
     if let Some(cron) = pipeline.schedule_cron.as_deref() {
         variables.insert("CI_EVENT_SCHEDULE".into(), serde_json::json!(cron));
     }
+    // Set for every run, `''` outside a pull request — as the embedded runner.
+    let (head_ref, base_ref) = rg_core::ci::pull_request_refs(
+        &pipeline.trigger_type,
+        pipeline.head_branch.as_deref(),
+        pipeline.base_branch.as_deref(),
+    );
+    variables.insert("CI_HEAD_REF".into(), serde_json::json!(head_ref));
+    variables.insert("CI_BASE_REF".into(), serde_json::json!(base_ref));
     let (repository_owner, repository_name) =
         match rg_core::repo::service::repository_identity(&state.db, pipeline.repo_id).await {
             Ok(identity) => identity,

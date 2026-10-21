@@ -1193,7 +1193,7 @@ fn unsupported_action_inputs(job_name: &str, index: usize, step: &GiteaStep) -> 
     unknown
 }
 
-const GITHUB_RUN_EXPRESSIONS: [(&str, &str); 6] = [
+const GITHUB_RUN_EXPRESSIONS: [(&str, &str); 8] = [
     ("github.ref", "${CI_REF}"),
     ("github.sha", "${CI_SHA}"),
     ("github.event_name", "${CI_EVENT}"),
@@ -1202,7 +1202,23 @@ const GITHUB_RUN_EXPRESSIONS: [(&str, &str); 6] = [
     // Set by both runners for a `schedule` run only; empty otherwise, which is
     // what GitHub's `null` reads as in a string.
     ("github.event.schedule", "${CI_EVENT_SCHEDULE}"),
+    // Set by both runners for every run: the pull request's branches for a
+    // `pull_request` run, `''` for any other (`rg_core::ci::pull_request_refs`).
+    ("github.head_ref", "${CI_HEAD_REF}"),
+    ("github.base_ref", "${CI_BASE_REF}"),
 ];
+
+/// The job variable `${{ github.event.inputs.<name> }}` reads in a text field:
+/// the `workflow_dispatch` input of that name as text, installed on every job
+/// by [`GiteaWorkflow::resolve_event_inputs`].
+///
+/// Not `INPUT_<NAME>`, which is what `inputs.<name>` reads: in a job a reusable
+/// workflow brings, that is the called workflow's own `with:`, while
+/// `github.event` is still the event of the run — the dispatch of the file
+/// that called it.
+pub(crate) fn event_input_environment_name(name: &str) -> String {
+    format!("EVENT_{}", input_environment_name(name))
+}
 
 fn context_member<'a>(key: &'a str, context: &str) -> Option<&'a str> {
     key.strip_prefix(context)
@@ -1228,7 +1244,7 @@ fn supported_run_expression(key: &str) -> bool {
         // every one as its value before this check runs, so one still standing
         // is a variable the run had no source for. An `env.*` value with the
         // same name is a different Actions context.
-        || ["env", "secrets", "matrix", "inputs"]
+        || ["env", "secrets", "matrix", "inputs", "github.event.inputs"]
             .iter()
             .any(|context| context_member(key, context).is_some())
 }
@@ -1271,6 +1287,10 @@ fn job_field_expression(key: &str) -> Option<ActionExpression> {
             .map(|name| ActionExpression::Matrix(name.to_owned()))
             .or_else(|| {
                 context_member(key, "inputs").map(|name| ActionExpression::Input(name.to_owned()))
+            })
+            .or_else(|| {
+                context_member(key, "github.event.inputs")
+                    .map(|name| ActionExpression::EventInput(name.to_owned()))
             }),
     }
 }
@@ -1784,6 +1804,10 @@ pub struct WorkflowContext {
     /// The `- cron:` entry a `schedule` run fired for — `github.event.schedule`.
     /// `None` for every other event.
     pub event_schedule: Option<String>,
+    /// `github.head_ref` / `github.base_ref`: the branches of a pull request,
+    /// `''` for every other event (`rg_core::ci::pull_request_refs`).
+    pub head_ref: String,
+    pub base_ref: String,
 }
 
 impl WorkflowContext {
@@ -2046,6 +2070,17 @@ impl GiteaWorkflow {
         let mut typed = HashMap::new();
         if let Some(definitions) = definitions {
             for (name, value) in provided {
+                // A value is the text typed into the form. Every job variable
+                // is expanded as the workflow's own text is, so one holding
+                // `${{` would be read as an expression: `${{ secrets.DEPLOY_KEY }}`
+                // in a field a `run:` echoes hands that step the secret, past
+                // the scope the workflow gave it.
+                if value.contains("${{") {
+                    anyhow::bail!(
+                        "workflow_dispatch input '{name}' holds `${{{{`, which this engine would \
+                         read as an expression rather than as the input's text"
+                    );
+                }
                 let definition = &definitions[name];
                 let input_type = definition.input_type.as_ref().ok_or_else(|| {
                     anyhow::anyhow!("workflow_dispatch.inputs.{name}.type is required")
@@ -4534,6 +4569,8 @@ pub(crate) fn actions_condition_context(
             "github.event.schedule".into(),
             ctx.event_schedule.clone().unwrap_or_default(),
         ),
+        ("github.head_ref".into(), ctx.head_ref.clone()),
+        ("github.base_ref".into(), ctx.base_ref.clone()),
     ]);
     for (name, value) in variables {
         context.insert(format!("env.{name}"), value.clone());
@@ -4914,10 +4951,53 @@ fn context_in_text(
 
 /// Every `${{ inputs.<name> }}` of a text field, by name.
 fn input_references(text: &str) -> Vec<String> {
+    context_references(text, "inputs")
+}
+
+/// Every `${{ <context>.<name> }}` of a text field, by name.
+fn context_references(text: &str, context: &str) -> Vec<String> {
     workflow_expressions(text)
         .iter()
-        .filter_map(|expression| context_member(expression, "inputs").map(str::to_owned))
+        .filter_map(|expression| context_member(expression, context).map(str::to_owned))
         .collect()
+}
+
+/// The text fields of a job that [`substitute_expr`] expands: its `env:`,
+/// `outputs:`, `container.env`, `services:` and `defaults.run`, and each step's
+/// `name:`, `run:`, `working-directory:`, `env:` and `with:`.
+fn job_texts(job: &GiteaJob) -> Vec<&String> {
+    let mut texts = job
+        .env
+        .values()
+        .chain(job.outputs.values())
+        .chain(
+            job.container
+                .iter()
+                .flat_map(|container| container.env.values()),
+        )
+        .collect::<Vec<_>>();
+    for service in job.services.values() {
+        texts.push(&service.image);
+        texts.extend(service.env.values());
+        if let Some(credentials) = &service.credentials {
+            texts.extend([&credentials.username, &credentials.password]);
+        }
+    }
+    texts.extend(
+        job.defaults
+            .as_ref()
+            .and_then(|defaults| defaults.run.as_ref())
+            .and_then(|run| run.working_directory.as_ref()),
+    );
+    for step in &job.steps {
+        texts.extend(
+            [&step.name, &step.run, &step.working_directory]
+                .into_iter()
+                .flatten(),
+        );
+        texts.extend(step.env.values().chain(step.with.values()));
+    }
+    texts
 }
 
 impl GiteaWorkflow {
@@ -4998,25 +5078,12 @@ impl GiteaWorkflow {
             if let Some(condition) = &mut job.condition {
                 *condition = context_in_condition(condition, "inputs.", literal).map_err(at)?;
             }
-            let mut texts = job
-                .env
-                .values()
-                .chain(job.outputs.values())
-                .collect::<Vec<_>>();
             for step in &mut job.steps {
                 if let Some(condition) = &mut step.condition {
                     *condition = context_in_condition(condition, "inputs.", literal).map_err(at)?;
                 }
             }
-            for step in &job.steps {
-                texts.extend(
-                    [&step.name, &step.run, &step.working_directory]
-                        .into_iter()
-                        .flatten(),
-                );
-                texts.extend(step.env.values().chain(step.with.values()));
-            }
-            if let Some(name) = texts
+            if let Some(name) = job_texts(job)
                 .into_iter()
                 .flat_map(|text| input_references(text))
                 .find(|name| find(name).is_none())
@@ -5027,11 +5094,19 @@ impl GiteaWorkflow {
         Ok(())
     }
 
-    /// Read `github.event.inputs.*` in every job's and step's `if:` and in
-    /// `concurrency.group`: the `workflow_dispatch` inputs of the run, as text
-    /// — `'true'`, not `true`, as GitHub's event payload carries them — or `''`
-    /// for a run that was not dispatched. A name `workflow_dispatch` does not
-    /// declare is refused.
+    /// Read `github.event.inputs.*` — the `workflow_dispatch` inputs of the
+    /// run, as text: `'true'`, not `true`, as GitHub's event payload carries
+    /// them, and `''` for a run that was not dispatched. A name
+    /// `workflow_dispatch` does not declare is refused, wherever it is read.
+    ///
+    /// In every job's and step's `if:` and in `concurrency.group` the value is
+    /// written in as a literal. A text field a job expands — `run:`, `env:`,
+    /// `with:` and the rest of [`job_texts`] — reads it the way it reads
+    /// `inputs.*`, from a job variable ([`event_input_environment_name`]) that
+    /// is installed here on every job of a workflow reading one
+    /// (card_71a3e7424faa). A job variable is expanded as the workflow's own
+    /// text is, which is why `resolve_dispatch_inputs` refuses a value typed
+    /// into the form that holds `${{`.
     ///
     /// Run after the reusable workflows and actions are expanded: a job they
     /// bring reads the event of the run it is part of, which is this file's.
@@ -5039,8 +5114,8 @@ impl GiteaWorkflow {
         let declared = self.declared_input_names(&["workflow_dispatch"]);
         let dispatched = event == rg_core::ci::WORKFLOW_DISPATCH_EVENT;
         let values = &self.resolved_inputs;
-        let literal = |name: &str| -> std::result::Result<String, String> {
-            let declared = declared
+        let find = |name: &str| {
+            declared
                 .iter()
                 .find(|declared| declared.eq_ignore_ascii_case(name))
                 .ok_or_else(|| {
@@ -5048,21 +5123,35 @@ impl GiteaWorkflow {
                         "reads github.event.inputs.{name}, which workflow_dispatch does not \
                          declare"
                     )
-                })?;
-            Ok(condition_literal(
-                &values
-                    .get(declared)
-                    .filter(|_| dispatched)
-                    .map(GiteaInputValue::as_string)
-                    .unwrap_or_default(),
-            ))
+                })
+        };
+        let text = |declared: &str| {
+            values
+                .get(declared)
+                .filter(|_| dispatched)
+                .map(GiteaInputValue::as_string)
+                .unwrap_or_default()
+        };
+        let literal = |name: &str| -> std::result::Result<String, String> {
+            Ok(condition_literal(&text(find(name)?)))
         };
         if let Some(concurrency) = &mut self.concurrency {
             concurrency.group =
                 context_in_text(&concurrency.group, "github.event.inputs.", literal)
                     .map_err(|error| format!("concurrency.group: {error}"))?;
         }
-        for (job_name, job) in &mut self.jobs {
+        let mut read_in_text = false;
+        for name in self
+            .env
+            .values()
+            .flat_map(|text| context_references(text, "github.event.inputs"))
+        {
+            find(&name).map_err(|error| format!("env: {error}"))?;
+            read_in_text = true;
+        }
+        let mut jobs = self.jobs.iter_mut().collect::<Vec<_>>();
+        jobs.sort_by_key(|(name, _)| *name);
+        for (job_name, job) in jobs {
             let at = |error: String| format!("jobs.{job_name}: {error}");
             let conditions = job.condition.iter_mut().chain(
                 job.steps
@@ -5073,6 +5162,38 @@ impl GiteaWorkflow {
                 *condition =
                     context_in_condition(condition, "github.event.inputs.", literal).map_err(at)?;
             }
+            // The job fields `job_field_expression` reads it in, besides.
+            let fields = [
+                job.container
+                    .as_ref()
+                    .map(|container| container.image.as_str()),
+                job.environment.as_ref().map(GiteaEnvironment::name),
+            ];
+            let runs_on = match &job.runs_on {
+                Some(GiteaRunsOn::Label(label)) => vec![label.as_str()],
+                Some(GiteaRunsOn::Labels(labels)) => labels.iter().map(String::as_str).collect(),
+                _ => Vec::new(),
+            };
+            for name in job_texts(job)
+                .into_iter()
+                .map(String::as_str)
+                .chain(fields.into_iter().flatten())
+                .chain(runs_on)
+                .flat_map(|text| context_references(text, "github.event.inputs"))
+            {
+                find(&name).map_err(at)?;
+                read_in_text = true;
+            }
+        }
+        if !read_in_text {
+            return Ok(());
+        }
+        let installed = declared
+            .iter()
+            .map(|name| (event_input_environment_name(name), text(name)))
+            .collect::<Vec<_>>();
+        for job in self.jobs.values_mut() {
+            job.env.extend(installed.iter().cloned());
         }
         Ok(())
     }
@@ -5115,6 +5236,9 @@ fn substitute_expr(
                 "${{MATRIX_{}}}",
                 name.to_ascii_uppercase().replace('-', "_")
             ));
+        }
+        if let Some(name) = context_member(key, "github.event.inputs") {
+            return Some(format!("${{{}}}", event_input_environment_name(name)));
         }
         context_member(key, "inputs")
             .map(|name| format!("${{INPUT_{}}}", name.to_ascii_uppercase().replace('-', "_")))
@@ -5269,6 +5393,8 @@ mod tests {
             repo_owner: "owner".into(),
             repo_name: "repo".into(),
             event_schedule: None,
+            head_ref: String::new(),
+            base_ref: String::new(),
         }
     }
 
@@ -6054,6 +6180,8 @@ jobs:
             repo_owner: "owner".into(),
             repo_name: "repo".into(),
             event_schedule: None,
+            head_ref: String::new(),
+            base_ref: String::new(),
         };
         let ci_config = wf.to_ci_config(&ctx);
         assert_eq!(ci_config.jobs.len(), 1);
@@ -6697,6 +6825,8 @@ jobs:
             repo_owner: "o".into(),
             repo_name: "r".into(),
             event_schedule: None,
+            head_ref: String::new(),
+            base_ref: String::new(),
         };
         let job = workflow.to_ci_config(&ctx).jobs.remove("build").unwrap();
         let variables = job.variables.expect("container env must become variables");
@@ -7575,6 +7705,8 @@ jobs:
             repo_owner: "o".into(),
             repo_name: "r".into(),
             event_schedule: None,
+            head_ref: String::new(),
+            base_ref: String::new(),
         });
         let cache = ci.jobs["test"].cache.as_ref().unwrap();
         assert_eq!(cache.key, "build-${CI_SHA}");
@@ -7645,6 +7777,8 @@ jobs:
             repo_owner: "o".into(),
             repo_name: "r".into(),
             event_schedule: None,
+            head_ref: String::new(),
+            base_ref: String::new(),
         });
         assert!(ci.jobs["shared/build"]
             .script
@@ -7727,6 +7861,8 @@ jobs:
             repo_owner: "o".into(),
             repo_name: "r".into(),
             event_schedule: None,
+            base_ref: String::new(),
+            head_ref: String::new(),
         });
         assert_eq!(ci.jobs["test"].allow_failure, Some(true));
         assert_eq!(ci.jobs["test"].timeout_seconds, Some(180));
@@ -7742,6 +7878,8 @@ jobs:
             repo_owner: "o".into(),
             repo_name: "r".into(),
             event_schedule: None,
+            head_ref: String::new(),
+            base_ref: String::new(),
         });
         assert_eq!(
             ci.jobs["test"].condition.as_deref(),
@@ -7924,6 +8062,8 @@ jobs:
             repo_owner: "o".into(),
             repo_name: "r".into(),
             event_schedule: None,
+            head_ref: String::new(),
+            base_ref: String::new(),
         };
         let ci = wf.to_ci_config(&ctx);
         let job = ci.jobs.get("build").unwrap();
@@ -7953,6 +8093,8 @@ jobs:
             repo_owner: "o".into(),
             repo_name: "r".into(),
             event_schedule: None,
+            head_ref: String::new(),
+            base_ref: String::new(),
         };
         let ci = wf.to_ci_config(&ctx);
         let job = ci.jobs.get("build").unwrap();
@@ -7989,6 +8131,8 @@ jobs:
             repo_owner: "o".into(),
             repo_name: "r".into(),
             event_schedule: None,
+            head_ref: String::new(),
+            base_ref: String::new(),
         };
         let ci = wf.to_ci_config(&ctx);
         assert_eq!(ci.jobs.len(), 3);
@@ -8044,6 +8188,8 @@ jobs:
             repo_owner: "o".into(),
             repo_name: "r".into(),
             event_schedule: None,
+            base_ref: String::new(),
+            head_ref: String::new(),
         };
         let unguarded = workflow("buidl").to_ci_config(&ctx);
         assert_eq!(unguarded.jobs["build"].stage.as_deref(), Some("stage-0"));
@@ -8192,6 +8338,8 @@ jobs:
             repo_owner: "o".into(),
             repo_name: "r".into(),
             event_schedule: None,
+            head_ref: String::new(),
+            base_ref: String::new(),
         };
         let ci = wf.to_ci_config(&ctx);
         let cc = ci.concurrency.as_ref().unwrap();
@@ -8220,6 +8368,8 @@ jobs:
             repo_owner: "o".into(),
             repo_name: "r".into(),
             event_schedule: None,
+            base_ref: String::new(),
+            head_ref: String::new(),
         });
         let job = ci.jobs.get("test").unwrap();
         let names = crate::expand_matrix("test", job)
@@ -8455,6 +8605,8 @@ jobs:
             repo_owner: "owner".into(),
             repo_name: "repo".into(),
             event_schedule: None,
+            head_ref: String::new(),
+            base_ref: String::new(),
         });
         let script = ci.jobs["build"].script.join("\n");
 
@@ -8664,6 +8816,8 @@ mod schedule_tests {
             repo_owner: "o".into(),
             repo_name: "r".into(),
             event_schedule: Some("0 3 * * *".into()),
+            base_ref: String::new(),
+            head_ref: String::new(),
         });
         let script = config.jobs["build"].script.join("\n");
         assert!(

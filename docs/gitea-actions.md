@@ -516,8 +516,14 @@ The same small expression language the native format uses, documented under
 parentheses, single-quoted strings (a quote inside one doubled: `'it''s'`), and
 `startsWith` / `endsWith` / `contains` / `success()`. Contexts are `github.ref`,
 `github.ref_name`, `github.event_name`, `github.sha`, `github.repository`,
-`github.repository_owner`, `github.event.schedule`, `env.NAME`, `inputs.NAME`
-and `github.event.inputs.NAME`.
+`github.repository_owner`, `github.event.schedule`, `github.head_ref`,
+`github.base_ref`, `env.NAME`, `inputs.NAME` and `github.event.inputs.NAME`.
+
+**`github.head_ref` / `github.base_ref`** are the branches of a `pull_request`
+run, by short name: the one the pull request comes from and the one it targets,
+so `if: github.base_ref == 'main'` runs a job only for pull requests into
+`main`. For every other event — a push, a dispatch, a schedule, a merge group —
+both are `''`, as on GitHub.
 
 **Inputs** are the [`workflow_dispatch` / `workflow_call` inputs](#workflow_dispatch-and-workflow_call-inputs)
 of the run, in a job's `if:` and a step's alike. `inputs.NAME` keeps the input's
@@ -532,7 +538,8 @@ dispatched or called — a `push` of a workflow that also declares
 is refused by name, here and in any `${{ inputs.NAME }}` of a `run:` or `env:`,
 where GitHub would read it as empty and a typo in a deploy gate would quietly
 never deploy. Inside a reusable workflow, `inputs.NAME` is that workflow's
-`workflow_call` input.
+`workflow_call` input, while `github.event.inputs.NAME` is still the dispatch of
+the workflow that called it.
 
 ```yaml
 on:
@@ -1108,7 +1115,7 @@ one ever existed.
 `${{ … }}` is resolved in two different places, and the two support different
 contexts.
 
-**In values that reach the shell** — `run:`, any `env:` value,
+**In values that reach the shell** — `run:`, any `env:` value, `with:`,
 `working-directory`, and `actions/cache`'s `key` — these are available:
 
 | Expression | Becomes |
@@ -1119,17 +1126,20 @@ contexts.
 | `github.repository` | `${CI_REPOSITORY}` |
 | `github.repository_owner` | `${CI_REPOSITORY_OWNER}` |
 | `github.event.schedule` | `${CI_EVENT_SCHEDULE}` — the `- cron:` entry of a `schedule` run; empty for any other event. |
+| `github.head_ref` | `${CI_HEAD_REF}` — the branch a pull request comes from; empty for any other event. |
+| `github.base_ref` | `${CI_BASE_REF}` — the branch a pull request targets; empty for any other event. |
 | `env.NAME` | The variable's value. |
 | `secrets.NAME` | The secret: the environment's value when the job declares an environment that sets the name, the repository-wide one otherwise. Naming it is also what gives the step — and the job — the secret at all (see [Composite actions](#composite-actions)). |
 | `matrix.NAME` | The variant's coordinate. |
 | `inputs.NAME` | The dispatch or call input; a name the workflow does not declare is refused. |
+| `github.event.inputs.NAME` | `${EVENT_INPUT_NAME}` — the `workflow_dispatch` input as text (`true`, not a boolean), empty in a run that was not dispatched. A name `workflow_dispatch` does not declare is refused, and so is a value holding `${{`, which would otherwise be read as an expression rather than as the text typed into the form. |
 
 **Between steps**, the runner resolves `steps.*` and `needs.*` — see
 [Outputs](#outputs).
 
 **In job fields resolved before a runner starts** — `runs-on`,
 `container.image` and `environment` — only the first five `github.*` above, plus
-`matrix.NAME` and `inputs.NAME`. `env.` and `secrets.` have no value at that
+`matrix.NAME`, `inputs.NAME` and `github.event.inputs.NAME`. `env.` and `secrets.` have no value at that
 boundary; they are refused there by field and expression rather than left in the
 configuration as literal `${{ … }}`.
 
@@ -1513,11 +1523,29 @@ value that holds `${{`. A group may compute its value —
 `deploy-${{ inputs.environment || 'staging' }}` — from these names and the
 `github.*` above.
 
+The recipe GitHub gives for cancelling superseded pull-request runs works as
+written:
+
+```yaml
+on: [push, pull_request]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: make test
+```
+
+A pull request is grouped by the branch it comes from, so a new push to it
+cancels the run for the old head; a push to a branch, where `github.head_ref`
+is `''`, is grouped by its ref.
+
 A group that still contains an unresolved expression after substitution is
 refused: left alone it would be one literal group shared by every ref of the
 repository, which under `cancel-in-progress` is a standing order to cancel
-whatever else is running. `${{ github.head_ref || github.ref }}` is refused this
-way: `github.head_ref` has no value here.
+whatever else is running.
 
 ## Reusable workflows
 

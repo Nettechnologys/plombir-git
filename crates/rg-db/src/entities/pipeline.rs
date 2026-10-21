@@ -44,6 +44,13 @@ pub struct Model {
     /// `main`: its workflow matches nothing and the run silently falls through
     /// to `.plombir-git-ci.yml` — a different graph under the same `201`.
     pub base_branch: Option<String>,
+    /// For a `pull_request` run: the branch the pull request comes from — what
+    /// a job reads as `github.head_ref`. `None` for every other event.
+    ///
+    /// The ref of such a run is `refs/pull/<n>/head`, which names the request
+    /// rather than the branch, so nothing else on the row carries it
+    /// (card_af3833480552).
+    pub head_branch: Option<String>,
     /// Where the ref stood before the event that produced this run, for the
     /// `paths:` / `paths-ignore:` filters, or `None` for a producer that had no
     /// previous revision to hand over.

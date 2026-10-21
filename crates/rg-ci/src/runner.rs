@@ -1807,10 +1807,19 @@ impl PipelineRunner {
         env.insert("CI_COMMIT_SHA".into(), pipeline.commit_sha.clone());
         env.insert("CI_SHA".into(), pipeline.commit_sha);
         env.insert("CI_REF".into(), pipeline.ref_name);
-        env.insert("CI_EVENT".into(), pipeline.trigger_type);
+        env.insert("CI_EVENT".into(), pipeline.trigger_type.clone());
         if let Some(cron) = pipeline.schedule_cron {
             env.insert("CI_EVENT_SCHEDULE".into(), cron);
         }
+        // Set for every run, `''` outside a pull request, so a step reading
+        // `${CI_HEAD_REF}` never finds it unset.
+        let (head_ref, base_ref) = rg_core::ci::pull_request_refs(
+            &pipeline.trigger_type,
+            pipeline.head_branch.as_deref(),
+            pipeline.base_branch.as_deref(),
+        );
+        env.insert("CI_HEAD_REF".into(), head_ref.to_string());
+        env.insert("CI_BASE_REF".into(), base_ref.to_string());
         let (repository_owner, repository_name) =
             rg_core::repo::service::repository_identity(&self.db, pipeline.repo_id).await?;
         env.insert(
@@ -3176,6 +3185,7 @@ mod tests {
                 concurrency_group: None,
                 dispatch_inputs: None,
                 base_branch: None,
+                head_branch: None,
                 previous_sha: None,
                 schedule: Some(("nightly.yml", "0 3 * * *")),
             },

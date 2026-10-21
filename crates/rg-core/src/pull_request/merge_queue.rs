@@ -1096,6 +1096,7 @@ async fn settle_refused_merge_group_config(
             // successful trigger passes. The group commit is built fresh, so
             // there is no previous revision, here or there.
             base_branch: Some(base_branch),
+            head_branch: None,
             previous_sha: None,
             schedule: None,
         },
@@ -1669,6 +1670,7 @@ async fn ensure_merge_group_ci(
                     // ref above is the synthetic group ref — the branch the filter
                     // is about is the one the queue is merging into.
                     base_branch: Some(&pr.base_branch),
+                    head_branch: None,
                     // The group commit is built fresh for this run; its first
                     // parent is the base branch tip, which is exactly the diff a
                     // `paths:` filter is asking about.

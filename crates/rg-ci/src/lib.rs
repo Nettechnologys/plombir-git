@@ -601,11 +601,10 @@ async fn resume_pipeline_with_engine(
 /// carries a `${{ … }}` this engine cannot expand is a **literal**, and a
 /// literal group is shared by every ref of the repository — under
 /// `cancel_in_progress` that is a standing order to cancel whatever else is
-/// running. The canonical GitHub recipe
-/// `${{ github.workflow }}-${{ github.head_ref || github.ref }}` lands here
-/// because this engine has no `github.head_ref`, and it has to land loudly:
-/// silently degrading it to "no concurrency" is how two deploys end up running
-/// at once, which is the very thing the block was written to prevent.
+/// running. A group reading a name this engine has no value for —
+/// `${{ github.actor }}` — lands here, and it has to land loudly: silently
+/// degrading it to "no concurrency" is how two deploys end up running at once,
+/// which is the very thing the block was written to prevent.
 fn resolved_concurrency_group(
     concurrency: Option<&config::ConcurrencyConfig>,
     ref_name: &str,
@@ -620,7 +619,8 @@ fn resolved_concurrency_group(
              engine cannot evaluate. A group may use ${{{{ github.ref }}}}, \
              ${{{{ github.ref_name }}}}, ${{{{ github.workflow }}}}, ${{{{ github.sha }}}}, \
              ${{{{ github.event_name }}}}, ${{{{ github.repository }}}}, \
-             ${{{{ github.repository_owner }}}}, ${{{{ inputs.NAME }}}}, \
+             ${{{{ github.repository_owner }}}}, ${{{{ github.head_ref }}}}, \
+             ${{{{ github.base_ref }}}}, ${{{{ inputs.NAME }}}}, \
              ${{{{ github.event.inputs.NAME }}}}, ${{{{ vars.NAME }}}} — and ${{{{ ref }}}} / \
              ${{{{ branch }}}} in .plombir-git-ci.yml. Left unresolved it is one literal group shared by every ref of \
              this repository."
@@ -706,6 +706,7 @@ async fn trigger_pipeline_with_barrier_and_engine(
         ref_name,
         trigger_type,
         base_branch,
+        head_branch,
         previous_sha,
         inputs,
         schedule,
@@ -750,6 +751,7 @@ async fn trigger_pipeline_with_barrier_and_engine(
             trigger_type.to_string(),
         );
         let base_branch = base_branch.map(str::to_string);
+        let head_branch = head_branch.map(str::to_string);
         let previous_sha = previous_sha.map(str::to_string);
         let inputs = inputs.cloned();
         let scheduled = schedule.map(|run| (run.workflow.to_string(), run.cron.to_string()));
@@ -791,6 +793,7 @@ async fn trigger_pipeline_with_barrier_and_engine(
                 WorkflowInvocation {
                     event: &event,
                     base_branch: base_branch.as_deref(),
+                    head_branch: head_branch.as_deref(),
                     previous_sha: previous_sha.as_deref(),
                     inputs: inputs.as_ref(),
                     schedule: scheduled
@@ -908,6 +911,7 @@ async fn trigger_pipeline_with_barrier_and_engine(
             concurrency_group: concurrency_group.as_deref(),
             dispatch_inputs: dispatch_inputs.as_deref(),
             base_branch: persisted_replay_value(base_branch),
+            head_branch: persisted_replay_value(head_branch),
             previous_sha: persisted_replay_value(previous_sha),
             schedule,
             config: &config,
@@ -1112,6 +1116,10 @@ struct PipelineGraph<'a> {
     /// different question for every pull request that does not target it
     /// (card_74d58ec3ac1e).
     base_branch: Option<&'a str>,
+    /// The branch a `pull_request` run's pull request comes from, or `None` for
+    /// every other event. Written onto the row because the runners read it
+    /// there, as `github.head_ref`, and so does a retry.
+    head_branch: Option<&'a str>,
     /// Where the ref stood before this event, or `None` for a producer with no
     /// previous revision. Written onto the row so a retry's `paths:` filters see
     /// the diff the original event saw, and not the narrower one against the
@@ -1143,6 +1151,7 @@ impl PipelineGraph<'_> {
                 concurrency_group: self.concurrency_group,
                 dispatch_inputs: self.dispatch_inputs,
                 base_branch: self.base_branch,
+                head_branch: self.head_branch,
                 previous_sha: self.previous_sha,
                 schedule: self.schedule.map(|run| (run.workflow, run.cron)),
             },
@@ -1182,6 +1191,8 @@ impl PipelineGraph<'_> {
             commit_sha,
             ref_name,
             trigger_type,
+            base_branch,
+            head_branch,
             schedule,
             config,
             ..
@@ -1212,6 +1223,8 @@ impl PipelineGraph<'_> {
                 create_deferred_matrix_job(tx, stage_id, job_name, job_config, spec).await?;
                 continue;
             }
+            let (head_ref, base_ref) =
+                rg_core::ci::pull_request_refs(trigger_type, head_branch, base_branch);
             let rows = JobRowContext {
                 repo_id,
                 repository,
@@ -1219,6 +1232,8 @@ impl PipelineGraph<'_> {
                 ref_name,
                 trigger_type,
                 schedule_cron: schedule.map(|run| run.cron),
+                head_ref,
+                base_ref,
             };
             create_variant_jobs(
                 tx,
@@ -1243,6 +1258,9 @@ struct JobRowContext<'a> {
     ref_name: &'a str,
     trigger_type: &'a str,
     schedule_cron: Option<&'a str>,
+    /// `github.head_ref` / `github.base_ref` ([`rg_core::ci::pull_request_refs`]).
+    head_ref: &'a str,
+    base_ref: &'a str,
 }
 
 /// Write the rows of one job of the graph, one per matrix variant: the job
@@ -1263,7 +1281,7 @@ async fn create_variant_jobs(
         commit_sha,
         ref_name,
         trigger_type,
-        schedule_cron,
+        ..
     } = *rows;
     for variant in variants {
         let fields = resolve_action_job_fields(
@@ -1399,17 +1417,8 @@ async fn create_variant_jobs(
             )),
             None => None,
         };
-        let condition_context = || {
-            job_condition_context(
-                ref_name,
-                trigger_type,
-                commit_sha,
-                repository,
-                schedule_cron,
-                &variant.variables,
-                &variant.coordinates,
-            )
-        };
+        let condition_context =
+            || job_condition_context(rows, &variant.variables, &variant.coordinates);
         // A condition that reads what a needed job left, or how the needed
         // jobs ended, has no answer yet; any other is answered now, as it
         // always was.
@@ -1611,6 +1620,11 @@ pub async fn expand_deferred_matrix(
         Ok(variants) => variants,
         Err(error) => return fail_deferred_matrix(db, placeholder, error).await,
     };
+    let (head_ref, base_ref) = rg_core::ci::pull_request_refs(
+        &pipeline.trigger_type,
+        pipeline.head_branch.as_deref(),
+        pipeline.base_branch.as_deref(),
+    );
     let rows = JobRowContext {
         repo_id: pipeline.repo_id,
         repository: RepositoryName {
@@ -1621,6 +1635,8 @@ pub async fn expand_deferred_matrix(
         ref_name: &pipeline.ref_name,
         trigger_type: &pipeline.trigger_type,
         schedule_cron: pipeline.schedule_cron.as_deref(),
+        head_ref,
+        base_ref,
     };
     let expanded = rg_db::ops::pipeline_matrix_ops::expand_deferred_job(db, placeholder, |tx| {
         let (rows, job_name, job_config, variants) = (&rows, &job_name, &job_config, &variants);
@@ -2385,14 +2401,20 @@ pub(crate) fn artifact_spec(
 }
 
 fn job_condition_context(
-    ref_name: &str,
-    event: &str,
-    sha: &str,
-    repository: RepositoryName<'_>,
-    event_schedule: Option<&str>,
+    rows: &JobRowContext<'_>,
     variables: &std::collections::BTreeMap<String, String>,
     coordinates: &std::collections::BTreeMap<String, String>,
 ) -> std::collections::HashMap<String, String> {
+    let &JobRowContext {
+        repository,
+        commit_sha: sha,
+        ref_name,
+        trigger_type: event,
+        schedule_cron: event_schedule,
+        head_ref,
+        base_ref,
+        ..
+    } = rows;
     let mut context = std::collections::HashMap::from([
         ("github.ref".into(), ref_name.to_string()),
         (
@@ -2417,6 +2439,8 @@ fn job_condition_context(
             "github.event.schedule".into(),
             event_schedule.unwrap_or_default().to_string(),
         ),
+        ("github.head_ref".into(), head_ref.to_string()),
+        ("github.base_ref".into(), base_ref.to_string()),
     ]);
     for (name, value) in variables {
         context.insert(format!("env.{name}"), value.clone());
@@ -2475,6 +2499,11 @@ fn action_expression_value(
                 "INPUT_{}",
                 name.to_ascii_uppercase().replace('-', "_")
             ))
+            .cloned(),
+        config::ActionExpression::EventInput(name) => context
+            .variant
+            .variables
+            .get(&gitea_actions::event_input_environment_name(name))
             .cloned(),
         config::ActionExpression::Unsupported(_) => None,
     }
@@ -2693,6 +2722,8 @@ pub struct RepositoryName<'a> {
 struct WorkflowInvocation<'a> {
     event: &'a str,
     base_branch: Option<&'a str>,
+    /// See [`rg_core::ci::TriggerPipelineParams::head_branch`].
+    head_branch: Option<&'a str>,
     previous_sha: Option<&'a str>,
     inputs: Option<&'a std::collections::HashMap<String, String>>,
     /// The cron entry a `schedule` tick fired for; see
@@ -2751,6 +2782,7 @@ fn read_ci_config(
         WorkflowInvocation {
             event,
             base_branch,
+            head_branch: None,
             previous_sha,
             inputs: None,
             schedule: None,
@@ -3279,6 +3311,11 @@ fn try_read_gitea_workflows(
     let scheduled = invocation
         .schedule
         .filter(|_| invocation.event == rg_core::ci::SCHEDULE_EVENT);
+    let (head_ref, base_ref) = rg_core::ci::pull_request_refs(
+        invocation.event,
+        invocation.head_branch,
+        invocation.base_branch,
+    );
     for (name, mut workflow) in workflows {
         // Check if this workflow should be triggered
         let triggered = match scheduled {
@@ -3368,6 +3405,8 @@ fn try_read_gitea_workflows(
             repo_owner: repository.owner.to_string(),
             repo_name: repository.name.to_string(),
             event_schedule: scheduled.map(|run| run.cron.to_string()),
+            head_ref: head_ref.to_string(),
+            base_ref: base_ref.to_string(),
         };
 
         let mut wf_config = workflow.to_ci_config(&ctx);
@@ -4127,6 +4166,8 @@ mod matrix_tests {
             repo_owner: "o".into(),
             repo_name: "r".into(),
             event_schedule: None,
+            head_ref: String::new(),
+            base_ref: String::new(),
         });
         let job = &config.jobs["test"];
         let variant = expand_matrix("test", job).unwrap().remove(0);
@@ -4270,6 +4311,7 @@ mod matrix_tests {
                 ref_name: "refs/heads/main",
                 trigger_type: "push",
                 base_branch: None,
+                head_branch: None,
                 previous_sha: None,
                 inputs: None,
                 triggered_by: Some(user.id),
@@ -4376,6 +4418,7 @@ mod matrix_tests {
                 ref_name: "refs/heads/dev",
                 trigger_type: "push",
                 base_branch: None,
+                head_branch: None,
                 previous_sha: None,
                 inputs: None,
                 triggered_by: Some(user.id),
@@ -4513,6 +4556,7 @@ mod matrix_tests {
                 ref_name: "refs/heads/main",
                 trigger_type: "push",
                 base_branch: None,
+                head_branch: None,
                 previous_sha: None,
                 inputs: None,
                 triggered_by: Some(user.id),
@@ -4695,6 +4739,7 @@ mod matrix_tests {
             ref_name: "refs/heads/main",
             trigger_type,
             base_branch: None,
+            head_branch: None,
             previous_sha: None,
             inputs: None,
             triggered_by: Some(user_id),
@@ -5331,6 +5376,7 @@ mod matrix_tests {
                 concurrency_group: Some("refs/heads/main"),
                 dispatch_inputs: None,
                 base_branch: None,
+                head_branch: None,
                 previous_sha: None,
                 schedule: None,
             },
@@ -5361,6 +5407,7 @@ mod matrix_tests {
                 ref_name: "refs/heads/main",
                 trigger_type: "push",
                 base_branch: None,
+                head_branch: None,
                 previous_sha: None,
                 inputs: None,
                 triggered_by: Some(user.id),
@@ -5486,6 +5533,7 @@ mod matrix_tests {
                 concurrency_group: Some("refs/heads/main"),
                 dispatch_inputs: None,
                 base_branch: None,
+                head_branch: None,
                 previous_sha: None,
                 schedule: None,
             },
@@ -5503,6 +5551,7 @@ mod matrix_tests {
                 ref_name: "refs/heads/main",
                 trigger_type: "manual",
                 base_branch: None,
+                head_branch: None,
                 previous_sha: None,
                 inputs: None,
                 triggered_by: Some(user.id),
@@ -5568,6 +5617,7 @@ mod matrix_tests {
                 ref_name: "refs/heads/other",
                 trigger_type: "manual",
                 base_branch: None,
+                head_branch: None,
                 previous_sha: None,
                 inputs: None,
                 triggered_by: Some(user.id),
@@ -5681,6 +5731,7 @@ mod matrix_tests {
                         ref_name,
                         trigger_type: "push",
                         base_branch: None,
+                        head_branch: None,
                         previous_sha: None,
                         inputs: None,
                         triggered_by: Some(user_id),
@@ -5715,6 +5766,7 @@ mod matrix_tests {
                         concurrency_group: Some(group),
                         dispatch_inputs: None,
                         base_branch: None,
+                        head_branch: None,
                         previous_sha: None,
                         schedule: None,
                     },
@@ -5847,52 +5899,75 @@ mod matrix_tests {
     /// forgetting to answer a canonical name, and answering a name the validator
     /// would have rejected.
     ///
-    /// The run is a scheduled one so that `github.event.schedule` — the one key
-    /// only some events give a value — is asked for a value too.
+    /// Two runs are asked, a scheduled one and a pull request, because some
+    /// keys have a value only for one event — `github.event.schedule` for the
+    /// first, `github.head_ref` / `github.base_ref` for the second — and every
+    /// key has to be answered with a value by one of them.
     #[test]
     fn every_condition_key_the_validator_accepts_is_answered_by_both_contexts() {
-        let job = job_condition_context(
-            "refs/heads/main",
-            "schedule",
-            "abc123",
-            RepositoryName {
-                owner: "acme",
-                name: "api",
-            },
-            Some("0 3 * * *"),
-            &std::collections::BTreeMap::new(),
-            &std::collections::BTreeMap::new(),
-        );
-        let step = gitea_actions::actions_condition_context(
-            &gitea_actions::WorkflowContext {
-                ref_name: "refs/heads/main".into(),
-                sha: "abc123".into(),
-                event: "schedule".into(),
-                repo_owner: "acme".into(),
-                repo_name: "api".into(),
-                event_schedule: Some("0 3 * * *".into()),
-            },
-            &std::collections::HashMap::new(),
-        );
+        let contexts = |event: &str, schedule: Option<&str>, head: &str, base: &str| {
+            let job = job_condition_context(
+                &JobRowContext {
+                    repo_id: 1,
+                    repository: RepositoryName {
+                        owner: "acme",
+                        name: "api",
+                    },
+                    commit_sha: "abc123",
+                    ref_name: "refs/heads/main",
+                    trigger_type: event,
+                    schedule_cron: schedule,
+                    head_ref: head,
+                    base_ref: base,
+                },
+                &std::collections::BTreeMap::new(),
+                &std::collections::BTreeMap::new(),
+            );
+            let step = gitea_actions::actions_condition_context(
+                &gitea_actions::WorkflowContext {
+                    ref_name: "refs/heads/main".into(),
+                    sha: "abc123".into(),
+                    event: event.into(),
+                    repo_owner: "acme".into(),
+                    repo_name: "api".into(),
+                    event_schedule: schedule.map(str::to_string),
+                    head_ref: head.into(),
+                    base_ref: base.into(),
+                },
+                &std::collections::HashMap::new(),
+            );
+            [("job", job), ("step", step)]
+        };
+        let runs = [
+            contexts("schedule", Some("0 3 * * *"), "", ""),
+            contexts("pull_request", None, "feature", "main"),
+        ];
 
         for key in condition::GITHUB_CONTEXT_KEYS {
-            for (label, context) in [("job", &job), ("step", &step)] {
-                let value = context.get(key).unwrap_or_else(|| {
-                    panic!(
-                        "the validator accepts `{key}` in an `if:` condition, but the {label} \
-                         context has no answer for it — the condition would compare against the \
-                         empty string and report a plain false"
-                    )
-                });
+            for scope in ["job", "step"] {
+                let answers = runs
+                    .iter()
+                    .flatten()
+                    .filter(|(label, _)| *label == scope)
+                    .map(|(_, context)| {
+                        context.get(key).unwrap_or_else(|| {
+                            panic!(
+                                "the validator accepts `{key}` in an `if:` condition, but the \
+                                 {scope} context has no answer for it — the condition would \
+                                 compare against the empty string and report a plain false"
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 assert!(
-                    !value.is_empty(),
-                    "the {label} context answers `{key}` with the empty string, which is what a \
-                     `// filled later` placeholder looks like from a condition"
+                    answers.iter().any(|value| !value.is_empty()),
+                    "the {scope} context answers `{key}` with the empty string for every event, \
+                     which is what a `// filled later` placeholder looks like from a condition"
                 );
             }
         }
 
-        for (label, context) in [("job", &job), ("step", &step)] {
+        for (label, context) in runs.iter().flatten() {
             for key in context.keys().filter(|key| key.starts_with("github.")) {
                 assert!(
                     condition::GITHUB_CONTEXT_KEYS.contains(&key.as_str()),
@@ -5989,6 +6064,7 @@ mod matrix_tests {
                 ref_name: "refs/heads/main",
                 trigger_type: "push",
                 base_branch: None,
+                head_branch: None,
                 previous_sha: None,
                 inputs: None,
                 triggered_by: Some(org_owner.id),
@@ -6858,6 +6934,7 @@ mod matrix_tests {
                     ref_name: "refs/heads/main",
                     trigger_type: "manual",
                     base_branch: None,
+                    head_branch: None,
                     previous_sha: None,
                     inputs: None,
                     triggered_by: Some(1),
@@ -6940,6 +7017,7 @@ mod matrix_tests {
                     ref_name: "refs/heads/main",
                     trigger_type: "manual",
                     base_branch: None,
+                    head_branch: None,
                     previous_sha: None,
                     inputs: None,
                     triggered_by: Some(1),
@@ -7100,6 +7178,7 @@ mod matrix_tests {
                     ref_name: "refs/heads/main",
                     trigger_type: "manual",
                     base_branch: None,
+                    head_branch: None,
                     previous_sha: None,
                     inputs: None,
                     triggered_by: Some(1),
@@ -7247,6 +7326,7 @@ mod matrix_tests {
                 ref_name: "refs/heads/main",
                 trigger_type: "push",
                 base_branch: None,
+                head_branch: None,
                 previous_sha: None,
                 inputs: None,
                 triggered_by: Some(1),
@@ -7466,14 +7546,13 @@ mod matrix_tests {
     }
 
     /// A group this engine cannot finish resolving must stop the trigger, not
-    /// serialize on the template text. `${{ github.head_ref || github.ref }}`
-    /// is the recipe GitHub's own documentation gives for cancelling superseded
-    /// PR runs, and `github.head_ref` is a name this engine has no value for.
+    /// serialize on the template text. `github.actor` is a name this engine
+    /// has no value for.
     #[test]
     fn an_unresolved_group_expression_is_refused_not_serialized_on() {
         let error = resolved_concurrency_group(
             Some(&config::ConcurrencyConfig {
-                group: "ci-${{ github.head_ref || github.ref }}".to_string(),
+                group: "ci-${{ github.actor || github.ref }}".to_string(),
                 cancel_in_progress: true,
             }),
             "refs/heads/main",
@@ -8510,6 +8589,7 @@ mod matrix_tests {
                 ref_name: "refs/heads/main",
                 trigger_type: "push",
                 base_branch: None,
+                head_branch: None,
                 previous_sha: None,
                 inputs: None,
                 triggered_by: Some(user.id),
@@ -8964,6 +9044,7 @@ jobs:
             WorkflowInvocation {
                 event: rg_core::ci::WORKFLOW_DISPATCH_EVENT,
                 base_branch: None,
+                head_branch: None,
                 previous_sha: None,
                 inputs: Some(&inputs),
                 schedule: None,
@@ -9007,6 +9088,7 @@ jobs:
                 WorkflowInvocation {
                     event: rg_core::ci::WORKFLOW_DISPATCH_EVENT,
                     base_branch: None,
+                    head_branch: None,
                     previous_sha: None,
                     inputs: Some(&inputs),
                     schedule: None,
@@ -9106,6 +9188,7 @@ jobs:
             WorkflowInvocation {
                 event: rg_core::ci::WORKFLOW_DISPATCH_EVENT,
                 base_branch: None,
+                head_branch: None,
                 previous_sha: None,
                 inputs: Some(&inputs),
                 schedule: None,
@@ -9135,6 +9218,7 @@ jobs:
             WorkflowInvocation {
                 event: rg_core::ci::WORKFLOW_DISPATCH_EVENT,
                 base_branch: None,
+                head_branch: None,
                 previous_sha: None,
                 inputs: Some(&unknown),
                 schedule: None,
@@ -9207,6 +9291,7 @@ jobs:
             WorkflowInvocation {
                 event: rg_core::ci::WORKFLOW_DISPATCH_EVENT,
                 base_branch: None,
+                head_branch: None,
                 previous_sha: None,
                 inputs: Some(&inputs),
                 schedule: None,
@@ -9284,6 +9369,7 @@ jobs:
                 WorkflowInvocation {
                     event: rg_core::ci::WORKFLOW_DISPATCH_EVENT,
                     base_branch: None,
+                    head_branch: None,
                     previous_sha: None,
                     inputs: Some(&inputs),
                     schedule: None,
@@ -9474,6 +9560,7 @@ jobs:
             ref_name: "refs/heads/main",
             trigger_type,
             base_branch: None,
+            head_branch: None,
             previous_sha: None,
             inputs,
             triggered_by: Some(user_id),
@@ -10554,6 +10641,7 @@ mod artifact_publication_tests {
                 ref_name: "refs/heads/main",
                 trigger_type: "push",
                 base_branch: None,
+                head_branch: None,
                 previous_sha: None,
                 inputs: None,
                 triggered_by: Some(user_id),
@@ -11348,6 +11436,7 @@ jobs:
                 WorkflowInvocation {
                     event: "schedule",
                     base_branch: None,
+                    head_branch: None,
                     previous_sha: None,
                     inputs: None,
                     schedule,
@@ -11467,7 +11556,59 @@ mod step_model_tests {
         event: &str,
         inputs: Option<&[(&str, &str)]>,
     ) -> Result<(rg_db::DatabaseConnection, i64, i64, tempfile::TempDir)> {
-        let inputs = inputs.map(|inputs| {
+        publish_pipeline_for(workflow, environments, TestEvent::on(event, inputs)).await
+    }
+
+    /// The event a test pipeline is published for: `event` on `refs/heads/main`
+    /// ([`TestEvent::on`]), or a pull request ([`TestEvent::pull_request`]).
+    #[derive(Clone, Copy, Debug)]
+    struct TestEvent<'a> {
+        event: &'a str,
+        ref_name: &'a str,
+        base_branch: Option<&'a str>,
+        head_branch: Option<&'a str>,
+        inputs: Option<&'a [(&'a str, &'a str)]>,
+    }
+
+    impl<'a> TestEvent<'a> {
+        fn on(event: &'a str, inputs: Option<&'a [(&'a str, &'a str)]>) -> Self {
+            Self {
+                event,
+                ref_name: "refs/heads/main",
+                base_branch: None,
+                head_branch: None,
+                inputs,
+            }
+        }
+
+        /// Pull request #1, from `head` into `base`, as
+        /// `rg_core::pull_request::ci` triggers it.
+        fn pull_request(head: &'a str, base: &'a str) -> Self {
+            Self {
+                event: rg_core::pull_request::PULL_REQUEST_EVENT,
+                ref_name: "refs/pull/1/head",
+                base_branch: Some(base),
+                head_branch: Some(head),
+                inputs: None,
+            }
+        }
+    }
+
+    async fn publish_pipeline_for(
+        workflow: &str,
+        environments: &[(&str, bool)],
+        event: TestEvent<'_>,
+    ) -> Result<(rg_db::DatabaseConnection, i64, i64, tempfile::TempDir)> {
+        publish_workflows_for(&[("build.yml", workflow)], environments, event).await
+    }
+
+    /// [`publish_pipeline_for`] over several files of `.gitea/workflows`.
+    async fn publish_workflows_for(
+        workflows: &[(&str, &str)],
+        environments: &[(&str, bool)],
+        event: TestEvent<'_>,
+    ) -> Result<(rg_db::DatabaseConnection, i64, i64, tempfile::TempDir)> {
+        let inputs = event.inputs.map(|inputs| {
             inputs
                 .iter()
                 .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
@@ -11476,7 +11617,9 @@ mod step_model_tests {
         let temp = tempfile::tempdir().unwrap();
         let repo_path = temp.path().join("step-owner/steps");
         std::fs::create_dir_all(repo_path.join(".gitea/workflows")).unwrap();
-        std::fs::write(repo_path.join(".gitea/workflows/build.yml"), workflow).unwrap();
+        for (file, workflow) in workflows {
+            std::fs::write(repo_path.join(".gitea/workflows").join(file), workflow).unwrap();
+        }
         let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
         for args in [
             vec!["init"],
@@ -11561,9 +11704,10 @@ mod step_model_tests {
                 repo_path: &repo_path,
                 repo_id: repo.id,
                 commit_sha: &sha,
-                ref_name: "refs/heads/main",
-                trigger_type: event,
-                base_branch: None,
+                ref_name: event.ref_name,
+                trigger_type: event.event,
+                base_branch: event.base_branch,
+                head_branch: event.head_branch,
                 previous_sha: None,
                 inputs: inputs.as_ref(),
                 schedule: None,
@@ -11594,7 +11738,34 @@ mod step_model_tests {
         rg_db::DatabaseConnection,
         tempfile::TempDir,
     ) {
-        let (db, pipeline_id, repo_id, temp) = publish_pipeline_on(workflow, &[], event, inputs)
+        run_pipeline_for(workflow, TestEvent::on(event, inputs)).await
+    }
+
+    async fn run_pipeline_for(
+        workflow: &str,
+        event: TestEvent<'_>,
+    ) -> (
+        std::collections::HashMap<String, rg_db::entities::pipeline_job::Model>,
+        String,
+        rg_db::DatabaseConnection,
+        tempfile::TempDir,
+    ) {
+        let (jobs, pipeline, db, temp) = run_workflows_for(&[("build.yml", workflow)], event).await;
+        (jobs, pipeline.status, db, temp)
+    }
+
+    /// [`run_pipeline_for`] over several files of `.gitea/workflows`, answering
+    /// with the whole pipeline row.
+    async fn run_workflows_for(
+        workflows: &[(&str, &str)],
+        event: TestEvent<'_>,
+    ) -> (
+        std::collections::HashMap<String, rg_db::entities::pipeline_job::Model>,
+        rg_db::entities::pipeline::Model,
+        rg_db::DatabaseConnection,
+        tempfile::TempDir,
+    ) {
+        let (db, pipeline_id, repo_id, temp) = publish_workflows_for(workflows, &[], event)
             .await
             .expect("the workflow publishes a pipeline");
         let repo_path = temp.path().join("step-owner/steps");
@@ -11609,12 +11780,11 @@ mod step_model_tests {
             .into_iter()
             .map(|job| (job.name.clone(), job))
             .collect();
-        let status = rg_db::ops::pipeline_ops::get_pipeline(&db, pipeline_id)
+        let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&db, pipeline_id)
             .await
             .unwrap()
-            .unwrap()
-            .status;
-        (jobs, status, db, temp)
+            .unwrap();
+        (jobs, pipeline, db, temp)
     }
 
     async fn step_rows(
@@ -12055,17 +12225,19 @@ jobs:
             (
                 "deploy-${{ inputs.enviroment }}",
                 &[("environment", "staging")][..],
-                "inputs.enviroment, which this workflow does not declare",
+                "concurrency.group: reads inputs.enviroment, which this workflow does not declare",
             ),
             (
                 "deploy-${{ github.event.inputs.nope }}",
                 &[("environment", "staging")][..],
-                "github.event.inputs.nope, which workflow_dispatch does not declare",
+                "concurrency.group: reads github.event.inputs.nope, which workflow_dispatch does \
+                 not declare",
             ),
+            // Refused for the whole workflow, before any field reads it.
             (
                 "deploy-${{ inputs.fallback }}",
                 &[("fallback", "${{ github.sha }}")][..],
-                "inputs.fallback holds `${{`",
+                "workflow_dispatch input 'fallback' holds `${{`",
             ),
         ] {
             let error =
@@ -12073,10 +12245,188 @@ jobs:
                     .await
                     .expect_err("the group must be refused");
             let message = format!("{error:#}");
+            assert!(message.contains(expected), "{group}: {message}");
             assert!(
-                message.contains("concurrency.group") && message.contains(expected),
-                "{group}: {message}"
+                error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "the workflow's mistake, not the server's: {message}"
             );
+        }
+    }
+
+    /// card_af3833480552: the workflow GitHub's documentation gives for
+    /// cancelling superseded PR runs, plus a job that runs only for a pull
+    /// request into `main` and a step that runs only for one from `feature`.
+    const PULL_REQUEST_REFS: &str = "on: [push, pull_request]\nconcurrency:\n  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}\n  cancel-in-progress: true\njobs:\n  print:\n    steps:\n      - run: echo \"head=[${{ github.head_ref }}] base=[${{ github.base_ref }}]\"\n  into-main:\n    if: github.base_ref == 'main'\n    steps:\n      - run: echo into-main\n  from-feature:\n    steps:\n      - if: ${{ github.head_ref == 'feature' }}\n        run: echo from-feature\n";
+
+    /// card_af3833480552's acceptance, through the embedded runner: a pull
+    /// request is grouped by its source branch and a push by its ref; a job's
+    /// `if:` on `github.base_ref` tells a PR into `main` from one into
+    /// `develop`; a step's `if:` and a `run:` read the same branches, and a
+    /// push reads both as `''`, as on GitHub. Each case asserts every answer,
+    /// so a name missing from any one context — read as `''` — cannot pass.
+    #[tokio::test]
+    async fn pull_request_branches_reach_groups_conditions_and_steps() {
+        for (event, group, printed, into_main, from_feature) in [
+            (
+                TestEvent::pull_request("feature", "main"),
+                "build-feature",
+                "head=[feature] base=[main]",
+                "success",
+                "success",
+            ),
+            (
+                TestEvent::pull_request("hotfix", "develop"),
+                "build-hotfix",
+                "head=[hotfix] base=[develop]",
+                "skipped",
+                "skipped",
+            ),
+            (
+                TestEvent::on("push", None),
+                "build-refs/heads/main",
+                "head=[] base=[]",
+                "skipped",
+                "skipped",
+            ),
+        ] {
+            let (jobs, pipeline, db, _temp) =
+                run_workflows_for(&[("build.yml", PULL_REQUEST_REFS)], event).await;
+            assert_eq!(pipeline.status, "success", "{event:?}");
+            assert_eq!(
+                pipeline.concurrency_group.as_deref(),
+                Some(group),
+                "{event:?}"
+            );
+            assert_eq!(
+                pipeline.head_branch.as_deref(),
+                event.head_branch,
+                "{event:?}"
+            );
+            let log = jobs["build/print"].log.clone().unwrap_or_default();
+            assert!(log.contains(printed), "{event:?}: {log}");
+            assert_eq!(jobs["build/into-main"].status, into_main, "{event:?}");
+            let rows = step_rows(&db, jobs["build/from-feature"].id).await;
+            assert_eq!(rows[0].1, from_feature, "{event:?}: {rows:?}");
+        }
+    }
+
+    /// card_71a3e7424faa: the pre-2022 spelling of a dispatch input, in a
+    /// step's `run:` and `env:` and a job's `env:`, and in a job a reusable
+    /// workflow brings, whose own `inputs.target` is a different value —
+    /// `github.event` there is still the dispatch.
+    const EVENT_INPUTS: &str = "on:\n  push:\n  workflow_dispatch:\n    inputs:\n      target:\n        type: string\n      dry-run:\n        type: boolean\njobs:\n  ship:\n    env:\n      JOB_TARGET: ${{ github.event.inputs.target }}\n    steps:\n      - run: echo \"run=[${{ github.event.inputs.target }}] dry=[${{ github.event.inputs.DRY-RUN }}] job=[$JOB_TARGET] step=[$STEP_TARGET]\"\n        env:\n          STEP_TARGET: ${{ github.event.inputs.target }}\n  shared:\n    uses: ./.gitea/workflows/called.yml\n    with:\n      target: from-caller\n";
+
+    const EVENT_INPUTS_CALLED: &str = "on:\n  workflow_call:\n    inputs:\n      target:\n        type: string\njobs:\n  inner:\n    steps:\n      - run: echo \"called=[${{ inputs.target }}] event=[${{ github.event.inputs.target }}]\"\n";
+
+    /// card_71a3e7424faa's acceptance, through the embedded runner: a dispatch
+    /// prints its input in `run:`, in `env:` and in the job of a called
+    /// workflow, as text — a ticked box is `true`, as the event payload carries
+    /// it; a push prints `''`. The called job prints its own `inputs.target`
+    /// beside it, so reading one for the other cannot pass.
+    #[tokio::test]
+    async fn dispatch_inputs_read_as_github_event_inputs_in_text_fields() {
+        for (event, inputs, ship, inner) in [
+            (
+                rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+                Some(&[("target", "staging"), ("dry-run", "true")][..]),
+                "run=[staging] dry=[true] job=[staging] step=[staging]",
+                "called=[from-caller] event=[staging]",
+            ),
+            (
+                "push",
+                None,
+                "run=[] dry=[] job=[] step=[]",
+                "called=[from-caller] event=[]",
+            ),
+        ] {
+            let (jobs, pipeline, _db, _temp) = run_workflows_for(
+                &[
+                    ("build.yml", EVENT_INPUTS),
+                    ("called.yml", EVENT_INPUTS_CALLED),
+                ],
+                TestEvent::on(event, inputs),
+            )
+            .await;
+            assert_eq!(pipeline.status, "success", "{event}: {jobs:?}");
+            for (job, expected) in [("build/ship", ship), ("build/shared/inner", inner)] {
+                let log = jobs[job].log.clone().unwrap_or_default();
+                assert!(log.contains(expected), "{job} on {event}: {log}");
+            }
+        }
+    }
+
+    /// The job fields resolved before a runner starts read the dispatch too:
+    /// `runs-on: ${{ github.event.inputs.pool }}` routes the job to the pool
+    /// the form named.
+    #[tokio::test]
+    async fn github_event_inputs_name_a_job_field() {
+        let workflow = "on:\n  workflow_dispatch:\n    inputs:\n      pool:\n        type: string\njobs:\n  ship:\n    runs-on: ${{ github.event.inputs.pool }}\n    steps:\n      - run: echo ship\n";
+        let (db, pipeline_id, _, _temp) = publish_pipeline_on(
+            workflow,
+            &[],
+            rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+            Some(&[("pool", "gpu-pool")]),
+        )
+        .await
+        .expect("the workflow publishes a pipeline");
+        let jobs = rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&db, pipeline_id)
+            .await
+            .unwrap();
+        assert_eq!(jobs[0].tags.as_deref(), Some(r#"["gpu-pool"]"#), "{jobs:?}");
+    }
+
+    /// A name `workflow_dispatch` does not declare is refused by name in a text
+    /// field as it is in `if:` — on GitHub it reads as `''`, and a typo in a
+    /// deploy command would quietly deploy nothing — and so is a value that
+    /// would turn into an expression of its own: `${{ secrets.X }}` typed into
+    /// the form must not hand the job that secret.
+    #[tokio::test]
+    async fn github_event_inputs_in_a_text_field_refuse_an_undeclared_or_expression_input() {
+        for (field, inputs, expected) in [
+            (
+                "      - run: echo ${{ github.event.inputs.tagret }}\n",
+                &[("target", "staging")][..],
+                "github.event.inputs.tagret, which workflow_dispatch does not declare",
+            ),
+            (
+                "      - run: echo x\n        env:\n          T: ${{ github.event.inputs.nope }}\n",
+                &[("target", "staging")][..],
+                "github.event.inputs.nope, which workflow_dispatch does not declare",
+            ),
+            (
+                "      - uses: actions/cache@v4\n        with:\n          path: x\n          key: ${{ github.event.inputs.nope }}\n",
+                &[("target", "staging")][..],
+                "github.event.inputs.nope, which workflow_dispatch does not declare",
+            ),
+            (
+                "      - run: echo ${{ github.event.inputs.target }}\n",
+                &[("target", "${{ secrets.DEPLOY_KEY }}")][..],
+                "workflow_dispatch input 'target' holds `${{`",
+            ),
+            // `inputs.*` read the same text before this was refused, and the
+            // step was handed `DEPLOY_KEY`.
+            (
+                "      - run: echo ${{ inputs.target }}\n",
+                &[("target", "${{ secrets.DEPLOY_KEY }}")][..],
+                "workflow_dispatch input 'target' holds `${{`",
+            ),
+        ] {
+            let workflow = format!(
+                "on:\n  workflow_dispatch:\n    inputs:\n      target:\n        type: string\njobs:\n  ship:\n    steps:\n{field}"
+            );
+            let error = publish_pipeline_on(
+                &workflow,
+                &[],
+                rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+                Some(inputs),
+            )
+            .await
+            .map(|_| ())
+            .expect_err("the workflow must be refused");
+            let message = format!("{error:#}");
+            assert!(message.contains(expected), "{field}: {message}");
             assert!(
                 error
                     .downcast_ref::<rg_core::error::InvalidRequest>()
@@ -12867,6 +13217,7 @@ mod composite_action_tests {
                 ref_name: "refs/heads/main",
                 trigger_type: "push",
                 base_branch: None,
+                head_branch: None,
                 previous_sha: None,
                 inputs: None,
                 schedule: None,
@@ -13201,6 +13552,8 @@ mod javascript_action_tests {
             repo_owner: "o".into(),
             repo_name: "r".into(),
             event_schedule: None,
+            head_ref: String::new(),
+            base_ref: String::new(),
         });
         let job = &config.jobs["build"];
         let steps = job.steps.clone().unwrap();

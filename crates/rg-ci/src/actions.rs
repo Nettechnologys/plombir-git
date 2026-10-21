@@ -2215,6 +2215,8 @@ mod tests {
             repo_owner: "o".into(),
             repo_name: "r".into(),
             event_schedule: None,
+            head_ref: String::new(),
+            base_ref: String::new(),
         });
         let job = &config.jobs["build"];
         let granted: Vec<(String, Vec<&str>)> = job

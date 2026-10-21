@@ -1194,6 +1194,7 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
             trigger_type: "push",
             // A push targets no branch other than the one it moves.
             base_branch: None,
+            head_branch: None,
             // Where the ref stood before this push — the other half of what a
             // `paths:` filter needs. This is the one producer that knows it.
             previous_sha: Some(&update.old_sha),
@@ -1241,6 +1242,7 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
                     // the way the push was, not the way the repository stands
                     // whenever someone presses the button.
                     base_branch: None,
+                    head_branch: None,
                     previous_sha: Some(&update.old_sha),
                     schedule: None,
                 },

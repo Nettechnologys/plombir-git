@@ -747,6 +747,8 @@ pub fn step_condition_context(env: &[(String, String)]) -> HashMap<String, Strin
             "github.event.schedule".to_string(),
             value("CI_EVENT_SCHEDULE"),
         ),
+        ("github.head_ref".to_string(), value("CI_HEAD_REF")),
+        ("github.base_ref".to_string(), value("CI_BASE_REF")),
     ]);
     for (name, value) in env {
         if !reserved_for_the_runner(name) && !matches!(name.as_str(), "LANG") {

@@ -80,7 +80,7 @@ const WINDOWS_PROCESS_VARIABLES: &[&str] = &[
 /// server, `plombir-git-runner` — and both drop a job's own copy of any of
 /// these names. Kept here, below both, so a new built-in is protected on every
 /// path at once; `rg_core::ci::BUILTIN_CI_VARIABLES` is this list.
-pub const RUNNER_OWNED_VARIABLES: [&str; 12] = [
+pub const RUNNER_OWNED_VARIABLES: [&str; 14] = [
     "CI",
     "PLOMBIR_GIT",
     "CI_PIPELINE_ID",
@@ -90,6 +90,10 @@ pub const RUNNER_OWNED_VARIABLES: [&str; 12] = [
     "CI_EVENT",
     // `github.event.schedule`: the `- cron:` entry a `schedule` run fired for.
     "CI_EVENT_SCHEDULE",
+    // `github.head_ref` / `github.base_ref`: the branches of a `pull_request`
+    // run, `''` for every other event.
+    "CI_HEAD_REF",
+    "CI_BASE_REF",
     "CI_REPOSITORY",
     "CI_REPOSITORY_OWNER",
     "CI_JOB_TOKEN",

@@ -65,7 +65,7 @@ enum Token {
 /// which a comparison reports as a plain `false` — a silently wrong answer, not
 /// an error. `every_condition_key_the_validator_accepts_is_answered_by_both_contexts`
 /// holds the three together.
-pub const GITHUB_CONTEXT_KEYS: [&str; 7] = [
+pub const GITHUB_CONTEXT_KEYS: [&str; 9] = [
     "github.ref",
     "github.ref_name",
     "github.event_name",
@@ -74,6 +74,10 @@ pub const GITHUB_CONTEXT_KEYS: [&str; 7] = [
     "github.repository_owner",
     // The `- cron:` entry of a `schedule` run; the empty string otherwise.
     "github.event.schedule",
+    // The source and target branch of a `pull_request` run, by short name;
+    // the empty string for every other event, as on GitHub.
+    "github.head_ref",
+    "github.base_ref",
 ];
 
 /// What the status functions of a step condition answer.

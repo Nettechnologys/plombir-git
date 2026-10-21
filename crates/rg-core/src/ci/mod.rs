@@ -236,7 +236,7 @@ impl NoMatchingCiJobs {
 /// Both the embedded runner and the external-runner API inject this vocabulary.
 /// Keeping one list prevents a new built-in from being protected on one path
 /// while a user-controlled value can still replace it on the other.
-pub const BUILTIN_CI_VARIABLES: [&str; 12] = rg_process::job_environment::RUNNER_OWNED_VARIABLES;
+pub const BUILTIN_CI_VARIABLES: [&str; 14] = rg_process::job_environment::RUNNER_OWNED_VARIABLES;
 
 /// The runner protocol of the step model, for the HTTP layer that hands jobs
 /// out — see [`rg_process::ci_steps::STEPS_PROTOCOL`].
@@ -270,6 +270,26 @@ pub const ID_TOKEN_SCOPE: &str = "id-token:write";
 
 pub fn is_builtin_ci_variable(name: &str) -> bool {
     BUILTIN_CI_VARIABLES.contains(&name)
+}
+
+/// `github.head_ref` and `github.base_ref` of a run — `CI_HEAD_REF` and
+/// `CI_BASE_REF` in its jobs: the branch a pull request comes from and the one
+/// it targets, by short name.
+///
+/// Both are `''` for every other event, as on GitHub. That includes a merge
+/// group, whose row records a `base_branch` too — the branch its `on:` filters
+/// are matched against — which is why the event decides here rather than the
+/// presence of the column.
+pub fn pull_request_refs<'a>(
+    trigger_type: &str,
+    head_branch: Option<&'a str>,
+    base_branch: Option<&'a str>,
+) -> (&'a str, &'a str) {
+    if trigger_type == crate::pull_request::ci::PULL_REQUEST_EVENT {
+        (head_branch.unwrap_or(""), base_branch.unwrap_or(""))
+    } else {
+        ("", "")
+    }
 }
 
 /// The outcome a runner may report for a job it took.
@@ -430,6 +450,10 @@ pub struct TriggerPipelineParams<'a> {
     /// wrong for a PR into `develop`. `None` keeps the old fallback and is the
     /// right answer for events that have no target branch (a push, a manual run).
     pub base_branch: Option<&'a str>,
+    /// The branch a `pull_request` run's pull request comes from — what a job
+    /// reads as `github.head_ref`. `None` for every other producer: on GitHub
+    /// the name is empty outside a pull request, merge groups included.
+    pub head_branch: Option<&'a str>,
     /// Where the ref stood before this event, for the `paths:` / `paths-ignore:`
     /// filters — they ask *which files changed*, and that is a diff, not a
     /// property of the new commit alone.
@@ -603,6 +627,9 @@ pub struct ConfigurationFailureParams<'a> {
     /// on the path that succeeds. See [`publish_configuration_failure`] for why
     /// a diagnostic row has to carry it.
     pub base_branch: Option<&'a str>,
+    /// The pull request's source branch, the same value the producer hands
+    /// [`TriggerPipelineParams::head_branch`].
+    pub head_branch: Option<&'a str>,
     /// Where the ref stood before the event that produced this run, the same
     /// value the producer hands [`TriggerPipelineParams::previous_sha`].
     pub previous_sha: Option<&'a str>,
@@ -663,6 +690,7 @@ pub async fn publish_configuration_failure(
         trigger_type,
         triggered_by,
         base_branch,
+        head_branch,
         previous_sha,
         schedule,
     } = params;
@@ -684,6 +712,7 @@ pub async fn publish_configuration_failure(
                 concurrency_group: None,
                 dispatch_inputs: None,
                 base_branch,
+                head_branch,
                 previous_sha,
                 schedule: schedule.map(|run| (run.workflow, run.cron)),
             },
@@ -1060,6 +1089,7 @@ mod configuration_failure_tests {
             trigger_type: crate::pull_request::ci::PULL_REQUEST_EVENT,
             triggered_by: Some(repo.owner_id),
             base_branch: Some("develop"),
+            head_branch: None,
             previous_sha: None,
             schedule: None,
         };
