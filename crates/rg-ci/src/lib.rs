@@ -1344,7 +1344,7 @@ async fn create_variant_jobs(
             artifacts_json.as_deref(),
             job_config.allow_failure.unwrap_or(DEFAULT_ALLOW_FAILURE),
             job_config.timeout_seconds,
-            job_config.when.as_deref(),
+            job_when(job_config),
             job_config.condition.as_deref(),
         )
         .await?;
@@ -1409,12 +1409,12 @@ async fn create_variant_jobs(
                 &variant.coordinates,
             )
         };
-        // A condition that reads what a needed job left has no answer yet;
-        // any other is answered now, as it always was.
-        let deferred_condition = job_config
-            .condition
-            .as_deref()
-            .filter(|condition| condition::reads_needs(condition));
+        // A condition that reads what a needed job left, or how the needed
+        // jobs ended, has no answer yet; any other is answered now, as it
+        // always was.
+        let deferred_condition = job_config.condition.as_deref().filter(|condition| {
+            condition::reads_needs(condition) || !condition::status_functions(condition).is_empty()
+        });
         let should_run = match job_config.condition.as_deref() {
             Some(condition) if deferred_condition.is_none() => {
                 condition::evaluate_condition(condition, &condition_context())?
@@ -1655,6 +1655,24 @@ async fn fail_deferred_matrix(
     rg_db::ops::pipeline_matrix_ops::fail_deferred_job(db, placeholder, &log).await
 }
 
+/// The `when_condition` a job's row is written with: its own `when:`, or —
+/// for a job whose `if:` may be true after a job it needs failed —
+/// [`rg_db::ops::pipeline_ops::RUNS_AFTER_FAILURE_WHEN`], which keeps it from
+/// being skipped with the rest of the stages after a failed one. Only a job
+/// that lists `needs:` may name a status function other than `success()`, so
+/// only one that is held gets it.
+fn job_when(job_config: &config::JobConfig) -> Option<&str> {
+    if job_config
+        .condition
+        .as_deref()
+        .is_some_and(condition::runs_after_failure)
+    {
+        Some(rg_db::ops::pipeline_ops::RUNS_AFTER_FAILURE_WHEN)
+    } else {
+        job_config.when.as_deref()
+    }
+}
+
 /// The `needs:` of a job of steps: alias in its expressions → job name in the
 /// pipeline. Empty for a native job and for one that needs nothing.
 fn job_needs(job_config: &config::JobConfig) -> std::collections::BTreeMap<String, String> {
@@ -1684,8 +1702,8 @@ struct HeldJob {
 
 /// The first job of `needs` that was skipped, by the alias the job reads it
 /// under. A job whose needed job was skipped is skipped too, as on GitHub,
-/// where only a status function (which a job condition here cannot name) would
-/// run it anyway.
+/// unless its condition names a status function (`always()`), which decides
+/// for itself.
 fn skipped_need(
     needs: &std::collections::BTreeMap<String, String>,
     needed: &std::collections::BTreeMap<String, rg_db::ops::pipeline_step_ops::NeededJob>,
@@ -1726,9 +1744,26 @@ pub async fn decide_deferred_condition(
         .await?
         .with_context(|| format!("pipeline {} of a held job is gone", stage.pipeline_id))?;
     let needed = rg_db::ops::pipeline_step_ops::needs_context(db, pipeline.id, &held.needs).await?;
-    if let Some(alias) = skipped_need(&held.needs, &needed) {
-        let log = format!("Skipped: `{alias}`, a job this one needs, was skipped.\n");
-        return pipeline_condition_ops::settle_held_job(db, job, "skipped", &log).await;
+    // A condition that names a status function decides for itself how the
+    // jobs it needs ended — `failure()` runs after one failed, `always()`
+    // after one was skipped — as on GitHub. Any other is `success() && …`.
+    let status = match held.condition.as_deref() {
+        Some(condition) if !condition::status_functions(condition).is_empty() => {
+            let ancestors =
+                rg_db::ops::pipeline_step_ops::ancestor_results(db, pipeline.id, &held.needs)
+                    .await?;
+            Some(condition::JobStatus {
+                any_failed: ancestors.values().any(|result| result == "failure"),
+                all_succeeded: ancestors.values().all(|result| result == "success"),
+            })
+        }
+        _ => None,
+    };
+    if status.is_none() {
+        if let Some(alias) = skipped_need(&held.needs, &needed) {
+            let log = format!("Skipped: `{alias}`, a job this one needs, was skipped.\n");
+            return pipeline_condition_ops::settle_held_job(db, job, "skipped", &log).await;
+        }
     }
     if let Some(condition) = held.condition.as_deref() {
         let mut context = held
@@ -1741,7 +1776,11 @@ pub async fn decide_deferred_condition(
                 context.insert(format!("needs.{alias}.outputs.{name}"), value.clone());
             }
         }
-        match condition::evaluate_condition(condition, &context) {
+        let decided = match status {
+            Some(status) => condition::evaluate_job_condition(condition, &context, status),
+            None => condition::evaluate_condition(condition, &context),
+        };
+        match decided {
             Ok(true) => {}
             Ok(false) => {
                 let log = format!("Skipped: `if: {condition}` is false.\n");
@@ -2245,6 +2284,20 @@ fn validate_execution_semantics(config: &CiConfig) -> Result<()> {
             if let Err(error) = validated {
                 return Err(rg_core::error::invalid_request(format!(
                     "job '{name}' has an unsupported if condition: {error:#}"
+                )));
+            }
+            // A matrix read from a needed job's outputs is expanded only once
+            // that job succeeded; after a failure it has no variants to run.
+            if condition::runs_after_failure(condition)
+                && job
+                    .actions_matrix
+                    .as_ref()
+                    .is_some_and(|spec| !spec.needs_outputs().is_empty())
+            {
+                return Err(rg_core::error::invalid_request(format!(
+                    "job '{name}' has an unsupported if condition: {condition} asks it to run \
+                     after a job it needs failed, and its matrix is read from the outputs of a \
+                     job it needs, which a failed job does not leave"
                 )));
             }
         }
@@ -3247,6 +3300,13 @@ fn try_read_gitea_workflows(
                 ))
             })?;
         }
+        // Before the reusable workflows are expanded: each of those reads its
+        // own `inputs.*` as it is expanded, not this file's.
+        workflow.resolve_condition_inputs().map_err(|reason| {
+            rg_core::error::invalid_request(format!(
+                "unsupported workflow {WORKFLOW_DIR}/{name}: {reason}"
+            ))
+        })?;
         let mut workflow = workflow
             .expand_local_reusable_workflows(&workflow_sources)
             .map_err(|e| {
@@ -3264,6 +3324,15 @@ fn try_read_gitea_workflows(
                 ))
             })?;
         }
+        // After the expansions, so a job a reusable workflow or an action
+        // brings reads the event of this run too.
+        workflow
+            .resolve_event_inputs(invocation.event)
+            .map_err(|reason| {
+                rg_core::error::invalid_request(format!(
+                    "unsupported workflow {WORKFLOW_DIR}/{name}: {reason}"
+                ))
+            })?;
         // After the actions, so a step an action brings reads them too; before
         // the check, which refuses any `vars.*` still standing.
         if let Some(vars) = invocation.vars {
@@ -11383,6 +11452,26 @@ mod step_model_tests {
         workflow: &str,
         environments: &[(&str, bool)],
     ) -> (rg_db::DatabaseConnection, i64, i64, tempfile::TempDir) {
+        publish_pipeline_on(workflow, environments, "push", None)
+            .await
+            .expect("the workflow publishes a pipeline")
+    }
+
+    /// [`publish_pipeline_with_environments`] for `event`, with the
+    /// `workflow_dispatch` inputs a manual run was given; the refusal when the
+    /// workflow is not one this engine runs.
+    async fn publish_pipeline_on(
+        workflow: &str,
+        environments: &[(&str, bool)],
+        event: &str,
+        inputs: Option<&[(&str, &str)]>,
+    ) -> Result<(rg_db::DatabaseConnection, i64, i64, tempfile::TempDir)> {
+        let inputs = inputs.map(|inputs| {
+            inputs
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect::<std::collections::HashMap<_, _>>()
+        });
         let temp = tempfile::tempdir().unwrap();
         let repo_path = temp.path().join("step-owner/steps");
         std::fs::create_dir_all(repo_path.join(".gitea/workflows")).unwrap();
@@ -11472,10 +11561,10 @@ mod step_model_tests {
                 repo_id: repo.id,
                 commit_sha: &sha,
                 ref_name: "refs/heads/main",
-                trigger_type: "push",
+                trigger_type: event,
                 base_branch: None,
                 previous_sha: None,
-                inputs: None,
+                inputs: inputs.as_ref(),
                 schedule: None,
                 triggered_by: Some(user.id),
                 docker_enabled: false,
@@ -11488,9 +11577,43 @@ mod step_model_tests {
             },
             &CiNotifications::default(),
         )
-        .await
-        .expect("the workflow publishes a pipeline");
-        (db, pipeline_id, repo.id, temp)
+        .await?;
+        Ok((db, pipeline_id, repo.id, temp))
+    }
+
+    /// Every job of the pipeline `workflow` publishes for `event`, by name,
+    /// once the embedded runner ran it — and the pipeline's own status.
+    async fn run_pipeline_on(
+        workflow: &str,
+        event: &str,
+        inputs: Option<&[(&str, &str)]>,
+    ) -> (
+        std::collections::HashMap<String, rg_db::entities::pipeline_job::Model>,
+        String,
+        rg_db::DatabaseConnection,
+        tempfile::TempDir,
+    ) {
+        let (db, pipeline_id, repo_id, temp) = publish_pipeline_on(workflow, &[], event, inputs)
+            .await
+            .expect("the workflow publishes a pipeline");
+        let repo_path = temp.path().join("step-owner/steps");
+        let mut runner =
+            PipelineRunner::new_local_only(db.clone(), temp.path(), &repo_path, pipeline_id);
+        runner.set_repo_id(repo_id);
+        runner.set_allow_host_runner(true);
+        runner.run().await.unwrap();
+        let jobs = rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&db, pipeline_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|job| (job.name.clone(), job))
+            .collect();
+        let status = rg_db::ops::pipeline_ops::get_pipeline(&db, pipeline_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status;
+        (jobs, status, db, temp)
     }
 
     async fn step_rows(
@@ -11717,6 +11840,312 @@ jobs:
             jobs["build/announce"].log
         );
         assert_eq!(jobs["build/after-lint"].status, "success");
+    }
+
+    /// card_28ac32f9c069's workflow: a deploy gated on a `workflow_dispatch`
+    /// checkbox, read as `inputs.*` and as `github.event.inputs.*`, by a job
+    /// and by a step.
+    const DISPATCH: &str = r#"on:
+  push:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        type: boolean
+      target:
+        type: choice
+        options: [staging, "it's prod"]
+        default: staging
+jobs:
+  deploy:
+    if: inputs.deploy
+    steps:
+      - run: echo deploy
+  by-event:
+    if: github.event.inputs.deploy == 'true'
+    steps:
+      - run: echo by-event
+  gated:
+    steps:
+      - name: Gated
+        if: inputs.deploy == true && inputs.target == 'staging'
+        run: echo gated
+      - name: Quoted
+        if: ${{ inputs.TARGET != 'it''s prod' }}
+        run: echo quoted
+"#;
+
+    /// card_28ac32f9c069's acceptance, through the embedded runner: a ticked
+    /// box runs the job and the step, an unticked one skips them, and a run
+    /// that was not dispatched reads every input as empty. Each case asserts
+    /// both answers, so an input missing from the condition — read as `''` —
+    /// cannot pass.
+    #[tokio::test]
+    async fn dispatch_inputs_decide_job_and_step_conditions() {
+        for (event, inputs, job_status, step_statuses) in [
+            (
+                rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+                Some(&[("deploy", "true")][..]),
+                "success",
+                ["success", "success"],
+            ),
+            (
+                rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+                Some(&[("deploy", "false"), ("target", "it's prod")][..]),
+                "skipped",
+                ["skipped", "skipped"],
+            ),
+            ("push", None, "skipped", ["skipped", "success"]),
+        ] {
+            let (jobs, status, db, _temp) = run_pipeline_on(DISPATCH, event, inputs).await;
+            assert_eq!(status, "success", "{event} {inputs:?}");
+            for name in ["build/deploy", "build/by-event"] {
+                assert_eq!(
+                    jobs[name].status, job_status,
+                    "{name} on {event} {inputs:?}: {:?}",
+                    jobs[name].log
+                );
+            }
+            let rows = step_rows(&db, jobs["build/gated"].id).await;
+            assert_eq!(
+                [rows[0].1.as_str(), rows[1].1.as_str()],
+                step_statuses,
+                "{event} {inputs:?}: {rows:?}"
+            );
+        }
+    }
+
+    /// An input the workflow does not declare is refused by name — in a job's
+    /// `if:`, a step's, `github.event.inputs.*`, and a `run:` — rather than
+    /// read as empty, which would quietly never deploy.
+    #[tokio::test]
+    async fn an_undeclared_input_is_refused_by_name() {
+        for (job, expected) in [
+            ("    if: inputs.nope\n    steps:\n      - run: echo x\n", "inputs.nope"),
+            (
+                "    steps:\n      - if: ${{ inputs.Deploy && inputs.nope == 'x' }}\n        run: echo x\n",
+                "inputs.nope",
+            ),
+            (
+                "    if: github.event.inputs.nope == 'true'\n    steps:\n      - run: echo x\n",
+                "github.event.inputs.nope",
+            ),
+            (
+                "    steps:\n      - run: echo ${{ inputs.nope }}\n",
+                "inputs.nope",
+            ),
+        ] {
+            let workflow = format!(
+                "on:\n  workflow_dispatch:\n    inputs:\n      deploy:\n        type: boolean\njobs:\n  ship:\n{job}"
+            );
+            let error = publish_pipeline_on(
+                &workflow,
+                &[],
+                rg_core::ci::WORKFLOW_DISPATCH_EVENT,
+                Some(&[("deploy", "true")]),
+            )
+            .await
+            .map(|_| ())
+            .expect_err("an undeclared input must refuse the workflow");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(expected) && message.contains("does not declare"),
+                "{message}"
+            );
+            assert!(
+                error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "the workflow's mistake, not the server's: {message}"
+            );
+        }
+    }
+
+    /// card_29fa305fba93's workflow: `notify` and `cleanup` hang off `test`,
+    /// `report` has no status function, `after` names `!cancelled()`.
+    const AFTER_FAILURE: &str = "on: push\njobs:\n  build:\n    steps:\n      - run: exit BUILD\n  test:\n    needs: build\n    steps:\n      - run: exit TEST\n  notify:\n    needs: test\n    if: failure()\n    steps:\n      - run: echo notify\n  cleanup:\n    needs: test\n    if: always()\n    steps:\n      - run: echo cleanup\n  report:\n    needs: test\n    steps:\n      - run: echo report\n  after:\n    needs: notify\n    if: ${{ !cancelled() }}\n    steps:\n      - run: echo after\n";
+
+    /// card_29fa305fba93's acceptance, through the embedded runner: `failure()`
+    /// runs after a needed job failed — or after a job *that* one needs failed
+    /// and skipped it — and is skipped otherwise; `always()` runs either way; a
+    /// job with no status function is skipped after a failure; the pipeline
+    /// stays `failed` however green the cleanup is.
+    #[tokio::test]
+    async fn status_functions_run_a_job_after_the_jobs_it_needs_failed() {
+        for (build, test, expected, pipeline) in [
+            (
+                "0",
+                "1",
+                [
+                    ("build/build", "success"),
+                    ("build/test", "failed"),
+                    ("build/notify", "success"),
+                    ("build/cleanup", "success"),
+                    ("build/report", "skipped"),
+                    ("build/after", "success"),
+                ],
+                "failed",
+            ),
+            (
+                "0",
+                "0",
+                [
+                    ("build/build", "success"),
+                    ("build/test", "success"),
+                    ("build/notify", "skipped"),
+                    ("build/cleanup", "success"),
+                    ("build/report", "success"),
+                    ("build/after", "success"),
+                ],
+                "success",
+            ),
+            (
+                "1",
+                "0",
+                [
+                    ("build/build", "failed"),
+                    ("build/test", "skipped"),
+                    ("build/notify", "success"),
+                    ("build/cleanup", "success"),
+                    ("build/report", "skipped"),
+                    ("build/after", "success"),
+                ],
+                "failed",
+            ),
+        ] {
+            let workflow = AFTER_FAILURE.replace("BUILD", build).replace("TEST", test);
+            let (jobs, status, _db, _temp) = run_pipeline_on(&workflow, "push", None).await;
+            for (name, job_status) in expected {
+                assert_eq!(
+                    jobs[name].status, job_status,
+                    "build={build} test={test} {name}: {:?}",
+                    jobs[name].log
+                );
+            }
+            assert_eq!(status, pipeline, "build={build} test={test}");
+        }
+    }
+
+    /// A job that failed under `continue-on-error: true` failed nothing: the
+    /// jobs that need it read `success`, as on GitHub, and a `failure()` after
+    /// it does not announce a failure on a green pipeline.
+    #[tokio::test]
+    async fn a_job_that_continued_on_error_is_no_failure_to_the_jobs_after_it() {
+        let (jobs, status, _db, _temp) = run_pipeline_on(
+            "on: push\njobs:\n  flaky:\n    continue-on-error: true\n    steps:\n      - run: exit 1\n  notify:\n    needs: flaky\n    if: failure()\n    steps:\n      - run: echo notify\n  report:\n    needs: flaky\n    if: needs.flaky.result == 'success'\n    steps:\n      - run: echo report\n",
+            "push",
+            None,
+        )
+        .await;
+        assert_eq!(jobs["build/flaky"].status, "failed");
+        assert_eq!(
+            jobs["build/notify"].status, "skipped",
+            "{:?}",
+            jobs["build/notify"].log
+        );
+        assert_eq!(
+            jobs["build/report"].status, "success",
+            "{:?}",
+            jobs["build/report"].log
+        );
+        assert_eq!(status, "success");
+    }
+
+    /// The external-runner path of the same: after `test` failed, the job
+    /// with no status function is skipped with the stage, the held
+    /// `failure()` job is decided once the stages before it finished, and
+    /// only then is it handed out.
+    #[tokio::test]
+    async fn a_polling_runner_gets_the_job_that_runs_after_a_failure() {
+        let workflow = AFTER_FAILURE.replace("BUILD", "0").replace("TEST", "1");
+        let (db, pipeline_id, repo_id, _temp) = publish_pipeline_on(&workflow, &[], "push", None)
+            .await
+            .unwrap();
+        let job = |name: &'static str| {
+            let db = db.clone();
+            async move {
+                rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&db, pipeline_id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|job| job.name == name)
+                    .unwrap()
+            }
+        };
+        let pick = || {
+            let db = db.clone();
+            async move {
+                match rg_db::ops::pipeline_ops::find_pending_job_for_runner(&db, repo_id, &[], true)
+                    .await
+                    .unwrap()
+                {
+                    rg_db::ops::pipeline_ops::PendingPick::Job(job) => Some(job.name),
+                    _ => None,
+                }
+            }
+        };
+        for (name, outcome) in [("build/build", "success"), ("build/test", "failed")] {
+            // `test` needs `build`, so it is held too: decided first, as a
+            // poll decides every held job whose stage is reached.
+            for held in rg_db::ops::pipeline_condition_ops::ready_deferred_conditions(&db, repo_id)
+                .await
+                .unwrap()
+            {
+                rg_core::ci::CiTrigger::decide_deferred_condition(&CiEngine::new(), &db, &held)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(pick().await.as_deref(), Some(name));
+            let row = job(name).await;
+            assert!(
+                rg_db::ops::pipeline_ops::start_job_if_active(&db, row.id, None)
+                    .await
+                    .unwrap()
+            );
+            rg_db::ops::pipeline_ops::finish_embedded_job(
+                &db,
+                pipeline_id,
+                row.stage_id,
+                row.id,
+                outcome,
+                Some(i32::from(outcome != "success")),
+                None,
+                Some(chrono::Utc::now().naive_utc()),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(job("build/report").await.status, "skipped");
+        assert_eq!(pick().await, None, "nothing runs before it is decided");
+        let mut ready = rg_db::ops::pipeline_condition_ops::ready_deferred_conditions(&db, repo_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|job| job.name)
+            .collect::<Vec<_>>();
+        ready.sort();
+        assert_eq!(ready, ["build/cleanup", "build/notify"]);
+        for held in rg_db::ops::pipeline_condition_ops::ready_deferred_conditions(&db, repo_id)
+            .await
+            .unwrap()
+        {
+            rg_core::ci::CiTrigger::decide_deferred_condition(&CiEngine::new(), &db, &held)
+                .await
+                .unwrap();
+        }
+        let picked = pick().await;
+        assert!(
+            matches!(picked.as_deref(), Some("build/notify" | "build/cleanup")),
+            "{picked:?}"
+        );
+        let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&db, pipeline_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(pipeline.status.as_str(), "pending" | "running"),
+            "notify and cleanup are still to run: {}",
+            pipeline.status
+        );
     }
 
     /// A matrix read from the outputs of a job that was skipped is not

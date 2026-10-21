@@ -513,18 +513,48 @@ runs first, and every other job runs one stage after the deepest job it needs.
 
 The same small expression language the native format uses, documented under
 [`if` in the pipeline reference](ci.md#if): `==`, `!=`, `&&`, `||`, `!`,
-parentheses, single-quoted strings, and `startsWith` / `endsWith` / `contains` /
-`success()`. Contexts are `github.ref`, `github.ref_name`, `github.event_name`,
-`github.sha`, `github.repository`, `github.repository_owner`,
-`github.event.schedule`, and `env.NAME`.
+parentheses, single-quoted strings (a quote inside one doubled: `'it''s'`), and
+`startsWith` / `endsWith` / `contains` / `success()`. Contexts are `github.ref`,
+`github.ref_name`, `github.event_name`, `github.sha`, `github.repository`,
+`github.repository_owner`, `github.event.schedule`, `env.NAME`, `inputs.NAME`
+and `github.event.inputs.NAME`.
 
-A **job**'s `if:` is evaluated once and may also read `matrix.NAME`;
-`success()` is the only status function it has, and it is always true there —
-a job is reached only when every stage before it succeeded. A job without
-`needs:` is decided when the pipeline is built. A job with `needs:` is decided
-when its stage is reached, after the jobs it needs have finished, so its `if:`
-may also read what they left — `needs.<job>.outputs.<name>` and
-`needs.<job>.result` ([Outputs](#outputs)) — which is the paths-filter pattern:
+**Inputs** are the [`workflow_dispatch` / `workflow_call` inputs](#workflow_dispatch-and-workflow_call-inputs)
+of the run, in a job's `if:` and a step's alike. `inputs.NAME` keeps the input's
+type, as on GitHub: a `boolean` input is `true` or `false`, so `if:
+inputs.deploy` is false for an unticked box, and `inputs.deploy == true` reads
+as written; every other input is its text. `github.event.inputs.NAME` is the
+`workflow_dispatch` input as the event carries it — always text, so a boolean
+is `'true'` / `'false'`, and `if: github.event.inputs.deploy` alone is true for
+both: compare it, `github.event.inputs.deploy == 'true'`. In a run that was not
+dispatched or called — a `push` of a workflow that also declares
+`workflow_dispatch` — every input is `''`. A name the workflow does not declare
+is refused by name, here and in any `${{ inputs.NAME }}` of a `run:` or `env:`,
+where GitHub would read it as empty and a typo in a deploy gate would quietly
+never deploy. Inside a reusable workflow, `inputs.NAME` is that workflow's
+`workflow_call` input.
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        type: boolean
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: inputs.deploy
+    steps:
+      - run: ./deploy.sh
+```
+
+A **job**'s `if:` is evaluated once and may also read `matrix.NAME`. A job
+without `needs:` is decided when the pipeline is built, and `success()` is the
+only status function it has — always true, since nothing ran before it. A job
+with `needs:` is decided when its stage is reached, after the jobs it needs have
+finished, so its `if:` may also read what they left —
+`needs.<job>.outputs.<name>` and `needs.<job>.result` ([Outputs](#outputs)) —
+which is the paths-filter pattern:
 
 ```yaml
 name: CI
@@ -549,11 +579,53 @@ jobs:
 ```
 
 A job whose `if:` is false is `skipped`, with the condition in its log, and so
-is every job that needs a skipped job — as on GitHub, where only a status
-function would run it anyway, and a job's `if:` here has none to name. Neither
-fails the pipeline. A job that needs others is never handed to a runner before
-it is decided, and its `environment` is attached only once it is to run, so a
-skipped deploy never asks anyone for an approval.
+is every job that needs a skipped job — as on GitHub, unless its condition names
+a status function. Neither fails the pipeline. A job that needs others is never
+handed to a runner before it is decided, and its `environment` is attached only
+once it is to run, so a skipped deploy never asks anyone for an approval.
+
+**Status functions** in the `if:` of a job with `needs:` answer for the jobs it
+needs and every job those need in turn, as on GitHub — the notify-and-clean-up
+pattern:
+
+```yaml
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: make test
+  notify:
+    runs-on: ubuntu-latest
+    needs: test
+    if: failure()
+    steps:
+      - run: ./notify-failure.sh
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: test
+    if: always()
+    steps:
+      - run: ./tear-down-stand.sh
+```
+
+- `success()` — every one of them succeeded; a condition that names no status
+  function means `success() && <condition>`.
+- `failure()` — one of them failed, even one reached only through a job that was
+  skipped because of it: `notify: needs: test` runs when `build`, which `test`
+  needs, failed.
+- `always()` — whatever they did; `!cancelled()` reads the same.
+- `cancelled()` on its own is **refused**: a canceled pipeline runs nothing more,
+  so a job waiting for it would never run. For the same reason `always()` and
+  `!cancelled()` run after a failure, and not after a cancellation.
+
+A job whose `if:` names `always()`, `failure()` or `!cancelled()` is the one job
+a failure does not skip: every other job in the stages after a failed one is
+`skipped` as before, and this one is decided once those stages have finished —
+its row carries `when_condition: always`. The pipeline stays `failed` however
+green the clean-up is. Its matrix may not be read from a needed job's outputs
+([A matrix from a needed job's outputs](#a-matrix-from-a-needed-jobs-outputs)):
+a failed job leaves none, and such a job is refused.
 
 A **step**'s `if:` is read by the runner between steps — see [Steps](#steps) —
 so it has all four status functions and no `matrix.`, and reads `steps.*` and
@@ -1050,7 +1122,7 @@ contexts.
 | `env.NAME` | The variable's value. |
 | `secrets.NAME` | The secret: the environment's value when the job declares an environment that sets the name, the repository-wide one otherwise. Naming it is also what gives the step — and the job — the secret at all (see [Composite actions](#composite-actions)). |
 | `matrix.NAME` | The variant's coordinate. |
-| `inputs.NAME` | The dispatch or call input. |
+| `inputs.NAME` | The dispatch or call input; a name the workflow does not declare is refused. |
 
 **Between steps**, the runner resolves `steps.*` and `needs.*` — see
 [Outputs](#outputs).

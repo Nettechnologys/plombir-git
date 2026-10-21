@@ -3,13 +3,18 @@
 //! Two scopes read the same grammar. A **job** condition is evaluated once:
 //! against the event when the pipeline graph is written, or — for a job that
 //! lists `needs:` — once its stage is reached, when it may also read what the
-//! needed jobs left. Only `success()` has a meaning there, and it is always
-//! true: a job's stage is reached only when every stage before it succeeded. A **step** condition is evaluated by
-//! the runner between two steps, so the status functions answer for the steps
-//! that ran before it — `success()`, `failure()`, `always()`, `cancelled()` —
-//! and a condition that names none of them means `success() && <condition>`,
-//! as on GitHub. The runner is either this process or an external one, which is
-//! why the evaluator lives below both.
+//! needed jobs left. A job that needs none has only `success()`, always true:
+//! nothing ran before it. For one that lists `needs:` the status functions
+//! answer for the jobs it needs and the jobs those need ([`JobStatus`]), so
+//! `if: failure()` runs it after one of them failed. A **step** condition is
+//! evaluated by the runner between two steps, so the status functions answer
+//! for the steps that ran before it — `success()`, `failure()`, `always()`,
+//! `cancelled()`. In either scope a condition that names none of them means
+//! `success() && <condition>`, as on GitHub. The runner is either this process
+//! or an external one, which is why the evaluator lives below both.
+//!
+//! A string literal is single-quoted and a quote inside it is doubled
+//! (`'it''s'`), as on GitHub; a backslash is an ordinary character.
 
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
@@ -80,6 +85,32 @@ pub struct StepStatus {
     pub cancelled: bool,
 }
 
+/// What the status functions of the condition of a job that lists `needs:`
+/// answer, once those jobs have finished.
+///
+/// They speak for every job it needs and every job those need in turn, as on
+/// GitHub: `notify: needs: test, if: failure()` runs when `build`, which `test`
+/// needs, failed — `test` itself was skipped, never run. `cancelled()` is
+/// `false`: a job is decided only while its pipeline is live, and a canceled
+/// one runs nothing more.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JobStatus {
+    /// One of those jobs failed.
+    pub any_failed: bool,
+    /// Every one of them succeeded — none failed, was canceled or skipped.
+    pub all_succeeded: bool,
+}
+
+/// Whose status the status functions of a condition answer for.
+#[derive(Clone, Copy, Debug)]
+enum Status {
+    Step(StepStatus),
+    Job(JobStatus),
+}
+
+/// The status functions, lower-cased, as a condition names them.
+const STATUS_FUNCTIONS: [&str; 4] = ["success", "failure", "always", "cancelled"];
+
 /// The names a condition may read, whatever its scope.
 fn known_context_name(name: &str) -> bool {
     GITHUB_CONTEXT_KEYS.contains(&name)
@@ -108,16 +139,61 @@ pub fn validate_condition(input: &str) -> Result<()> {
 
 /// [`validate_condition`] for a job that lists `needs:`: it may read what the
 /// needed jobs left — `needs.<job>.outputs.<name>` and `needs.<job>.result` —
-/// because such a job is decided only once they have finished. Not `steps.*`:
-/// a job's `if:` is read before any of its steps run. Whether each one names a
-/// job this one needs is the workflow reader's question.
+/// because such a job is decided only once they have finished, and the status
+/// functions answer for them ([`JobStatus`]). Not `steps.*`: a job's `if:` is
+/// read before any of its steps run. Whether each one names a job this one
+/// needs is the workflow reader's question.
+///
+/// `cancelled()` is refused unless it is negated: a canceled pipeline runs
+/// nothing more, so a job asking to run after a cancellation would never run.
+/// `!cancelled()` — GitHub's "after success or failure" — is honoured.
 pub fn validate_job_condition(input: &str) -> Result<()> {
     evaluate_with(
         input,
         |name| (known_context_name(name) || needs_key(name)).then(String::new),
-        None,
-    )
-    .map(|_| ())
+        Some(Status::Job(JobStatus::default())),
+    )?;
+    let tokens = tokenize(unwrap_expression(input)?)?;
+    for (index, token) in tokens.iter().enumerate() {
+        let calls_cancelled = matches!(token, Token::Ident(name) if name.eq_ignore_ascii_case("cancelled"))
+            && tokens.get(index + 1) == Some(&Token::LParen);
+        let negated = index > 0 && tokens[index - 1] == Token::Not;
+        if calls_cancelled && !negated {
+            bail!(
+                "cancelled() asks for the job to run after its pipeline was canceled, and a \
+                 canceled pipeline runs nothing more; `!cancelled()` is honoured"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The status functions a condition calls, lower-cased, outside its quoted
+/// strings. Empty for one that does not parse; the validator is what refuses
+/// that.
+pub fn status_functions(input: &str) -> std::collections::BTreeSet<String> {
+    let Ok(tokens) = unwrap_expression(input).and_then(tokenize) else {
+        return Default::default();
+    };
+    tokens
+        .windows(2)
+        .filter_map(|pair| match pair {
+            [Token::Ident(name), Token::LParen] => {
+                let lower = name.to_ascii_lowercase();
+                STATUS_FUNCTIONS.contains(&lower.as_str()).then_some(lower)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a job condition may be true after a job it needs failed — it calls
+/// a status function other than `success()`. Such a job is still decided when
+/// an earlier stage failed, rather than skipped with the rest.
+pub fn runs_after_failure(input: &str) -> bool {
+    status_functions(input)
+        .iter()
+        .any(|function| function != "success")
 }
 
 /// Whether a condition reads `needs.*`, outside its quoted strings — whether it
@@ -155,7 +231,7 @@ pub fn validate_step_condition(input: &str) -> Result<()> {
             (known_context_name(name) || crate::ci_steps::RuntimeKey::parse(name).is_some())
                 .then(String::new)
         },
-        Some(StepStatus::default()),
+        Some(Status::Step(StepStatus::default())),
     )
     .map(|_| ())
 }
@@ -209,11 +285,36 @@ pub fn evaluate_step_condition(
     context: &HashMap<String, String>,
     status: StepStatus,
 ) -> Result<bool> {
-    let outcome = evaluate_with(input, |name| lookup(context, name), Some(status))?;
+    let outcome = evaluate_with(
+        input,
+        |name| lookup(context, name),
+        Some(Status::Step(status)),
+    )?;
     Ok(if outcome.named_status {
         outcome.value
     } else {
         outcome.value && !status.failed && !status.cancelled
+    })
+}
+
+/// Evaluate the condition of a job that lists `needs:`, once they finished.
+///
+/// One that names no status function is read as `success() && <condition>`,
+/// as a step condition is.
+pub fn evaluate_job_condition(
+    input: &str,
+    context: &HashMap<String, String>,
+    status: JobStatus,
+) -> Result<bool> {
+    let outcome = evaluate_with(
+        input,
+        |name| lookup(context, name),
+        Some(Status::Job(status)),
+    )?;
+    Ok(if outcome.named_status {
+        outcome.value
+    } else {
+        outcome.value && status.all_succeeded
     })
 }
 
@@ -233,7 +334,7 @@ struct Outcome {
 fn evaluate_with(
     input: &str,
     resolver: impl Fn(&str) -> Option<String>,
-    status: Option<StepStatus>,
+    status: Option<Status>,
 ) -> Result<Outcome> {
     let expression = unwrap_expression(input)?;
     let tokens = tokenize(expression)?;
@@ -311,15 +412,20 @@ fn tokenize(input: &str) -> Result<Vec<Token>> {
                 let mut closed = false;
                 while i < chars.len() {
                     if chars[i] == quote {
+                        // A doubled quote is one quote of the text, as on
+                        // GitHub — and as every substitution here writes a
+                        // value into a literal (`vars.*`, an action's
+                        // `inputs.*`). A backslash escaped it once, which
+                        // read `'it''s'` as two strings and `'C:\'` as one
+                        // that never closes.
+                        if chars.get(i + 1) == Some(&quote) {
+                            value.push(quote);
+                            i += 2;
+                            continue;
+                        }
                         i += 1;
                         closed = true;
                         break;
-                    }
-                    if chars[i] == '\\' {
-                        i += 1;
-                        if i >= chars.len() {
-                            bail!("unterminated escape in condition string");
-                        }
                     }
                     value.push(chars[i]);
                     i += 1;
@@ -368,8 +474,9 @@ struct Parser<'a, F> {
     position: usize,
     resolver: &'a F,
     depth: usize,
-    /// `Some` for a step condition, whose status functions have an answer.
-    status: Option<StepStatus>,
+    /// `Some` for a step condition and for that of a job that lists `needs:`,
+    /// whose status functions have an answer.
+    status: Option<Status>,
     named_status: bool,
 }
 impl<'a, F: Fn(&str) -> Option<String>> Parser<'a, F> {
@@ -468,22 +575,24 @@ impl<'a, F: Fn(&str) -> Option<String>> Parser<'a, F> {
                 bail!("{name}() does not accept arguments");
             }
             let Some(status) = self.status else {
-                // A job condition is read before the job runs, and a job is
-                // reached only when every stage before it succeeded: only
-                // `success()` has an answer there, and it is always yes.
+                // The condition of a job that needs no other job: nothing ran
+                // before it, so only `success()` has an answer, and it is yes.
                 if lower == "success" {
                     return Ok(Value::Bool(true));
                 }
                 bail!(
-                    "{name}() has no meaning in a job condition: a job is reached only when \
-                     every stage before it succeeded; it is a step condition function"
+                    "{name}() has no meaning in the condition of a job that lists no `needs:`: \
+                     in a job condition it answers for the jobs it needs"
                 );
             };
             self.named_status = true;
-            return Ok(Value::Bool(match lower.as_str() {
-                "success" => !status.failed && !status.cancelled,
-                "failure" => status.failed,
-                "cancelled" => status.cancelled,
+            return Ok(Value::Bool(match (lower.as_str(), status) {
+                ("success", Status::Step(step)) => !step.failed && !step.cancelled,
+                ("failure", Status::Step(step)) => step.failed,
+                ("cancelled", Status::Step(step)) => step.cancelled,
+                ("success", Status::Job(job)) => job.all_succeeded,
+                ("failure", Status::Job(job)) => job.any_failed,
+                ("cancelled", Status::Job(_)) => false,
                 _ => true,
             }));
         }
@@ -667,7 +776,7 @@ mod tests {
         for refused in [
             "steps.a.outputs.b == 'x'",
             "needs.build.outputs == 'x'",
-            "always() && needs.build.result == 'failure'",
+            "cancelled() || needs.build.result == 'failure'",
             "secrets.TOKEN == 'x'",
         ] {
             assert!(validate_job_condition(refused).is_err(), "{refused}");
@@ -684,5 +793,92 @@ mod tests {
         ]);
         assert!(evaluate_condition("needs.changes.outputs.backend == 'true'", &context).unwrap());
         assert!(!evaluate_condition("needs.changes.outputs.frontend == 'true'", &context).unwrap());
+    }
+
+    /// card_29fa305fba93: the status functions of a job that lists `needs:`
+    /// answer for those jobs, and a condition naming none of them is
+    /// `success() && <condition>`.
+    #[test]
+    fn job_status_functions_answer_for_the_jobs_it_needs() {
+        let context = HashMap::from([("github.ref".into(), "refs/heads/main".into())]);
+        let succeeded = JobStatus {
+            any_failed: false,
+            all_succeeded: true,
+        };
+        let failed = JobStatus {
+            any_failed: true,
+            all_succeeded: false,
+        };
+        let skipped = JobStatus {
+            any_failed: false,
+            all_succeeded: false,
+        };
+        for (condition, after_success, after_failure, after_skip) in [
+            ("success()", true, false, false),
+            ("failure()", false, true, false),
+            ("always()", true, true, true),
+            ("!cancelled()", true, true, true),
+            ("github.ref == 'refs/heads/main'", true, false, false),
+            (
+                "${{ failure() && github.ref == 'refs/heads/main' }}",
+                false,
+                true,
+                false,
+            ),
+        ] {
+            validate_job_condition(condition)
+                .unwrap_or_else(|error| panic!("{condition}: {error}"));
+            for (status, expected) in [
+                (succeeded, after_success),
+                (failed, after_failure),
+                (skipped, after_skip),
+            ] {
+                assert_eq!(
+                    evaluate_job_condition(condition, &context, status).unwrap(),
+                    expected,
+                    "`{condition}` with {status:?}"
+                );
+            }
+        }
+        for refused in [
+            "cancelled()",
+            "${{ cancelled() || failure() }}",
+            "always(1)",
+        ] {
+            assert!(validate_job_condition(refused).is_err(), "{refused}");
+        }
+        // A job that needs none still has only `success()`.
+        assert!(validate_condition("failure()").is_err());
+        assert!(validate_condition("success()").is_ok());
+    }
+
+    #[test]
+    fn status_functions_are_read_outside_strings() {
+        assert_eq!(
+            status_functions("${{ failure() && github.ref == 'always()' }}"),
+            ["failure".to_string()].into()
+        );
+        assert!(status_functions("github.ref == 'failure()'").is_empty());
+        assert!(runs_after_failure("Always()"));
+        assert!(runs_after_failure("!cancelled()"));
+        assert!(!runs_after_failure(
+            "success() && needs.a.result == 'success'"
+        ));
+        assert!(!runs_after_failure("needs.a.result == 'failure'"));
+    }
+
+    /// A quote inside a literal is doubled, as on GitHub and as the `vars.*`
+    /// and action-input substitutions write it; a backslash is text.
+    #[test]
+    fn a_doubled_quote_is_one_quote_of_the_literal() {
+        let context = HashMap::from([("github.ref_name".into(), "it's".into())]);
+        assert!(evaluate_condition("github.ref_name == 'it''s'", &context).unwrap());
+        assert_eq!(
+            evaluate_text("'C:\\' || 'x'", &context).unwrap(),
+            "C:\\",
+            "a backslash does not escape the closing quote"
+        );
+        assert_eq!(evaluate_text("''''", &context).unwrap(), "'");
+        assert!(validate_condition("'it's'").is_err());
     }
 }

@@ -241,7 +241,8 @@ accepted as a synonym.
   `github.repository`, `github.repository_owner`; plus `env.NAME` for the job's
   variables and `matrix.NAME` for the current matrix variant.
 - Operators: `==`, `!=`, `&&`, `||`, `!`, parentheses; string literals in single
-  quotes; `true` / `false`.
+  quotes, a quote inside one doubled (`'it''s'`) as on GitHub, a backslash an
+  ordinary character; `true` / `false`.
 - Functions: `startsWith(a, b)`, `endsWith(a, b)`, `contains(a, b)`, `success()`.
 
 Anything else — an unknown context name, an unsupported function — is refused

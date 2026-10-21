@@ -115,41 +115,15 @@ pub async fn needs_context(
     pipeline_id: i64,
     needs: &std::collections::BTreeMap<String, String>,
 ) -> Result<std::collections::BTreeMap<String, NeededJob>> {
-    use crate::entities::pipeline_stage;
     if needs.is_empty() {
         return Ok(Default::default());
     }
-    let stage_ids = pipeline_stage::Entity::find()
-        .filter(pipeline_stage::Column::PipelineId.eq(pipeline_id))
-        .all(db)
-        .await
-        .context("db: list the pipeline's stages")?
-        .into_iter()
-        .map(|stage| stage.id)
-        .collect::<Vec<_>>();
-    let jobs = pipeline_job::Entity::find()
-        .filter(pipeline_job::Column::StageId.is_in(stage_ids))
-        .all(db)
-        .await
-        .context("db: list the pipeline's jobs")?;
+    let jobs = pipeline_jobs(db, pipeline_id).await?;
     let mut context = std::collections::BTreeMap::new();
     for (alias, name) in needs {
-        let variant_prefix = format!("{name} [");
-        let mut variants = jobs
-            .iter()
-            .filter(|job| job.name == *name || job.name.starts_with(&variant_prefix))
-            .collect::<Vec<_>>();
+        let mut variants = job_rows(&jobs, name);
         variants.sort_by_key(|job| job.finished_at);
-        let failed = |status: &str| matches!(status, "failed" | "failure" | "error");
-        let result = if variants.iter().any(|job| failed(&job.status)) {
-            "failure"
-        } else if variants.iter().any(|job| job.status == "canceled") {
-            "cancelled"
-        } else if !variants.is_empty() && variants.iter().all(|job| job.status == "skipped") {
-            "skipped"
-        } else {
-            "success"
-        };
+        let result = job_result(&variants);
         let outputs = variants
             .iter()
             .rev()
@@ -168,6 +142,103 @@ pub async fn needs_context(
         );
     }
     Ok(context)
+}
+
+/// The result — as [`NeededJob::result`] spells it — of every job `needs`
+/// names and every job those need in turn, by job name: what the status
+/// functions of a job condition answer for. A job reached only through a
+/// skipped one counts too, as on GitHub, where `failure()` is true when any
+/// ancestor failed.
+///
+/// The edges are each job's own `needs:`, from the job context its row
+/// carries; a job named by no row (not in this pipeline) contributes nothing.
+pub async fn ancestor_results(
+    db: &impl ConnectionTrait,
+    pipeline_id: i64,
+    needs: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    if needs.is_empty() {
+        return Ok(Default::default());
+    }
+    let jobs = pipeline_jobs(db, pipeline_id).await?;
+    let mut results = std::collections::BTreeMap::new();
+    let mut queue = needs.values().cloned().collect::<Vec<_>>();
+    while let Some(name) = queue.pop() {
+        if results.contains_key(&name) {
+            continue;
+        }
+        let rows = job_rows(&jobs, &name);
+        if rows.is_empty() {
+            continue;
+        }
+        results.insert(name, job_result(&rows).to_string());
+        for row in rows {
+            let Some(context) = row.job_context.as_deref() else {
+                continue;
+            };
+            let context: serde_json::Value =
+                serde_json::from_str(context).context("a job's stored job context is not JSON")?;
+            if let Some(needed) = context.get("needs").and_then(|needs| needs.as_object()) {
+                queue.extend(
+                    needed
+                        .values()
+                        .filter_map(|name| name.as_str())
+                        .map(str::to_owned),
+                );
+            }
+        }
+    }
+    Ok(results)
+}
+
+/// Every job row of one pipeline.
+async fn pipeline_jobs(
+    db: &impl ConnectionTrait,
+    pipeline_id: i64,
+) -> Result<Vec<pipeline_job::Model>> {
+    use crate::entities::pipeline_stage;
+    let stage_ids = pipeline_stage::Entity::find()
+        .filter(pipeline_stage::Column::PipelineId.eq(pipeline_id))
+        .all(db)
+        .await
+        .context("db: list the pipeline's stages")?
+        .into_iter()
+        .map(|stage| stage.id)
+        .collect::<Vec<_>>();
+    pipeline_job::Entity::find()
+        .filter(pipeline_job::Column::StageId.is_in(stage_ids))
+        .all(db)
+        .await
+        .context("db: list the pipeline's jobs")
+}
+
+/// The rows of the job `name`: itself, or every variant `<name> [<coordinates>]`
+/// of a matrix job.
+fn job_rows<'a>(jobs: &'a [pipeline_job::Model], name: &str) -> Vec<&'a pipeline_job::Model> {
+    let variant_prefix = format!("{name} [");
+    jobs.iter()
+        .filter(|job| job.name == name || job.name.starts_with(&variant_prefix))
+        .collect()
+}
+
+/// One job's result from its rows: a failure if any variant failed.
+///
+/// A variant that failed under `continue-on-error: true` did not fail the job:
+/// its result is `success`, as on GitHub — it failed nothing else either, so a
+/// `failure()` after it would announce a failure on a green pipeline.
+fn job_result(rows: &[&pipeline_job::Model]) -> &'static str {
+    let failed = |job: &pipeline_job::Model| {
+        matches!(job.status.as_str(), "failed" | "failure" | "error") && !job.allow_failure
+    };
+    if rows.iter().any(|job| failed(job)) {
+        "failure"
+    } else if rows.iter().any(|job| job.status == "canceled") {
+        "cancelled"
+    } else if !rows.is_empty() && rows.iter().all(|job| job.status == "skipped") {
+        "skipped"
+    } else {
+        "success"
+    }
 }
 
 /// Put every step of a job back to `pending`, for the run that is about to

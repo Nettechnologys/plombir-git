@@ -298,6 +298,14 @@ pub async fn update_stage_status(
 /// value has to have something to hold it to (`rg-ci/src/config.rs`).
 pub const DEFAULT_JOB_WHEN: &str = "on_success";
 
+/// The `when_condition` of a job that is reached even after an earlier stage
+/// failed: an Actions job whose `if:` names `always()`, `failure()` or
+/// `!cancelled()`. Nothing but its stage order changes — it is still held until
+/// the jobs it needs have finished, and its `if:` still decides whether it
+/// runs. Every other job of a stage after a failed one is skipped
+/// ([`try_update_stage`]); the manual-play route accepts only `manual`.
+pub const RUNS_AFTER_FAILURE_WHEN: &str = "always";
+
 /// Create a pipeline job.
 ///
 /// A job is born `pending`, i.e. schedulable the moment it is visible — so a
@@ -1234,6 +1242,11 @@ pub async fn try_update_stage(db: &impl ConnectionTrait, stage_id: i64) -> Resul
     Ok(Some(new_status.to_string()))
 }
 
+/// Skip what a failed stage leaves unreachable: every unfinished job of the
+/// stages after it, except one that runs after a failure
+/// ([`RUNS_AFTER_FAILURE_WHEN`]), and every such stage left with nothing to
+/// run. A stage that keeps one stays as it is, to be reached once the stages
+/// before it have finished ([`stage_reached_by`]).
 async fn skip_downstream_stages(db: &impl ConnectionTrait, failed_stage_id: i64) -> Result<()> {
     let Some(failed_stage) = get_stage_by_id(db, failed_stage_id).await? else {
         return Ok(());
@@ -1251,16 +1264,30 @@ async fn skip_downstream_stages(db: &impl ConnectionTrait, failed_stage_id: i64)
         {
             continue;
         }
+        let mut kept = false;
         for job in jobs {
-            if !is_finished_pipeline_work(&job.status) {
-                update_job_result(db, job.id, "skipped", None, None, None, now).await?;
+            if is_finished_pipeline_work(&job.status) {
+                continue;
             }
+            if job.when_condition == RUNS_AFTER_FAILURE_WHEN {
+                kept = true;
+                continue;
+            }
+            update_job_result(db, job.id, "skipped", None, None, None, now).await?;
         }
-        if !is_finished_pipeline_work(&stage.status) {
+        if !kept && !is_finished_pipeline_work(&stage.status) {
             update_stage_status(db, stage.id, "skipped", None, now).await?;
         }
     }
     Ok(())
+}
+
+/// Whether a stage after a failed one still holds a job that runs after a
+/// failure — what the in-process runner walks rather than skips.
+pub async fn stage_runs_after_failure(db: &impl ConnectionTrait, stage_id: i64) -> Result<bool> {
+    Ok(list_jobs_by_stage(db, stage_id).await?.iter().any(|job| {
+        job.when_condition == RUNS_AFTER_FAILURE_WHEN && !is_finished_pipeline_work(&job.status)
+    }))
 }
 
 /// Check if all stages in a pipeline are done.
@@ -1445,7 +1472,7 @@ async fn first_pending_job(
         let Some(stage) = stages_by_id.get(&job.stage_id) else {
             continue;
         };
-        if !earlier_stages_succeeded(stage, &sibling_stages) {
+        if !stage_reached_by(&job, stage, &sibling_stages) {
             continue;
         }
         let job_tags = match decode_job_tags(job.tags.as_deref()) {
@@ -1522,16 +1549,24 @@ pub(crate) fn active_pending_jobs_query(repo_id: i64) -> Select<pipeline_job::En
         .order_by_asc(pipeline_job::Column::Id)
 }
 
-/// Whether every stage that comes before `stage` in its pipeline succeeded.
-pub(crate) fn earlier_stages_succeeded(
+/// Whether `job`'s stage is reached: every stage that comes before it in its
+/// pipeline succeeded — or, for a job that runs after a failure
+/// ([`RUNS_AFTER_FAILURE_WHEN`]), every one of them has finished, whatever
+/// its outcome.
+pub(crate) fn stage_reached_by(
+    job: &pipeline_job::Model,
     stage: &pipeline_stage::Model,
     stages: &[pipeline_stage::Model],
 ) -> bool {
-    stages
+    let mut earlier = stages
         .iter()
         .filter(|candidate| candidate.pipeline_id == stage.pipeline_id)
-        .filter(|candidate| candidate.stage_order < stage.stage_order)
-        .all(|candidate| candidate.status == "success")
+        .filter(|candidate| candidate.stage_order < stage.stage_order);
+    if job.when_condition == RUNS_AFTER_FAILURE_WHEN {
+        earlier.all(|candidate| is_finished_pipeline_work(&candidate.status))
+    } else {
+        earlier.all(|candidate| candidate.status == "success")
+    }
 }
 
 #[cfg(test)]

@@ -3633,6 +3633,9 @@ fn expand_reusable_jobs(
             anyhow::bail!("workflow {target} is not reusable; declare `on: workflow_call`");
         }
         called.resolve_reusable_inputs(name, &original.with, &workflow.resolved_inputs)?;
+        called
+            .resolve_condition_inputs()
+            .map_err(|error| anyhow::anyhow!("reusable workflow {target}: {error}"))?;
         // This boundary flattens one workflow into another, so every new
         // workflow-level field must make an explicit survive-or-refuse choice.
         // `on` is checked above, `jobs`, `env`, and working-directory defaults
@@ -4790,6 +4793,230 @@ impl GiteaWorkflow {
     }
 }
 
+// ── inputs.* in conditions ─────────────────────────────────────────────
+
+/// `value` as a string literal of a condition: quoted, a quote doubled.
+fn condition_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// `expression` with every `<prefix><name>` outside a string literal replaced
+/// by what `literal` makes of the name — a literal, so a value can never turn
+/// into operators of the condition. A name is what an input may be called:
+/// letters, digits, `_` and `-`.
+fn context_in_expression(
+    expression: &str,
+    prefix: &str,
+    literal: &mut impl FnMut(&str) -> std::result::Result<String, String>,
+) -> std::result::Result<String, String> {
+    let bytes = expression.as_bytes();
+    let mut out = String::with_capacity(expression.len());
+    let mut index = 0;
+    let mut in_string = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\'' {
+            in_string = !in_string;
+            out.push('\'');
+            index += 1;
+            continue;
+        }
+        let boundary = index == 0 || {
+            let before = bytes[index - 1];
+            !(before.is_ascii_alphanumeric() || matches!(before, b'_' | b'-' | b'.'))
+        };
+        if !in_string && boundary && expression[index..].starts_with(prefix) {
+            let start = index + prefix.len();
+            let len = expression[start..]
+                .bytes()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                .count();
+            if len > 0 {
+                out.push_str(&literal(&expression[start..start + len])?);
+                index = start + len;
+                continue;
+            }
+        }
+        let ch = expression[index..].chars().next().expect("in bounds");
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    Ok(out)
+}
+
+/// An `if:`, with or without its `${{ }}`, with [`context_in_expression`]
+/// applied to every expression in it.
+fn context_in_condition(
+    condition: &str,
+    prefix: &str,
+    mut literal: impl FnMut(&str) -> std::result::Result<String, String>,
+) -> std::result::Result<String, String> {
+    if !condition.contains(prefix) {
+        return Ok(condition.to_string());
+    }
+    if !condition.contains("${{") {
+        return context_in_expression(condition, prefix, &mut literal);
+    }
+    map_expression_groups(condition, |body| {
+        Ok(format!(
+            "${{{{ {} }}}}",
+            context_in_expression(body, prefix, &mut literal)?
+        ))
+    })
+}
+
+/// Every `${{ inputs.<name> }}` of a text field, by name.
+fn input_references(text: &str) -> Vec<String> {
+    workflow_expressions(text)
+        .iter()
+        .filter_map(|expression| context_member(expression, "inputs").map(str::to_owned))
+        .collect()
+}
+
+impl GiteaWorkflow {
+    /// The inputs this workflow declares, under any trigger that has them.
+    fn declared_input_names(&self, triggers: &[&str]) -> Vec<String> {
+        let mut names = triggers
+            .iter()
+            .filter_map(|trigger| self.trigger_input_definitions(trigger))
+            .flat_map(|definitions| definitions.keys().cloned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Read `inputs.*` in every job's and step's `if:` (card_28ac32f9c069):
+    /// each becomes the input's value as a literal — `true` / `false` for a
+    /// boolean input, as on GitHub, so `if: inputs.deploy` is false for an
+    /// unticked box; text otherwise. An input this run was not given — the
+    /// workflow ran on `push`, not by hand — is `''`.
+    ///
+    /// A name the workflow declares under neither `workflow_dispatch` nor
+    /// `workflow_call` is refused, there and in every `${{ inputs.<name> }}` of
+    /// its text fields: on GitHub it reads as empty, and a typo in a deploy
+    /// gate would quietly never deploy. Names match without regard to case, as
+    /// on GitHub.
+    ///
+    /// Run once per workflow file, before its reusable workflows are expanded
+    /// into it: each one is read against its own inputs as it is expanded, and
+    /// what it brings in carries no `inputs.*` of its caller's.
+    pub(crate) fn resolve_condition_inputs(&mut self) -> std::result::Result<(), String> {
+        let declared = self.declared_input_names(&["workflow_dispatch", WORKFLOW_CALL_TRIGGER]);
+        let find = |name: &str| {
+            declared
+                .iter()
+                .find(|declared| declared.eq_ignore_ascii_case(name))
+                .cloned()
+        };
+        let undeclared = |name: &str| {
+            let mut known = declared.join(", ");
+            if known.is_empty() {
+                known = "none".into();
+            }
+            format!(
+                "reads inputs.{name}, which this workflow does not declare (declared inputs: \
+                 {known})"
+            )
+        };
+        let values = &self.resolved_inputs;
+        let literal = |name: &str| -> std::result::Result<String, String> {
+            let declared = find(name).ok_or_else(|| undeclared(name))?;
+            Ok(match values.get(&declared) {
+                Some(GiteaInputValue::Boolean(value)) => value.to_string(),
+                Some(value) => condition_literal(&value.as_string()),
+                None => condition_literal(""),
+            })
+        };
+        if let Some(name) = self
+            .env
+            .values()
+            .flat_map(|text| input_references(text))
+            .find(|name| find(name).is_none())
+        {
+            return Err(format!("env: {}", undeclared(&name)));
+        }
+        let mut jobs = self.jobs.iter_mut().collect::<Vec<_>>();
+        jobs.sort_by_key(|(name, _)| *name);
+        for (job_name, job) in jobs {
+            let at = |error: String| format!("jobs.{job_name}: {error}");
+            if let Some(condition) = &mut job.condition {
+                *condition = context_in_condition(condition, "inputs.", literal).map_err(at)?;
+            }
+            let mut texts = job
+                .env
+                .values()
+                .chain(job.outputs.values())
+                .collect::<Vec<_>>();
+            for step in &mut job.steps {
+                if let Some(condition) = &mut step.condition {
+                    *condition = context_in_condition(condition, "inputs.", literal).map_err(at)?;
+                }
+            }
+            for step in &job.steps {
+                texts.extend(
+                    [&step.name, &step.run, &step.working_directory]
+                        .into_iter()
+                        .flatten(),
+                );
+                texts.extend(step.env.values().chain(step.with.values()));
+            }
+            if let Some(name) = texts
+                .into_iter()
+                .flat_map(|text| input_references(text))
+                .find(|name| find(name).is_none())
+            {
+                return Err(at(undeclared(&name)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Read `github.event.inputs.*` in every job's and step's `if:`: the
+    /// `workflow_dispatch` inputs of the run, as text — `'true'`, not `true`,
+    /// as GitHub's event payload carries them — or `''` for a run that was not
+    /// dispatched. A name `workflow_dispatch` does not declare is refused.
+    ///
+    /// Run after the reusable workflows and actions are expanded: a job they
+    /// bring reads the event of the run it is part of, which is this file's.
+    pub(crate) fn resolve_event_inputs(&mut self, event: &str) -> std::result::Result<(), String> {
+        let declared = self.declared_input_names(&["workflow_dispatch"]);
+        let dispatched = event == rg_core::ci::WORKFLOW_DISPATCH_EVENT;
+        let values = &self.resolved_inputs;
+        let literal = |name: &str| -> std::result::Result<String, String> {
+            let declared = declared
+                .iter()
+                .find(|declared| declared.eq_ignore_ascii_case(name))
+                .ok_or_else(|| {
+                    format!(
+                        "reads github.event.inputs.{name}, which workflow_dispatch does not \
+                         declare"
+                    )
+                })?;
+            Ok(condition_literal(
+                &values
+                    .get(declared)
+                    .filter(|_| dispatched)
+                    .map(GiteaInputValue::as_string)
+                    .unwrap_or_default(),
+            ))
+        };
+        for (job_name, job) in &mut self.jobs {
+            let at = |error: String| format!("jobs.{job_name}: {error}");
+            let conditions = job.condition.iter_mut().chain(
+                job.steps
+                    .iter_mut()
+                    .filter_map(|step| step.condition.as_mut()),
+            );
+            for condition in conditions {
+                *condition =
+                    context_in_condition(condition, "github.event.inputs.", literal).map_err(at)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Basic `${{ expression }}` substitution.
 fn substitute_expr(
     input: &str,
@@ -5362,10 +5589,17 @@ mod tests {
         sources: &HashMap<String, String>,
         actions: &HashMap<String, String>,
     ) -> Result<()> {
-        let workflow = GiteaWorkflow::parse(body)?;
+        let mut workflow = GiteaWorkflow::parse(body)?;
         workflow.validate_supported_triggers()?;
+        // As a run that was not dispatched reads it: every input `''`.
+        workflow
+            .resolve_condition_inputs()
+            .map_err(anyhow::Error::msg)?;
         let mut workflow = workflow.expand_local_reusable_workflows(sources)?;
         crate::actions::expand_actions(&mut workflow, &DocumentedActions(actions))?
+            .map_err(anyhow::Error::msg)?;
+        workflow
+            .resolve_event_inputs("push")
             .map_err(anyhow::Error::msg)?;
         // As a trigger reads it: a repository with no variables set.
         workflow

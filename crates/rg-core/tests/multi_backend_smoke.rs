@@ -3637,7 +3637,11 @@ async fn assert_free_text_columns_are_wide(db: &DatabaseConnection) {
 /// bounded — an id, a digest, a state, a name validated at the door. The CI
 /// names a workflow file chooses (job, stage, concurrency group) and a commit
 /// status context are refused past 255 characters before the write
-/// (card_51b860efc19c). A column joins this list only with the same answer.
+/// (card_51b860efc19c). The `on: schedule` ledger key and the provenance it
+/// replays — a workflow file name and a `- cron:` entry — are refused past 255
+/// bytes as well, the cron when the workflow is read and the file name before a
+/// tick is claimed: the ledger keys a unique index on them, which MySQL cannot
+/// build over `TEXT`. A column joins this list only with the same answer.
 const NARROW_MYSQL_COLUMNS: &[(&str, &[&str])] = &[
     ("access_tokens", &["name", "scopes", "token_hash"]),
     ("artifacts", &["name", "sha256"]),
@@ -3647,6 +3651,7 @@ const NARROW_MYSQL_COLUMNS: &[(&str, &[&str])] = &[
     ("boards", &["name"]),
     ("ci_cache_entries", &["sha256"]),
     ("ci_environments", &["name"]),
+    ("ci_schedule_ticks", &["cron", "workflow"]),
     ("ci_secrets", &["name"]),
     ("commit_signing_keys", &["fingerprint", "kind", "title"]),
     ("commit_statuses", &["context"]),
@@ -3721,6 +3726,8 @@ const NARROW_MYSQL_COLUMNS: &[(&str, &[&str])] = &[
             "commit_sha",
             "concurrency_group",
             "ref_name",
+            "schedule_cron",
+            "schedule_workflow",
             "status",
             "trigger_type",
         ],

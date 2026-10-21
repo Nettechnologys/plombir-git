@@ -630,7 +630,12 @@ impl PipelineRunner {
                 pipeline_failed = true;
                 continue;
             }
-            if pipeline_failed {
+            // After a failure only a job whose `if:` asks to run then
+            // (`always()`, `failure()`) is still to be decided; a stage that
+            // holds none is skipped whole.
+            if pipeline_failed
+                && !pipeline_ops::stage_runs_after_failure(&self.db_write, stage.id).await?
+            {
                 self.skip_stage(stage).await?;
                 continue;
             }
@@ -647,7 +652,7 @@ impl PipelineRunner {
                 return Ok(());
             }
 
-            match self.run_stage(stage).await? {
+            match self.run_stage(stage, pipeline_failed).await? {
                 StageOutcome::Paused | StageOutcome::Settled | StageOutcome::Interrupted => {
                     return Ok(())
                 }
@@ -733,9 +738,15 @@ impl PipelineRunner {
     /// awaiting environment approval is reached (the pipeline stops there),
     /// [`StageOutcome::Settled`] when the pipeline was canceled mid-stage,
     /// otherwise [`StageOutcome::Completed`] carrying whether the stage failed.
+    ///
+    /// `after_failure`: an earlier stage failed, and only a job that runs
+    /// after a failure ([`pipeline_ops::RUNS_AFTER_FAILURE_WHEN`]) may run
+    /// here. The failure skipped every other one already; one found pending
+    /// anyway is skipped rather than run past it.
     async fn run_stage(
         &self,
         stage: &rg_db::entities::pipeline_stage::Model,
+        after_failure: bool,
     ) -> Result<StageOutcome> {
         // Mark stage as running
         let stage_start = chrono::Utc::now().naive_utc();
@@ -852,6 +863,20 @@ impl PipelineRunner {
                     job.id,
                     job.status
                 );
+            }
+            if after_failure && job.when_condition != pipeline_ops::RUNS_AFTER_FAILURE_WHEN {
+                pipeline_ops::finish_embedded_job(
+                    &self.db_write,
+                    self.pipeline_id,
+                    stage.id,
+                    job.id,
+                    "skipped",
+                    None,
+                    None,
+                    Some(chrono::Utc::now().naive_utc()),
+                )
+                .await?;
+                continue;
             }
             // Two checks, not one. This is the cheap one: a stop already in
             // effect stops the loop before the next job is even started.

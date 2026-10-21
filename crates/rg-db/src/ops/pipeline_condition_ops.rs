@@ -39,8 +39,8 @@ pub async fn set_deferred_condition(
 }
 
 /// The held jobs of one repository whose stage may run now: every stage before
-/// theirs succeeded, and their pipeline and stage would let a job of theirs be
-/// handed out.
+/// theirs succeeded (or finished, for a job that runs after a failure), and
+/// their pipeline and stage would let a job of theirs be handed out.
 pub async fn ready_deferred_conditions(
     db: &DatabaseConnection,
     repo_id: i64,

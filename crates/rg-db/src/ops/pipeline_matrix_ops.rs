@@ -76,8 +76,9 @@ pub async fn ready_deferred_jobs(
     in_reached_stages(db, placeholders).await
 }
 
-/// The jobs of `jobs` whose stage was reached: every stage before theirs
-/// succeeded.
+/// The jobs of `jobs` whose stage was reached
+/// ([`pipeline_ops::stage_reached_by`]): every stage before theirs succeeded,
+/// or — for a job that runs after a failure — finished.
 pub(crate) async fn in_reached_stages(
     db: &DatabaseConnection,
     jobs: Vec<pipeline_job::Model>,
@@ -110,7 +111,7 @@ pub(crate) async fn in_reached_stages(
             stages
                 .iter()
                 .find(|stage| stage.id == job.stage_id)
-                .is_some_and(|stage| pipeline_ops::earlier_stages_succeeded(stage, &siblings))
+                .is_some_and(|stage| pipeline_ops::stage_reached_by(job, stage, &siblings))
         })
         .collect())
 }
