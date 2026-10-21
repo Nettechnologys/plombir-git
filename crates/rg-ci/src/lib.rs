@@ -603,9 +603,9 @@ async fn resume_pipeline_with_engine(
 /// `cancel_in_progress` that is a standing order to cancel whatever else is
 /// running. The canonical GitHub recipe
 /// `${{ github.workflow }}-${{ github.head_ref || github.ref }}` lands here
-/// because of the `||`, and it has to land loudly: silently degrading it to "no
-/// concurrency" is how two deploys end up running at once, which is the very
-/// thing the block was written to prevent.
+/// because this engine has no `github.head_ref`, and it has to land loudly:
+/// silently degrading it to "no concurrency" is how two deploys end up running
+/// at once, which is the very thing the block was written to prevent.
 fn resolved_concurrency_group(
     concurrency: Option<&config::ConcurrencyConfig>,
     ref_name: &str,
@@ -620,8 +620,9 @@ fn resolved_concurrency_group(
              engine cannot evaluate. A group may use ${{{{ github.ref }}}}, \
              ${{{{ github.ref_name }}}}, ${{{{ github.workflow }}}}, ${{{{ github.sha }}}}, \
              ${{{{ github.event_name }}}}, ${{{{ github.repository }}}}, \
-             ${{{{ github.repository_owner }}}} — and ${{{{ ref }}}} / ${{{{ branch }}}} in \
-             .plombir-git-ci.yml. Left unresolved it is one literal group shared by every ref of \
+             ${{{{ github.repository_owner }}}}, ${{{{ inputs.NAME }}}}, \
+             ${{{{ github.event.inputs.NAME }}}}, ${{{{ vars.NAME }}}} — and ${{{{ ref }}}} / \
+             ${{{{ branch }}}} in .plombir-git-ci.yml. Left unresolved it is one literal group shared by every ref of \
              this repository."
         )));
     }
@@ -7467,7 +7468,7 @@ mod matrix_tests {
     /// A group this engine cannot finish resolving must stop the trigger, not
     /// serialize on the template text. `${{ github.head_ref || github.ref }}`
     /// is the recipe GitHub's own documentation gives for cancelling superseded
-    /// PR runs, and the `||` is beyond this evaluator.
+    /// PR runs, and `github.head_ref` is a name this engine has no value for.
     #[test]
     fn an_unresolved_group_expression_is_refused_not_serialized_on() {
         let error = resolved_concurrency_group(
@@ -11950,6 +11951,131 @@ jobs:
             assert!(
                 message.contains(expected) && message.contains("does not declare"),
                 "{message}"
+            );
+            assert!(
+                error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "the workflow's mistake, not the server's: {message}"
+            );
+        }
+    }
+
+    /// The `concurrency.group` of the pipeline a workflow declaring `group`
+    /// publishes for `event` — or the refusal.
+    async fn concurrency_group_of(
+        group: &str,
+        event: &str,
+        inputs: Option<&[(&str, &str)]>,
+    ) -> Result<Option<String>> {
+        let workflow = format!(
+            "on:\n  push:\n  workflow_dispatch:\n    inputs:\n      environment:\n        \
+             type: choice\n        options: [staging, production]\n      fallback:\n        \
+             type: string\n      dry:\n        type: boolean\nconcurrency:\n  group: {group}\n\
+             jobs:\n  ship:\n    steps:\n      - run: echo ship\n"
+        );
+        let (db, pipeline_id, _, _temp) =
+            publish_pipeline_on(&workflow, &[], event, inputs).await?;
+        Ok(rg_db::ops::pipeline_ops::get_pipeline(&db, pipeline_id)
+            .await
+            .unwrap()
+            .expect("the pipeline was published")
+            .concurrency_group)
+    }
+
+    /// card_b06309f3cefb: one deploy per environment. Two dispatches with
+    /// different inputs get different groups and the same input the same one;
+    /// a push reads the input as `''`, as on GitHub; `github.event.inputs.*`, a
+    /// boolean and a group that computes its value read the same inputs.
+    #[tokio::test]
+    async fn dispatch_inputs_name_the_concurrency_group() {
+        let dispatch = rg_core::ci::WORKFLOW_DISPATCH_EVENT;
+        for (group, event, inputs, expected) in [
+            (
+                "deploy-${{ inputs.environment }}",
+                dispatch,
+                Some(&[("environment", "staging")][..]),
+                "deploy-staging",
+            ),
+            (
+                "deploy-${{ inputs.environment }}",
+                dispatch,
+                Some(&[("environment", "production")][..]),
+                "deploy-production",
+            ),
+            ("deploy-${{ inputs.environment }}", "push", None, "deploy-"),
+            (
+                "deploy-${{inputs.ENVIRONMENT}}",
+                dispatch,
+                Some(&[("environment", "production")][..]),
+                "deploy-production",
+            ),
+            (
+                "deploy-${{ github.event.inputs.environment }}",
+                dispatch,
+                Some(&[("environment", "production")][..]),
+                "deploy-production",
+            ),
+            (
+                "deploy-${{ inputs.fallback || 'staging' }}",
+                dispatch,
+                Some(&[("environment", "production")][..]),
+                "deploy-staging",
+            ),
+            (
+                "deploy-${{ inputs.fallback || 'staging' }}",
+                dispatch,
+                Some(&[("environment", "production"), ("fallback", "it's qa")][..]),
+                "deploy-it's qa",
+            ),
+            (
+                "${{ inputs.dry }}-${{ inputs.environment }}",
+                dispatch,
+                Some(&[("environment", "staging"), ("dry", "true")][..]),
+                "true-staging",
+            ),
+        ] {
+            let resolved = concurrency_group_of(group, event, inputs)
+                .await
+                .unwrap_or_else(|error| panic!("{group} on {event} {inputs:?}: {error:#}"));
+            assert_eq!(
+                resolved.as_deref(),
+                Some(expected),
+                "{group} on {event} {inputs:?}"
+            );
+        }
+    }
+
+    /// An input the workflow does not declare is refused by name in a group as
+    /// it is in `if:` — on GitHub it reads as `''`, and every deploy would
+    /// share one group — and so is an input that would turn into an expression.
+    #[tokio::test]
+    async fn a_concurrency_group_refuses_an_undeclared_or_expression_input() {
+        for (group, inputs, expected) in [
+            (
+                "deploy-${{ inputs.enviroment }}",
+                &[("environment", "staging")][..],
+                "inputs.enviroment, which this workflow does not declare",
+            ),
+            (
+                "deploy-${{ github.event.inputs.nope }}",
+                &[("environment", "staging")][..],
+                "github.event.inputs.nope, which workflow_dispatch does not declare",
+            ),
+            (
+                "deploy-${{ inputs.fallback }}",
+                &[("fallback", "${{ github.sha }}")][..],
+                "inputs.fallback holds `${{`",
+            ),
+        ] {
+            let error =
+                concurrency_group_of(group, rg_core::ci::WORKFLOW_DISPATCH_EVENT, Some(inputs))
+                    .await
+                    .expect_err("the group must be refused");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("concurrency.group") && message.contains(expected),
+                "{group}: {message}"
             );
             assert!(
                 error

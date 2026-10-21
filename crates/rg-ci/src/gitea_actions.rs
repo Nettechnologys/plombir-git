@@ -1224,9 +1224,10 @@ fn supported_run_expression(key: &str) -> bool {
         || GITHUB_RUN_EXPRESSIONS
         .iter()
         .any(|(supported, _)| key == *supported)
-        // `vars.*` is deliberately absent. Plombir Git has no repository,
-        // organization, or environment configuration-variable source, and an
-        // `env.*` value with the same name is a different Actions context.
+        // `vars.*` is absent on purpose: `resolve_vars` has already written
+        // every one as its value before this check runs, so one still standing
+        // is a variable the run had no source for. An `env.*` value with the
+        // same name is a different Actions context.
         || ["env", "secrets", "matrix", "inputs"]
             .iter()
             .any(|context| context_member(key, context).is_some())
@@ -4550,10 +4551,15 @@ pub(crate) fn actions_condition_context(
 /// and the canonical GitHub group (`${{ github.workflow }}-${{ github.ref }}`)
 /// is built from it.
 ///
-/// Anything not in the context is left **verbatim**, expression braces and all.
-/// That is the signal the caller refuses on: a group that still carries an
-/// expression is a literal shared by every ref of the repository, which turns
-/// `cancel-in-progress` into "cancel whatever else is running".
+/// A group that is more than one name — `${{ inputs.environment || 'staging' }}`,
+/// once the inputs are literals — is evaluated as an expression over the same
+/// context, the way GitHub evaluates it.
+///
+/// Anything that reads a name not in the context is left **verbatim**,
+/// expression braces and all. That is the signal the caller refuses on: a group
+/// that still carries an expression is a literal shared by every ref of the
+/// repository, which turns `cancel-in-progress` into "cancel whatever else is
+/// running".
 pub(crate) fn expand_concurrency_group(
     template: &str,
     ctx: &WorkflowContext,
@@ -4561,7 +4567,12 @@ pub(crate) fn expand_concurrency_group(
 ) -> String {
     let mut context = actions_condition_context(ctx, &HashMap::new());
     context.insert("github.workflow".into(), workflow_label.to_string());
-    expand_expressions(template, |key| context.get(key).cloned())
+    expand_expressions(template, |key| {
+        context
+            .get(key)
+            .cloned()
+            .or_else(|| rg_process::ci_condition::evaluate_text(key, &context).ok())
+    })
 }
 
 /// Replace every `${{ key }}` the lookup answers for, leaving the rest as-is.
@@ -4865,6 +4876,42 @@ fn context_in_condition(
     })
 }
 
+/// A text field read when the workflow is, not by a job — `concurrency.group`:
+/// [`context_in_expression`] applied to every `${{ … }}` group, and a group
+/// left holding a single string literal becomes that literal's text, so
+/// `deploy-${{ inputs.environment }}` is `deploy-staging`. A group that still
+/// computes something — `${{ inputs.environment || 'staging' }}` — keeps its
+/// braces for [`expand_concurrency_group`] to evaluate.
+///
+/// A value holding `${{` is refused: inserted here it would become an
+/// expression of its own, where GitHub inserts text.
+fn context_in_text(
+    text: &str,
+    prefix: &str,
+    mut literal: impl FnMut(&str) -> std::result::Result<String, String>,
+) -> std::result::Result<String, String> {
+    if !text.contains(prefix) {
+        return Ok(text.to_string());
+    }
+    let mut literal = |name: &str| {
+        let value = literal(name)?;
+        if value.contains("${{") {
+            return Err(format!(
+                "{prefix}{name} holds `${{{{`, which this engine would read as an expression \
+                 rather than as the input's text"
+            ));
+        }
+        Ok(value)
+    };
+    map_expression_groups(text, |body| {
+        let body = context_in_expression(body, prefix, &mut literal)?;
+        Ok(match crate::actions::single_literal(&body) {
+            Some(text) => text,
+            None => format!("${{{{ {body} }}}}"),
+        })
+    })
+}
+
 /// Every `${{ inputs.<name> }}` of a text field, by name.
 fn input_references(text: &str) -> Vec<String> {
     workflow_expressions(text)
@@ -4886,7 +4933,8 @@ impl GiteaWorkflow {
         names
     }
 
-    /// Read `inputs.*` in every job's and step's `if:` (card_28ac32f9c069):
+    /// Read `inputs.*` in every job's and step's `if:` (card_28ac32f9c069) and
+    /// in `concurrency.group` (card_b06309f3cefb):
     /// each becomes the input's value as a literal — `true` / `false` for a
     /// boolean input, as on GitHub, so `if: inputs.deploy` is false for an
     /// unticked box; text otherwise. An input this run was not given — the
@@ -4936,6 +4984,13 @@ impl GiteaWorkflow {
         {
             return Err(format!("env: {}", undeclared(&name)));
         }
+        // `deploy-${{ inputs.environment }}`: one deploy per environment
+        // (card_b06309f3cefb). Read here, as text, because the group is a key
+        // the pipeline is serialized on, not a string a job expands.
+        if let Some(concurrency) = &mut self.concurrency {
+            concurrency.group = context_in_text(&concurrency.group, "inputs.", literal)
+                .map_err(|error| format!("concurrency.group: {error}"))?;
+        }
         let mut jobs = self.jobs.iter_mut().collect::<Vec<_>>();
         jobs.sort_by_key(|(name, _)| *name);
         for (job_name, job) in jobs {
@@ -4972,10 +5027,11 @@ impl GiteaWorkflow {
         Ok(())
     }
 
-    /// Read `github.event.inputs.*` in every job's and step's `if:`: the
-    /// `workflow_dispatch` inputs of the run, as text — `'true'`, not `true`,
-    /// as GitHub's event payload carries them — or `''` for a run that was not
-    /// dispatched. A name `workflow_dispatch` does not declare is refused.
+    /// Read `github.event.inputs.*` in every job's and step's `if:` and in
+    /// `concurrency.group`: the `workflow_dispatch` inputs of the run, as text
+    /// — `'true'`, not `true`, as GitHub's event payload carries them — or `''`
+    /// for a run that was not dispatched. A name `workflow_dispatch` does not
+    /// declare is refused.
     ///
     /// Run after the reusable workflows and actions are expanded: a job they
     /// bring reads the event of the run it is part of, which is this file's.
@@ -5001,6 +5057,11 @@ impl GiteaWorkflow {
                     .unwrap_or_default(),
             ))
         };
+        if let Some(concurrency) = &mut self.concurrency {
+            concurrency.group =
+                context_in_text(&concurrency.group, "github.event.inputs.", literal)
+                    .map_err(|error| format!("concurrency.group: {error}"))?;
+        }
         for (job_name, job) in &mut self.jobs {
             let at = |error: String| format!("jobs.{job_name}: {error}");
             let conditions = job.condition.iter_mut().chain(

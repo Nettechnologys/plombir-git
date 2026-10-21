@@ -54,7 +54,9 @@ cd plombir-git
 
 # Install the optional repository pre-push hook. It runs formatting, strict
 # workspace Clippy, and the local source/contract checks. The GitHub workflow
-# also runs tests and deployment checks; review its result on your PR.
+# also runs tests and deployment checks; review its result on your PR. A push
+# to main is refused while main's last Regression run is red (`gh` reads it);
+# PUSH_OVER_RED_MAIN=1 pushes over it, typically with the fix.
 ./scripts/install-git-hooks.sh
 
 # Before pushing, run the local push gates once:

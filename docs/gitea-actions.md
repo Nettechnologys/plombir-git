@@ -1482,10 +1482,42 @@ jobs:
 
 `group` and `cancel-in-progress` are the two keys. `group` additionally
 understands `${{ github.workflow }}`, so the canonical GitHub group
-`${{ github.workflow }}-${{ github.ref }}` works. A group that still contains an
-unresolved expression after substitution is refused: left alone it would be one
-literal group shared by every ref of the repository, which under
-`cancel-in-progress` is a standing order to cancel whatever else is running.
+`${{ github.workflow }}-${{ github.ref }}` works.
+
+It also reads the run's [inputs](#workflow_dispatch-and-workflow_call-inputs),
+`inputs.NAME` and `github.event.inputs.NAME`, and `vars.NAME`, so one deploy
+per environment is the usual
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [staging, production]
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: ./deploy.sh ${{ inputs.environment }}
+```
+
+A dispatch with `staging` and one with `production` run side by side; two with
+`staging` wait for each other. In a run that was not dispatched the input is
+`''`, as on GitHub, so every push shares the group `deploy-`. An input the
+workflow does not declare is refused by name, as in `if:`, and so is an input
+value that holds `${{`. A group may compute its value —
+`deploy-${{ inputs.environment || 'staging' }}` — from these names and the
+`github.*` above.
+
+A group that still contains an unresolved expression after substitution is
+refused: left alone it would be one literal group shared by every ref of the
+repository, which under `cancel-in-progress` is a standing order to cancel
+whatever else is running. `${{ github.head_ref || github.ref }}` is refused this
+way: `github.head_ref` has no value here.
 
 ## Reusable workflows
 

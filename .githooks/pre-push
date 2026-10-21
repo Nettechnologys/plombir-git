@@ -16,6 +16,20 @@ set -eu
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
+# A push to main first asks whether main is already red: the gates below cannot
+# run the database smokes and the dependency audit, and a push goes straight to
+# main with no pull request to show the red (card_5b91d8c6f3c2). Git hands the
+# hook one `<local ref> <local sha> <remote ref> <remote sha>` line per ref.
+pushes_main=false
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+    if [ "$remote_ref" = refs/heads/main ]; then
+        pushes_main=true
+    fi
+done
+if [ "$pushes_main" = true ]; then
+    node scripts/red-main-push-guard.mjs
+fi
+
 head_sha=$(git rev-parse HEAD)
 receipt_path=$(git rev-parse --git-path plombir-git-push-gates.receipt)
 receipt_sha=''

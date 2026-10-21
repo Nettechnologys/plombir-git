@@ -191,6 +191,13 @@ The workspace test suite — 3,440 tests on 4 October 2026, about six minutes
 under `cargo nextest` on a warm build — is not part of that push gate; it is
 run before a piece of work is closed.
 
+The database smokes and the dependency audit need a live database or the
+network, so they run only in the Regression workflow after the push. A push to
+`main` therefore also asks GitHub how the last finished Regression run on `main`
+went, and is refused while it is red — naming the run and its failed jobs —
+unless `PUSH_OVER_RED_MAIN=1` says the pusher saw it. Without `gh` or a network
+it warns instead of refusing.
+
 ## Built with codeindexer
 
 The agents that write Plombir Git work through
