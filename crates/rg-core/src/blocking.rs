@@ -117,9 +117,11 @@ mod tests {
         for (source, function, boundary_count, blocking_calls) in [
             (
                 import,
-                "clone_repo",
+                "clone_repo_with_pull_heads",
                 1,
-                &["run_under_disk_budget"] as &[&str],
+                // The pull request heads are fetched by a sync helper the same
+                // closure calls, under the same pinned invocation.
+                &["run_under_disk_budget", "fetch_source_pull_heads"] as &[&str],
             ),
             (
                 mirror,

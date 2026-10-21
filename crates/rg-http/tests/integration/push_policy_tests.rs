@@ -136,6 +136,7 @@ async fn a_push_into_a_server_namespace_is_refused_ref_by_ref() {
                 "HEAD:refs/heads/main",
                 "HEAD:refs/merge-queue/1",
                 "HEAD:refs/forks/x",
+                "HEAD:refs/imported-pulls/1/head",
             ],
         );
         (pushed, head)
@@ -147,7 +148,11 @@ async fn a_push_into_a_server_namespace_is_refused_ref_by_ref() {
         "a push into the server's namespaces was reported as a success:\n{}",
         pushed.output
     );
-    for refname in ["refs/merge-queue/1", "refs/forks/x"] {
+    for refname in [
+        "refs/merge-queue/1",
+        "refs/forks/x",
+        "refs/imported-pulls/1/head",
+    ] {
         assert!(
             pushed
                 .output
@@ -164,7 +169,10 @@ async fn a_push_into_a_server_namespace_is_refused_ref_by_ref() {
         "the allowed half of the push did not land"
     );
     assert_eq!(
-        refs_in(&bare, &["refs/merge-queue/", "refs/forks/"]),
+        refs_in(
+            &bare,
+            &["refs/merge-queue/", "refs/forks/", "refs/imported-pulls/"]
+        ),
         "",
         "a refused ref was written anyway"
     );

@@ -49,7 +49,11 @@ pub struct RefAdvertisement {
 /// * `refs/merge-queue/` — the merge-group commit of a queued pull request,
 ///   kept so the commit outlives the pass that built it. Runners receive the
 ///   workspace as an archive, not by fetching this ref.
-pub const SERVER_PRIVATE_NAMESPACES: &[&str] = &["refs/forks/", "refs/merge-queue/"];
+/// * `refs/imported-pulls/` — the head of every pull request an import brought
+///   from its source, so the commits of one whose branch was deleted stay in
+///   the repository instead of being collected as unreachable.
+pub const SERVER_PRIVATE_NAMESPACES: &[&str] =
+    &["refs/forks/", "refs/merge-queue/", "refs/imported-pulls/"];
 
 /// Whether `refname` lies in one of [`SERVER_PRIVATE_NAMESPACES`].
 pub fn is_server_private(refname: &str) -> bool {
@@ -347,7 +351,7 @@ mod tests {
         );
         assert_eq!(
             collect(&repo_path).unwrap().refs.len(),
-            5,
+            6,
             "the server's own view keeps every ref"
         );
     }

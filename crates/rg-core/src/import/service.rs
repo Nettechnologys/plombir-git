@@ -119,6 +119,12 @@ pub struct ImportStats {
     /// wrote. Counted so the source's note total still adds up.
     pub system_notes_skipped: usize,
     pub prs_imported: usize,
+    /// Pull request heads kept under `refs/imported-pulls/`, so the commits of
+    /// pull requests whose branch is gone stay in the repository.
+    pub pull_request_heads_imported: usize,
+    /// Why the pull request heads could not be fetched, when they could not.
+    /// The branches and tags are cloned either way.
+    pub pull_request_heads_failed: Option<&'static str>,
     /// Pull and merge requests the target could not write, for the same
     /// reason as [`Self::issues_failed`].
     pub prs_failed: Vec<ImportedObjectFailure>,
@@ -429,6 +435,12 @@ impl ImportStats {
                 "{} LFS object(s) could not be fetched from the source",
                 self.lfs_objects_failed.len()
             ));
+        }
+        if self.pull_request_heads_failed.is_some() {
+            missing.push(
+                "the commits of pull requests whose branch is gone could not be fetched"
+                    .to_string(),
+            );
         }
         let not_imported: Vec<String> = [
             (self.labels_failed.len(), "label"),
@@ -976,14 +988,23 @@ async fn clone_into_target_with_destination(
     // Awaited only after the lifecycle recheck, then consumed by the very next
     // network-capable step. Metadata/API work cannot age this DNS decision.
     let destination = destination.await?;
-    let outcome = clone_repo(
+    let ClonedRepository {
+        outcome,
+        pull_heads,
+    } = clone_repo_with_pull_heads(
         destination,
         repo_root,
         &task.target_owner,
         &task.target_name,
         source_credentials(&task.platform, &task.source_url, token),
+        SourcePullHeads::for_task(task),
     )
     .await?;
+    match pull_heads {
+        Some(PullHeadsFetch::Fetched(count)) => stats.pull_request_heads_imported = count,
+        Some(PullHeadsFetch::Failed(reason)) => stats.pull_request_heads_failed = Some(reason),
+        None => {}
+    }
     // The fact, not the intention. Set unconditionally, this reported the one
     // case where the clone deliberately does nothing exactly like a clone that
     // transferred the whole upstream — and the status response is all a user
@@ -1842,6 +1863,51 @@ fn source_credentials(platform: &str, source_url: &str, token: &str) -> Option<G
     Some(GitCredentials::token(&username, token))
 }
 
+/// Where a source platform keeps the head of every pull request it has, merged,
+/// closed and from forks included — the commits a `git clone --bare` does not
+/// bring, because they are on no branch once a merged branch is deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourcePullHeads {
+    /// `refs/pull/<n>/head`.
+    GitHub,
+    /// `refs/merge-requests/<iid>/head`.
+    GitLab,
+}
+
+impl SourcePullHeads {
+    /// The heads worth fetching for `task`: only when its pull requests are
+    /// imported, and only from a platform whose pull requests the import
+    /// writes. Gitea has the refs too, but its pull requests are not imported
+    /// yet, so there would be no row for a head to belong to.
+    fn for_task(task: &ImportTask) -> Option<Self> {
+        if !task.import_pull_requests {
+            return None;
+        }
+        match task.platform.as_str() {
+            "github" => Some(Self::GitHub),
+            "gitlab" => Some(Self::GitLab),
+            _ => None,
+        }
+    }
+}
+
+/// What fetching the source's pull request heads into a fresh clone came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PullHeadsFetch {
+    /// This many heads are kept under `refs/imported-pulls/`.
+    Fetched(usize),
+    /// The fetch was refused. The clone is kept — its branches and tags are
+    /// whole — and the reason is the one the task owner is shown.
+    Failed(&'static str),
+}
+
+/// A clone step's outcome, with what became of the pull request heads when the
+/// step was asked to bring them.
+struct ClonedRepository {
+    outcome: CloneOutcome,
+    pull_heads: Option<PullHeadsFetch>,
+}
+
 /// What the clone step did with `<owner>/<name>.git`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloneOutcome {
@@ -2037,6 +2103,7 @@ fn install_clone(
 /// verbatim by git into the new repository's `remote.origin.url`, leaving a
 /// plaintext PAT on disk long after the import finished, and would show up in
 /// `ps`, in the gateway's error text, and in its trace span.
+#[cfg(test)]
 async fn clone_repo(
     remote: crate::net::GuardedGitRemote,
     repo_root: &Path,
@@ -2044,6 +2111,26 @@ async fn clone_repo(
     name: &str,
     credentials: Option<GitCredentials>,
 ) -> Result<CloneOutcome> {
+    clone_repo_with_pull_heads(remote, repo_root, owner, name, credentials, None)
+        .await
+        .map(|cloned| cloned.outcome)
+}
+
+/// Clone the source into `<owner>/<name>.git`, and — with `pull_heads` — keep
+/// every pull request head the source has under `refs/imported-pulls/`.
+///
+/// The heads are fetched into the staging clone, before it is installed, by
+/// the same pinned invocation and under the same disk budget as the clone: the
+/// checked destination is good for one consumer, and one pass's git half is
+/// what the budget bounds.
+async fn clone_repo_with_pull_heads(
+    remote: crate::net::GuardedGitRemote,
+    repo_root: &Path,
+    owner: &str,
+    name: &str,
+    credentials: Option<GitCredentials>,
+    pull_heads: Option<SourcePullHeads>,
+) -> Result<ClonedRepository> {
     // Admission guard before any filesystem touch. The blocking closure repeats
     // it at the final sink so a future direct caller or derived clone URL cannot
     // reintroduce native plaintext Git.
@@ -2128,17 +2215,30 @@ async fn clone_repo(
                 Some(budget) => budget.explain(error),
                 None => error,
             })?;
-        Ok(Some((import_lock, staged_clone)))
+        let pull_heads = pull_heads.map(|source| {
+            fetch_source_pull_heads(
+                git,
+                &invocation,
+                remote.url(),
+                &staged_clone.path,
+                budget,
+                source,
+            )
+        });
+        Ok(Some((import_lock, staged_clone, pull_heads)))
     })
     .await?;
-    let (_import_lock, mut staged_clone) = match prepared {
+    let (_import_lock, mut staged_clone, pull_heads) = match prepared {
         Some(prepared) => prepared,
         None => {
             tracing::info!(
                 path = %target_dir.display(),
                 "Import target already holds a repository, skipping clone"
             );
-            return Ok(CloneOutcome::Skipped);
+            return Ok(ClonedRepository {
+                outcome: CloneOutcome::Skipped,
+                pull_heads: None,
+            });
         }
     };
 
@@ -2208,7 +2308,110 @@ async fn clone_repo(
     }
 
     tracing::info!(path = %target_dir.display(), "Repository cloned");
-    Ok(CloneOutcome::Cloned)
+    Ok(ClonedRepository {
+        outcome: CloneOutcome::Cloned,
+        pull_heads,
+    })
+}
+
+/// The private namespace imported pull request heads are kept under, one
+/// `refs/imported-pulls/<n>/head` per pull request, `<n>` its source number.
+///
+/// Not `refs/pull/`: that name is the server's for a pull request's pipelines
+/// and holds no refs ([`rg_git::ref_advertisement::SERVER_RESERVED_NAMESPACES`]).
+/// The heads are there so the commits stay in the repository — a merged pull
+/// request whose branch was deleted has no other ref to them, and `gc` would
+/// take them — not for clients to fetch, so the namespace is server-private:
+/// not advertised, not pushable, and left out of push mirrors and forks, which
+/// copy branches and tags only.
+const IMPORTED_PULL_HEADS_PREFIX: &str = "refs/imported-pulls/";
+
+/// Fetch every pull request head `source` has into the staging clone at
+/// `repository`.
+///
+/// Not fatal. A clone whose branches and tags arrived is the repository; the
+/// heads only add the commits of pull requests no branch reaches any more, so
+/// a refusal is named in the task's stats and the import goes on.
+fn fetch_source_pull_heads(
+    git: &rg_git::cli_gateway::GitCommandGateway,
+    invocation: &rg_git::credentials::OutboundGitInvocation,
+    remote_url: &str,
+    repository: &Path,
+    budget: Option<crate::clone_budget::CloneBudget>,
+    source: SourcePullHeads,
+) -> PullHeadsFetch {
+    let refspec = match source {
+        SourcePullHeads::GitHub => "+refs/pull/*/head:refs/imported-pulls/*/head",
+        SourcePullHeads::GitLab => "+refs/merge-requests/*/head:refs/imported-pulls/*/head",
+    };
+    let fetched = invocation
+        .run_under_disk_budget(
+            git,
+            &[
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                remote_url,
+                refspec,
+            ],
+            Some(repository),
+            // The same ceiling as the clone, measured over the same directory:
+            // what the clone wrote counts against it.
+            budget
+                .and_then(|budget| budget.for_clone(repository))
+                .as_ref(),
+        )
+        .and_then(|output| {
+            output
+                .ensure_success()
+                .context("git fetch pull request heads")
+        });
+    if let Err(error) = fetched {
+        let budget_refused = crate::clone_budget::CloneBudget::refused(&error);
+        tracing::warn!(
+            repository = %repository.display(),
+            error = %format!("{error:#}"),
+            "the import could not fetch the source's pull request heads; the clone is kept"
+        );
+        return PullHeadsFetch::Failed(if budget_refused {
+            "the clone size limit was reached before the pull request heads arrived"
+        } else {
+            "the source refused to send its pull request heads; ask the instance operator \
+             to check the server log"
+        });
+    }
+    match count_imported_pull_heads(repository) {
+        Ok(count) => PullHeadsFetch::Fetched(count),
+        Err(error) => {
+            tracing::warn!(
+                repository = %repository.display(),
+                error = %format!("{error:#}"),
+                "the pull request heads were fetched but could not be counted"
+            );
+            PullHeadsFetch::Failed(
+                "the pull request heads were fetched but could not be read back; ask the \
+                 instance operator to check the server log",
+            )
+        }
+    }
+}
+
+/// How many refs `repository` holds under [`IMPORTED_PULL_HEADS_PREFIX`].
+fn count_imported_pull_heads(repository: &Path) -> Result<usize> {
+    let repo = rg_git::repository::open(repository)
+        .with_context(|| format!("failed to open {}", repository.display()))?;
+    let references = repo
+        .references()
+        .context("failed to list the clone's references")?;
+    let mut count = 0;
+    for reference in references
+        .prefixed(IMPORTED_PULL_HEADS_PREFIX)
+        .context("failed to list the imported pull request heads")?
+    {
+        reference.map_err(|error| anyhow::anyhow!("failed to read a reference: {error}"))?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4692,6 +4895,26 @@ mod imported_issue_label_tests {
         );
     }
 
+    /// A clone whose pull request heads were refused is still the repository,
+    /// but the finished task must not read as a clean import.
+    #[test]
+    fn refused_pull_request_heads_are_named_in_the_completion_stage() {
+        let stats = ImportStats {
+            pull_request_heads_failed: Some("the source refused"),
+            ..ImportStats::default()
+        };
+        let stage = stats.completion_stage();
+        assert!(
+            stage
+                .contains("the commits of pull requests whose branch is gone could not be fetched"),
+            "{stage}"
+        );
+        assert_eq!(
+            ImportStats::default().completion_stage(),
+            "Import completed"
+        );
+    }
+
     /// A number the target already holds — the same source imported twice, or
     /// an import into a repository with issues of its own — is that object's
     /// named failure, never a write under another number, and the import goes
@@ -6173,6 +6396,165 @@ mod clone_effect_tests {
             .expect("read the upstream commit");
         head.ensure_success().expect("rev-parse succeeds");
         head.stdout_str().trim().to_string()
+    }
+
+    /// Push a commit that no branch holds to `refname` in the upstream at
+    /// `bare_path` — the head of a pull request whose branch was deleted after
+    /// it merged — and return its id.
+    fn upstream_pull_head(bare_path: &Path, refname: &str) -> String {
+        let worktree = tempfile::tempdir().expect("pull request worktree");
+        let path = worktree.path();
+        let bare_arg = bare_path.to_str().expect("UTF-8 bare path");
+        git(&["clone", "-q", bare_arg, path.to_str().unwrap()], None);
+        git(&["config", "user.name", "Import fixture"], Some(path));
+        git(
+            &["config", "user.email", "import-fixture@example.invalid"],
+            Some(path),
+        );
+        git(&["checkout", "-q", "-b", "feature"], Some(path));
+        std::fs::write(path.join("feature.txt"), "only in the pull request\n").unwrap();
+        git(&["add", "."], Some(path));
+        git(&["commit", "-qm", "pull request commit"], Some(path));
+        git(
+            &["push", "-q", "origin", &format!("HEAD:{refname}")],
+            Some(path),
+        );
+        let head = global_gateway()
+            .as_ref()
+            .expect("git gateway")
+            .run(&["rev-parse", "HEAD"], Some(path))
+            .expect("read the pull request commit");
+        head.ensure_success().expect("rev-parse succeeds");
+        head.stdout_str().trim().to_string()
+    }
+
+    fn holds_commit(repository: &Path, commit: &str) -> bool {
+        global_gateway()
+            .as_ref()
+            .expect("git gateway")
+            .run(
+                &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+                Some(repository),
+            )
+            .expect("run git cat-file")
+            .success()
+    }
+
+    fn refs_under(repository: &Path, prefix: &str) -> String {
+        let output = global_gateway()
+            .as_ref()
+            .expect("git gateway")
+            .run(
+                &["for-each-ref", "--format=%(refname) %(objectname)", prefix],
+                Some(repository),
+            )
+            .expect("run git for-each-ref");
+        output.ensure_success().expect("for-each-ref succeeds");
+        output.stdout_str().trim().to_string()
+    }
+
+    /// `git clone --bare` brings branches and tags only, so the commits of a
+    /// pull request whose branch was deleted after it merged never reached the
+    /// imported repository: the pull request row named a head the repository
+    /// did not hold (card_e67736328cfd). The import now keeps every source
+    /// head under the server-private `refs/imported-pulls/`, and never under
+    /// `refs/pull/`, the name the server gives pipelines.
+    #[tokio::test]
+    async fn an_import_keeps_the_heads_of_pull_requests_no_branch_holds() {
+        for (source, source_ref, kept_ref) in [
+            (
+                SourcePullHeads::GitHub,
+                "refs/pull/7/head",
+                "refs/imported-pulls/7/head",
+            ),
+            (
+                SourcePullHeads::GitLab,
+                "refs/merge-requests/3/head",
+                "refs/imported-pulls/3/head",
+            ),
+        ] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let upstream = directory.path().join("upstream.git");
+            upstream_with_a_commit(&upstream);
+            let pull_head = upstream_pull_head(&upstream, source_ref);
+            let repo_root = directory.path().join("repos");
+
+            let cloned = clone_repo_with_pull_heads(
+                // `file://`, not the path: a clone from a local path copies the
+                // whole object directory, unreachable commits included, and would
+                // hold the pull request's commit whatever the fetch did.
+                crate::net::GuardedGitRemote::unbound_for_test(&format!(
+                    "file://{}",
+                    upstream.display()
+                )),
+                &repo_root,
+                "importer",
+                "site",
+                None,
+                Some(source),
+            )
+            .await
+            .expect("the import clones");
+
+            assert_eq!(cloned.outcome, CloneOutcome::Cloned);
+            assert_eq!(
+                cloned.pull_heads,
+                Some(PullHeadsFetch::Fetched(1)),
+                "{source:?}"
+            );
+            let target = repo_root.join("importer/site.git");
+            assert!(
+                holds_commit(&target, &pull_head),
+                "{source:?}: the pull request's head commit is not in the imported repository"
+            );
+            assert_eq!(
+                refs_under(&target, IMPORTED_PULL_HEADS_PREFIX),
+                format!("{kept_ref} {pull_head}")
+            );
+            assert_eq!(
+                refs_under(&target, "refs/pull/"),
+                "",
+                "the pipelines' namespace holds no refs"
+            );
+            assert_eq!(refs_under(&target, "refs/merge-requests/"), "");
+            assert!(
+                rg_git::ref_advertisement::is_server_private(kept_ref),
+                "the kept heads are not advertised to clients"
+            );
+        }
+    }
+
+    /// Without pull requests to import there is nothing for a head to belong
+    /// to, and the clone stays what `git clone --bare` makes.
+    #[tokio::test]
+    async fn an_import_without_pull_requests_fetches_no_heads() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let upstream = directory.path().join("upstream.git");
+        upstream_with_a_commit(&upstream);
+        let pull_head = upstream_pull_head(&upstream, "refs/pull/7/head");
+        let repo_root = directory.path().join("repos");
+
+        let cloned = clone_repo_with_pull_heads(
+            // `file://`, not the path: a clone from a local path copies the
+            // whole object directory, unreachable commits included, and would
+            // hold the pull request's commit whatever the fetch did.
+            crate::net::GuardedGitRemote::unbound_for_test(&format!(
+                "file://{}",
+                upstream.display()
+            )),
+            &repo_root,
+            "importer",
+            "site",
+            None,
+            None,
+        )
+        .await
+        .expect("the import clones");
+
+        assert_eq!(cloned.pull_heads, None);
+        let target = repo_root.join("importer/site.git");
+        assert_eq!(refs_under(&target, IMPORTED_PULL_HEADS_PREFIX), "");
+        assert!(!holds_commit(&target, &pull_head));
     }
 
     /// A clone past `[imports].max_clone_size_mb` is refused naming that key,

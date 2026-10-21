@@ -75,6 +75,7 @@ pub(crate) fn repository_with_server_private_refs(dir: &std::path::Path) -> std:
         "refs/tags/v1",
         "refs/forks/alice/feature",
         "refs/merge-queue/7",
+        "refs/imported-pulls/12/head",
     ] {
         let path = repo_path.join(refname);
         std::fs::create_dir_all(path.parent().expect("ref directory")).expect("ref directory");
@@ -86,7 +87,7 @@ pub(crate) fn repository_with_server_private_refs(dir: &std::path::Path) -> std:
 
 /// Every server-private ref name `text` mentions.
 pub(crate) fn server_private_refs_in(text: &str) -> Vec<&'static str> {
-    ["refs/forks/", "refs/merge-queue/"]
+    ["refs/forks/", "refs/merge-queue/", "refs/imported-pulls/"]
         .into_iter()
         .filter(|namespace| text.contains(namespace))
         .collect()

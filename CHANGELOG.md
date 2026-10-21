@@ -44,6 +44,15 @@ This project records user-facing changes here. The format follows
 
 ### Fixed
 
+- An import from GitHub or GitLab keeps the head commit of every pull request
+  the source has, under the server-private `refs/imported-pulls/<n>/head`.
+  `git clone --bare` brings branches and tags only, so a merged pull request
+  whose branch had been deleted named a head commit the imported repository
+  did not hold. A refused fetch of the heads keeps the clone and is named in
+  the task's stats (`pull_request_heads_failed`); the number kept is
+  `pull_request_heads_imported`. The namespace is not advertised, cannot be
+  pushed to, and is not copied to push mirrors or forks.
+
 - An issue or pull request imported from GitHub or GitLab keeps the number it
   had there. The import used to take the next free number in the order the
   source listed them — newest first on GitHub — so the newest issue became

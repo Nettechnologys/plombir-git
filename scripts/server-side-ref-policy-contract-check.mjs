@@ -87,7 +87,11 @@ const CLASSIFIED_MOVERS = new Map(
     ['crates/rg-core/src/mirror/service.rs', 'publish_mirrored_refs', 'git:fetch', 'pull_mirror_publication'],
     ['crates/rg-core/src/mirror/service.rs', 'run_git_clone_mirror', 'git:clone', 'mirror_private_clone'],
     ['crates/rg-core/src/mirror/service.rs', 'run_git_remote_update', 'git:remote', 'mirror_private_clone'],
-    ['crates/rg-core/src/import/service.rs', 'clone_repo', 'git:clone', 'repository_creation'],
+    ['crates/rg-core/src/import/service.rs', 'clone_repo_with_pull_heads', 'git:clone', 'repository_creation'],
+    // The source's pull request heads, fetched into the staging clone before
+    // it is installed. Only into the server-private `refs/imported-pulls/`:
+    // `refs/pull/*` is the pipelines' name and holds no refs (card_03ed757463d4).
+    ['crates/rg-core/src/import/service.rs', 'fetch_source_pull_heads', 'git:fetch', 'imported_pull_heads'],
     // The upstream action cache (`_ci_actions/`) is a private clone like a
     // mirror's: no client is served from it, and the ref only keeps a fetched
     // action's commit from being pruned.
@@ -268,6 +272,26 @@ for (const mover of movers) {
       failures.push(
         `${where} publishes ${JSON.stringify(outside)} — a pull mirror may write only refs/heads/* and refs/tags/* of the served repository.`,
       );
+    }
+  }
+
+  if (classification.policy === 'imported_pull_heads') {
+    // The refspecs are chosen by a `match` beside the call, so they are read
+    // from the whole body rather than from the call's own literals.
+    const bodyRefspecs = [...mover.body.matchAll(/"((?:[^"\\]|\\.)*)"/g)]
+      .map((literal) => literal[1])
+      .filter((literal) => /^\+?refs\//.test(literal) && literal.includes(':'));
+    const outside = bodyRefspecs.filter(
+      (refspec) =>
+        !/^\+refs\/(pull|merge-requests)\/\*\/head:refs\/imported-pulls\/\*\/head$/.test(refspec),
+    );
+    if (bodyRefspecs.length === 0 || outside.length > 0) {
+      failures.push(
+        `${where} fetches ${JSON.stringify(outside)} — imported pull request heads may land only under refs/imported-pulls/.`,
+      );
+    }
+    if (!literals.includes('--no-tags')) {
+      failures.push(`${where} fetches pull request heads without \`--no-tags\`.`);
     }
   }
 
