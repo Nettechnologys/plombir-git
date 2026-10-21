@@ -2,7 +2,7 @@
 
 This is the reference for Plombir Git's **native** pipeline format: the file you
 commit to the root of your own repository. The alternative format, Gitea
-Actions (`.gitea/workflows/*.yml`), has its own page —
+Actions (`.gitea/workflows/*.yml`, or `.github/workflows/*.yml` without it), has its own page —
 [the supported subset](gitea-actions.md). Read that one rather than Gitea's or
 GitHub's: Plombir Git implements a subset of Actions, and a workflow that is valid
 by their documentation is often refused whole by this engine.
@@ -11,8 +11,9 @@ by their documentation is often refused whole by this engine.
 commit being built. The engine reads it from the commit, not from a checkout,
 so a pipeline always runs the configuration that was committed with the code.
 
-**Which format wins:** `.gitea/workflows/*.yml` is tried first. The native file
-is used when that directory is absent at the commit, or when no workflow in it
+**Which format wins:** `.gitea/workflows/*.yml` is tried first, or
+`.github/workflows/*.yml` when the commit has no `.gitea/workflows`. The native file
+is used when neither directory is at the commit, or when no workflow in it
 is triggered by this event. If neither exists the trigger is refused with a
 message naming both paths. Workflows that exist but sit out the event are not
 that refusal: a push to the branch of a repository whose only workflow is

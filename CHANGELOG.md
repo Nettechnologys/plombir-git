@@ -8,6 +8,12 @@ This project records user-facing changes here. The format follows
 
 ### Added
 
+- A repository brought over from GitHub runs its `.github/workflows/*.yml` as
+  it is: the workflows are read from there when the commit has no
+  `.gitea/workflows`, the order Gitea uses. The two directories are never
+  merged, and `uses: ./.github/workflows/<file>` resolves in a repository read
+  from `.github/workflows`. Before, such a repository got no pipeline and no
+  message saying why.
 - `GET /repos/{owner}/{name}/compare` takes a tag or a commit id (full or
   abbreviated) on either side, besides a branch. A branch of the same name
   still wins; a fork head is still a branch.

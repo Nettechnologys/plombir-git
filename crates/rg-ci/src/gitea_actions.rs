@@ -1,6 +1,7 @@
 //! Gitea Actions / GitHub Actions workflow compatibility layer.
 //!
-//! Parses `.gitea/workflows/*.yml` (GitHub Actions-compatible format) and
+//! Parses `.gitea/workflows/*.yml` or `.github/workflows/*.yml` (GitHub
+//! Actions-compatible format) and
 //! translates them into Plombir Git's internal `CiConfig` model.
 //!
 //! Supported features:
@@ -2187,13 +2188,21 @@ impl GiteaWorkflow {
         self.resolved_inputs = inputs;
     }
 
+    /// Inline every `uses: ./<workflow_dir>/<file>` job from `sources`, the
+    /// files of `workflow_dir` at the same commit.
+    ///
+    /// `workflow_dir` is the directory this commit's workflows were read from,
+    /// and the only one a local call may name: the other directory is not
+    /// loaded, so a call into it is refused by name rather than reported as a
+    /// missing file.
     pub fn expand_local_reusable_workflows(
         &self,
+        workflow_dir: &str,
         sources: &HashMap<String, String>,
     ) -> Result<Self> {
         let mut stack = Vec::new();
         let mut expanded = self.clone();
-        expanded.jobs = expand_reusable_jobs(self, sources, 0, &mut stack)?;
+        expanded.jobs = expand_reusable_jobs(self, workflow_dir, sources, 0, &mut stack)?;
         // Every executable job now carries the working-directory default of
         // the workflow file that declared it. Leaving the caller's fallback on
         // the flattened workflow would make jobs from a nested workflow with
@@ -3694,6 +3703,7 @@ fn runs_on_tags(runs_on: &Option<GiteaRunsOn>) -> Option<Vec<String>> {
 
 fn expand_reusable_jobs(
     workflow: &GiteaWorkflow,
+    workflow_dir: &str,
     sources: &HashMap<String, String>,
     depth: usize,
     stack: &mut Vec<String>,
@@ -3721,8 +3731,10 @@ fn expand_reusable_jobs(
         };
 
         let target = uses
-            .strip_prefix("./.gitea/workflows/")
-            .ok_or_else(|| anyhow::anyhow!("only repository-local reusable workflows under .gitea/workflows/ are supported: {uses}"))?;
+            .strip_prefix("./")
+            .and_then(|path| path.strip_prefix(workflow_dir))
+            .and_then(|path| path.strip_prefix('/'))
+            .ok_or_else(|| anyhow::anyhow!("only repository-local reusable workflows under {workflow_dir}/, the directory this commit's workflows are read from, are supported: {uses}"))?;
         if target.is_empty() || target.contains('/') || target.contains("..") {
             anyhow::bail!("invalid local reusable workflow path: {uses}");
         }
@@ -3773,7 +3785,7 @@ fn expand_reusable_jobs(
             );
         }
         stack.push(target.to_owned());
-        let called_jobs = expand_reusable_jobs(&called, sources, depth + 1, stack)?;
+        let called_jobs = expand_reusable_jobs(&called, workflow_dir, sources, depth + 1, stack)?;
         stack.pop();
 
         let depended_on = called_jobs
@@ -5452,7 +5464,9 @@ mod tests {
             "called.yml".to_string(),
             "on: workflow_call\npermissions:\n  contents: read\n  packages: read\n  id-token: write\njobs:\n  inner:\n    steps:\n      - run: echo\n".to_string(),
         )]);
-        let expanded = workflow.expand_local_reusable_workflows(&sources).unwrap();
+        let expanded = workflow
+            .expand_local_reusable_workflows(".gitea/workflows", &sources)
+            .unwrap();
         expanded.validate_supported_actions().unwrap();
         assert_eq!(scopes(&expanded, "plain"), "repo:read");
         assert_eq!(scopes(&expanded, "oidc"), "repo:read id-token:write");
@@ -5925,7 +5939,7 @@ mod tests {
         workflow
             .resolve_condition_inputs()
             .map_err(anyhow::Error::msg)?;
-        let mut workflow = workflow.expand_local_reusable_workflows(sources)?;
+        let mut workflow = workflow.expand_local_reusable_workflows(".gitea/workflows", sources)?;
         crate::actions::expand_actions(&mut workflow, &DocumentedActions(actions))?
             .map_err(anyhow::Error::msg)?;
         workflow
@@ -7288,7 +7302,9 @@ jobs:
                 .into(),
             ),
         ]);
-        let expanded = caller.expand_local_reusable_workflows(&sources).unwrap();
+        let expanded = caller
+            .expand_local_reusable_workflows(".gitea/workflows", &sources)
+            .unwrap();
         let config = expanded.to_ci_config(&test_context());
 
         for job_name in [
@@ -7898,7 +7914,9 @@ jobs:
 "#
             .into(),
         )]);
-        let expanded = caller.expand_local_reusable_workflows(&sources).unwrap();
+        let expanded = caller
+            .expand_local_reusable_workflows(".gitea/workflows", &sources)
+            .unwrap();
         assert!(expanded.jobs.contains_key("shared/build"));
         assert_eq!(
             expanded.jobs["shared/verify"].needs.as_ref().unwrap(),
@@ -7966,7 +7984,7 @@ jobs:
             ))
             .unwrap();
             let error = caller
-                .expand_local_reusable_workflows(&sources)
+                .expand_local_reusable_workflows(".gitea/workflows", &sources)
                 .expect_err("the called workflow schema must judge jobs.<id>.with");
             assert!(format!("{error:#}").contains(expected), "{error:#}");
         }
@@ -7979,7 +7997,7 @@ jobs:
         )
         .unwrap();
         assert!(remote
-            .expand_local_reusable_workflows(&HashMap::new())
+            .expand_local_reusable_workflows(".gitea/workflows", &HashMap::new())
             .is_err());
         let caller =
             GiteaWorkflow::parse("on: push\njobs:\n  call:\n    uses: ./.gitea/workflows/a.yml\n")
@@ -7988,7 +8006,9 @@ jobs:
             "a.yml".into(),
             "on: workflow_call\njobs:\n  again:\n    uses: ./.gitea/workflows/a.yml\n".into(),
         )]);
-        assert!(caller.expand_local_reusable_workflows(&sources).is_err());
+        assert!(caller
+            .expand_local_reusable_workflows(".gitea/workflows", &sources)
+            .is_err());
     }
 
     #[test]
@@ -8433,7 +8453,7 @@ jobs:
 "#
             ))
             .unwrap()
-            .expand_local_reusable_workflows(&sources)
+            .expand_local_reusable_workflows(".gitea/workflows", &sources)
             .unwrap()
         };
 

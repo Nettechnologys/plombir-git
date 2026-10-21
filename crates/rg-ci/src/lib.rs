@@ -1,7 +1,8 @@
 //! Plombir Git CI/CD Engine.
 //!
-//! Parses `.plombir-git-ci.yml` or `.gitea/workflows/*.yml` (Gitea Actions format)
-//! from the repository and executes pipelines.
+//! Parses `.plombir-git-ci.yml` or `.gitea/workflows/*.yml` (Gitea Actions format;
+//! `.github/workflows/*.yml` when a commit has no `.gitea/workflows`) from the
+//! repository and executes pipelines.
 //!
 //! ## Native format (`.plombir-git-ci.yml`)
 //!
@@ -2877,14 +2878,16 @@ struct WorkflowInvocation<'a> {
 /// Read CI configuration from the repo at the given commit.
 ///
 /// Tries formats in order:
-/// 1. `.gitea/workflows/*.yml` (Gitea Actions format)
+/// 1. `.gitea/workflows/*.yml`, or `.github/workflows/*.yml` when the commit
+///    has no `.gitea/workflows` (Actions format, see [`WORKFLOW_DIRS`])
 /// 2. `.plombir-git-ci.yml` (native format)
 ///
 /// For Gitea Actions workflows, multiple files are merged into a single `CiConfig`.
 /// Jobs from different workflow files are placed in separate stages.
 ///
-/// The fallback from the first format to the second happens only when
-/// `.gitea/workflows` is absent, or holds no workflow triggered by this event.
+/// The fallback from the first format to the second happens only when the
+/// commit has neither workflow directory, or the one it has holds no workflow
+/// triggered by this event.
 /// A workflow file that *is* there but cannot be read or parsed is an error
 /// naming the file and the reason — never a silent "no CI config found".
 ///
@@ -2938,12 +2941,12 @@ fn read_ci_config_with_inputs(
     let tree = tree_at_commit(&repo, commit_sha)?;
 
     // Try Gitea Actions format first
-    let gitea = try_read_gitea_workflows(&repo, repository, commit_sha, ref_name, invocation)?;
-    let workflows_untriggered = matches!(gitea, GiteaWorkflows::NoneTriggered);
-    if let GiteaWorkflows::Config(config) = gitea {
-        tracing::info!("Using Gitea Actions workflow from {}/", WORKFLOW_DIR);
-        return Ok(config);
-    }
+    let untriggered_dir =
+        match try_read_gitea_workflows(&repo, repository, commit_sha, ref_name, invocation)? {
+            GiteaWorkflows::Config(config) => return Ok(config),
+            GiteaWorkflows::NoneTriggered { dir } => Some(dir),
+            GiteaWorkflows::Absent => None,
+        };
 
     // A tick names one workflow file, and the native format has no `on:` at
     // all: falling through would run `.plombir-git-ci.yml` — a pipeline nobody
@@ -2951,11 +2954,12 @@ fn read_ci_config_with_inputs(
     if invocation.event == rg_core::ci::SCHEDULE_EVENT {
         let named = invocation
             .schedule
-            .map(|run| {
-                format!(
-                    "{WORKFLOW_DIR}/{} with `- cron: '{}'`",
-                    run.workflow, run.cron
-                )
+            .map(|run| match untriggered_dir {
+                Some(dir) => format!("{dir}/{} with `- cron: '{}'`", run.workflow, run.cron),
+                None => format!(
+                    "{} with `- cron: '{}'` (it has neither {} nor {})",
+                    run.workflow, run.cron, WORKFLOW_DIRS[0], WORKFLOW_DIRS[1]
+                ),
             })
             .unwrap_or_else(|| "no workflow file at all".to_string());
         return Err(rg_core::error::invalid_request(format!(
@@ -2994,22 +2998,21 @@ fn read_ci_config_with_inputs(
             // retry still answers `400` with this text, which is the difference
             // between fixing an `on:` filter and hunting for a file that is
             // already there.
-            if workflows_untriggered {
-                anyhow::Error::new(rg_core::ci::NoMatchingCiJobs::untriggered(
+            match untriggered_dir {
+                Some(dir) => anyhow::Error::new(rg_core::ci::NoMatchingCiJobs::untriggered(
                     ref_name,
                     format!(
                         "no workflow in {}/ is triggered by event {} on {}, and no native CI config (.plombir-git-ci.yml) at commit {}",
-                        WORKFLOW_DIR,
+                        dir,
                         invocation.event,
                         ref_name,
                         commit_sha
                     ),
-                ))
-            } else {
-                rg_core::error::invalid_request(format!(
-                    "no CI config found (.gitea/workflows/*.yml or .plombir-git-ci.yml) at commit {}",
-                    commit_sha
-                ))
+                )),
+                None => rg_core::error::invalid_request(format!(
+                    "no CI config found ({}/*.yml, {}/*.yml or .plombir-git-ci.yml) at commit {}",
+                    WORKFLOW_DIRS[0], WORKFLOW_DIRS[1], commit_sha
+                )),
             }
         })?;
 
@@ -3091,11 +3094,11 @@ pub fn workflow_dispatch_schema(
 ) -> Result<rg_core::ci::WorkflowDispatchSchema> {
     let repo = rg_git::repository::open(repo_path)
         .with_context(|| format!("failed to open repository at {}", repo_path.display()))?;
-    let Some(workflow_sources) = load_workflow_sources(&repo, commit_sha)? else {
+    let Some(sources) = load_workflow_sources(&repo, commit_sha)? else {
         return Ok(rg_core::ci::WorkflowDispatchSchema::default());
     };
-    let workflows = parse_gitea_workflows(&workflow_sources)?;
-    Ok(WorkflowDispatchContract::from_workflows(&workflows)?.into_schema())
+    let workflows = parse_gitea_workflows(&sources)?;
+    Ok(WorkflowDispatchContract::from_workflows(sources.dir, &workflows)?.into_schema())
 }
 
 /// The `on: schedule` entries committed at `commit_sha`, one item per workflow
@@ -3116,7 +3119,7 @@ pub fn scheduled_workflows(
         return Ok(Vec::new());
     };
     let mut schedules = Vec::new();
-    for (name, yml) in sorted_workflows(&sources) {
+    for (name, yml) in sorted_workflows(&sources.files) {
         let workflow = match gitea_actions::GiteaWorkflow::parse(yml) {
             Ok(workflow) => workflow,
             Err(error) => {
@@ -3191,8 +3194,25 @@ fn tree_at_commit<'repo>(
         .with_context(|| format!("failed to read CI tree at commit {commit_sha}"))
 }
 
-/// Directory holding Gitea Actions workflow files, relative to the repo root.
-const WORKFLOW_DIR: &str = ".gitea/workflows";
+/// Directories holding Actions workflow files, relative to the repo root, in
+/// the order they are looked for.
+///
+/// The first one a commit has is the one read, and the other is not merged in
+/// — Gitea's `WorkflowDirs` order. A repository brought over from GitHub runs
+/// its `.github/workflows` as it is; one that has both runs only what it wrote
+/// for this forge, so a workflow kept for GitHub's own runners never starts
+/// here by surprise.
+const WORKFLOW_DIRS: [&str; 2] = [".gitea/workflows", ".github/workflows"];
+
+/// The workflow files committed at one commit, and the directory they came from.
+#[derive(Debug)]
+struct WorkflowSources {
+    /// The one of [`WORKFLOW_DIRS`] this commit has; every message about a file
+    /// names it, and local reusable workflows are resolved inside it.
+    dir: &'static str,
+    /// File name (no directory) → YAML source.
+    files: std::collections::HashMap<String, String>,
+}
 
 /// Largest native CI config or individual Actions workflow held for parsing.
 ///
@@ -3214,10 +3234,10 @@ const MAX_WORKFLOW_FILE_COUNT: usize = 256;
 
 /// Outcome of looking for Gitea Actions workflows at a commit.
 enum GiteaWorkflows {
-    /// The commit has no `.gitea/workflows` directory at all.
+    /// The commit has none of the [`WORKFLOW_DIRS`] at all.
     Absent,
-    /// The directory is there, but no workflow in it is triggered by this event.
-    NoneTriggered,
+    /// `dir` is there, but no workflow in it is triggered by this event.
+    NoneTriggered { dir: &'static str },
     /// Merged configuration of every workflow triggered by this event.
     Config(CiConfig),
 }
@@ -3240,7 +3260,10 @@ struct WorkflowDispatchContract {
 }
 
 impl WorkflowDispatchContract {
-    fn from_workflows(workflows: &[(String, gitea_actions::GiteaWorkflow)]) -> Result<Self> {
+    fn from_workflows(
+        dir: &str,
+        workflows: &[(String, gitea_actions::GiteaWorkflow)],
+    ) -> Result<Self> {
         let mut schemas = Vec::new();
         let mut aggregate = std::collections::BTreeMap::<
             String,
@@ -3250,13 +3273,13 @@ impl WorkflowDispatchContract {
         for (file_name, workflow) in workflows {
             let Some(inputs) = workflow.workflow_dispatch_input_schema().map_err(|error| {
                 rg_core::error::invalid_request(format!(
-                    "invalid inputs for {WORKFLOW_DIR}/{file_name}: {error:#}"
+                    "invalid inputs for {dir}/{file_name}: {error:#}"
                 ))
             })?
             else {
                 continue;
             };
-            let path = format!("{WORKFLOW_DIR}/{file_name}");
+            let path = format!("{dir}/{file_name}");
             for input in &inputs {
                 match aggregate.entry(input.name.clone()) {
                     std::collections::btree_map::Entry::Vacant(entry) => {
@@ -3361,19 +3384,20 @@ impl WorkflowDispatchContract {
 /// this helper to preserve the same fail-loud boundary and file-qualified
 /// diagnostics.
 fn parse_gitea_workflows(
-    workflow_sources: &std::collections::HashMap<String, String>,
+    sources: &WorkflowSources,
 ) -> Result<Vec<(String, gitea_actions::GiteaWorkflow)>> {
-    sorted_workflows(workflow_sources)
+    let dir = sources.dir;
+    sorted_workflows(&sources.files)
         .into_iter()
         .map(|(file_name, yml)| {
             let workflow = gitea_actions::GiteaWorkflow::parse(yml).map_err(|error| {
                 rg_core::error::invalid_request(format!(
-                    "failed to parse {WORKFLOW_DIR}/{file_name}: {error}"
+                    "failed to parse {dir}/{file_name}: {error}"
                 ))
             })?;
             workflow.validate_supported_triggers().map_err(|error| {
                 rg_core::error::invalid_request(format!(
-                    "unsupported trigger in {WORKFLOW_DIR}/{file_name}: {error:#}"
+                    "unsupported trigger in {dir}/{file_name}: {error:#}"
                 ))
             })?;
             Ok((file_name.clone(), workflow))
@@ -3381,7 +3405,8 @@ fn parse_gitea_workflows(
         .collect()
 }
 
-/// Try to find and parse Gitea Actions workflow files in `.gitea/workflows/`.
+/// Try to find and parse the Actions workflow files of the first of
+/// [`WORKFLOW_DIRS`] the commit has.
 ///
 /// `Absent` / `NoneTriggered` are the two legitimate fallbacks to the native
 /// `.plombir-git-ci.yml`, and they are told apart so the caller can explain which
@@ -3398,10 +3423,11 @@ fn try_read_gitea_workflows(
     ref_name: &str,
     invocation: WorkflowInvocation<'_>,
 ) -> Result<GiteaWorkflows> {
-    let Some(workflow_sources) = load_workflow_sources(repo, commit_sha)? else {
-        // Nothing at that path in this commit: the native format is next in line.
+    let Some(sources) = load_workflow_sources(repo, commit_sha)? else {
+        // Nothing at either path in this commit: the native format is next in line.
         return Ok(GiteaWorkflows::Absent);
     };
+    let dir = sources.dir;
 
     let match_branch = event_match_branch(repo, invocation.base_branch)?;
     let changed = gitea_actions::ChangedPaths::of_event(
@@ -3412,9 +3438,9 @@ fn try_read_gitea_workflows(
         commit_sha,
     );
 
-    let workflows = parse_gitea_workflows(&workflow_sources)?;
+    let workflows = parse_gitea_workflows(&sources)?;
     let dispatch_contract = if invocation.event == rg_core::ci::WORKFLOW_DISPATCH_EVENT {
-        let contract = WorkflowDispatchContract::from_workflows(&workflows)?;
+        let contract = WorkflowDispatchContract::from_workflows(dir, &workflows)?;
         if contract.workflows.is_empty() {
             None
         } else {
@@ -3467,24 +3493,18 @@ fn try_read_gitea_workflows(
                     .unwrap_or(&std::collections::HashMap::new()),
             );
             workflow.resolve_dispatch_inputs(&provided).map_err(|e| {
-                rg_core::error::invalid_request(format!(
-                    "invalid inputs for {WORKFLOW_DIR}/{name}: {e:#}"
-                ))
+                rg_core::error::invalid_request(format!("invalid inputs for {dir}/{name}: {e:#}"))
             })?;
         }
         // Before the reusable workflows are expanded: each of those reads its
         // own `inputs.*` as it is expanded, not this file's.
         workflow.resolve_condition_inputs().map_err(|reason| {
-            rg_core::error::invalid_request(format!(
-                "unsupported workflow {WORKFLOW_DIR}/{name}: {reason}"
-            ))
+            rg_core::error::invalid_request(format!("unsupported workflow {dir}/{name}: {reason}"))
         })?;
         let mut workflow = workflow
-            .expand_local_reusable_workflows(&workflow_sources)
+            .expand_local_reusable_workflows(dir, &sources.files)
             .map_err(|e| {
-                rg_core::error::invalid_request(format!(
-                    "failed to expand {WORKFLOW_DIR}/{name}: {e:#}"
-                ))
+                rg_core::error::invalid_request(format!("failed to expand {dir}/{name}: {e:#}"))
             })?;
         // After the reusable workflows, so the jobs they bring load their
         // actions too; before the check, so what it judges is the steps that
@@ -3492,7 +3512,7 @@ fn try_read_gitea_workflows(
         if let Some(loader) = invocation.actions {
             actions::expand_actions(&mut workflow, loader)?.map_err(|reason| {
                 rg_core::error::invalid_request(format!(
-                    "cannot load the actions of {WORKFLOW_DIR}/{name}: {reason}"
+                    "cannot load the actions of {dir}/{name}: {reason}"
                 ))
             })?;
         }
@@ -3502,7 +3522,7 @@ fn try_read_gitea_workflows(
             .resolve_event_inputs(invocation.event)
             .map_err(|reason| {
                 rg_core::error::invalid_request(format!(
-                    "unsupported workflow {WORKFLOW_DIR}/{name}: {reason}"
+                    "unsupported workflow {dir}/{name}: {reason}"
                 ))
             })?;
         // After the actions, so a step an action brings reads them too; before
@@ -3510,14 +3530,12 @@ fn try_read_gitea_workflows(
         if let Some(vars) = invocation.vars {
             workflow.resolve_vars(vars).map_err(|reason| {
                 rg_core::error::invalid_request(format!(
-                    "cannot read the variables of {WORKFLOW_DIR}/{name}: {reason}"
+                    "cannot read the variables of {dir}/{name}: {reason}"
                 ))
             })?;
         }
         workflow.validate_supported_actions().map_err(|e| {
-            rg_core::error::invalid_request(format!(
-                "unsupported workflow {WORKFLOW_DIR}/{name}: {e:#}"
-            ))
+            rg_core::error::invalid_request(format!("unsupported workflow {dir}/{name}: {e:#}"))
         })?;
         // After the expansion, not before it: the stage pass reads the
         // prefixed, flattened job names, and a `needs:` entry naming a job that
@@ -3526,11 +3544,11 @@ fn try_read_gitea_workflows(
         // (card_85ba100789a8).
         workflow.validate_job_dependencies().map_err(|e| {
             rg_core::error::invalid_request(format!(
-                "invalid job dependencies in {WORKFLOW_DIR}/{name}: {e:#}"
+                "invalid job dependencies in {dir}/{name}: {e:#}"
             ))
         })?;
 
-        tracing::info!("Triggering workflow from {}/{}", WORKFLOW_DIR, name);
+        tracing::info!("Triggering workflow from {}/{}", dir, name);
 
         let ctx = gitea_actions::WorkflowContext {
             ref_name: ref_name.to_string(),
@@ -3592,16 +3610,16 @@ fn try_read_gitea_workflows(
     if all_jobs.is_empty() {
         tracing::debug!(
             "No workflow in {}/ is triggered by event {} on {}; trying the native CI config",
-            WORKFLOW_DIR,
+            dir,
             invocation.event,
             ref_name
         );
-        return Ok(GiteaWorkflows::NoneTriggered);
+        return Ok(GiteaWorkflows::NoneTriggered { dir });
     }
 
     Ok(GiteaWorkflows::Config(CiConfig {
         stages: Some(all_stages),
-        concurrency: merge_concurrency(declared_concurrency)?,
+        concurrency: merge_concurrency(dir, declared_concurrency)?,
         jobs: all_jobs,
         actions_workflow: true,
     }))
@@ -3625,6 +3643,7 @@ fn try_read_gitea_workflows(
 /// is the same answer this engine already gives for an unsupported trigger or
 /// an unsupported action.
 fn merge_concurrency(
+    dir: &str,
     declared: Vec<(String, config::ConcurrencyConfig)>,
 ) -> Result<Option<config::ConcurrencyConfig>> {
     let mut declared = declared.into_iter();
@@ -3635,7 +3654,7 @@ fn merge_concurrency(
     for (file, other) in declared {
         if other.group != first.group || other.cancel_in_progress != first.cancel_in_progress {
             return Err(rg_core::error::invalid_request(format!(
-                "{WORKFLOW_DIR}/{first_file} and {WORKFLOW_DIR}/{file} are both triggered by this \
+                "{dir}/{first_file} and {dir}/{file} are both triggered by this \
                  event and declare different `concurrency:` blocks (group '{}' \
                  cancel-in-progress: {} vs group '{}' cancel-in-progress: {}). \
                  Plombir Git runs every workflow triggered by one event as a single pipeline, which \
@@ -3649,10 +3668,15 @@ fn merge_concurrency(
     Ok(Some(first))
 }
 
-/// Read every `*.yml` / `*.yaml` blob under [`WORKFLOW_DIR`] at `commit_sha`.
+/// Read every `*.yml` / `*.yaml` blob under the first of [`WORKFLOW_DIRS`]
+/// that `commit_sha` has.
 ///
-/// `None` means the directory is not in this commit at all — the one outcome
-/// that legitimately falls back to the native config. Everything else that goes
+/// `None` means neither directory is in this commit at all — the one outcome
+/// that legitimately falls back to the native config. A first directory that
+/// is there is the one read even when it holds no workflow, the way Gitea
+/// reads it: the second is a fallback for a repository that has not written
+/// anything for this forge, not a place a file is looked for when the first
+/// lacks it. Everything else that goes
 /// wrong is an `Err` naming the file: a workflow that exists but cannot be read
 /// must never be mistaken for "no CI config here".
 ///
@@ -3661,7 +3685,7 @@ fn merge_concurrency(
 fn load_workflow_sources(
     repo: &gix::Repository,
     commit_sha: &str,
-) -> Result<Option<std::collections::HashMap<String, String>>> {
+) -> Result<Option<WorkflowSources>> {
     load_workflow_sources_with_limits(
         repo,
         commit_sha,
@@ -3675,15 +3699,19 @@ fn load_workflow_sources_with_limits(
     commit_sha: &str,
     max_file_count: usize,
     max_total_bytes: u64,
-) -> Result<Option<std::collections::HashMap<String, String>>> {
+) -> Result<Option<WorkflowSources>> {
     let tree = tree_at_commit(repo, commit_sha)?;
-    let Some(workflow_dir) = tree.lookup_entry_by_path(WORKFLOW_DIR).with_context(|| {
-        format!(
-            "failed to look up {} at commit {}",
-            WORKFLOW_DIR, commit_sha
-        )
-    })?
-    else {
+    let mut found = None;
+    for dir in WORKFLOW_DIRS {
+        if let Some(entry) = tree
+            .lookup_entry_by_path(dir)
+            .with_context(|| format!("failed to look up {dir} at commit {commit_sha}"))?
+        {
+            found = Some((dir, entry));
+            break;
+        }
+    }
+    let Some((dir, workflow_dir)) = found else {
         return Ok(None);
     };
 
@@ -3703,18 +3731,18 @@ fn load_workflow_sources_with_limits(
     };
     if let Some(shape) = not_a_directory {
         return Err(rg_core::error::invalid_request(format!(
-            "{WORKFLOW_DIR} exists at commit {commit_sha} but is {shape}, not a directory"
+            "{dir} exists at commit {commit_sha} but is {shape}, not a directory"
         )));
     }
 
     let object = workflow_dir
         .object()
-        .with_context(|| format!("failed to read {} at commit {}", WORKFLOW_DIR, commit_sha))?;
+        .with_context(|| format!("failed to read {} at commit {}", dir, commit_sha))?;
     // Past the mode check this is a tree whose mode and object disagree: still
     // the committed shape, and still fixed by pushing a sound one.
     let tree = object.try_into_tree().map_err(|_| {
         rg_core::error::invalid_request(format!(
-            "{WORKFLOW_DIR} at commit {commit_sha} is committed as a directory, but its object is not a tree"
+            "{dir} at commit {commit_sha} is committed as a directory, but its object is not a tree"
         ))
     })?;
 
@@ -3722,8 +3750,8 @@ fn load_workflow_sources_with_limits(
     let mut workflow_file_count = 0usize;
     let mut workflow_total_bytes = 0u64;
     for entry in tree.iter() {
-        let entry = entry
-            .with_context(|| format!("failed to list {} at commit {}", WORKFLOW_DIR, commit_sha))?;
+        let entry =
+            entry.with_context(|| format!("failed to list {} at commit {}", dir, commit_sha))?;
         let name = entry.filename().to_string();
         if !name.ends_with(".yml") && !name.ends_with(".yaml") {
             continue;
@@ -3732,17 +3760,17 @@ fn load_workflow_sources_with_limits(
         if !mode.is_blob() && !mode.is_executable() {
             // A directory or submodule that happens to be named `*.yml` is not a
             // workflow; say so instead of failing the whole pipeline over it.
-            tracing::warn!("Skipping {}/{}: not a regular file", WORKFLOW_DIR, name);
+            tracing::warn!("Skipping {}/{}: not a regular file", dir, name);
             continue;
         }
 
-        let workflow_path = format!("{WORKFLOW_DIR}/{name}");
+        let workflow_path = format!("{dir}/{name}");
         workflow_file_count = workflow_file_count
             .checked_add(1)
             .filter(|count| *count <= max_file_count)
             .ok_or_else(|| {
                 rg_core::error::invalid_request(format!(
-                    "{WORKFLOW_DIR} contains more than {max_file_count} workflow files; limit reached at {workflow_path}"
+                    "{dir} contains more than {max_file_count} workflow files; limit reached at {workflow_path}"
                 ))
             })?;
 
@@ -3770,20 +3798,20 @@ fn load_workflow_sources_with_limits(
             })?;
 
         let entry_object = repo.find_object(entry.oid()).with_context(|| {
-            format!(
-                "failed to read {}/{} from the object database",
-                WORKFLOW_DIR, name
-            )
+            format!("failed to read {dir}/{name} from the object database, at commit {commit_sha}")
         })?;
-        let blob = entry_object.try_into_blob().map_err(|_| {
-            rg_core::error::invalid_request(format!("{WORKFLOW_DIR}/{name} is not a file"))
-        })?;
+        let blob = entry_object
+            .try_into_blob()
+            .map_err(|_| rg_core::error::invalid_request(format!("{dir}/{name} is not a file")))?;
         let yml = String::from_utf8(blob.data.to_vec()).map_err(|_| {
-            rg_core::error::invalid_request(format!("{WORKFLOW_DIR}/{name} is not valid UTF-8"))
+            rg_core::error::invalid_request(format!("{dir}/{name} is not valid UTF-8"))
         })?;
         workflow_sources.insert(name, yml);
     }
-    Ok(Some(workflow_sources))
+    Ok(Some(WorkflowSources {
+        dir,
+        files: workflow_sources,
+    }))
 }
 
 /// Workflow sources by filename, in a deterministic order.
@@ -3868,15 +3896,16 @@ fn workflow_matches_event(query: rg_core::ci::WorkflowEventQuery<'_>) -> Result<
         commit_sha,
     );
 
-    for (name, yml) in sorted_workflows(&sources) {
+    let dir = sources.dir;
+    for (name, yml) in sorted_workflows(&sources.files) {
         let workflow = gitea_actions::GiteaWorkflow::parse(yml).map_err(|error| {
             rg_core::error::invalid_request(format!(
-                "failed to parse {WORKFLOW_DIR}/{name} while matching event {event}: {error}"
+                "failed to parse {dir}/{name} while matching event {event}: {error}"
             ))
         })?;
         workflow.validate_supported_triggers().map_err(|error| {
             rg_core::error::invalid_request(format!(
-                "unsupported trigger in {WORKFLOW_DIR}/{name}: {error:#}"
+                "unsupported trigger in {dir}/{name}: {error:#}"
             ))
         })?;
         if workflow.matches_event(event, ref_name, &match_branch, &changed) {
@@ -6510,7 +6539,7 @@ mod matrix_tests {
     /// repository actually committed.
     #[test]
     fn a_gitlink_mounted_at_the_workflow_directory_is_a_client_error() {
-        let (_dir, repo_path, sha) = commit_repo_with_submodule_at(WORKFLOW_DIR);
+        let (_dir, repo_path, sha) = commit_repo_with_submodule_at(WORKFLOW_DIRS[0]);
 
         let error =
             read_ci_config_for_test(&repo_path, &sha, "refs/heads/main", "push", None, None)
@@ -6523,13 +6552,185 @@ mod matrix_tests {
         );
         let message = format!("{error:#}");
         assert!(
-            message.contains(WORKFLOW_DIR) && message.contains("is a submodule, not a directory"),
+            message.contains(WORKFLOW_DIRS[0])
+                && message.contains("is a submodule, not a directory"),
             "{message}"
         );
         assert!(
             !message.contains("failed to read"),
             "a healthy submodule must not be reported as an unreadable object: {message}"
         );
+    }
+
+    fn job_names(config: &CiConfig) -> Vec<String> {
+        let mut names = config.jobs.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    /// A repository brought over from GitHub runs its `.github/workflows` as
+    /// it is: no `.gitea/workflows` has to be written first (card_c9a7d2687a30).
+    #[test]
+    fn a_commit_with_only_github_workflows_runs_them() {
+        let (temp, sha) = commit_repo(&[(
+            ".github/workflows/ci.yml",
+            b"on: push\njobs:\n  test:\n    steps:\n      - run: echo github\n" as &[u8],
+        )]);
+
+        let config =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect("`.github/workflows` is read when `.gitea/workflows` is absent");
+
+        assert_eq!(job_names(&config), vec!["ci/test".to_string()]);
+    }
+
+    /// Gitea's order: the first directory the commit has is the one read, and
+    /// the second is not merged in. A workflow kept for GitHub's own runners
+    /// next to the ones written for this forge must not start here too.
+    #[test]
+    fn gitea_workflows_win_over_github_workflows() {
+        let (temp, sha) = commit_repo(&[
+            (
+                ".gitea/workflows/forge.yml",
+                b"on: push\njobs:\n  here:\n    steps:\n      - run: echo gitea\n" as &[u8],
+            ),
+            (
+                ".github/workflows/hosted.yml",
+                b"on: push\njobs:\n  there:\n    steps:\n      - run: echo github\n",
+            ),
+        ]);
+
+        let config =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .unwrap();
+
+        assert_eq!(job_names(&config), vec!["forge/here".to_string()]);
+    }
+
+    /// The first directory wins by being there, not by having a workflow this
+    /// event triggers: falling through to `.github/workflows` on a push the
+    /// `.gitea` files ignore would run a second CI exactly when the author's
+    /// own filter said "nothing to do".
+    #[test]
+    fn an_untriggered_gitea_directory_does_not_fall_through_to_github() {
+        let (temp, sha) = commit_repo(&[
+            (
+                ".gitea/workflows/pr.yml",
+                b"on: pull_request\njobs:\n  review:\n    steps:\n      - run: echo pr\n"
+                    as &[u8],
+            ),
+            (
+                ".github/workflows/push.yml",
+                b"on: push\njobs:\n  there:\n    steps:\n      - run: echo github\n",
+            ),
+        ]);
+
+        let error =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect_err("nothing in `.gitea/workflows` is triggered by push");
+
+        assert!(
+            error
+                .downcast_ref::<rg_core::ci::NoMatchingCiJobs>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains(".gitea/workflows/"),
+            "{error:#}"
+        );
+    }
+
+    /// Every message about a file names the directory it was read from, so a
+    /// broken workflow brought over from GitHub is reported where it lives.
+    #[test]
+    fn a_broken_github_workflow_is_named_by_its_own_path() {
+        let (temp, sha) = commit_repo(&[(
+            ".github/workflows/ci.yml",
+            b"on: push\njobs: [not, a, map]\n" as &[u8],
+        )]);
+
+        let error =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect_err("the workflow does not parse");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("failed to parse .github/workflows/ci.yml"),
+            "{message}"
+        );
+        assert!(!message.contains(".gitea/workflows"), "{message}");
+    }
+
+    /// GitHub spells a local reusable workflow `./.github/workflows/<file>`,
+    /// and in a repository read from that directory it resolves there.
+    #[test]
+    fn a_github_reusable_workflow_resolves_in_github_workflows() {
+        let (temp, sha) = commit_repo(&[
+            (
+                ".github/workflows/main.yml",
+                b"on: push\njobs:\n  shared:\n    uses: ./.github/workflows/shared.yml\n"
+                    as &[u8],
+            ),
+            (
+                ".github/workflows/shared.yml",
+                b"on: workflow_call\njobs:\n  build:\n    steps:\n      - run: echo shared\n",
+            ),
+        ]);
+
+        let config =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect("a reusable workflow in the directory being read resolves");
+
+        assert_eq!(job_names(&config), vec!["main/shared/build".to_string()]);
+    }
+
+    /// Only the directory being read is loaded, so a call into the other one
+    /// is refused by name — not reported as a missing file, and not quietly
+    /// resolved against a directory whose workflows this commit does not run.
+    #[test]
+    fn a_reusable_workflow_in_the_other_directory_is_refused_by_name() {
+        let (temp, sha) = commit_repo(&[
+            (
+                ".gitea/workflows/main.yml",
+                b"on: push\njobs:\n  shared:\n    uses: ./.github/workflows/shared.yml\n"
+                    as &[u8],
+            ),
+            (
+                ".github/workflows/shared.yml",
+                b"on: workflow_call\njobs:\n  build:\n    steps:\n      - run: echo shared\n",
+            ),
+        ]);
+
+        let error =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect_err(
+                    "`.github/workflows` is not read in a commit that has `.gitea/workflows`",
+                );
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("under .gitea/workflows/")
+                && message.contains("./.github/workflows/shared.yml"),
+            "{message}"
+        );
+    }
+
+    /// The scheduler reads its cron entries through the same loader, so a
+    /// nightly workflow brought over from GitHub is scheduled too.
+    #[test]
+    fn github_workflows_declare_their_schedules() {
+        let (temp, sha) = commit_repo(&[(
+            ".github/workflows/nightly.yml",
+            b"on:\n  schedule:\n    - cron: '0 3 * * *'\njobs:\n  run:\n    steps:\n      - run: echo night\n"
+                as &[u8],
+        )]);
+
+        let schedules = scheduled_workflows(temp.path(), &sha).unwrap();
+
+        assert_eq!(schedules.len(), 1, "{schedules:?}");
+        assert_eq!(schedules[0].workflow, "nightly.yml");
+        assert_eq!(schedules[0].crons, vec!["0 3 * * *".to_string()]);
     }
 
     /// The mode check must not swallow the case it sits in front of: an entry

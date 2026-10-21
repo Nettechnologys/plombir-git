@@ -168,7 +168,8 @@ pub const SCHEDULE_EVENT: &str = "schedule";
 /// file and that entry rather than every workflow that declares `schedule`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScheduledRun<'a> {
-    /// The workflow's file name under `.gitea/workflows/`, e.g. `nightly.yml`.
+    /// The workflow's file name under the commit's workflow directory
+    /// (`.gitea/workflows/`, or `.github/workflows/` without it), e.g. `nightly.yml`.
     pub workflow: &'a str,
     /// The `- cron:` value exactly as the file spells it.
     pub cron: &'a str,
@@ -177,7 +178,7 @@ pub struct ScheduledRun<'a> {
 /// The `on: schedule` entries one workflow file declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowSchedule {
-    /// The file name under `.gitea/workflows/`.
+    /// The file name under the commit's workflow directory.
     pub workflow: String,
     /// Every `- cron:` value, as written, each already accepted by
     /// [`cron::CronSchedule::parse`].
@@ -592,7 +593,8 @@ pub struct WorkflowDispatchSchema {
 /// One workflow that declares `on: workflow_dispatch` at a committed revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowDispatchWorkflow {
-    /// Repository-relative workflow path, including `.gitea/workflows/`.
+    /// Repository-relative workflow path, including its directory
+    /// (`.gitea/workflows/` or `.github/workflows/`).
     pub path: String,
     /// Declared workflow name, or the filename stem when `name:` is absent.
     pub name: String,
@@ -966,7 +968,7 @@ pub trait CiTrigger: Send + Sync {
 /// for just as long — so a repository using Gitea Actions was told its perfectly
 /// valid config did not exist.
 pub const NO_CI_CONFIG_MESSAGE: &str =
-    "no CI config found at this commit — expected `.plombir-git-ci.yml` or `.gitea/workflows/*.yml`";
+    "no CI config found at this commit — expected `.plombir-git-ci.yml`, `.gitea/workflows/*.yml` or `.github/workflows/*.yml`";
 
 /// Check if a repo has any CI config at the given commit.
 ///
@@ -1027,7 +1029,15 @@ pub fn has_ci_config_checked(repo_path: &Path, commit_sha: &str) -> Result<bool>
         .peel_to_tree()
         .with_context(|| format!("failed to read CI tree at commit {commit_sha}"))?;
 
-    for path in [".gitea/workflows", ".plombir-git-ci.yml"] {
+    // Both Actions directories: the engine reads `.github/workflows` when a
+    // commit has no `.gitea/workflows`, so a gate that knew only the first
+    // kept every repository brought over from GitHub from reaching it — no
+    // pipeline and no refusal either.
+    for path in [
+        ".gitea/workflows",
+        ".github/workflows",
+        ".plombir-git-ci.yml",
+    ] {
         if commit
             .lookup_entry_by_path(path)
             .with_context(|| format!("failed to look up {path} at commit {commit_sha}"))?
@@ -1370,5 +1380,38 @@ mod tests {
     fn the_operator_message_names_every_accepted_location() {
         assert!(NO_CI_CONFIG_MESSAGE.contains(".plombir-git-ci.yml"));
         assert!(NO_CI_CONFIG_MESSAGE.contains(".gitea/workflows"));
+        assert!(NO_CI_CONFIG_MESSAGE.contains(".github/workflows"));
+    }
+
+    /// A repository brought over from GitHub keeps its workflows in
+    /// `.github/workflows`, and the engine reads them there. The gate in front
+    /// of it knew only `.gitea/workflows`, so every trigger path returned
+    /// before the engine was asked: no pipeline, and no refusal saying why.
+    #[test]
+    fn a_commit_with_only_github_workflows_has_a_ci_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("work");
+        let git = rg_git::cli_gateway::GitCommandGateway::new().expect("git must be installed");
+        git.run_or_bail(&["init", "-q", repo_path.to_str().unwrap()], None)
+            .unwrap();
+        std::fs::create_dir_all(repo_path.join(".github/workflows")).unwrap();
+        std::fs::write(
+            repo_path.join(".github/workflows/ci.yml"),
+            "on: push\njobs:\n  test:\n    steps:\n      - run: echo ok\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["config", "user.email", "ci@example.com"],
+            vec!["config", "user.name", "CI"],
+            vec!["add", "."],
+            vec!["-c", "commit.gpgsign=false", "commit", "-qm", "ci"],
+        ] {
+            git.run_or_bail(&args, Some(&repo_path)).unwrap();
+        }
+
+        assert!(
+            has_ci_config_checked(&repo_path, "HEAD").expect("an openable repo must not error"),
+            "`.github/workflows` must let the commit reach the workflow engine"
+        );
     }
 }
