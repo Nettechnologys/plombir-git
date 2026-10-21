@@ -728,11 +728,7 @@ pub fn step_condition_context(env: &[(String, String)]) -> HashMap<String, Strin
             .unwrap_or_default()
     };
     let ref_name = value("CI_REF");
-    let short_ref = ref_name
-        .strip_prefix("refs/heads/")
-        .or_else(|| ref_name.strip_prefix("refs/tags/"))
-        .unwrap_or(&ref_name)
-        .to_string();
+    let short_ref = crate::ci_condition::ref_name_short(&ref_name).to_string();
     let mut context = HashMap::from([
         ("github.ref".to_string(), ref_name.clone()),
         ("github.ref_name".to_string(), short_ref),
@@ -1254,11 +1250,7 @@ fn github_context_variables(env: &mut BTreeMap<String, String>) {
         }
     }
     if let Some(reference) = env.get("CI_REF").cloned() {
-        let name = reference
-            .strip_prefix("refs/heads/")
-            .or_else(|| reference.strip_prefix("refs/tags/"))
-            .unwrap_or(&reference)
-            .to_string();
+        let name = crate::ci_condition::ref_name_short(&reference).to_string();
         env.insert("GITHUB_REF_NAME".into(), name);
     }
     env.insert(

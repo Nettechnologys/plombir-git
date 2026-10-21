@@ -398,11 +398,18 @@ async fn poll_keeps_the_wire_contract_for_decodable_and_null_job_columns() {
                 "{body}"
             );
         }
-        let (head_ref, base_ref) = if suffix == "decodable" {
-            ("", "")
+        let (head_ref, base_ref, ref_name) = if suffix == "decodable" {
+            ("", "", "main")
         } else {
-            ("feature", "main")
+            ("feature", "main", "refs/pull/1/head")
         };
+        // `github.ref_name`: a branch by its short name, a pull request's ref
+        // as it is — what an `if:` reads (card_a93f0cb6c158).
+        assert_eq!(
+            body["variables"]["CI_REF_NAME"],
+            serde_json::json!(ref_name),
+            "{body}"
+        );
         assert_eq!(
             body["variables"]["CI_HEAD_REF"],
             serde_json::json!(head_ref),

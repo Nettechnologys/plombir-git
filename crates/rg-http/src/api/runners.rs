@@ -1101,6 +1101,10 @@ async fn add_server_variables(
     );
     variables.insert("CI_SHA".into(), serde_json::json!(pipeline.commit_sha));
     variables.insert("CI_REF".into(), serde_json::json!(pipeline.ref_name));
+    variables.insert(
+        "CI_REF_NAME".into(),
+        serde_json::json!(rg_core::ci::ref_name_short(&pipeline.ref_name)),
+    );
     variables.insert("CI_EVENT".into(), serde_json::json!(pipeline.trigger_type));
     if let Some(cron) = pipeline.schedule_cron.as_deref() {
         variables.insert("CI_EVENT_SCHEDULE".into(), serde_json::json!(cron));

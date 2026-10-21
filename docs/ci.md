@@ -221,7 +221,8 @@ the runner operator's credentials, never the job's. The pull's output opens the
 job log.
 
 The runner supplies these on its own: `CI_PIPELINE_ID`, `CI_COMMIT_SHA`,
-`CI_SHA`, `CI_REF`, `CI_EVENT`, `CI_REPOSITORY`, `CI_REPOSITORY_OWNER`,
+`CI_SHA`, `CI_REF`, `CI_REF_NAME` (`CI_REF` by its short name: `main`, `v1.2`),
+`CI_EVENT`, `CI_REPOSITORY`, `CI_REPOSITORY_OWNER`,
 `CI_HEAD_REF` and `CI_BASE_REF` — the branch a pull request comes from and the
 one it targets, empty for every other event — and, where a job token is issued,
 `CI_JOB_TOKEN`. A run of an Actions workflow's `on: schedule` also gets

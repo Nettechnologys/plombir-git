@@ -65,6 +65,19 @@ enum Token {
 /// which a comparison reports as a plain `false` — a silently wrong answer, not
 /// an error. `every_condition_key_the_validator_accepts_is_answered_by_both_contexts`
 /// holds the three together.
+/// `github.ref_name` of a ref: a branch or tag by its short name, any other
+/// ref — `refs/pull/<n>/head` — as it is.
+///
+/// One answer for every reader — the three condition contexts, both runners'
+/// `CI_REF_NAME` and the `GITHUB_REF_NAME` a JavaScript action reads — so the
+/// name cannot mean one thing in an `if:` and another in a `run:`.
+pub fn ref_name_short(reference: &str) -> &str {
+    reference
+        .strip_prefix("refs/heads/")
+        .or_else(|| reference.strip_prefix("refs/tags/"))
+        .unwrap_or(reference)
+}
+
 pub const GITHUB_CONTEXT_KEYS: [&str; 9] = [
     "github.ref",
     "github.ref_name",

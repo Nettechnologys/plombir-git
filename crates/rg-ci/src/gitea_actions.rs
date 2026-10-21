@@ -1138,6 +1138,10 @@ const CACHE_INPUTS: &[&str] = &["path", "key"];
 /// opposite of what the workflow asked for.
 const UPLOAD_ARTIFACT_INPUTS: &[&str] = &["name", "path"];
 
+/// The name `actions/upload-artifact` publishes under without a `name:`, as on
+/// GitHub.
+const DEFAULT_ARTIFACT_NAME: &str = "artifact";
+
 /// The `uses:` values this engine implements natively.
 ///
 /// A constant rather than two literals inside the filter below, because the
@@ -1193,8 +1197,9 @@ fn unsupported_action_inputs(job_name: &str, index: usize, step: &GiteaStep) -> 
     unknown
 }
 
-const GITHUB_RUN_EXPRESSIONS: [(&str, &str); 8] = [
+const GITHUB_RUN_EXPRESSIONS: [(&str, &str); 9] = [
     ("github.ref", "${CI_REF}"),
+    ("github.ref_name", "${CI_REF_NAME}"),
     ("github.sha", "${CI_SHA}"),
     ("github.event_name", "${CI_EVENT}"),
     ("github.repository", "${CI_REPOSITORY}"),
@@ -1279,6 +1284,7 @@ fn unsupported_run_expressions(input: &str) -> Vec<String> {
 fn job_field_expression(key: &str) -> Option<ActionExpression> {
     match key {
         "github.ref" => Some(ActionExpression::GithubRef),
+        "github.ref_name" => Some(ActionExpression::GithubRefName),
         "github.sha" => Some(ActionExpression::GithubSha),
         "github.event_name" => Some(ActionExpression::GithubEventName),
         "github.repository" => Some(ActionExpression::GithubRepository),
@@ -1764,6 +1770,7 @@ fn unsupported_job_field_expression_sites(workflow: &GiteaWorkflow) -> Vec<Strin
         }
     };
 
+    let mut artifact_names = Vec::new();
     for (job_name, job) in &workflow.jobs {
         match &job.runs_on {
             Some(GiteaRunsOn::Label(value)) => {
@@ -1782,8 +1789,29 @@ fn unsupported_job_field_expression_sites(workflow: &GiteaWorkflow) -> Vec<Strin
         if let Some(environment) = job.environment.as_ref().map(GiteaEnvironment::name) {
             inspect(format!("{job_name}: environment.name"), environment);
         }
+        for (index, step) in job.steps.iter().enumerate() {
+            let uploads = step
+                .uses
+                .as_deref()
+                .is_some_and(|uses| uses.starts_with("actions/upload-artifact@"));
+            if let Some(name) = step.with.get("name").filter(|_| uploads) {
+                // `env.*` is read as text when the job is translated
+                // (`substitute_env`); every other name is the template's.
+                let site = format!("{job_name}: step {} with.name", index + 1);
+                if let Some(template) = compile_action_template(name) {
+                    artifact_names.extend(
+                        template
+                            .unsupported_expressions()
+                            .into_iter()
+                            .filter(|expression| context_member(expression, "env").is_none())
+                            .map(|expression| format!("{site} expression `{expression}`")),
+                    );
+                }
+            }
+        }
     }
 
+    unsupported.extend(artifact_names);
     unsupported
 }
 
@@ -2977,10 +3005,19 @@ impl GiteaWorkflow {
                     .map(str::to_owned),
             );
             let (tags, tag_templates) = split_action_template_list(runs_on_tags(&job.runs_on));
+            let (artifacts, artifact_name_template) = match artifacts {
+                Some(mut artifacts) => {
+                    let (name, template) = split_action_template(artifacts.name.take());
+                    artifacts.name = name;
+                    (Some(artifacts), template)
+                }
+                None => (None, None),
+            };
             let action_templates = ActionJobTemplates {
                 image: image_template,
                 tags: tag_templates,
                 environment: environment_template,
+                artifact_name: artifact_name_template,
             };
             let action_templates = (!action_templates.is_empty()).then_some(action_templates);
 
@@ -3282,16 +3319,24 @@ impl GiteaWorkflow {
                             .filter(|path| !path.is_empty())
                             .map(str::to_owned)
                             .collect::<Vec<_>>();
+                        // Only `env.*` is read here, as text: the name is a
+                        // job field, rendered per matrix variant when the
+                        // graph is written (`ActionJobTemplates::artifact_name`),
+                        // and never reaches a shell that would expand the
+                        // `${MATRIX_OS}` `substitute_expr` defers it to.
+                        //
+                        // Without one it is GitHub's `artifact`. The native
+                        // default — the job's name — is `<file>/<job>` here,
+                        // which no artifact name may spell, so every unnamed
+                        // upload used to be refused.
+                        let name = step.with.get("name").map_or_else(
+                            || DEFAULT_ARTIFACT_NAME.to_owned(),
+                            |name| {
+                                substitute_env(name, &self.env, &job_vars, Some(&resolved_step_env))
+                            },
+                        );
                         artifacts = Some(ArtifactsConfig {
-                            name: step.with.get("name").map(|name| {
-                                substitute_expr(
-                                    name,
-                                    job_name,
-                                    &self.env,
-                                    &job_vars,
-                                    Some(&resolved_step_env),
-                                )
-                            }),
+                            name: Some(name),
                             paths,
                         });
                     } else {
@@ -4555,11 +4600,7 @@ pub(crate) fn actions_condition_context(
         ("github.ref".into(), ctx.ref_name.clone()),
         (
             "github.ref_name".into(),
-            ctx.ref_name
-                .strip_prefix("refs/heads/")
-                .or_else(|| ctx.ref_name.strip_prefix("refs/tags/"))
-                .unwrap_or(&ctx.ref_name)
-                .to_string(),
+            crate::condition::ref_name_short(&ctx.ref_name).to_string(),
         ),
         ("github.event_name".into(), ctx.event.clone()),
         ("github.sha".into(), ctx.sha.clone()),
@@ -5199,6 +5240,36 @@ impl GiteaWorkflow {
     }
 }
 
+/// What `${{ env.<name> }}` reads: the step's variable over the job's over the
+/// workflow's, `''` for a name none of them sets.
+fn env_value(
+    name: &str,
+    workflow_env: &HashMap<String, String>,
+    job_env: &HashMap<String, String>,
+    step_env: Option<&HashMap<String, String>>,
+) -> String {
+    step_env
+        .and_then(|env| env.get(name))
+        .or_else(|| job_env.get(name))
+        .or_else(|| workflow_env.get(name))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// [`substitute_expr`]'s `env.*` alone, every other expression left in place —
+/// for a field compiled into an [`ActionTemplate`] afterwards, whose other
+/// expressions have a value only per matrix variant.
+fn substitute_env(
+    input: &str,
+    workflow_env: &HashMap<String, String>,
+    job_env: &HashMap<String, String>,
+    step_env: Option<&HashMap<String, String>>,
+) -> String {
+    expand_expressions(input, |key| {
+        context_member(key, "env").map(|name| env_value(name, workflow_env, job_env, step_env))
+    })
+}
+
 /// Basic `${{ expression }}` substitution.
 fn substitute_expr(
     input: &str,
@@ -5219,14 +5290,7 @@ fn substitute_expr(
             return Some((*replacement).to_owned());
         }
         if let Some(name) = context_member(key, "env") {
-            return Some(
-                step_env
-                    .and_then(|env| env.get(name))
-                    .or_else(|| job_env.get(name))
-                    .or_else(|| workflow_env.get(name))
-                    .cloned()
-                    .unwrap_or_default(),
-            );
+            return Some(env_value(name, workflow_env, job_env, step_env));
         }
         if let Some(name) = context_member(key, "secrets") {
             return Some(format!("${{{name}}}"));

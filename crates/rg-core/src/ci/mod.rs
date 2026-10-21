@@ -236,7 +236,7 @@ impl NoMatchingCiJobs {
 /// Both the embedded runner and the external-runner API inject this vocabulary.
 /// Keeping one list prevents a new built-in from being protected on one path
 /// while a user-controlled value can still replace it on the other.
-pub const BUILTIN_CI_VARIABLES: [&str; 14] = rg_process::job_environment::RUNNER_OWNED_VARIABLES;
+pub const BUILTIN_CI_VARIABLES: [&str; 15] = rg_process::job_environment::RUNNER_OWNED_VARIABLES;
 
 /// The runner protocol of the step model, for the HTTP layer that hands jobs
 /// out — see [`rg_process::ci_steps::STEPS_PROTOCOL`].
@@ -271,6 +271,10 @@ pub const ID_TOKEN_SCOPE: &str = "id-token:write";
 pub fn is_builtin_ci_variable(name: &str) -> bool {
     BUILTIN_CI_VARIABLES.contains(&name)
 }
+
+/// `github.ref_name` of a ref — `CI_REF_NAME` in its jobs. See
+/// [`rg_process::ci_condition::ref_name_short`].
+pub use rg_process::ci_condition::ref_name_short;
 
 /// `github.head_ref` and `github.base_ref` of a run — `CI_HEAD_REF` and
 /// `CI_BASE_REF` in its jobs: the branch a pull request comes from and the one

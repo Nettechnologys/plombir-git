@@ -1806,6 +1806,10 @@ impl PipelineRunner {
         env.insert("CI_PIPELINE_ID".into(), self.pipeline_id.to_string());
         env.insert("CI_COMMIT_SHA".into(), pipeline.commit_sha.clone());
         env.insert("CI_SHA".into(), pipeline.commit_sha);
+        env.insert(
+            "CI_REF_NAME".into(),
+            rg_core::ci::ref_name_short(&pipeline.ref_name).to_string(),
+        );
         env.insert("CI_REF".into(), pipeline.ref_name);
         env.insert("CI_EVENT".into(), pipeline.trigger_type.clone());
         if let Some(cron) = pipeline.schedule_cron {

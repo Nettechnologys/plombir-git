@@ -1099,7 +1099,11 @@ path
 ```
 
 `path` takes one path per line, exactly as the real action does; `name`
-defaults to the job's own name. The rest change behaviour this artifact store
+defaults to `artifact`, as on GitHub. `name` may read `matrix.NAME`, `github.*`,
+`inputs.NAME`, `github.event.inputs.NAME` and `env.NAME`, and is resolved for
+each matrix variant, so `name: dist-${{ matrix.os }}` publishes `dist-linux` and
+`dist-mac`; any other expression is refused by name, and so is a resolved name
+outside ASCII letters, digits, `.`, `-` and `_`. The rest change behaviour this artifact store
 does not implement: `retention-days` would override a policy the repository
 owns, `if-no-files-found`, `overwrite` and `include-hidden-files` each decide
 what an empty or partial match means, and `compression-level` picks an archive
@@ -1121,6 +1125,7 @@ contexts.
 | Expression | Becomes |
 |------------|---------|
 | `github.ref` | `${CI_REF}` |
+| `github.ref_name` | `${CI_REF_NAME}` — a branch or tag by its short name (`main`, `v1.2`); a pull request's `refs/pull/<n>/head` as it is. |
 | `github.sha` | `${CI_SHA}` |
 | `github.event_name` | `${CI_EVENT}` |
 | `github.repository` | `${CI_REPOSITORY}` |
@@ -1138,8 +1143,9 @@ contexts.
 [Outputs](#outputs).
 
 **In job fields resolved before a runner starts** — `runs-on`,
-`container.image` and `environment` — only the first five `github.*` above, plus
-`matrix.NAME`, `inputs.NAME` and `github.event.inputs.NAME`. `env.` and `secrets.` have no value at that
+`container.image`, `environment` and `actions/upload-artifact`'s `name` — only
+the first six `github.*` above, plus `matrix.NAME`, `inputs.NAME` and
+`github.event.inputs.NAME`. `env.` and `secrets.` have no value at that
 boundary; they are refused there by field and expression rather than left in the
 configuration as literal `${{ … }}`.
 

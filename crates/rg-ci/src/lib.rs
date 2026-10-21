@@ -1341,8 +1341,23 @@ async fn create_variant_jobs(
         // under one name where each run overwrites the last.
         let artifacts_json = match job_config.artifacts.as_ref() {
             Some(artifacts) => {
-                let (name, paths) = artifact_spec(&variant.name, artifacts)
-                    .map_err(rg_core::error::invalid_request)?;
+                let rendered;
+                let artifacts = match &fields.artifact_name {
+                    Some(name) => {
+                        rendered = config::ArtifactsConfig {
+                            name: Some(name.clone()),
+                            paths: artifacts.paths.clone(),
+                        };
+                        &rendered
+                    }
+                    None => artifacts,
+                };
+                let (name, paths) = artifact_spec(&variant.name, artifacts).map_err(|error| {
+                    rg_core::error::invalid_request(format!(
+                        "job '{}' has an unusable artifacts block: {error}",
+                        variant.name
+                    ))
+                })?;
                 Some(serde_json::to_string(&serde_json::json!({
                     "name": name,
                     "paths": paths,
@@ -2324,6 +2339,23 @@ fn validate_execution_semantics(config: &CiConfig) -> Result<()> {
             // the file would otherwise be discovered by a green job whose
             // artifact silently never appeared, which is the one failure a
             // pipeline cannot report.
+            // A name that is a template is checked once it is rendered for
+            // each variant, in `create_variant_jobs`; the paths are checked
+            // here either way.
+            let templated = job
+                .action_templates
+                .as_ref()
+                .is_some_and(|templates| templates.artifact_name.is_some());
+            let literal_name;
+            let artifacts = if templated {
+                literal_name = config::ArtifactsConfig {
+                    name: Some("artifact".to_owned()),
+                    paths: artifacts.paths.clone(),
+                };
+                &literal_name
+            } else {
+                artifacts
+            };
             if let Err(error) = artifact_spec(name, artifacts) {
                 return Err(rg_core::error::invalid_request(format!(
                     "job '{name}' has an unusable artifacts block: {error}"
@@ -2419,11 +2451,7 @@ fn job_condition_context(
         ("github.ref".into(), ref_name.to_string()),
         (
             "github.ref_name".into(),
-            ref_name
-                .strip_prefix("refs/heads/")
-                .or_else(|| ref_name.strip_prefix("refs/tags/"))
-                .unwrap_or(ref_name)
-                .to_string(),
+            condition::ref_name_short(ref_name).to_string(),
         ),
         ("github.event_name".into(), event.to_string()),
         ("github.sha".into(), sha.to_string()),
@@ -2466,6 +2494,8 @@ struct ResolvedActionJobFields {
     image: Option<String>,
     tags: Option<Vec<String>>,
     environment: Option<String>,
+    /// The rendered `actions/upload-artifact` name, when it was a template.
+    artifact_name: Option<String>,
 }
 
 struct ActionTemplateContext<'value, 'repo> {
@@ -2482,6 +2512,9 @@ fn action_expression_value(
 ) -> Option<String> {
     match expression {
         config::ActionExpression::GithubRef => Some(context.ref_name.to_owned()),
+        config::ActionExpression::GithubRefName => {
+            Some(condition::ref_name_short(context.ref_name).to_owned())
+        }
         config::ActionExpression::GithubSha => Some(context.sha.to_owned()),
         config::ActionExpression::GithubEventName => Some(context.event.to_owned()),
         config::ActionExpression::GithubRepository => Some(format!(
@@ -2538,6 +2571,7 @@ fn resolve_action_job_fields(
             image: config.image.clone(),
             tags: config.tags.clone(),
             environment: config.environment.clone(),
+            artifact_name: None,
         });
     };
     let context = ActionTemplateContext {
@@ -2580,10 +2614,17 @@ fn resolve_action_job_fields(
         )));
     }
 
+    let artifact_name = templates
+        .artifact_name
+        .as_ref()
+        .map(|template| render_action_template(job_name, "artifact name", template, &context))
+        .transpose()?;
+
     Ok(ResolvedActionJobFields {
         image,
         tags,
         environment,
+        artifact_name,
     })
 }
 
@@ -12309,6 +12350,157 @@ jobs:
             assert_eq!(jobs["build/into-main"].status, into_main, "{event:?}");
             let rows = step_rows(&db, jobs["build/from-feature"].id).await;
             assert_eq!(rows[0].1, from_feature, "{event:?}: {rows:?}");
+        }
+    }
+
+    /// card_a93f0cb6c158: `github.ref_name` in a `run:` and in a step's `if:`
+    /// — a branch and a tag by their short name, a pull request's ref as it
+    /// is, the same answer in both.
+    const REF_NAME: &str = "on: [push, pull_request]\njobs:\n  print:\n    steps:\n      - run: echo \"ref-name=[${{ github.ref_name }}]\"\n      - if: github.ref_name == 'v1.2'\n        run: echo tagged\n";
+
+    #[tokio::test]
+    async fn github_ref_name_is_the_short_ref_in_run_and_if() {
+        for (event, printed, tagged) in [
+            (TestEvent::on("push", None), "ref-name=[main]", "skipped"),
+            (
+                TestEvent {
+                    ref_name: "refs/tags/v1.2",
+                    ..TestEvent::on("push", None)
+                },
+                "ref-name=[v1.2]",
+                "success",
+            ),
+            (
+                TestEvent::pull_request("feature", "main"),
+                "ref-name=[refs/pull/1/head]",
+                "skipped",
+            ),
+        ] {
+            let (jobs, pipeline, db, _temp) =
+                run_workflows_for(&[("build.yml", REF_NAME)], event).await;
+            assert_eq!(pipeline.status, "success", "{event:?}: {jobs:?}");
+            let log = jobs["build/print"].log.clone().unwrap_or_default();
+            assert!(log.contains(printed), "{event:?}: {log}");
+            let rows = step_rows(&db, jobs["build/print"].id).await;
+            assert_eq!(rows[1].1, tagged, "{event:?}: {rows:?}");
+        }
+    }
+
+    /// The job fields resolved before a runner starts read it too.
+    #[tokio::test]
+    async fn github_ref_name_names_a_job_field() {
+        let workflow = "on: push\njobs:\n  ship:\n    runs-on: pool-${{ github.ref_name }}\n    steps:\n      - run: echo ship\n";
+        let (db, pipeline_id, _, _temp) = publish_pipeline_on(workflow, &[], "push", None)
+            .await
+            .expect("the workflow publishes a pipeline");
+        let jobs = rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&db, pipeline_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            jobs[0].tags.as_deref(),
+            Some(r#"["pool-main"]"#),
+            "{jobs:?}"
+        );
+    }
+
+    /// The `actions/upload-artifact` name each job of the pipeline `workflow`
+    /// publishes on a push stores, by job — or the refusal.
+    async fn artifact_names_of(
+        workflow: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        let (db, pipeline_id, _, _temp) = publish_pipeline_on(workflow, &[], "push", None).await?;
+        Ok(
+            rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&db, pipeline_id)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|job| {
+                    let artifacts: serde_json::Value =
+                        serde_json::from_str(job.artifacts.as_deref().expect("an artifact"))
+                            .unwrap();
+                    (job.name, artifacts["name"].as_str().unwrap().to_owned())
+                })
+                .collect(),
+        )
+    }
+
+    const UPLOAD: &str = "on: push\nenv:\n  ART: bundle\njobs:\n  build:\nSTRATEGY    steps:\n      - run: echo\n      - uses: actions/upload-artifact@v4\n        with:\n          name: NAME\n          path: dist\n";
+
+    /// card_5bb39c78906d: the name of a job's artifact is rendered per matrix
+    /// variant, as `runs-on` is, so a matrix publishes one artifact per
+    /// variant; `github.*` and `env.*` read as they did; a literal name is
+    /// unchanged.
+    #[tokio::test]
+    async fn an_artifact_name_reads_the_matrix_variant_and_github_context() {
+        let matrix = "    strategy:\n      matrix:\n        os: [linux, mac]\n";
+        for (strategy, name, expected) in [
+            (
+                matrix,
+                "dist-${{ matrix.os }}",
+                &[
+                    ("build/build [os=linux]", "dist-linux"),
+                    ("build/build [os=mac]", "dist-mac"),
+                ][..],
+            ),
+            (
+                "",
+                "${{ env.ART }}-${{ github.ref_name }}",
+                &[("build/build", "bundle-main")][..],
+            ),
+            ("", "plain", &[("build/build", "plain")][..]),
+            // No `name:` at all is GitHub's `artifact`, not the job's
+            // `build/build`, which no artifact may be called.
+            ("", "", &[("build/build", "artifact")][..]),
+        ] {
+            let workflow = UPLOAD.replace("STRATEGY", strategy);
+            let workflow = if name.is_empty() {
+                workflow.replace("          name: NAME\n", "")
+            } else {
+                workflow.replace("NAME", name)
+            };
+            let names = artifact_names_of(&workflow)
+                .await
+                .unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            let expected = expected
+                .iter()
+                .map(|(job, artifact)| ((*job).to_owned(), (*artifact).to_owned()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            assert_eq!(names, expected, "{name}");
+        }
+    }
+
+    /// A name this engine has no value for is refused by field and
+    /// expression, not by the characters of `${{` it would otherwise have been
+    /// stored under; a rendered name the store cannot keep names the job.
+    #[tokio::test]
+    async fn an_artifact_name_refuses_an_unknown_expression_or_an_unusable_value() {
+        for (name, expected) in [
+            (
+                "art-${{ github.actor }}",
+                "build: step 2 with.name expression `github.actor`",
+            ),
+            (
+                "art-${{ secrets.TOKEN }}",
+                "build: step 2 with.name expression `secrets.TOKEN`",
+            ),
+            (
+                "art-${{ github.ref }}",
+                "job 'build/build' has an unusable artifacts block: artifact name \
+                 'art-refs/heads/main'",
+            ),
+        ] {
+            let workflow = UPLOAD.replace("STRATEGY", "").replace("NAME", name);
+            let error = artifact_names_of(&workflow)
+                .await
+                .expect_err("the artifact name must be refused");
+            let message = format!("{error:#}");
+            assert!(message.contains(expected), "{name}: {message}");
+            assert!(
+                error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "the workflow's mistake, not the server's: {message}"
+            );
         }
     }
 

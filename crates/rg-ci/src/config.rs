@@ -205,11 +205,19 @@ pub(crate) struct ActionJobTemplates {
     pub(crate) image: Option<ActionTemplate>,
     pub(crate) tags: Option<Vec<ActionTemplate>>,
     pub(crate) environment: Option<ActionTemplate>,
+    /// `actions/upload-artifact`'s `name:`, e.g. `dist-${{ matrix.os }}`.
+    /// Absent from a deferred matrix job stored before it existed, which reads
+    /// back as `None`: that job's name was a literal.
+    #[serde(default)]
+    pub(crate) artifact_name: Option<ActionTemplate>,
 }
 
 impl ActionJobTemplates {
     pub(crate) fn is_empty(&self) -> bool {
-        self.image.is_none() && self.tags.is_none() && self.environment.is_none()
+        self.image.is_none()
+            && self.tags.is_none()
+            && self.environment.is_none()
+            && self.artifact_name.is_none()
     }
 }
 
@@ -266,6 +274,7 @@ pub(crate) enum ActionTemplatePart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum ActionExpression {
     GithubRef,
+    GithubRefName,
     GithubSha,
     GithubEventName,
     GithubRepository,
@@ -281,6 +290,7 @@ impl ActionExpression {
     pub(crate) fn source_name(&self) -> String {
         match self {
             Self::GithubRef => "github.ref".into(),
+            Self::GithubRefName => "github.ref_name".into(),
             Self::GithubSha => "github.sha".into(),
             Self::GithubEventName => "github.event_name".into(),
             Self::GithubRepository => "github.repository".into(),
@@ -930,7 +940,13 @@ pub struct CacheConfig {
     /// Built-in defaults of this engine that no row of `docs/ci.md` states,
     /// each with the reason. The list exists so the next unpaired default is a
     /// decision someone wrote down rather than one that slipped past the census.
-    const DEFAULTS_NOT_IN_THE_CI_DOCUMENT: [(&str, &str); 5] = [
+    const DEFAULTS_NOT_IN_THE_CI_DOCUMENT: [(&str, &str); 6] = [
+        (
+            "DEFAULT_ARTIFACT_NAME",
+            "what an Actions `actions/upload-artifact` step without `name:` publishes under, \
+             stated in docs/gitea-actions.md; a `.plombir-git-ci.yml` artifact still defaults \
+             to its job's name",
+        ),
         (
             "DEFAULT_CI_TOKEN_SCOPES",
             "the scopes the engine mints `CI_JOB_TOKEN` with; `.plombir-git-ci.yml` has no key \
