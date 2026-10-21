@@ -73,20 +73,26 @@ pub async fn ready_deferred_jobs(
         .all(db)
         .await
         .context("db: find deferred matrix jobs")?;
-    if placeholders.is_empty() {
-        return Ok(placeholders);
+    in_reached_stages(db, placeholders).await
+}
+
+/// The jobs of `jobs` whose stage was reached: every stage before theirs
+/// succeeded.
+pub(crate) async fn in_reached_stages(
+    db: &DatabaseConnection,
+    jobs: Vec<pipeline_job::Model>,
+) -> Result<Vec<pipeline_job::Model>> {
+    if jobs.is_empty() {
+        return Ok(jobs);
     }
-    let mut stage_ids = placeholders
-        .iter()
-        .map(|job| job.stage_id)
-        .collect::<Vec<_>>();
+    let mut stage_ids = jobs.iter().map(|job| job.stage_id).collect::<Vec<_>>();
     stage_ids.sort_unstable();
     stage_ids.dedup();
     let stages = pipeline_stage::Entity::find()
         .filter(pipeline_stage::Column::Id.is_in(stage_ids))
         .all(db)
         .await
-        .context("db: load stages of deferred matrix jobs")?;
+        .context("db: load stages of held jobs")?;
     let mut pipeline_ids = stages
         .iter()
         .map(|stage| stage.pipeline_id)
@@ -97,8 +103,8 @@ pub async fn ready_deferred_jobs(
         .filter(pipeline_stage::Column::PipelineId.is_in(pipeline_ids))
         .all(db)
         .await
-        .context("db: load stages of deferred matrix pipelines")?;
-    Ok(placeholders
+        .context("db: load stages of held jobs' pipelines")?;
+    Ok(jobs
         .into_iter()
         .filter(|job| {
             stages

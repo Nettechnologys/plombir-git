@@ -40,6 +40,7 @@ pub mod package_registry_ops;
 pub mod package_version_ops;
 pub mod passkey_credential_ops;
 pub mod password_reset_token_ops;
+pub mod pipeline_condition_ops;
 pub mod pipeline_matrix_ops;
 pub mod pipeline_ops;
 pub mod pipeline_step_ops;

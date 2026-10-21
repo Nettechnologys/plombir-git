@@ -351,6 +351,20 @@ impl rg_core::ci::CiTrigger for CiEngine {
         Box::pin(expand_deferred_matrix(db, placeholder))
     }
 
+    fn decide_deferred_condition<'a>(
+        &'a self,
+        db: &'a sea_orm::DatabaseConnection,
+        job: &'a rg_db::entities::pipeline_job::Model,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<rg_db::entities::pipeline::Model>>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(decide_deferred_condition(db, job))
+    }
+
     fn trigger_pipeline<'a>(
         &'a self,
         params: rg_core::ci::TriggerPipelineParams<'a>,
@@ -1384,23 +1398,50 @@ async fn create_variant_jobs(
             )),
             None => None,
         };
-        let should_run = if let Some(condition) = job_config.condition.as_deref() {
-            condition::evaluate_condition(
-                condition,
-                &job_condition_context(
-                    ref_name,
-                    trigger_type,
-                    commit_sha,
-                    repository,
-                    schedule_cron,
-                    &variant.variables,
-                    &variant.coordinates,
-                ),
-            )?
-        } else {
-            true
+        let condition_context = || {
+            job_condition_context(
+                ref_name,
+                trigger_type,
+                commit_sha,
+                repository,
+                schedule_cron,
+                &variant.variables,
+                &variant.coordinates,
+            )
         };
-        if !should_run {
+        // A condition that reads what a needed job left has no answer yet;
+        // any other is answered now, as it always was.
+        let deferred_condition = job_config
+            .condition
+            .as_deref()
+            .filter(|condition| condition::reads_needs(condition));
+        let should_run = match job_config.condition.as_deref() {
+            Some(condition) if deferred_condition.is_none() => {
+                condition::evaluate_condition(condition, &condition_context())?
+            }
+            _ => true,
+        };
+        let needs = job_needs(job_config);
+        if should_run && !needs.is_empty() {
+            // Held until its stage is reached: then it runs, or is skipped
+            // because its condition is false or a job it needs was skipped.
+            // Its environment is attached only if it runs, so a job that is
+            // skipped never asks anyone for an approval.
+            let held = HeldJob {
+                condition: deferred_condition.map(str::to_owned),
+                needs,
+                context: deferred_condition
+                    .map(|_| condition_context().into_iter().collect())
+                    .unwrap_or_default(),
+                environment: environment.as_ref().map(|(name, _)| (*name).to_owned()),
+            };
+            rg_db::ops::pipeline_condition_ops::set_deferred_condition(
+                tx,
+                job.id,
+                &serde_json::to_string(&held).context("serialize a held job")?,
+            )
+            .await?;
+        } else if !should_run {
             let now = chrono::Utc::now().naive_utc();
             rg_db::ops::pipeline_ops::update_job_result(
                 tx,
@@ -1542,6 +1583,18 @@ pub async fn expand_deferred_matrix(
         .map(|context| context.needs.clone())
         .unwrap_or_default();
     let needed = rg_db::ops::pipeline_step_ops::needs_context(db, pipeline.id, &needs).await?;
+    // A matrix job whose needed job was skipped is skipped whole: its matrix
+    // would be read from outputs nobody wrote.
+    if let Some(alias) = skipped_need(&needs, &needed) {
+        let log = format!("Skipped: `{alias}`, a job this one needs, was skipped.\n");
+        return rg_db::ops::pipeline_condition_ops::settle_held_job(
+            db,
+            placeholder,
+            "skipped",
+            &log,
+        )
+        .await;
+    }
     let combinations = spec
         .resolve(|reference| {
             needed
@@ -1600,6 +1653,131 @@ async fn fail_deferred_matrix(
     }
     let log = format!("The matrix could not be expanded: {reason:#}\n");
     rg_db::ops::pipeline_matrix_ops::fail_deferred_job(db, placeholder, &log).await
+}
+
+/// The `needs:` of a job of steps: alias in its expressions → job name in the
+/// pipeline. Empty for a native job and for one that needs nothing.
+fn job_needs(job_config: &config::JobConfig) -> std::collections::BTreeMap<String, String> {
+    job_config
+        .job_context
+        .as_ref()
+        .map(|context| context.needs.clone())
+        .unwrap_or_default()
+}
+
+/// What decides whether a job that lists `needs:` runs, once they have
+/// finished: written on its row with the graph, read by
+/// [`decide_deferred_condition`].
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeldJob {
+    /// The job's `if:` when it reads what a needed job left; `None` when it
+    /// has none, or one already answered when the graph was written.
+    condition: Option<String>,
+    needs: std::collections::BTreeMap<String, String>,
+    /// What `condition` reads besides `needs.*` — `github.*`, `env.*`,
+    /// `matrix.*` — as they were for this job when the graph was written.
+    context: std::collections::BTreeMap<String, String>,
+    /// The environment the job names, attached only once it may run.
+    environment: Option<String>,
+}
+
+/// The first job of `needs` that was skipped, by the alias the job reads it
+/// under. A job whose needed job was skipped is skipped too, as on GitHub,
+/// where only a status function (which a job condition here cannot name) would
+/// run it anyway.
+fn skipped_need(
+    needs: &std::collections::BTreeMap<String, String>,
+    needed: &std::collections::BTreeMap<String, rg_db::ops::pipeline_step_ops::NeededJob>,
+) -> Option<String> {
+    needs
+        .keys()
+        .find(|alias| {
+            needed
+                .get(*alias)
+                .is_some_and(|job| job.result == "skipped")
+        })
+        .cloned()
+}
+
+/// Decide a job held until the jobs it needs have finished, now that its stage
+/// is reached: skip it when one of them was skipped or its `if:` is false, and
+/// otherwise release it to run, attaching its environment.
+///
+/// A condition with no answer, or an environment that is gone, is the
+/// workflow's to fix: the job fails with the reason in its log, rather than the
+/// error surfacing as this server's and the job staying held for good. A job
+/// another caller already decided is left alone. `Some(pipeline)` when the job's
+/// verdict finished the pipeline, for the caller's completion hooks.
+pub async fn decide_deferred_condition(
+    db: &sea_orm::DatabaseConnection,
+    job: &rg_db::entities::pipeline_job::Model,
+) -> Result<Option<rg_db::entities::pipeline::Model>> {
+    use rg_db::ops::pipeline_condition_ops;
+    let Some(stored) = job.deferred_condition.as_deref() else {
+        return Ok(None);
+    };
+    let held: HeldJob =
+        serde_json::from_str(stored).context("a held job's stored form is unreadable")?;
+    let stage = rg_db::ops::pipeline_ops::get_stage_by_id(db, job.stage_id)
+        .await?
+        .with_context(|| format!("stage {} of a held job is gone", job.stage_id))?;
+    let pipeline = rg_db::ops::pipeline_ops::get_pipeline(db, stage.pipeline_id)
+        .await?
+        .with_context(|| format!("pipeline {} of a held job is gone", stage.pipeline_id))?;
+    let needed = rg_db::ops::pipeline_step_ops::needs_context(db, pipeline.id, &held.needs).await?;
+    if let Some(alias) = skipped_need(&held.needs, &needed) {
+        let log = format!("Skipped: `{alias}`, a job this one needs, was skipped.\n");
+        return pipeline_condition_ops::settle_held_job(db, job, "skipped", &log).await;
+    }
+    if let Some(condition) = held.condition.as_deref() {
+        let mut context = held
+            .context
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        for (alias, needed_job) in &needed {
+            context.insert(format!("needs.{alias}.result"), needed_job.result.clone());
+            for (name, value) in &needed_job.outputs {
+                context.insert(format!("needs.{alias}.outputs.{name}"), value.clone());
+            }
+        }
+        match condition::evaluate_condition(condition, &context) {
+            Ok(true) => {}
+            Ok(false) => {
+                let log = format!("Skipped: `if: {condition}` is false.\n");
+                return pipeline_condition_ops::settle_held_job(db, job, "skipped", &log).await;
+            }
+            Err(error) => {
+                let log = format!("`if: {condition}` could not be evaluated: {error:#}\n");
+                return pipeline_condition_ops::settle_held_job(db, job, "failed", &log).await;
+            }
+        }
+    }
+    let environment = held.environment.as_deref();
+    let released = pipeline_condition_ops::release_deferred_job(db, job, |tx| async move {
+        let attached = async {
+            if let Some(name) = environment {
+                let found = resolve_job_environment(&tx, pipeline.repo_id, &job.name, name).await?;
+                rg_db::ops::ci_environment_ops::attach_job(&tx, job.id, Some(&found), name).await?;
+            }
+            Ok(())
+        }
+        .await;
+        (tx, attached)
+    })
+    .await;
+    match released {
+        Ok(_) => Ok(None),
+        Err(error)
+            if error
+                .downcast_ref::<rg_core::error::InvalidRequest>()
+                .is_some() =>
+        {
+            let log = format!("The job could not be started: {error:#}\n");
+            pipeline_condition_ops::settle_held_job(db, job, "failed", &log).await
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Resolve the environment a job names, refusing a name this repository has no
@@ -2057,7 +2235,14 @@ fn validate_execution_semantics(config: &CiConfig) -> Result<()> {
             // is the half that says what to fix, so it is folded into the
             // message rather than left as a `.context(...)` source the
             // client-facing render would drop.
-            if let Err(error) = crate::condition::validate_condition(condition) {
+            // A job that needs others is decided once they have finished,
+            // and may read what they left (see `hold_job`).
+            let validated = if job_needs(job).is_empty() {
+                crate::condition::validate_condition(condition)
+            } else {
+                crate::condition::validate_job_condition(condition)
+            };
+            if let Err(error) = validated {
                 return Err(rg_core::error::invalid_request(format!(
                     "job '{name}' has an unsupported if condition: {error:#}"
                 )));
@@ -11189,6 +11374,15 @@ mod step_model_tests {
     async fn publish_pipeline(
         workflow: &str,
     ) -> (rg_db::DatabaseConnection, i64, i64, tempfile::TempDir) {
+        publish_pipeline_with_environments(workflow, &[]).await
+    }
+
+    /// [`publish_pipeline`] in a repository that has these environments —
+    /// `(name, protected)` — before the workflow is read.
+    async fn publish_pipeline_with_environments(
+        workflow: &str,
+        environments: &[(&str, bool)],
+    ) -> (rg_db::DatabaseConnection, i64, i64, tempfile::TempDir) {
         let temp = tempfile::tempdir().unwrap();
         let repo_path = temp.path().join("step-owner/steps");
         std::fs::create_dir_all(repo_path.join(".gitea/workflows")).unwrap();
@@ -11252,6 +11446,24 @@ mod step_model_tests {
         )
         .await
         .unwrap();
+        for (name, protected) in environments {
+            rg_db::ops::ci_environment_ops::create_with_approvers(
+                &db,
+                rg_db::entities::ci_environment::ActiveModel {
+                    id: NotSet,
+                    repo_id: Set(repo.id),
+                    name: Set((*name).to_string()),
+                    protected: Set(*protected),
+                    required_approvals: Set(1),
+                    allowed_approver_ids: Set(None),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        }
         let pipeline_id = trigger_pipeline(
             TriggerPipelineParams {
                 db: &db,
@@ -11409,6 +11621,247 @@ mod step_model_tests {
         assert_eq!(rows[2].1, "skipped", "{rows:?}");
     }
 
+    /// card_8a48a54066a7's acceptance, through the embedded runner: the
+    /// paths-filter pattern. A job's `if:` reads what the job it needs left —
+    /// an output, or its result — once that job has finished; a false one
+    /// skips the job, and the job that needs the skipped one is skipped too,
+    /// as on GitHub. Nothing of that fails the pipeline.
+    #[tokio::test]
+    async fn a_job_condition_reads_what_a_needed_job_left() {
+        let (db, jobs, _temp) = run_pipeline_jobs(
+            r#"on: push
+jobs:
+  changes:
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - id: filter
+        run: |
+          echo backend=true >> "$GITHUB_OUTPUT"
+          echo frontend=false >> "$GITHUB_OUTPUT"
+  backend:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    steps:
+      - run: echo backend
+  frontend:
+    needs: changes
+    if: ${{ needs.changes.outputs.frontend == 'true' }}
+    steps:
+      - run: echo frontend
+  frontend-e2e:
+    needs: frontend
+    steps:
+      - run: echo e2e
+  report:
+    needs: [changes, backend]
+    if: needs.changes.result == 'success' && needs.backend.result == 'success'
+    steps:
+      - run: echo report
+"#,
+        )
+        .await;
+        for (name, status) in [
+            ("build/changes", "success"),
+            ("build/backend", "success"),
+            ("build/frontend", "skipped"),
+            ("build/frontend-e2e", "skipped"),
+            ("build/report", "success"),
+        ] {
+            assert_eq!(jobs[name].status, status, "{name}: {:?}", jobs[name].log);
+            assert!(
+                jobs[name].deferred_condition.is_none(),
+                "{name}: a decided job holds nothing"
+            );
+        }
+        assert!(
+            jobs["build/frontend"].log.as_deref().is_some_and(|log| log
+                .contains("needs.changes.outputs.frontend == 'true'")
+                && log.contains("is false")),
+            "{:?}",
+            jobs["build/frontend"].log
+        );
+        assert!(
+            jobs["build/frontend-e2e"]
+                .log
+                .as_deref()
+                .is_some_and(|log| log.contains("`frontend`, a job this one needs, was skipped")),
+            "{:?}",
+            jobs["build/frontend-e2e"].log
+        );
+        let stage = rg_db::ops::pipeline_ops::get_stage_by_id(&db, jobs["build/changes"].stage_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&db, stage.pipeline_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pipeline.status, "success");
+    }
+
+    /// A job skipped by an `if:` answered when the graph was written skips
+    /// the job that needs it. It used to run it: a skipped job does not fail
+    /// its stage, and the next stage was reached as if it had succeeded.
+    #[tokio::test]
+    async fn a_job_that_needs_a_skipped_job_is_skipped() {
+        let (_db, jobs, _temp) = run_pipeline_jobs(
+            "on: push\njobs:\n  release:\n    if: github.ref == 'refs/heads/release'\n    steps:\n      - run: echo release\n  announce:\n    needs: release\n    steps:\n      - run: echo announce\n  lint:\n    steps:\n      - run: echo lint\n  after-lint:\n    needs: lint\n    steps:\n      - run: echo after\n",
+        )
+        .await;
+        assert_eq!(jobs["build/release"].status, "skipped");
+        assert_eq!(
+            jobs["build/announce"].status, "skipped",
+            "{:?}",
+            jobs["build/announce"].log
+        );
+        assert_eq!(jobs["build/after-lint"].status, "success");
+    }
+
+    /// A matrix read from the outputs of a job that was skipped is not
+    /// expanded from outputs nobody wrote, and does not fail: the matrix job
+    /// is skipped whole.
+    #[tokio::test]
+    async fn a_matrix_whose_needed_job_was_skipped_is_skipped() {
+        let (_db, jobs, _temp) = run_pipeline_jobs(
+            "on: push\njobs:\n  setup:\n    if: github.ref == 'refs/heads/release'\n    outputs:\n      os: ${{ steps.list.outputs.os }}\n    steps:\n      - id: list\n        run: echo 'os=[\"linux\"]' >> \"$GITHUB_OUTPUT\"\n  test:\n    needs: setup\n    strategy:\n      matrix:\n        os: ${{ fromJSON(needs.setup.outputs.os) }}\n    steps:\n      - run: echo test\n",
+        )
+        .await;
+        let test = &jobs["build/test"];
+        assert_eq!(test.status, "skipped", "{:?}", test.log);
+        assert!(test.deferred_matrix.is_none());
+        assert!(test
+            .log
+            .as_deref()
+            .is_some_and(|log| log.contains("`setup`, a job this one needs, was skipped")));
+    }
+
+    /// The external-runner path: a job that needs another is never handed out
+    /// before it is decided, and its environment — which may stop it for an
+    /// approval — is attached only when it is to run, so a job its `if:`
+    /// skips never asks anyone to approve it.
+    #[tokio::test]
+    async fn the_engine_decides_a_held_job_for_a_polling_runner() {
+        let (db, pipeline_id, repo_id, _temp) = publish_pipeline_with_environments(
+            "on: push\njobs:\n  changes:\n    outputs:\n      deploy: ${{ steps.f.outputs.deploy }}\n    steps:\n      - id: f\n        run: echo deploy=yes >> \"$GITHUB_OUTPUT\"\n  deploy:\n    needs: changes\n    if: needs.changes.outputs.deploy == 'yes'\n    environment: production\n    steps:\n      - run: echo deploy\n  preview:\n    needs: changes\n    if: needs.changes.outputs.deploy == 'no'\n    environment: staging\n    steps:\n      - run: echo preview\n",
+            &[("production", true), ("staging", false)],
+        )
+        .await;
+        let jobs = rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&db, pipeline_id)
+            .await
+            .unwrap();
+        let named = |name: &str| jobs.iter().find(|job| job.name == name).unwrap().clone();
+        let (changes, deploy, preview) = (
+            named("build/changes"),
+            named("build/deploy"),
+            named("build/preview"),
+        );
+        for held in [&deploy, &preview] {
+            assert_eq!(held.status, "pending");
+            assert!(held.deferred_condition.is_some(), "{held:?}");
+            assert_eq!(held.environment_name, None, "not attached before it runs");
+        }
+        let picked = rg_db::ops::pipeline_ops::find_pending_job_for_runner(&db, repo_id, &[], true)
+            .await
+            .unwrap();
+        let rg_db::ops::pipeline_ops::PendingPick::Job(picked) = picked else {
+            panic!("changes is there to hand out: {picked:?}");
+        };
+        assert_eq!(picked.id, changes.id);
+        assert!(
+            rg_db::ops::pipeline_condition_ops::ready_deferred_conditions(&db, repo_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "changes has not run"
+        );
+        assert!(
+            !rg_db::ops::pipeline_ops::assign_job(&db, deploy.id, 1)
+                .await
+                .unwrap(),
+            "a held job cannot be claimed, even by id"
+        );
+
+        assert!(
+            rg_db::ops::pipeline_ops::start_job_if_active(&db, changes.id, None)
+                .await
+                .unwrap()
+        );
+        assert!(rg_db::ops::pipeline_step_ops::record_job_outputs(
+            &db,
+            changes.id,
+            r#"{"deploy":"yes"}"#
+        )
+        .await
+        .unwrap());
+        rg_db::ops::pipeline_ops::finish_embedded_job(
+            &db,
+            pipeline_id,
+            changes.stage_id,
+            changes.id,
+            "success",
+            Some(0),
+            None,
+            Some(chrono::Utc::now().naive_utc()),
+        )
+        .await
+        .unwrap();
+
+        // The stage is reached, and still nothing is handed out before the
+        // held jobs are decided.
+        assert!(matches!(
+            rg_db::ops::pipeline_ops::find_pending_job_for_runner(&db, repo_id, &[], true)
+                .await
+                .unwrap(),
+            rg_db::ops::pipeline_ops::PendingPick::Nothing
+        ));
+        let ready = rg_db::ops::pipeline_condition_ops::ready_deferred_conditions(&db, repo_id)
+            .await
+            .unwrap();
+        let mut ready_ids = ready.iter().map(|job| job.id).collect::<Vec<_>>();
+        ready_ids.sort_unstable();
+        let mut held_ids = vec![deploy.id, preview.id];
+        held_ids.sort_unstable();
+        assert_eq!(ready_ids, held_ids);
+        for held in &ready {
+            assert!(
+                rg_core::ci::CiTrigger::decide_deferred_condition(&CiEngine::new(), &db, held)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let reread = |id: i64| {
+            let db = db.clone();
+            async move {
+                rg_db::ops::pipeline_ops::get_job(&db, id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        let deploy = reread(deploy.id).await;
+        assert_eq!(deploy.status, "waiting_approval", "{deploy:?}");
+        assert_eq!(deploy.environment_name.as_deref(), Some("production"));
+        assert!(deploy.deferred_condition.is_none());
+        let preview = reread(preview.id).await;
+        assert_eq!(preview.status, "skipped", "{preview:?}");
+        assert_eq!(
+            preview.environment_name, None,
+            "a skipped job asks for no environment"
+        );
+
+        // Deciding again changes nothing.
+        for held in &ready {
+            rg_core::ci::CiTrigger::decide_deferred_condition(&CiEngine::new(), &db, held)
+                .await
+                .unwrap();
+        }
+        assert_eq!(reread(deploy.id).await.status, "waiting_approval");
+        assert_eq!(reread(preview.id).await.status, "skipped");
+    }
+
     async fn step_log(db: &rg_db::DatabaseConnection, job_id: i64, number: i32) -> String {
         rg_db::ops::pipeline_step_ops::find_job_step(db, job_id, number)
             .await
@@ -11542,6 +11995,33 @@ mod step_model_tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("build/setup"));
+        }
+        // A variant needs `setup` like its job did, so it is held until the
+        // poll decides it, which the poll does right after expanding.
+        assert!(
+            variants
+                .iter()
+                .all(|variant| variant.deferred_condition.is_some()),
+            "{variants:?}"
+        );
+        assert!(matches!(
+            rg_db::ops::pipeline_ops::find_pending_job_for_runner(&db, repo_id, &[], true)
+                .await
+                .unwrap(),
+            rg_db::ops::pipeline_ops::PendingPick::Nothing
+        ));
+        for held in rg_db::ops::pipeline_condition_ops::ready_deferred_conditions(&db, repo_id)
+            .await
+            .unwrap()
+        {
+            assert!(rg_core::ci::CiTrigger::decide_deferred_condition(
+                &CiEngine::new(),
+                &db,
+                &held
+            )
+            .await
+            .unwrap()
+            .is_none());
         }
         let picked = rg_db::ops::pipeline_ops::find_pending_job_for_runner(&db, repo_id, &[], true)
             .await
@@ -11919,6 +12399,92 @@ mod composite_action_tests {
         assert_eq!(status, "success", "{log}");
         assert!(log.contains("caller read <Hello world>"), "{log}");
         assert!(log.contains("from this repository"), "{log}");
+    }
+
+    const SCRIPTS: &str = "name: Scripts\ninputs:\n  who:\n    required: true\nruns:\n  using: composite\n  steps:\n    - shell: sh\n      run: sh ${{ github.action_path }}/hello.sh \"${{ inputs.who }}\"\n    - shell: sh\n      working-directory: ${{ github.action_path }}/data\n      env:\n        GREETING_FILE: ${{ github.action_path }}/data/greeting.txt\n      run: echo \"dir=$(basename \"$PWD\") file=$(cat \"$GREETING_FILE\") direct=$(cat \"$GITHUB_ACTION_PATH/data/greeting.txt\")\"\n";
+
+    const SCRIPTS_CALLER: &str = "on: push\njobs:\n  build:\n    steps:\n      - uses: USES\n        with:\n          who: world\n";
+
+    /// card_3e5298bfab47's acceptance on the embedded runner: a composite
+    /// action that runs a script from its own directory — `${{
+    /// github.action_path }}` in `run:`, `working-directory` and `env:`, and
+    /// `$GITHUB_ACTION_PATH` — runs it from this instance and from `./path`.
+    #[tokio::test]
+    async fn a_composite_action_runs_the_scripts_beside_its_action_yml() {
+        let files = [
+            ("action.yml", SCRIPTS),
+            ("hello.sh", "echo \"script says hello, $1\"\n"),
+            ("data/greeting.txt", "hi-from-the-action\n"),
+        ];
+        let fixture = fixture(&SCRIPTS_CALLER.replace("USES", "tools/greet@v1")).await;
+        let action = fixture.temp.path().join("tools/greet.git");
+        std::fs::remove_dir_all(&action).unwrap();
+        bare_with(&action, &files);
+        let pipeline_id = trigger(&fixture, actions::ActionsPolicy::default())
+            .await
+            .expect("a composite action reading its own directory loads");
+        let jobs = rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&fixture.db, pipeline_id)
+            .await
+            .unwrap();
+        let steps = jobs[0].steps.as_deref().unwrap_or_default();
+        assert!(
+            steps.contains("\"using\":\"composite\"") && steps.contains("${GITHUB_ACTION_PATH}"),
+            "{steps}"
+        );
+        let (status, log) = run_log(&fixture, pipeline_id).await;
+        assert_eq!(status, "success", "{log}");
+        assert!(log.contains("script says hello, world"), "{log}");
+        assert!(
+            log.contains("dir=data file=hi-from-the-action direct=hi-from-the-action"),
+            "{log}"
+        );
+
+        let workflow = SCRIPTS_CALLER.replace("USES", "./.gitea/actions/scripts");
+        let fixture = self::fixture(&workflow).await;
+        std::fs::remove_dir_all(&fixture.repo_path).unwrap();
+        let mut local = vec![(".gitea/workflows/build.yml", workflow.as_str())];
+        let placed = files
+            .iter()
+            .map(|(path, body)| (format!(".gitea/actions/scripts/{path}"), *body))
+            .collect::<Vec<_>>();
+        local.extend(placed.iter().map(|(path, body)| (path.as_str(), *body)));
+        let sha = bare_with(&fixture.repo_path, &local);
+        let fixture = Fixture { sha, ..fixture };
+        let pipeline_id = trigger(&fixture, actions::ActionsPolicy::default())
+            .await
+            .expect("a local composite action reading its own directory loads");
+        let (status, log) = run_log(&fixture, pipeline_id).await;
+        assert_eq!(status, "success", "{log}");
+        assert!(log.contains("script says hello, world"), "{log}");
+        assert!(log.contains("dir=data file=hi-from-the-action"), "{log}");
+    }
+
+    /// `github.action_path` is read whole in a step's `run:`, `env:` and
+    /// `working-directory`; anywhere else — an `if:`, the `with:` of an action
+    /// the action calls, part of a larger expression — it is refused by name.
+    #[tokio::test]
+    async fn github_action_path_outside_the_text_of_a_step_is_refused_by_name() {
+        for step in [
+            "    - shell: sh\n      if: github.action_path != ''\n      run: echo x\n",
+            "    - uses: tools/secret@v1\n      with:\n        who: ${{ github.action_path }}\n",
+            "    - shell: sh\n      run: echo ${{ github.action_path || 'x' }}\n",
+        ] {
+            let fixture = fixture(&SCRIPTS_CALLER.replace("USES", "tools/greet@v1")).await;
+            let action = fixture.temp.path().join("tools/greet.git");
+            std::fs::remove_dir_all(&action).unwrap();
+            let manifest = format!(
+                "name: Scripts\ninputs:\n  who:\n    required: true\nruns:\n  using: composite\n  steps:\n{step}"
+            );
+            bare_with(&action, &[("action.yml", manifest.as_str())]);
+            let error = trigger(&fixture, actions::ActionsPolicy::default())
+                .await
+                .expect_err("github.action_path outside a step's text is refused");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("reads github.action_path") && message.contains("nowhere else"),
+                "`{step}`: {message}"
+            );
+        }
     }
 
     /// A source the policy does not allow is refused by its name, before any

@@ -1489,12 +1489,17 @@ async fn first_pending_job(
 /// repository ever ran; `query_plan_tests` holds it to that.
 ///
 /// A placeholder for a matrix decided at run time is not among them: it is
-/// replaced by its variants, never run (see `pipeline_matrix_ops`).
+/// replaced by its variants, never run (see `pipeline_matrix_ops`). Nor is a
+/// job held until the jobs it needs have finished: it is released or skipped
+/// first (see `pipeline_condition_ops`).
 pub(crate) fn pending_jobs_query(repo_id: i64) -> Select<pipeline_job::Entity> {
-    active_pending_jobs_query(repo_id).filter(pipeline_job::Column::DeferredMatrix.is_null())
+    active_pending_jobs_query(repo_id)
+        .filter(pipeline_job::Column::DeferredMatrix.is_null())
+        .filter(pipeline_job::Column::DeferredCondition.is_null())
 }
 
-/// [`pending_jobs_query`] with the matrix placeholders still in it.
+/// [`pending_jobs_query`] with the matrix placeholders and held jobs still in
+/// it.
 pub(crate) fn active_pending_jobs_query(repo_id: i64) -> Select<pipeline_job::Entity> {
     pipeline_job::Entity::find()
         .join(
@@ -2058,6 +2063,10 @@ async fn claim_pending_job(
         .filter(pipeline_job::Column::Id.eq(job_id))
         .filter(pipeline_job::Column::Status.eq("pending"))
         .filter(pipeline_job::Column::RunnerId.is_null())
+        // A held job or a matrix placeholder is never anyone's to run, even
+        // through a candidate read before the hold was seen.
+        .filter(pipeline_job::Column::DeferredCondition.is_null())
+        .filter(pipeline_job::Column::DeferredMatrix.is_null())
         .col_expr(pipeline_job::Column::Status, Expr::value("assigned"))
         .col_expr(pipeline_job::Column::RunnerId, Expr::value(runner_id))
         .col_expr(

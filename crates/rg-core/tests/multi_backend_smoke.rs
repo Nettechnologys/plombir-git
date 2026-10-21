@@ -6551,3 +6551,154 @@ async fn pipeline_matrix_variants_are_portable() {
         ("failed", None)
     );
 }
+
+/// A job held until the jobs it needs have finished, on every backend: the
+/// hold keeps it from the poll and from a claim by id, a hold past what MySQL's
+/// `TEXT` holds survives, and of two releases exactly one takes it — the
+/// conditional UPDATE inside the graph transaction.
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn held_jobs_are_portable() {
+    use rg_db::ops::{pipeline_condition_ops, pipeline_ops};
+
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("held{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Held Smoke",
+    )
+    .await
+    .expect("create owner");
+    let repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("heldrepo{suffix}")),
+    )
+    .await
+    .expect("create repository");
+    let (runner, _) = rg_db::ops::runner_ops::register_runner(
+        &db,
+        repo.id,
+        &format!("held-runner-{suffix}"),
+        "[]",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let pipeline = pipeline_ops::create_pipeline(
+        &db,
+        repo.id,
+        "2123456789012345678901234567890123456789",
+        "refs/heads/main",
+        "push",
+        None,
+    )
+    .await
+    .unwrap();
+    let first = pipeline_ops::create_stage(&db, pipeline.id, "first", 0)
+        .await
+        .unwrap();
+    let second = pipeline_ops::create_stage(&db, pipeline.id, "second", 1)
+        .await
+        .unwrap();
+    let job = |stage_id: i64, name: &'static str| {
+        let db = db.clone();
+        async move {
+            pipeline_ops::create_job(
+                &db, stage_id, name, "echo ok", None, None, None, None, None, None, false, None,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .id
+        }
+    };
+    let setup = job(first.id, "setup").await;
+    let released = job(second.id, "deploy").await;
+    let skipped = job(second.id, "preview").await;
+    let big = format!("{{\"context\":\"{}\"}}", "x".repeat(200_000));
+    for id in [released, skipped] {
+        pipeline_condition_ops::set_deferred_condition(&db, id, &big)
+            .await
+            .unwrap();
+    }
+    assert!(
+        pipeline_condition_ops::ready_deferred_conditions(&db, repo.id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "setup has not run"
+    );
+    pipeline_ops::finish_embedded_job(
+        &db,
+        pipeline.id,
+        first.id,
+        setup,
+        "success",
+        Some(0),
+        None,
+        Some(chrono::Utc::now().naive_utc()),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        pipeline_ops::find_pending_job_for_runner(&db, repo.id, &[], true)
+            .await
+            .unwrap(),
+        pipeline_ops::PendingPick::Nothing
+    ));
+    assert!(!pipeline_ops::assign_job(&db, released, runner.id)
+        .await
+        .unwrap());
+    let ready = pipeline_condition_ops::ready_deferred_conditions(&db, repo.id)
+        .await
+        .unwrap();
+    let mut ready_ids = ready.iter().map(|job| job.id).collect::<Vec<_>>();
+    ready_ids.sort_unstable();
+    assert_eq!(ready_ids, [released, skipped]);
+    assert_eq!(
+        ready[0].deferred_condition.as_deref().map(str::len),
+        Some(big.len()),
+        "a hold past what TEXT holds"
+    );
+
+    let to_release = ready.iter().find(|job| job.id == released).unwrap();
+    for expected in [true, false] {
+        let taken =
+            pipeline_condition_ops::release_deferred_job(&db, to_release, |tx| async move {
+                (tx, Ok(()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(taken, expected, "one caller releases the job");
+    }
+    let to_skip = ready.iter().find(|job| job.id == skipped).unwrap();
+    assert!(
+        pipeline_condition_ops::settle_held_job(&db, to_skip, "skipped", "Skipped\n")
+            .await
+            .unwrap()
+            .is_none(),
+        "deploy still has to run"
+    );
+    let skipped_job = pipeline_ops::get_job(&db, skipped).await.unwrap().unwrap();
+    assert_eq!(
+        (skipped_job.status.as_str(), skipped_job.deferred_condition),
+        ("skipped", None)
+    );
+    assert!(pipeline_ops::assign_job(&db, released, runner.id)
+        .await
+        .unwrap());
+}

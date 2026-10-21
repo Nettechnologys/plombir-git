@@ -177,6 +177,19 @@ The value must be an image reference, `[registry[:port]/]path[:tag][@digest]`
 pipeline is created, with the job and the rule in the error, and the runners
 refuse it again before `docker run`.
 
+**Rootful and rootless Docker are both supported.** The container runs with
+`--cap-drop ALL`, so it can write to the mounted workspace only as the
+workspace's owner. On a rootful daemon that is the runner's own uid and gid
+(`--user <uid>:<gid>`). On a rootless daemon — `docker info` lists
+`name=rootless` under its security options — a container's uid is mapped onto
+a subordinate id of the daemon's user, so the runner's uid would not own the
+workspace inside the container; the job runs as the container's root
+(`--user 0:0`) instead, which is the daemon's user on the host, and the
+capabilities stay dropped. That needs the runner to run as the user that runs
+the rootless daemon. The runner asks the daemon once per process; when
+`docker info` does not answer, the job runs as the runner's uid and its log
+says that writing to `/workspace` may fail on a rootless daemon.
+
 ### `only`
 
 Plain string equality against the ref — no globs, no patterns. Each entry is

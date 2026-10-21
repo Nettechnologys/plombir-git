@@ -666,15 +666,7 @@ fn node_step(
     env: HashMap<String, String>,
     condition: Option<String>,
 ) -> GiteaStep {
-    let (repository, git_ref) = match use_.reference {
-        ActionReference::Local { .. } => (String::new(), String::new()),
-        ActionReference::Remote {
-            owner,
-            repo,
-            git_ref,
-            ..
-        } => (format!("{owner}/{repo}"), git_ref.clone()),
-    };
+    let (repository, git_ref) = action_identity(use_.reference);
     GiteaStep {
         name: Some(name),
         uses: None,
@@ -697,6 +689,33 @@ fn node_step(
             state: use_.caller_id.clone(),
         }),
     }
+}
+
+/// `GITHUB_ACTION_REPOSITORY` and `GITHUB_ACTION_REF` of a use of an action:
+/// `owner/repo` and the ref the workflow named, both empty for `./path`.
+fn action_identity(reference: &ActionReference) -> (String, String) {
+    match reference {
+        ActionReference::Local { .. } => (String::new(), String::new()),
+        ActionReference::Remote {
+            owner,
+            repo,
+            git_ref,
+            ..
+        } => (format!("{owner}/{repo}"), git_ref.clone()),
+    }
+}
+
+/// Whether a composite action's steps name its directory — `${{
+/// github.action_path }}` or `$GITHUB_ACTION_PATH` — in what they run or set,
+/// and so need its files.
+fn names_its_directory(steps: &[GiteaStep]) -> bool {
+    steps.iter().any(|step| {
+        step.run
+            .iter()
+            .chain(step.working_directory.iter())
+            .chain(step.env.values())
+            .any(|text| text.contains("github.action_path") || text.contains("GITHUB_ACTION_PATH"))
+    })
 }
 
 /// `a` and `b` as one condition; `None` when neither says anything.
@@ -911,8 +930,40 @@ impl Expansion<'_> {
                 });
             }
         };
+        // A composite action that names its own directory gets its files
+        // beside every one of its `run:` steps, as on GitHub, where each of
+        // them has `GITHUB_ACTION_PATH`. One that names it nowhere runs as it
+        // always did — and a runner that cannot fetch an action's files can
+        // still take its job.
+        let files = if names_its_directory(&steps) {
+            match self.loader.files(&reference, &loaded) {
+                Ok(files) => Some(files),
+                Err(ActionLoadError::Refused(reason)) => {
+                    return Err(StepError::Refused(format!("uses: {uses} — {reason}")))
+                }
+                Err(ActionLoadError::Failed(error)) => {
+                    return Err(StepError::Failed(error.context(format!(
+                        "packing action {uses} for job {}",
+                        self.job_name
+                    ))))
+                }
+            }
+        } else {
+            None
+        };
         for inner in steps {
-            let inner = context.rewrite(inner, &step, &caller_name)?;
+            let mut inner = context.rewrite(inner, &step, &caller_name)?;
+            if let (Some(files), Some(_)) = (&files, &inner.run) {
+                let (repository, git_ref) = action_identity(&reference);
+                inner.action = Some(rg_process::ci_steps::ActionStep {
+                    files: files.clone(),
+                    repository,
+                    git_ref,
+                    using: rg_process::ci_steps::ActionStep::COMPOSITE.to_string(),
+                    entry: String::new(),
+                    state: caller_id.clone(),
+                });
+            }
             self.step(inner, depth + 1)?;
         }
 
@@ -1088,7 +1139,7 @@ impl ActionContext<'_> {
             env.insert(name.clone(), value.clone());
         }
         for (name, value) in &inner.env {
-            env.insert(name.clone(), self.text(value)?);
+            env.insert(name.clone(), self.path_text(value)?);
         }
         let mut with = HashMap::new();
         for (name, value) in &inner.with {
@@ -1112,18 +1163,24 @@ impl ActionContext<'_> {
             )),
         };
         Ok(GiteaStep {
-            name: Some(format!("{caller_name} / {}", self.text(&inner_label)?)),
+            // An unnamed step is labelled with the first line of its `run:`,
+            // which may read the action's directory.
+            name: Some(format!("{caller_name} / {}", self.path_text(&inner_label)?)),
             uses: inner
                 .uses
                 .as_deref()
                 .map(|uses| self.text(uses))
                 .transpose()?,
-            run: inner.run.as_deref().map(|run| self.text(run)).transpose()?,
+            run: inner
+                .run
+                .as_deref()
+                .map(|run| self.path_text(run))
+                .transpose()?,
             shell: inner.shell.clone(),
             working_directory: inner
                 .working_directory
                 .as_deref()
-                .map(|directory| self.text(directory))
+                .map(|directory| self.path_text(directory))
                 .transpose()?,
             id: inner.id.as_deref().map(|id| self.prefixed(id)),
             continue_on_error: inner.continue_on_error.clone(),
@@ -1150,8 +1207,25 @@ impl ActionContext<'_> {
     /// secrets.X }}` — is refused, or an action could name a secret its
     /// expressions are not allowed to.
     fn text(&self, text: &str) -> Result<String, String> {
+        self.text_in(text, false)
+    }
+
+    /// [`Self::text`] for a step's `run:`, an `env:` value or its
+    /// `working-directory`, where `${{ github.action_path }}` — read whole —
+    /// is the action's directory: [`ACTION_PATH_PLACEHOLDER`], which the
+    /// runner sets for a step that has the action's files beside it.
+    ///
+    /// [`ACTION_PATH_PLACEHOLDER`]: rg_process::ci_steps::ACTION_PATH_PLACEHOLDER
+    fn path_text(&self, text: &str) -> Result<String, String> {
+        self.text_in(text, true)
+    }
+
+    fn text_in(&self, text: &str, action_path: bool) -> Result<String, String> {
         let mut written = 0;
         let out = map_groups(text, |expression| {
+            if action_path && expression == "github.action_path" {
+                return Ok(rg_process::ci_steps::ACTION_PATH_PLACEHOLDER.to_string());
+            }
             if let Some(name) = whole_input(expression) {
                 let value = self.input(name)?.to_string();
                 written += value.matches("${{").count();
@@ -1206,13 +1280,15 @@ impl ActionContext<'_> {
     /// The inside of one expression: `inputs.<name>` becomes a string
     /// literal, the action's own `steps.<id>` its prefixed id, and
     /// `github.action_repository` / `github.action_ref` what the reference
-    /// names. `github.action_path` is refused: an action's files are not
-    /// shipped to the runner, only its steps.
+    /// names. `github.action_path` is not an expression of its own: it is
+    /// read whole in a step's `run:`, `env:` and `working-directory`
+    /// ([`Self::path_text`]), and refused anywhere else.
     fn expression_body(&self, expression: &str) -> Result<String, String> {
         if expression.contains("github.action_path") {
             return Err(format!(
-                "action {} reads github.action_path; the files of an action do not reach the \
-                 runner here — only its steps run, so inline what it runs from its directory",
+                "action {} reads github.action_path in `${{{{ {expression} }}}}`; it is read \
+                 whole — `${{{{ github.action_path }}}}` — in a step's run:, env: and \
+                 working-directory:, and nowhere else",
                 self.label
             ));
         }
@@ -2067,8 +2143,8 @@ mod tests {
             ),
             (
                 "      - uses: acme/greet@v1\n",
-                "runs:\n  using: composite\n  steps:\n    - shell: sh\n      run: ${{ github.action_path }}/x.sh\n",
-                "github.action_path",
+                "runs:\n  using: composite\n  steps:\n    - shell: sh\n      if: github.action_path != ''\n      run: ./x.sh\n",
+                "reads github.action_path in `${{ github.action_path != '' }}`",
             ),
             (
                 "      - uses: acme/greet@v1\n",

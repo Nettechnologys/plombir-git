@@ -144,8 +144,8 @@ cited in the row added it. Plombir Git's side is specified in full in
 | `services:` | ✅ Docker mode; a network per job, health-checked before the first step, `ports:` on loopback only; `volumes` and non-health `options` refused | ✅ |
 | `uses:` actions | ⚠️ composite and JavaScript (`node12`–`node24`) actions from `./path`, this instance or an upstream the operator allows (`[ci] actions_sources`), plus the built-in `actions/checkout`, `actions/cache`, `actions/upload-artifact`; Docker actions refused by name; GitHub's artifact, cache and OIDC services not emulated | ✅ any action |
 | Step `id` | ✅ | ✅ |
-| Step outputs, `jobs.<id>.outputs`, `needs.<id>.outputs` | ✅ `$GITHUB_OUTPUT`, 1 MiB per job, masked; `::set-output` refused | ✅ |
-| Composite actions | ✅ `inputs`, `outputs`, nested up to 10 deep; the resolved commit is in the job log; `github.action_path` refused — an action's files do not reach the runner | ✅ |
+| Step outputs, `jobs.<id>.outputs`, `needs.<id>.outputs` | ✅ `$GITHUB_OUTPUT`, 1 MiB per job, masked; `::set-output` refused; a job's `if:` reads them, and a job that needs a skipped one is skipped | ✅ |
+| Composite actions | ✅ `inputs`, `outputs`, nested up to 10 deep; the resolved commit is in the job log; `github.action_path` / `$GITHUB_ACTION_PATH` — the action's files reach the runner (runner protocol 6) | ✅ |
 | Step `continue-on-error`, step `timeout-minutes`, step `shell` | ✅ each step is its own process, in both runners; `$GITHUB_ENV` / `$GITHUB_PATH` between steps | ✅ |
 | `vars.*` | ✅ repository and organization variables, the repository's winning | ✅ |
 | `permissions` | ⚠️ narrows the job token (`contents`, `packages`, `id-token: write` for OIDC); any other `write` refused — the token cannot write | ✅ |
@@ -884,7 +884,9 @@ your registry logins and credential helpers, never the job's variables — and t
 container then starts from the image's ID with `--pull never` (Docker 20.10 or
 newer). An image already present is reused as `docker run` would; with
 `DOCKER_CONTENT_TRUST=1` in the runner's environment it is pulled again for
-every job, so its signature is checked each time.
+every job, so its signature is checked each time. Rootful and rootless Docker
+both work; on a rootless daemon the runner must run as the daemon's user (see
+[`image`](docs/ci.md#image)).
 
 The server hands jobs to registered runners only with `external_runners = true`
 under `[ci]`. With the default `false` it keeps running every job in-process, and

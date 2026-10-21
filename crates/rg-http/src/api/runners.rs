@@ -541,6 +541,7 @@ pub async fn poll_job(
     let runs_services = protocol >= rg_core::ci::SERVICES_PROTOCOL;
     let scopes_secrets = protocol >= rg_core::ci::SCOPED_SECRETS_PROTOCOL;
     let runs_javascript = protocol >= rg_core::ci::JS_ACTIONS_PROTOCOL;
+    let fetches_composite_files = protocol >= rg_core::ci::COMPOSITE_FILES_PROTOCOL;
 
     // Use tokio::time::timeout to wrap a polling loop
     let poll_future = async {
@@ -548,8 +549,10 @@ pub async fn poll_job(
 
         loop {
             // A matrix that reads a needed job's outputs becomes its variants
-            // once its stage may run; only then is there a variant to hand out.
+            // once its stage may run, and a job that needs others is decided
+            // then; only after that is there something to hand out.
             expand_ready_matrices(&state, runner_repo_id).await;
+            decide_ready_conditions(&state, runner_repo_id).await;
             match crate::metrics::time_db(
                 "pipeline.find_pending_job",
                 rg_db::ops::pipeline_ops::find_pending_job_for_runner(
@@ -577,6 +580,9 @@ pub async fn poll_job(
                     }
                     if !runs_javascript && runs_javascript_action(&resp) {
                         return Err(javascript_protocol_refusal(runner_id, &job));
+                    }
+                    if !fetches_composite_files && runs_composite_with_files(&resp) {
+                        return Err(composite_files_protocol_refusal(runner_id, &job));
                     }
                     // Everything the response needs is prepared before the
                     // irreversible claim. The long-poll future can be dropped
@@ -681,6 +687,38 @@ async fn expand_ready_matrices(state: &AppState, repo_id: i64) {
     }
 }
 
+/// Decide every job of `repo_id` that waits for the jobs it needs and whose
+/// stage was reached — run it or skip it. Like [`expand_ready_matrices`], a
+/// failure is the decision's own to report and never the poll's.
+async fn decide_ready_conditions(state: &AppState, repo_id: i64) {
+    let ready = match rg_db::ops::pipeline_condition_ops::ready_deferred_conditions(
+        &state.db, repo_id,
+    )
+    .await
+    {
+        Ok(ready) => ready,
+        Err(error) => {
+            tracing::error!(repo_id, error = %format!("{error:#}"), "poll_job: held jobs could not be listed");
+            return;
+        }
+    };
+    for held in ready {
+        match state
+            .ci_engine
+            .decide_deferred_condition(&state.db, &held)
+            .await
+        {
+            Ok(Some(pipeline)) => pipeline_finished(state, &pipeline, true).await,
+            Ok(None) => {}
+            Err(error) => tracing::error!(
+                job_id = held.id,
+                error = %format!("{error:#}"),
+                "poll_job: a held job could not be decided"
+            ),
+        }
+    }
+}
+
 /// Whether the polling runner runs a job's steps one by one — it says so with
 /// [`rg_core::ci::RUNNER_PROTOCOL_HEADER`].
 ///
@@ -724,12 +762,50 @@ fn services_protocol_refusal(
         .into_response()
 }
 
+/// The `using` of every step of the job that runs with an action's files.
+fn action_step_kinds(resp: &PollJobResponse) -> impl Iterator<Item = &str> {
+    resp.steps.iter().flatten().filter_map(|step| {
+        step.get("action")
+            .filter(|action| !action.is_null())
+            .map(|action| action["using"].as_str().unwrap_or_default())
+    })
+}
+
 /// Whether a step of the job runs a JavaScript action.
 fn runs_javascript_action(resp: &PollJobResponse) -> bool {
-    resp.steps
-        .iter()
-        .flatten()
-        .any(|step| step.get("action").is_some_and(|action| !action.is_null()))
+    action_step_kinds(resp).any(|using| using != rg_core::ci::COMPOSITE_ACTION_USING)
+}
+
+/// Whether a step of the job is a composite action's that needs the action's
+/// files beside it.
+fn runs_composite_with_files(resp: &PollJobResponse) -> bool {
+    action_step_kinds(resp).any(|using| using == rg_core::ci::COMPOSITE_ACTION_USING)
+}
+
+/// [`steps_protocol_refusal`] for a runner that does not fetch a composite
+/// action's files: it would read such a step as a JavaScript action's and
+/// start Node on nothing.
+fn composite_files_protocol_refusal(
+    runner_id: i64,
+    job: &rg_db::entities::pipeline_job::Model,
+) -> Response {
+    tracing::warn!(
+        runner_id,
+        job_id = job.id,
+        "poll_job: refused a job whose composite action needs its files to a runner that does not fetch them"
+    );
+    (
+        StatusCode::UPGRADE_REQUIRED,
+        Json(serde_json::json!({
+            "error": format!(
+                "job #{} ({}) runs a composite action that reads its own directory \
+                 (github.action_path), and this runner does not fetch an action's files for \
+                 it. Upgrade plombir-git-runner; the job waits for a runner that can run it.",
+                job.id, job.name
+            ),
+        })),
+    )
+        .into_response()
 }
 
 /// [`steps_protocol_refusal`] for a runner that does not run JavaScript

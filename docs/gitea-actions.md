@@ -488,7 +488,7 @@ quietly win.
 | `runs-on` | string or non-empty list of strings | Runner labels required to pick the job up. |
 | `steps` | list | The job's work. See [Steps](#steps). |
 | `needs` | string or list of strings | Jobs that must finish first. |
-| `if` | string | Condition evaluated before the job is scheduled. |
+| `if` | string | Condition evaluated before the job is scheduled — for a job with `needs:`, once they have finished. See [`if:`](#if). |
 | `env` | map string→string | Variables for this job, overriding the workflow's. |
 | `container` | block | See [Containers](#containers). |
 | `services` | map key→block | Containers the job's steps talk to, in Docker mode. See [Services](#services). |
@@ -518,11 +518,47 @@ parentheses, single-quoted strings, and `startsWith` / `endsWith` / `contains` /
 `github.sha`, `github.repository`, `github.repository_owner`,
 `github.event.schedule`, and `env.NAME`.
 
-A **job**'s `if:` is evaluated once, when the pipeline is built, and may also
-read `matrix.NAME`; `success()` is the only status function it has, and it is
-always true there. A **step**'s `if:` is read by the runner between steps — see
-[Steps](#steps) — so it has all four status functions and no `matrix.`, and
-reads `steps.*` and `needs.*` ([Outputs](#outputs)), which a job's `if:` cannot.
+A **job**'s `if:` is evaluated once and may also read `matrix.NAME`;
+`success()` is the only status function it has, and it is always true there —
+a job is reached only when every stage before it succeeded. A job without
+`needs:` is decided when the pipeline is built. A job with `needs:` is decided
+when its stage is reached, after the jobs it needs have finished, so its `if:`
+may also read what they left — `needs.<job>.outputs.<name>` and
+`needs.<job>.result` ([Outputs](#outputs)) — which is the paths-filter pattern:
+
+```yaml
+name: CI
+on: push
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+    steps:
+      - id: filter
+        run: |
+          if git diff --name-only HEAD~1 | grep -q '^server/'; then
+            echo backend=true >> "$GITHUB_OUTPUT"
+          fi
+  backend:
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    steps:
+      - run: make -C server test
+```
+
+A job whose `if:` is false is `skipped`, with the condition in its log, and so
+is every job that needs a skipped job — as on GitHub, where only a status
+function would run it anyway, and a job's `if:` here has none to name. Neither
+fails the pipeline. A job that needs others is never handed to a runner before
+it is decided, and its `environment` is attached only once it is to run, so a
+skipped deploy never asks anyone for an approval.
+
+A **step**'s `if:` is read by the runner between steps — see [Steps](#steps) —
+so it has all four status functions and no `matrix.`, and reads `steps.*` and
+`needs.*` ([Outputs](#outputs)). `steps.*` is not available in a job's `if:`,
+which is read before the job's first step runs.
 
 ## Steps
 
@@ -658,7 +694,8 @@ jobs:
 | `needs.<job>.result` | `success`, `failure`, `cancelled` or `skipped`. |
 
 They are read in a step's `run:`, `env:`, `working-directory` and `if:`.
-`needs.*` is also read in the job's `env:`, which is set when the job starts;
+`needs.*` is also read in the job's `if:` (see [`if:`](#if)) and its `env:`,
+which is set when the job starts;
 `steps.*` is not — a job variable exists before the first step runs. A job's
 `outputs:` reads `steps.*`, `needs.*` and `env.*`, and is resolved after its
 last step.
@@ -681,7 +718,7 @@ naming it, rather than leaving an output that was never set.
 
 A matrix job's `outputs` are those of the variant that finished last with
 success, and its `result` is `failure` if any variant failed — GitHub's rule.
-`needs.*` is not available in a job's `if:`, `runs-on`, `container.image` or
+`needs.*` is not available in a job's `runs-on`, `container.image` or
 `environment`: those are decided when the pipeline is built, before any job ran.
 
 ### Keys parsed only so they can be refused
@@ -822,6 +859,37 @@ Inside the action, `${{ inputs.<name> }}` is the value the step gave, and
 `github.action_repository` / `github.action_ref` name the action. The steps run
 in the caller's job, so every other expression means what it means there.
 
+**An action that runs files of its own.** `${{ github.action_path }}` is the
+action's directory, read whole in a step's `run:`, `env:` values and
+`working-directory`; `$GITHUB_ACTION_PATH` is the same directory in the step's
+environment:
+
+<!-- example: action acme/lint@v1 -->
+```yaml
+name: Lint
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: ${{ github.action_path }}/lint.sh
+    - shell: bash
+      working-directory: ${{ github.action_path }}/rules
+      run: ./check-all.sh "$GITHUB_WORKSPACE"
+```
+
+When any step of an action names its directory, the server keeps an archive of
+the action's directory at the resolved commit — as it does for a
+[JavaScript action](#javascript-actions) — and the runner unpacks it before
+the step and sets `GITHUB_ACTION_PATH` on every `run:` step of the action. For
+`./path` the directory is that path of the workspace. An action that never
+names its directory gets no archive and runs as before. A `working-directory`
+under the action's directory stays inside it: `${{ github.action_path }}/..`
+fails the step.
+
+`plombir-git-runner` fetches a composite action's files from runner protocol
+6; an older runner is not handed such a job (`426`, naming the job), and the
+job waits for one that is.
+
 One difference from GitHub to know before writing an `if:` on it: the calling
 step's id belongs to the step that hands the action's `outputs` back, which runs
 last. When a step inside the action fails, that step does not run, so
@@ -835,7 +903,7 @@ Refused, by name:
 |------|-----|
 | `runs.using: node10` or any Node runtime but `node12`, `node16`, `node20`, `node24` | Not a runtime this engine knows. |
 | `runs.using: docker` | A Docker action is a container the workflow builds; refused like `container.options`. |
-| `github.action_path` in a composite action | A composite action's files do not reach the runner — only its steps do. Inline what it runs from its directory. (A JavaScript action's files do; see below.) |
+| `github.action_path` anywhere but whole in a step's `run:`, `env:` or `working-directory` — an `if:`, the `with:` of an action the action calls, part of a larger expression | Each of those would need the directory of a different action, or before the files are there. |
 | `secrets.*` inside the action | An action has no secrets context, as on GitHub; the workflow passes what it needs as an input. |
 | `continue-on-error`, `timeout-minutes`, `shell`, `working-directory`, `run` on the calling step | They have no single step to apply to. |
 | `timeout-minutes` on an action's step | GitHub does not allow it either. |

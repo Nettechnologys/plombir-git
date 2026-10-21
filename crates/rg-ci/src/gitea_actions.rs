@@ -1582,6 +1582,16 @@ fn unresolvable_runtime_references(workflow: &GiteaWorkflow) -> Vec<String> {
             }
         }
 
+        if let Some(condition) = &job.condition {
+            for key in runtime_names_in_condition(condition) {
+                if let Some(parsed) = RuntimeKey::parse(&key) {
+                    if let Some(problem) = needed(&format!("{job_name}: if"), &key, &parsed) {
+                        problems.push(problem);
+                    }
+                }
+            }
+        }
+
         let job_level = |site: String, text: &str, problems: &mut Vec<String>| {
             for (key, parsed) in keys(text) {
                 if step_ref(&parsed).is_some() {
@@ -2492,10 +2502,19 @@ impl GiteaWorkflow {
                 .map(|(job_name, _)| format!("{job_name}: with without a reusable workflow uses")),
         );
         unsupported.extend(self.jobs.iter().flat_map(|(job_name, job)| {
+            // A job that lists `needs:` is decided once they have finished,
+            // so its condition may read what they left; whether it names one
+            // of them is `unresolvable_runtime_references`' question.
             let job_condition = job
                 .condition
                 .as_deref()
-                .filter(|condition| !supported_condition(condition, true))
+                .filter(|condition| {
+                    if job.needs.iter().flatten().next().is_some() {
+                        crate::condition::validate_job_condition(condition).is_err()
+                    } else {
+                        !supported_condition(condition, true)
+                    }
+                })
                 .map(|condition| format!("{job_name}: unsupported job condition {condition}"));
             let step_conditions = job.steps.iter().filter_map(move |step| {
                 step.condition
@@ -3257,7 +3276,7 @@ impl GiteaWorkflow {
 
             // A step of a JavaScript action: its file, run with Node by the
             // runner. The flat script cannot run one, and says so.
-            if let Some(action) = &step.action {
+            if let Some(action) = step.action.as_ref().filter(|action| action.runs_node()) {
                 let name = step.name.clone().unwrap_or_default();
                 if statically_runs {
                     script.push(format!(
@@ -3340,7 +3359,9 @@ impl GiteaWorkflow {
                         }
                         secrets
                     },
-                    action: None,
+                    // A composite action's step that has the action's files
+                    // beside it (`github.action_path`).
+                    action: step.action.clone(),
                 });
             }
         }
@@ -6913,8 +6934,16 @@ jobs:
                 "a job output reads `steps.*`, `needs.*` and `env.*`",
             ),
             (
-                "  lint:\n    steps:\n      - run: echo ok\n  build:\n    needs: lint\n    if: needs.lint.result == 'success'\n    steps:\n      - run: echo ok\n",
-                "needs.lint.result",
+                "  lint:\n    steps:\n      - run: echo ok\n  build:\n    needs: lint\n    if: needs.test.result == 'success'\n    steps:\n      - run: echo ok\n",
+                "build: if expression `needs.test.result`: `test` is not a job this job needs — it needs lint",
+            ),
+            (
+                "  lint:\n    steps:\n      - run: echo ok\n  build:\n    needs: lint\n    if: steps.a.outputs.b == 'x'\n    steps:\n      - run: echo ok\n",
+                "build: unsupported job condition steps.a.outputs.b == 'x'",
+            ),
+            (
+                "  build:\n    if: needs.lint.result == 'success'\n    steps:\n      - run: echo ok\n",
+                "build: unsupported job condition needs.lint.result == 'success'",
             ),
             (
                 "  lint:\n    steps:\n      - run: echo ok\n  build:\n    needs: lint\n    runs-on: ${{ needs.lint.outputs.os }}\n    steps:\n      - run: echo ok\n",
@@ -6946,6 +6975,13 @@ jobs:
             error.contains("env.V expression `needs.a.result`: nothing has run"),
             "{error}"
         );
+        // card_8a48a54066a7: a job's `if:` reads what the jobs it needs left.
+        GiteaWorkflow::parse(
+            "on: push\njobs:\n  changes:\n    outputs:\n      backend: ${{ steps.f.outputs.backend }}\n    steps:\n      - id: f\n        run: echo backend=true >> $GITHUB_OUTPUT\n  backend:\n    needs: changes\n    if: needs.changes.outputs.backend == 'true' && needs.changes.result == 'success'\n    steps:\n      - run: echo ok\n",
+        )
+        .unwrap()
+        .validate_supported_actions()
+        .expect("a job condition over what a needed job left is honoured");
     }
 
     /// card_d97de416d0b0: `strategy` takes `matrix`, `fail-fast` and

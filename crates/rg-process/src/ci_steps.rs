@@ -65,8 +65,16 @@ pub const SCOPED_SECRETS_PROTOCOL: u32 = 4;
 /// with Node. A runner below it is never handed a job with such a step.
 pub const JS_ACTIONS_PROTOCOL: u32 = 5;
 
+/// The protocol in which a runner also hands a composite action's steps the
+/// action's files: it fetches them like a JavaScript action's, sets
+/// `GITHUB_ACTION_PATH`, and runs the step's `run:` with its shell
+/// ([`ActionStep::COMPOSITE`]). A runner below it would read such a step as a
+/// JavaScript one and start Node on nothing, so it is never handed a job with
+/// one.
+pub const COMPOSITE_FILES_PROTOCOL: u32 = 6;
+
 /// What this build's runner speaks, and sends with every poll.
-pub const RUNNER_PROTOCOL: u32 = JS_ACTIONS_PROTOCOL;
+pub const RUNNER_PROTOCOL: u32 = COMPOSITE_FILES_PROTOCOL;
 
 /// Where a containerised job's workspace is mounted.
 pub const CONTAINER_WORKSPACE: &str = "/workspace";
@@ -118,14 +126,17 @@ pub struct StepSpec {
     /// step may read none.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub secrets: BTreeSet<String>,
-    /// A step of a JavaScript action: it runs [`ActionStep::entry`] with Node
-    /// instead of `run`. Absent from every other step.
+    /// A step of an action whose files it needs: a JavaScript action's, which
+    /// runs [`ActionStep::entry`] with Node instead of `run`, or a composite
+    /// action's that names its directory, which runs `run` in reach of them.
+    /// Absent from every other step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<ActionStep>,
 }
 
 /// A step that runs one file of a JavaScript action (`runs.using: node*`)
-/// with Node: the action's `pre`, `main` or `post`.
+/// with Node — the action's `pre`, `main` or `post` — or a `run:` step of a
+/// composite action, with the action's files beside it ([`Self::COMPOSITE`]).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActionStep {
@@ -135,14 +146,32 @@ pub struct ActionStep {
     pub repository: String,
     /// The ref the workflow named — `GITHUB_ACTION_REF`.
     pub git_ref: String,
-    /// `runs.using`: `node20`, `node24`, …, for the message when Node is missing.
+    /// `runs.using`: `node20`, `node24`, …, for the message when Node is
+    /// missing — or [`Self::COMPOSITE`].
     pub using: String,
-    /// The file to run, relative to the action's directory.
+    /// The file to run, relative to the action's directory; empty for a
+    /// composite action's step, which runs its own `run`.
     pub entry: String,
     /// Shared by the `pre`, `main` and `post` of one use of the action: what
     /// one of them writes to `$GITHUB_STATE` the later ones read as `STATE_*`.
     pub state: String,
 }
+
+impl ActionStep {
+    /// [`Self::using`] of a composite action's `run:` step: the files are
+    /// fetched and `GITHUB_ACTION_PATH` set, and the step runs its script.
+    pub const COMPOSITE: &'static str = "composite";
+
+    /// Whether the step is a JavaScript action's file, run with Node.
+    pub fn runs_node(&self) -> bool {
+        self.using != Self::COMPOSITE
+    }
+}
+
+/// What `${{ github.action_path }}` became in a composite action's step: the
+/// variable the runner sets to the action's directory, in `run:`, in `env:`
+/// values and at the start of `working-directory`.
+pub const ACTION_PATH_PLACEHOLDER: &str = "${GITHUB_ACTION_PATH}";
 
 /// Where a JavaScript action's files come from.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -760,6 +789,32 @@ struct StepPaths {
 
 /// The working directory a step runs in, relative to the workspace, refused
 /// when it would leave it.
+/// Where a step runs: `(in the action's directory, relative path)`. A
+/// composite action's step may start its `working-directory` with
+/// [`ACTION_PATH_PLACEHOLDER`] — `${{ github.action_path }}` — and then runs in
+/// the action's files; any other one is inside the workspace.
+fn step_working_directory(step: &StepSpec) -> Result<(bool, Option<&str>), String> {
+    let Some(declared) = step.working_directory.as_deref() else {
+        return Ok((false, None));
+    };
+    let Some(rest) = declared.strip_prefix(ACTION_PATH_PLACEHOLDER) else {
+        return working_directory(Some(declared)).map(|directory| (false, directory));
+    };
+    if step.action.is_none() {
+        return Err(format!(
+            "working-directory `{declared}` names an action's directory, and this step is not \
+             an action's"
+        ));
+    }
+    let rest = rest.trim_start_matches('/');
+    if rest.is_empty() {
+        return Ok((true, None));
+    }
+    working_directory(Some(rest))
+        .map(|directory| (true, directory))
+        .map_err(|_| format!("working-directory `{declared}` must stay inside the action's files"))
+}
+
 fn working_directory(declared: Option<&str>) -> Result<Option<&str>, String> {
     let Some(declared) = declared else {
         return Ok(None);
@@ -1089,6 +1144,14 @@ fn step_environment(
     // What `${NAME}` in a declared value reads: what the step may see.
     let mut visible = job_env.clone();
     visible.extend(carried_env.iter().cloned());
+    // A composite action's step reads its directory in `env:` as well as in
+    // `run:` — `${{ github.action_path }}` became this variable.
+    if let Some(action) = &step.action {
+        visible.insert(
+            "GITHUB_ACTION_PATH".into(),
+            action_directory(action, &paths),
+        );
+    }
     let mut env: BTreeMap<String, String> = job_env
         .iter()
         .map(|(name, value)| {
@@ -1217,7 +1280,7 @@ fn github_context_variables(env: &mut BTreeMap<String, String>) {
     );
 }
 
-/// Where a JavaScript action's files are, as the step sees them.
+/// Where an action's files are, as the step sees them.
 fn action_directory(action: &ActionStep, paths: &StepPaths) -> String {
     match &action.files {
         ActionFiles::Archive { key } => format!("{}/{ACTIONS_DIRECTORY}/{key}", paths.temp),
@@ -1314,7 +1377,7 @@ async fn execute_step(
             )
         }
     };
-    let directory = match working_directory(step.working_directory.as_deref()) {
+    let (in_action, directory) = match step_working_directory(step) {
         Ok(directory) => directory,
         Err(reason) => {
             return (
@@ -1326,7 +1389,8 @@ async fn execute_step(
     };
     let host = |name: &str| run.temp.join(name);
     let extension = shell.extension();
-    if step.action.is_none() {
+    let runs_node = step.action.as_ref().is_some_and(ActionStep::runs_node);
+    if !runs_node {
         if let Err(error) = std::fs::write(host(&format!("step-{number}.{extension}")), &step.run) {
             return (
                 None,
@@ -1356,11 +1420,21 @@ async fn execute_step(
     // A JavaScript action's step is its entry file run by Node, in the
     // workspace; everything else is the step's script run by its shell.
     let argv = match &step.action {
-        Some(action) => vec![
+        Some(action) if runs_node => vec![
             "node".to_string(),
             format!("{}/{}", action_directory(action, &paths), action.entry),
         ],
-        None => shell.argv(&paths.script),
+        _ => shell.argv(&paths.script),
+    };
+    // The directory the step starts in, as the step sees it: the workspace's
+    // or — for a composite action's step that asked — the action's own.
+    let base = match (&step.action, in_action) {
+        (Some(action), true) => action_directory(action, &paths),
+        _ => paths.workspace.clone(),
+    };
+    let start = match directory {
+        Some(directory) => format!("{base}/{directory}"),
+        None => base,
     };
     let timeout = step.timeout_minutes.map(|minutes| {
         run.minute
@@ -1369,12 +1443,8 @@ async fn execute_step(
 
     let (code, log) = match &run.backend {
         StepBackend::Local => {
-            let cwd = match directory {
-                Some(directory) => run.workspace.join(directory),
-                None => run.workspace.to_path_buf(),
-            };
             let mut command = tokio::process::Command::new(&argv[0]);
-            command.args(&argv[1..]).current_dir(cwd).env_clear();
+            command.args(&argv[1..]).current_dir(&start).env_clear();
             for (name, value) in env {
                 command.env(name, value);
             }
@@ -1392,10 +1462,7 @@ async fn execute_step(
         StepBackend::Docker {
             program, container, ..
         } => {
-            let workdir = match directory {
-                Some(directory) => format!("{CONTAINER_WORKSPACE}/{directory}"),
-                None => CONTAINER_WORKSPACE.to_string(),
-            };
+            let workdir = start.clone();
             let pid_file = format!("{CONTAINER_TEMP}/step-{number}.pid");
             // The step writes its own process id before it becomes the shell,
             // and `docker exec` makes it the leader of its own process group,
@@ -1451,7 +1518,7 @@ async fn execute_step(
         })
     })();
     let log = match &step.action {
-        Some(action) if node_missing(code, &log) => format!(
+        Some(action) if runs_node && node_missing(code, &log) => format!(
             "{log}[plombir-git-runner] this step runs a JavaScript action (runs.using: {}), and \
              there is no `node` to run it with: {}\n",
             action.using,
@@ -1653,7 +1720,6 @@ pub struct StepsImage<'a> {
     /// `--name`, so a timeout or a cancellation can remove it by name.
     pub name: &'a str,
     pub image: &'a str,
-    pub user: Option<String>,
     pub limits: &'a crate::docker_job::JobLimits,
 }
 
@@ -1811,12 +1877,18 @@ pub async fn run_job_steps(
         };
     };
 
+    // Who the job runs as depends on the daemon: on a rootless one this
+    // process's uid is not the workspace's owner inside the container.
+    let (user, user_notice) = crate::docker_job::job_user(image.program).await;
+    let user_notice = user_notice
+        .map(|notice| format!("[plombir-git-runner] {notice}\n"))
+        .unwrap_or_default();
     let job = crate::docker_job::JobContainer {
         name: image.name,
         image: image.image,
         script: "",
         workspace,
-        user: image.user.clone(),
+        user,
         variables: job_env,
         limits: image.limits,
         temp: Some(&temp),
@@ -1832,7 +1904,7 @@ pub async fn run_job_steps(
             }
             return JobRun {
                 exit_code: failed.exit_code,
-                log: mask(&format!("{services_log}{}", failed.log)),
+                log: mask(&format!("{services_log}{user_notice}{}", failed.log)),
                 outputs: BTreeMap::new(),
             };
         }
@@ -1863,6 +1935,7 @@ pub async fn run_job_steps(
         services.stop().await;
     }
     let mut log = mask(&services_log);
+    log.push_str(&user_notice);
     log.push_str(&container.pull_log);
     if !log.is_empty() && !log.ends_with('\n') {
         log.push('\n');
@@ -2133,6 +2206,130 @@ mod tests {
             logs[2]
         );
         assert!(logs[3].contains("post sees yes tool=set"), "{}", logs[3]);
+    }
+
+    fn composite_step(name: &str, run: &str, files: ActionFiles) -> StepSpec {
+        let mut spec = step(name, run);
+        spec.shell = Some("sh".into());
+        spec.action = Some(ActionStep {
+            files,
+            repository: "acme/scripts".into(),
+            git_ref: "v1".into(),
+            using: ActionStep::COMPOSITE.into(),
+            entry: String::new(),
+            state: "use-1".into(),
+        });
+        spec
+    }
+
+    /// card_3e5298bfab47: a composite action's step runs its own `run:` with
+    /// its shell — not Node — beside the action's files, fetched like a
+    /// JavaScript action's: `${{ github.action_path }}` (which the translation
+    /// made `${GITHUB_ACTION_PATH}`) is that directory in `run:`, in `env:`
+    /// and at the start of `working-directory`, which may not climb out of it.
+    #[tokio::test]
+    async fn a_composite_actions_step_runs_its_script_beside_the_actions_files() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let temp = root.path().join("temp");
+        std::fs::create_dir_all(workspace.join("local-action")).unwrap();
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(
+            workspace.join("local-action/hello.sh"),
+            "echo local hello\n",
+        )
+        .unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, body) in [
+            ("hello.sh", "echo \"hello from $1\"\n"),
+            ("lib/data.txt", "data-in-lib\n"),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, body.as_bytes())
+                .unwrap();
+        }
+        let key = "b".repeat(64);
+        let archives = OneArchive {
+            key: key.clone(),
+            tar: builder.into_inner().unwrap(),
+        };
+        let archive = || ActionFiles::Archive { key: key.clone() };
+
+        let hello = composite_step(
+            "Hello",
+            "sh ${GITHUB_ACTION_PATH}/hello.sh archive",
+            archive(),
+        );
+        let mut from_env = composite_step("Env", "cat \"$DATA\"", archive());
+        from_env
+            .env
+            .insert("DATA".into(), "${GITHUB_ACTION_PATH}/lib/data.txt".into());
+        let mut inside = composite_step("Inside", "pwd; cat data.txt", archive());
+        inside.working_directory = Some("${GITHUB_ACTION_PATH}/lib".into());
+        let local = composite_step(
+            "Local",
+            "sh \"$GITHUB_ACTION_PATH/hello.sh\"",
+            ActionFiles::Workspace {
+                path: "local-action".into(),
+            },
+        );
+        let mut climbing = composite_step("Climb", "pwd", archive());
+        climbing.working_directory = Some("${GITHUB_ACTION_PATH}/../..".into());
+        climbing.continue_on_error = true;
+        let mut not_an_action = step("Plain", "pwd");
+        not_an_action.working_directory = Some("${GITHUB_ACTION_PATH}".into());
+        not_an_action.continue_on_error = true;
+
+        let env = job_env();
+        let mask = |log: &str| log.to_string();
+        let result = run_steps(
+            &StepRun {
+                steps: &[hello, from_env, inside, local, climbing, not_an_action],
+                job_env: &env,
+                workspace: &workspace,
+                temp: &temp,
+                backend: StepBackend::Local,
+                mask: &mask,
+                minute: MINUTE,
+                needs: &BTreeMap::new(),
+                outputs: &BTreeMap::new(),
+                secrets: None,
+                support: JobSupport {
+                    actions: Some(&archives),
+                    tool_cache: None,
+                },
+            },
+            &mut Recorder::default(),
+        )
+        .await;
+        let logs: Vec<&str> = result.steps.iter().map(|step| step.log.as_str()).collect();
+        assert_eq!(result.exit_code, 0, "{logs:#?}");
+        assert!(logs[0].contains("hello from archive"), "{}", logs[0]);
+        assert!(logs[1].contains("data-in-lib"), "{}", logs[1]);
+        let unpacked = temp.join(ACTIONS_DIRECTORY).join(&key).join("lib");
+        assert!(
+            logs[2].contains(&unpacked.display().to_string()) && logs[2].contains("data-in-lib"),
+            "{}",
+            logs[2]
+        );
+        assert!(logs[3].contains("local hello"), "{}", logs[3]);
+        assert_eq!(result.steps[4].outcome, StepOutcome::Failure);
+        assert!(
+            logs[4].contains("must stay inside the action's files"),
+            "{}",
+            logs[4]
+        );
+        assert_eq!(result.steps[5].outcome, StepOutcome::Failure);
+        assert!(
+            logs[5].contains("this step is not an action's"),
+            "{}",
+            logs[5]
+        );
     }
 
     /// No Node to run an action with is said as that, not as a failed script.
@@ -2524,6 +2721,53 @@ mod tests {
         assert!(result.steps[0].log.contains("***"));
     }
 
+    /// card_b6c6944d94cd's acceptance, on whatever daemon the host has —
+    /// rootless included: the job's container writes to the workspace, the
+    /// file is there on the host, and the cleanup that follows a job removes
+    /// it. Who the job runs as is decided inside [`run_job_steps`], from the
+    /// daemon, not by the caller.
+    #[tokio::test]
+    #[ignore = "needs a Docker daemon and the alpine:3.20 image"]
+    async fn a_container_job_writes_to_its_workspace_on_any_daemon() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let name = format!("plombir-git-workspace-test-{}", std::process::id());
+        let limits = crate::docker_job::JobLimits::default();
+        let env = vec![("CI".to_string(), "true".to_string())];
+        let mask = |log: &str| log.to_string();
+        let run = run_job_steps(
+            &[step(
+                "Write",
+                "mkdir -p build && echo artefact > build/out.txt && id",
+            )],
+            &env,
+            &workspace,
+            Some(StepsImage {
+                program: std::ffi::OsStr::new("docker"),
+                name: &name,
+                image: "alpine:3.20",
+                limits: &limits,
+            }),
+            None,
+            &mask,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+            JobSupport::default(),
+            &mut Recorder::default(),
+        )
+        .await;
+        assert_eq!(run.exit_code, 0, "{}", run.log);
+        assert!(!run.log.contains("Permission denied"), "{}", run.log);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("build/out.txt")).unwrap(),
+            "artefact\n"
+        );
+        std::fs::remove_dir_all(&workspace)
+            .expect("what the job wrote is removable by the runner that cleans up");
+    }
+
     /// The container half, on a real daemon: the steps of a job share one
     /// container — what one installs the next finds — and its workspace; a
     /// `$GITHUB_PATH` entry reaches the next step; a step that runs out of its
@@ -2542,20 +2786,14 @@ mod tests {
         let env = vec![("CI".to_string(), "true".to_string())];
         // A rootless daemon maps the container's root onto this user, and this
         // user onto a subordinate id the workspace does not belong to.
-        let rootless = std::process::Command::new("docker")
-            .args(["info", "--format", "{{.SecurityOptions}}"])
-            .output()
-            .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("rootless"));
+        let (user, notice) = crate::docker_job::job_user(std::ffi::OsStr::new("docker")).await;
+        assert_eq!(notice, None, "the daemon says what it is");
         let job = crate::docker_job::JobContainer {
             name: &name,
             image: "alpine:3.20",
             script: "",
             workspace: &workspace,
-            user: if rootless {
-                Some("0:0".to_string())
-            } else {
-                crate::container_user()
-            },
+            user,
             variables: &env,
             limits: &limits,
             temp: Some(&temp),
@@ -2893,13 +3131,6 @@ mod services_docker_tests {
         }
     }
 
-    fn rootless() -> bool {
-        std::process::Command::new("docker")
-            .args(["info", "--format", "{{.SecurityOptions}}"])
-            .output()
-            .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("rootless"))
-    }
-
     /// What the daemon still holds of `owner`'s services: containers and
     /// networks carrying its label.
     fn leftovers(owner: &str) -> Vec<String> {
@@ -2958,11 +3189,6 @@ mod services_docker_tests {
                 program: std::ffi::OsStr::new("docker"),
                 name: &job.name,
                 image: IMAGE,
-                user: if rootless() {
-                    Some("0:0".to_string())
-                } else {
-                    crate::container_user()
-                },
                 limits: &job.limits,
             }),
             Some(ServicesRun {

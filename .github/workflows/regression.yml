@@ -229,11 +229,14 @@ jobs:
       # cancelled job leaves no service and no network (card_bc6676ec0ae3).
       # And the sweep after a killed runner: its steps container and a network
       # its containers no longer hold go, a live runner's stay
-      # (card_1bc3247315ff).
+      # (card_1bc3247315ff). And the job's own write to its workspace, with the
+      # container user chosen from the daemon — rootful or rootless
+      # (card_b6c6944d94cd).
       - name: Run step-model container test
         run: >-
           cargo nextest run -p rg-process --run-ignored only
           -E 'test(ci_steps::tests::steps_share_one_container_and_a_timeout_spares_it)
+          | test(ci_steps::tests::a_container_job_writes_to_its_workspace_on_any_daemon)
           | test(/^ci_steps::services_docker_tests::/)
           | test(ci_services::tests::the_sweep_removes_a_dead_runners_container_and_network_on_a_real_daemon)'
 

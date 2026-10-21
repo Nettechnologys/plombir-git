@@ -762,6 +762,17 @@ impl PipelineRunner {
             // and the pipeline's own completion is this runner's to announce.
             crate::expand_deferred_matrix(&self.db_write, &placeholder).await?;
         }
+        // A job that needs others is decided now that they have finished —
+        // including a variant the expansion above just wrote. A skipped one
+        // is walked past below like any finished job.
+        for held in rg_db::ops::pipeline_condition_ops::deferred_conditions_in_stage(
+            &self.db_write,
+            stage.id,
+        )
+        .await?
+        {
+            crate::decide_deferred_condition(&self.db_write, &held).await?;
+        }
 
         let mut stage_failed = false;
         let jobs = pipeline_ops::list_jobs_by_stage(&self.db_write, stage.id).await?;
@@ -1515,7 +1526,6 @@ impl PipelineRunner {
             program: self.docker_program.as_os_str(),
             name: &container_name,
             image,
-            user: rg_process::container_user(),
             limits: &self.job_limits,
         });
         let services = rg_process::ci_services::ServicesRun {
@@ -1653,6 +1663,10 @@ impl PipelineRunner {
 
         // Generate a unique container name
         let container_name = self.job_container_name(job_id);
+        // Who the job runs as depends on the daemon: on a rootless one this
+        // process's uid is not the workspace's owner inside the container.
+        let (user, user_notice) =
+            rg_process::docker_job::job_user(self.docker_program.as_os_str()).await;
 
         // The image is found or pulled with the operator's credentials, then
         // `docker run` starts its ID with the job's variables. The hardening,
@@ -1665,7 +1679,7 @@ impl PipelineRunner {
                 image,
                 script,
                 workspace: &workspace_path,
-                user: rg_process::container_user(),
+                user,
                 variables: job_environment,
                 limits: &self.job_limits,
                 temp: None,
@@ -1700,6 +1714,9 @@ impl PipelineRunner {
         }
         if !prepared.pull_log.is_empty() {
             log = format!("{}\n{log}", prepared.pull_log.trim_end());
+        }
+        if let Some(notice) = user_notice {
+            log = format!("[plombir-git-runner] {notice}\n{log}");
         }
 
         Ok((exit_code, log))

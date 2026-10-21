@@ -995,3 +995,78 @@ async fn a_javascript_action_goes_only_to_a_runner_that_runs_it_with_its_files()
         StatusCode::NOT_FOUND
     );
 }
+
+/// card_3e5298bfab47: a composite action's step that has the action's files
+/// beside it goes only to a runner that fetches them — a JavaScript-actions
+/// runner would start Node on it — and that runner may fetch the archive the
+/// step names.
+#[tokio::test]
+async fn a_composite_action_with_its_files_goes_only_to_a_runner_that_fetches_them() {
+    let (base, db, repo_root) = crate::common::spawn_test_app_with_db_and_repo_root().await;
+    let seeded = seed(&base, &db, "composite").await;
+    let job_id = job(&db, seeded.stage_id, "build", &[]).await;
+    let key = "e".repeat(64);
+    let steps = serde_json::json!([{
+        "name": "Scripts / Run sh ${GITHUB_ACTION_PATH}/hello.sh",
+        "run": "sh ${GITHUB_ACTION_PATH}/hello.sh",
+        "shell": "sh",
+        "action": {
+            "files": { "kind": "archive", "key": key },
+            "repository": "tools/scripts",
+            "git_ref": "v1",
+            "using": rg_core::ci::COMPOSITE_ACTION_USING,
+            "entry": "",
+            "state": "__action1",
+        },
+    }]);
+    rg_db::ops::pipeline_step_ops::create_job_steps(
+        &db,
+        job_id,
+        &steps.to_string(),
+        &["Scripts / Run sh ${GITHUB_ACTION_PATH}/hello.sh".to_string()],
+    )
+    .await
+    .unwrap();
+    let archives = repo_root.join(rg_core::ci::ACTION_ARCHIVES_DIR);
+    std::fs::create_dir_all(&archives).unwrap();
+    std::fs::write(archives.join(format!("{key}.tar")), b"composite-bytes").unwrap();
+
+    for older in [
+        rg_core::ci::SCOPED_SECRETS_PROTOCOL,
+        rg_core::ci::JS_ACTIONS_PROTOCOL,
+    ] {
+        let response = poll(&base, &seeded, Some(&older.to_string())).await;
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED, "{older}");
+        let error = response.json::<serde_json::Value>().await.unwrap()["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            error.contains(&format!("job #{job_id}"))
+                && error.contains("composite action")
+                && !error.contains("JavaScript"),
+            "{older}: {error}"
+        );
+    }
+
+    let response = poll(
+        &base,
+        &seeded,
+        Some(&rg_core::ci::COMPOSITE_FILES_PROTOCOL.to_string()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["job_id"].as_i64(), Some(job_id));
+    let fetched = reqwest::Client::new()
+        .get(format!(
+            "{base}/api/v1/runners/{}/jobs/{job_id}/actions/{key}",
+            seeded.runner_id
+        ))
+        .bearer_auth(&seeded.runner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fetched.status(), StatusCode::OK);
+    assert_eq!(fetched.bytes().await.unwrap().as_ref(), b"composite-bytes");
+}

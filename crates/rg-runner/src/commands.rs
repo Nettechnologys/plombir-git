@@ -1065,7 +1065,6 @@ pub async fn run_jobs_until_shutdown_checking_every(
                                             .as_deref()
                                             .expect("docker job has a container name"),
                                         image,
-                                        user: rg_process::container_user(),
                                         limits: job_limits,
                                     }
                                 }),

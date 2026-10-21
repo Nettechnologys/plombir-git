@@ -58,6 +58,12 @@ pub struct Model {
     /// on the one placeholder row that stands for it until its stage is
     /// reached. Such a row is never handed to a runner.
     pub deferred_matrix: Option<String>,
+    /// What decides whether an Actions job that lists `needs:` runs at all —
+    /// its `if:`, which may read what the needed jobs left, and whether one
+    /// of them was skipped — until its stage is reached
+    /// (`m20261021_000002_pipeline_job_deferred_condition`). Such a row is
+    /// never handed to a runner; the column is cleared once it may run.
+    pub deferred_condition: Option<String>,
     /// The matrix job this row is a variant of — its name in the pipeline —
     /// and that job's `strategy.fail-fast` / `strategy.max-parallel`.
     pub matrix_group: Option<String>,

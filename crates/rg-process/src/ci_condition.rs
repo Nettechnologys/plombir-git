@@ -1,8 +1,10 @@
 //! Safe, deliberately small evaluator for CI `if` expressions.
 //!
-//! Two scopes read the same grammar. A **job** condition is evaluated once,
-//! against the event, when the pipeline graph is written: only `success()` has
-//! a meaning there, and it is always true. A **step** condition is evaluated by
+//! Two scopes read the same grammar. A **job** condition is evaluated once:
+//! against the event when the pipeline graph is written, or — for a job that
+//! lists `needs:` — once its stage is reached, when it may also read what the
+//! needed jobs left. Only `success()` has a meaning there, and it is always
+//! true: a job's stage is reached only when every stage before it succeeded. A **step** condition is evaluated by
 //! the runner between two steps, so the status functions answer for the steps
 //! that ran before it — `success()`, `failure()`, `always()`, `cancelled()` —
 //! and a condition that names none of them means `success() && <condition>`,
@@ -102,6 +104,43 @@ pub fn validate_condition(input: &str) -> Result<()> {
         None,
     )
     .map(|_| ())
+}
+
+/// [`validate_condition`] for a job that lists `needs:`: it may read what the
+/// needed jobs left — `needs.<job>.outputs.<name>` and `needs.<job>.result` —
+/// because such a job is decided only once they have finished. Not `steps.*`:
+/// a job's `if:` is read before any of its steps run. Whether each one names a
+/// job this one needs is the workflow reader's question.
+pub fn validate_job_condition(input: &str) -> Result<()> {
+    evaluate_with(
+        input,
+        |name| (known_context_name(name) || needs_key(name)).then(String::new),
+        None,
+    )
+    .map(|_| ())
+}
+
+/// Whether a condition reads `needs.*`, outside its quoted strings — whether it
+/// has an answer only once the jobs it needs have finished. `false` for one
+/// that does not parse; the validator is what refuses that.
+pub fn reads_needs(input: &str) -> bool {
+    unwrap_expression(input)
+        .and_then(tokenize)
+        .is_ok_and(|tokens| {
+            tokens
+                .iter()
+                .any(|token| matches!(token, Token::Ident(name) if needs_key(name)))
+        })
+}
+
+fn needs_key(name: &str) -> bool {
+    matches!(
+        crate::ci_steps::RuntimeKey::parse(name),
+        Some(
+            crate::ci_steps::RuntimeKey::NeedsOutput { .. }
+                | crate::ci_steps::RuntimeKey::NeedsResult(_)
+        )
+    )
 }
 
 /// [`validate_condition`] for a step: the status functions are accepted too,
@@ -429,14 +468,15 @@ impl<'a, F: Fn(&str) -> Option<String>> Parser<'a, F> {
                 bail!("{name}() does not accept arguments");
             }
             let Some(status) = self.status else {
-                // A job condition is read once, before anything has run: only
+                // A job condition is read before the job runs, and a job is
+                // reached only when every stage before it succeeded: only
                 // `success()` has an answer there, and it is always yes.
                 if lower == "success" {
                     return Ok(Value::Bool(true));
                 }
                 bail!(
-                    "{name}() has no meaning in a job condition, which is evaluated before any \
-                     job has run; it is a step condition function"
+                    "{name}() has no meaning in a job condition: a job is reached only when \
+                     every stage before it succeeded; it is a step condition function"
                 );
             };
             self.named_status = true;
@@ -609,5 +649,40 @@ mod tests {
         assert!(validate_condition("always()").is_err());
         assert!(validate_condition("failure()").is_err());
         assert!(validate_condition("github.ref ==").is_err());
+    }
+
+    /// A job that lists `needs:` may read what they left, and nothing a step
+    /// would: its `if:` is read before its first step runs.
+    #[test]
+    fn a_job_condition_reads_needs_but_not_steps() {
+        for accepted in [
+            "needs.changes.outputs.backend == 'true'",
+            "${{ needs.build.result == 'success' && github.ref == 'refs/heads/main' }}",
+            "contains(needs.my-job.outputs.list, 'x')",
+        ] {
+            validate_job_condition(accepted).unwrap_or_else(|error| panic!("{accepted}: {error}"));
+            assert!(reads_needs(accepted), "{accepted}");
+            assert!(validate_condition(accepted).is_err(), "{accepted}");
+        }
+        for refused in [
+            "steps.a.outputs.b == 'x'",
+            "needs.build.outputs == 'x'",
+            "always() && needs.build.result == 'failure'",
+            "secrets.TOKEN == 'x'",
+        ] {
+            assert!(validate_job_condition(refused).is_err(), "{refused}");
+        }
+        assert!(!reads_needs("github.ref == 'needs.build.result'"));
+        assert!(!reads_needs("env.needs == 'x'"));
+
+        let context = HashMap::from([
+            (
+                "needs.changes.outputs.backend".to_string(),
+                "true".to_string(),
+            ),
+            ("needs.changes.result".to_string(), "success".to_string()),
+        ]);
+        assert!(evaluate_condition("needs.changes.outputs.backend == 'true'", &context).unwrap());
+        assert!(!evaluate_condition("needs.changes.outputs.frontend == 'true'", &context).unwrap());
     }
 }

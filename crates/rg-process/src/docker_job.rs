@@ -848,6 +848,110 @@ pub fn left_out_variables_notice(variables: &[(String, String)]) -> Option<Strin
     })
 }
 
+/// How the daemon a `docker` program talks to maps a container's users onto
+/// the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonUsers {
+    /// A container's uid is the host's: the job runs as the workspace's owner,
+    /// [`crate::container_user`].
+    Rootful,
+    /// A rootless daemon: the container's root is the user that runs the
+    /// daemon, and every other uid one of that user's subordinate ids — so
+    /// `--user <this process>` lands on an id the workspace does not belong
+    /// to, and the job cannot write a file in it.
+    Rootless,
+    /// `docker info` did not say; why.
+    Unknown(String),
+}
+
+/// Read the daemon's `{{json .SecurityOptions}}` — `["name=seccomp,profile=
+/// builtin","name=rootless","name=cgroupns"]` on a rootless one.
+pub fn daemon_users_from_security_options(options: &str) -> DaemonUsers {
+    let rootless = options
+        .split(|ch: char| matches!(ch, '[' | ']' | '"' | ',') || ch.is_whitespace())
+        .any(|option| option == "name=rootless");
+    if rootless {
+        DaemonUsers::Rootless
+    } else {
+        DaemonUsers::Rootful
+    }
+}
+
+/// What the daemon a `docker` program talks to is, asked once per program for
+/// the life of the process. Only an answer is kept: a daemon that did not
+/// answer is asked again by the next job.
+pub async fn daemon_users(program: &std::ffi::OsStr) -> DaemonUsers {
+    static KNOWN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::ffi::OsString, DaemonUsers>>,
+    > = std::sync::OnceLock::new();
+    let known = KNOWN.get_or_init(Default::default);
+    if let Some(answer) = known
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(program)
+    {
+        return answer.clone();
+    }
+    // The environment `docker run` gets, so this is the daemon the job's
+    // container will be started on.
+    let mut command = client(program);
+    command
+        .env_clear()
+        .envs(crate::job_environment::docker_run_environment())
+        .args(["info", "--format", "{{json .SecurityOptions}}"]);
+    let answer =
+        match tokio::time::timeout(std::time::Duration::from_secs(10), command.output()).await {
+            Ok(Ok(output)) if output.status.success() => {
+                daemon_users_from_security_options(&String::from_utf8_lossy(&output.stdout))
+            }
+            Ok(Ok(output)) => DaemonUsers::Unknown(format!(
+                "`docker info` exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Ok(Err(error)) => DaemonUsers::Unknown(format!("`docker info` did not start: {error}")),
+            Err(_) => DaemonUsers::Unknown("`docker info` did not answer in 10 seconds".into()),
+        };
+    if !matches!(answer, DaemonUsers::Unknown(_)) {
+        known
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(program.to_os_string(), answer.clone());
+    }
+    answer
+}
+
+/// Who a job container runs as on `daemon`, and what the job log has to say
+/// about it.
+///
+/// On a rootful daemon, this process — the owner of the workspace. On a
+/// rootless one, the container's root (`0:0`): that is the user running the
+/// daemon on the host, which owns the workspace when it runs this runner too,
+/// and `--cap-drop ALL` still holds. When the daemon would not say, this
+/// process, with a line for the log naming why writing to `/workspace` may
+/// fail — rather than a bare `Permission denied` from the job's first write.
+pub fn job_user_for(daemon: &DaemonUsers) -> (Option<String>, Option<String>) {
+    match daemon {
+        DaemonUsers::Rootful => (crate::container_user(), None),
+        DaemonUsers::Rootless => (Some("0:0".to_string()), None),
+        DaemonUsers::Unknown(reason) => {
+            let user = crate::container_user();
+            let notice = format!(
+                "could not tell whether the Docker daemon is rootless ({reason}); the job runs \
+                 as {}. On a rootless daemon that id is not the workspace's owner inside the \
+                 container, and writing to /workspace fails with `Permission denied`",
+                user.as_deref().unwrap_or("the image's user")
+            );
+            (user, Some(notice))
+        }
+    }
+}
+
+/// [`job_user_for`] the daemon `program` talks to.
+pub async fn job_user(program: &std::ffi::OsStr) -> (Option<String>, Option<String>) {
+    job_user_for(&daemon_users(program).await)
+}
+
 /// A `docker` client that is dropped with its future.
 ///
 /// A timeout that drops `output()` must kill the Docker CLI as well; otherwise a
@@ -1189,6 +1293,67 @@ mod tests {
         assert!(has_pair(&args, "-v", "/srv/repo:/workspace"), "{args:?}");
         assert!(has_pair(&args, "-w", "/workspace"), "{args:?}");
         assert!(has_pair(&args, "--user", "1000:1000"), "{args:?}");
+    }
+
+    /// card_b6c6944d94cd: what `docker info` says about the daemon decides who
+    /// the job runs as. A rootful daemon keeps the argv every job always had,
+    /// byte for byte; a rootless one runs the job as the container's root —
+    /// the daemon's own user on the host — and one that would not say keeps
+    /// this process and has the job log name why a write may fail.
+    #[test]
+    fn the_daemon_decides_who_a_job_container_runs_as() {
+        for (options, expected) in [
+            (
+                r#"["name=seccomp,profile=builtin","name=rootless","name=cgroupns"]"#,
+                DaemonUsers::Rootless,
+            ),
+            (
+                "[name=seccomp,profile=builtin name=rootless]",
+                DaemonUsers::Rootless,
+            ),
+            (
+                r#"["name=apparmor","name=seccomp,profile=builtin","name=cgroupns"]"#,
+                DaemonUsers::Rootful,
+            ),
+            ("null", DaemonUsers::Rootful),
+            (r#"["name=rootlessish"]"#, DaemonUsers::Rootful),
+        ] {
+            assert_eq!(
+                daemon_users_from_security_options(options),
+                expected,
+                "{options}"
+            );
+        }
+
+        let variables: [(String, String); 0] = [];
+        let argv_as = |user: Option<String>| {
+            let mut container = job(Path::new("/srv/repo"), &variables);
+            container.user = user;
+            run_args(&container, IMAGE_ID).unwrap()
+        };
+        let (rootful, notice) = job_user_for(&DaemonUsers::Rootful);
+        assert_eq!(notice, None);
+        assert_eq!(
+            argv_as(rootful),
+            argv_as(crate::container_user()),
+            "a rootful daemon's argv is the one jobs always had"
+        );
+
+        let (rootless, notice) = job_user_for(&DaemonUsers::Rootless);
+        assert_eq!((rootless.as_deref(), notice), (Some("0:0"), None));
+        let argv = argv_as(rootless);
+        assert!(has_pair(&argv, "--user", "0:0"), "{argv:?}");
+        assert!(has_pair(&argv, "--cap-drop", "ALL"), "{argv:?}");
+
+        let (unknown, notice) = job_user_for(&DaemonUsers::Unknown("`docker info` exited".into()));
+        assert_eq!(unknown, crate::container_user());
+        let notice = notice.expect("the job log says why a write may fail");
+        assert!(
+            notice.contains("`docker info` exited")
+                && notice.contains("rootless")
+                && notice.contains("Permission denied"),
+            "{notice}"
+        );
     }
 
     #[cfg(unix)]

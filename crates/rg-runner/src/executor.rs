@@ -198,6 +198,10 @@ pub(crate) async fn run_job_docker(
         return (-1, msg);
     }
 
+    // Who the job runs as depends on the daemon: on a rootless one this
+    // process's uid is not the workspace's owner inside the container.
+    let (user, user_notice) = rg_process::docker_job::job_user("docker".as_ref()).await;
+
     // The image is found or pulled with the operator's credentials, then
     // `docker run` starts its ID with the job's variables; see
     // `rg_process::docker_job`.
@@ -208,7 +212,7 @@ pub(crate) async fn run_job_docker(
             image,
             script,
             workspace,
-            user: rg_process::container_user(),
+            user,
             variables,
             limits,
             temp: None,
@@ -237,6 +241,9 @@ pub(crate) async fn run_job_docker(
             }
             if !prepared.pull_log.is_empty() {
                 log = format!("{}\n{log}", prepared.pull_log.trim_end());
+            }
+            if let Some(notice) = user_notice {
+                log = format!("[plombir-git-runner] {notice}\n{log}");
             }
             if let Some(notice) = rg_process::docker_job::left_out_variables_notice(variables) {
                 if !log.is_empty() && !log.ends_with('\n') {

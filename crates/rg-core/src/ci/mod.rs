@@ -241,9 +241,13 @@ pub const BUILTIN_CI_VARIABLES: [&str; 12] = rg_process::job_environment::RUNNER
 /// The runner protocol of the step model, for the HTTP layer that hands jobs
 /// out — see [`rg_process::ci_steps::STEPS_PROTOCOL`].
 pub use rg_process::ci_steps::{
-    JS_ACTIONS_PROTOCOL, MAX_JOB_OUTPUT_BYTES, RUNNER_PROTOCOL_HEADER, SCOPED_SECRETS_PROTOCOL,
-    SERVICES_PROTOCOL, STEPS_PROTOCOL,
+    COMPOSITE_FILES_PROTOCOL, JS_ACTIONS_PROTOCOL, MAX_JOB_OUTPUT_BYTES, RUNNER_PROTOCOL_HEADER,
+    SCOPED_SECRETS_PROTOCOL, SERVICES_PROTOCOL, STEPS_PROTOCOL,
 };
+
+/// [`rg_process::ci_steps::ActionStep::using`] of a composite action's step
+/// that has the action's files beside it.
+pub const COMPOSITE_ACTION_USING: &str = rg_process::ci_steps::ActionStep::COMPOSITE;
 
 /// What a native `.plombir-git-ci.yml` job's `CI_JOB_TOKEN` may do: read the
 /// repository and its packages, and be exchanged for a workload-identity token
@@ -883,6 +887,28 @@ pub trait CiTrigger: Send + Sync {
     {
         Box::pin(async {
             anyhow::bail!("this CI engine cannot expand a matrix decided at run time")
+        })
+    }
+
+    /// Decide a job held until the jobs it needs have finished, once the stage
+    /// it is in may run: release it to run, or skip it because its `if:` is
+    /// false or a job it needs was skipped.
+    ///
+    /// `Some(pipeline)` when that verdict finished the pipeline: the caller
+    /// owes it the completion hooks a finished job would have fired.
+    ///
+    /// Fails loudly by default, for the reason
+    /// [`Self::expand_deferred_matrix`] does: a silent no-op would leave the
+    /// job held for good.
+    #[allow(clippy::type_complexity)]
+    fn decide_deferred_condition<'a>(
+        &'a self,
+        _db: &'a DatabaseConnection,
+        _job: &'a rg_db::entities::pipeline_job::Model,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<rg_db::entities::pipeline::Model>>> + Send + 'a>>
+    {
+        Box::pin(async {
+            anyhow::bail!("this CI engine cannot decide a job that waits for the jobs it needs")
         })
     }
 
