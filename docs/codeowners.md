@@ -2,9 +2,10 @@
 
 This is the reference for the `CODEOWNERS` file you commit to **your own**
 repository so that Plombir Git requests reviewers on a new pull request by
-itself. The format is the GitHub/Gitea one — a pattern followed by the owners
-of everything it matches — but the matcher is Plombir Git's own, so the rules
-below are the ones that decide, not the ones you remember from elsewhere.
+itself. The format is the GitHub one — a pattern followed by the owners of
+everything it matches — together with GitLab's sections, but the matcher is
+Plombir Git's own, so the rules below are the ones that decide, not the ones
+you remember from elsewhere.
 
 **Nothing in the product mentions this file**, which is why this page exists:
 there is no settings screen for it, no editor that offers to create it, and no
@@ -53,10 +54,16 @@ rest are not looked at. There is no merging of two files.
 CODEOWNERS
 docs/CODEOWNERS
 .gitea/CODEOWNERS
+.gitlab/CODEOWNERS
 ```
 
-`.gitea/CODEOWNERS` is the path Gitea and Forgejo read, so a repository moved
-here from either keeps requesting the reviewers it did there.
+`.gitea/CODEOWNERS` is the path Gitea and Forgejo read, and
+`.gitlab/CODEOWNERS` the one GitLab reads besides `CODEOWNERS` and
+`docs/CODEOWNERS`. A GitLab file is read with its sections (see
+[GitLab sections](#gitlab-sections)). A Gitea or Forgejo file is **not** read
+in its own dialect: Gitea writes patterns as regular expressions
+(`.*\.go`), and here every pattern is the glob described below, so a Gitea
+pattern has to be rewritten (`*.go`) before it requests anybody.
 
 **There is a size limit.** The file is matched line by line, so the whole of it
 has to be held in memory at once, and a file over the limit is refused before a
@@ -83,7 +90,8 @@ whitespace.
 Five ways a line produces **no executable rule**:
 
 - It is blank, or a comment. This is intentional and produces no diagnostic.
-- It names no owner (`*` on its own). Plombir Git logs the line and reason.
+- It names no owner (`*` on its own) and sits in no section with a default
+  owner. Plombir Git logs the line and reason.
 - None of its owners starts with `@`. An email address — which GitHub
   accepts — is not an owner here, and neither is a bare `alice`. A line whose
   owners are all unusable does not become an ownerless rule that wins; it
@@ -127,6 +135,7 @@ requested once.
 | `**` | Any run of characters, `/` included. |
 | `?` | Exactly one character, never a `/`. |
 | `\` | The character after it is a literal — not a wildcard, not a comment marker. |
+| A **leading `!`** | An exclusion, see [GitLab sections](#gitlab-sections). `\!` is a file name starting with `!`. |
 
 Worked out on real paths:
 
@@ -151,6 +160,62 @@ Worked out on real paths:
 Two of those rows are the ones that catch people out: `src/*.rs` does **not**
 reach `src/api/pulls.rs`, because `*` stops at a slash, and `/docs` does not
 reach a `docs` directory that is not at the root.
+
+## GitLab sections
+
+A line of the form `[Section name]` is a section heading, not a rule. It may
+be followed by owners, and those are the **default owners** of the section:
+a rule under it that names no owner of its own gets them.
+
+- Within one section the **last matching rule wins**, exactly as in a file
+  without headings. The rules above the first heading are a section of their
+  own.
+- **Every section contributes**: a path gets the winner of each section that
+  has one, sections in the order their names first appear.
+- Section names are compared **without case**, so `[Docs]` and `[DOCS]` further
+  down are one section.
+- `!pattern` is an **exclusion**: a path it matches gets nobody from that
+  section, and no rule further down the same section takes it back. Other
+  sections are not affected. An exclusion names no owner; owners written after
+  it are logged and ignored.
+- `^[Section]`, an optional section, is read like any other. Nothing here is
+  required anyway — see "It requests, it does not require" above.
+- `[Section][2]`, an approval count, is **not enforced**: no code-owner approval
+  is required here, so there is nothing to count. The section's owners are
+  still requested, and the heading is logged as a
+  `CODEOWNERS declaration ignored` line naming the count.
+
+A heading is recognised only when the closing `]` (or the `]` of the count)
+ends the word: `[id].tsx @web` is a rule for the file `[id].tsx`. To write a
+rule that starts with `[`, escape it: `\[Docs] @alice`.
+
+<!-- example: codeowners-sections-file -->
+```text
+* @admin
+
+[Docs] @tech-writers
+/docs/
+*.md
+/docs/api/ @api-team
+!/docs/drafts/
+
+[Rust] @rustaceans
+*.rs
+```
+
+<!-- examples: codeowners-sections-resolution -->
+| Changed path | Owners requested |
+|--------------|------------------|
+| `src/lib.rs` | `@admin`, `@rustaceans` |
+| `README.md` | `@admin`, `@tech-writers` |
+| `docs/api/v1.md` | `@admin`, `@api-team` |
+| `docs/drafts/plan.md` | `@admin` |
+| `build.sh` | `@admin` |
+
+`docs/api/v1.md` goes to `@api-team` rather than to the writers because
+`/docs/api/` is the last rule of `[Docs]` that matches it — `*.md` above it
+changes nothing — and `docs/drafts/plan.md` gets nobody from `[Docs]` at all,
+because the exclusion takes it out of that section.
 
 ## Who the owners can be
 

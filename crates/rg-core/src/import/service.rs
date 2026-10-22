@@ -7294,6 +7294,77 @@ mod tests {
             .any(|item| item.starts_with("CI secret values")));
     }
 
+    /// card_5e13b87a247f, end to end through the receipt an import answers
+    /// with: a cloned GitLab project whose only CI is `.gitlab-ci.yml` gets it
+    /// named, and nothing is said for a clone with no CI at all.
+    #[tokio::test]
+    async fn the_receipt_names_a_gitlab_ci_file_that_will_not_run_here() {
+        async fn receipt_for(files: &[(&str, &str)]) -> crate::import::receipt::ImportReceipt {
+            let db = test_db().await;
+            let root = tempfile::tempdir().unwrap();
+            let work = root.path().join("work");
+            let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+            git.run_or_bail(&["init", "-q", "-b", "main", work.to_str().unwrap()], None)
+                .unwrap();
+            for (path, contents) in files {
+                let file = work.join(path);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(file, contents).unwrap();
+            }
+            git.run_or_bail(&["add", "."], Some(&work)).unwrap();
+            git.run_or_bail(
+                &[
+                    "-c",
+                    "user.name=receipt test",
+                    "-c",
+                    "user.email=receipt@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "fixture",
+                ],
+                Some(&work),
+            )
+            .unwrap();
+            let bare = root.path().join("o/r.git");
+            git.run_or_bail(
+                &[
+                    "clone",
+                    "--bare",
+                    "-q",
+                    work.to_str().unwrap(),
+                    bare.to_str().unwrap(),
+                ],
+                None,
+            )
+            .unwrap();
+            let stats = ImportStats {
+                repo_cloned: true,
+                ..ImportStats::default()
+            };
+            crate::import::receipt::build(&db, root.path(), "gitlab", ("o", "r"), &stats)
+                .await
+                .unwrap()
+        }
+
+        let receipt = receipt_for(&[(".gitlab-ci.yml", "test:\n  script: [make test]\n")]).await;
+        let ci = receipt
+            .ci
+            .expect("a cloned repository has its CI looked at");
+        assert!(ci.unavailable.is_none(), "{ci:?}");
+        assert_eq!(
+            ci.not_run.iter().map(|item| item.path).collect::<Vec<_>>(),
+            [".gitlab-ci.yml"]
+        );
+
+        let receipt = receipt_for(&[("README.md", "hello\n")]).await;
+        let ci = receipt
+            .ci
+            .expect("a cloned repository has its CI looked at");
+        assert!(ci.unavailable.is_none() && ci.not_run.is_empty(), "{ci:?}");
+    }
+
     fn review_comment(
         id: i64,
         review: Option<i64>,

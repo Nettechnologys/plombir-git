@@ -3008,7 +3008,7 @@ fn read_ci_config_with_inputs(
     // `.expect("the CI config was found above")`, an invariant that held only
     // because two independent operations happened to agree about a tree the
     // client committed.
-    let (ci_filename, entry) = [".plombir-git-ci.yml"]
+    let (ci_filename, entry) = rg_core::ci::NATIVE_CI_FILES
         .into_iter()
         .find_map(|name| {
             tree.lookup_entry_by_path(name)
@@ -3221,15 +3221,9 @@ fn tree_at_commit<'repo>(
         .with_context(|| format!("failed to read CI tree at commit {commit_sha}"))
 }
 
-/// Directories holding Actions workflow files, relative to the repo root, in
-/// the order they are looked for.
-///
-/// The first one a commit has is the one read, and the other is not merged in
-/// — Gitea's `WorkflowDirs` order. A repository brought over from GitHub runs
-/// its `.github/workflows` as it is; one that has both runs only what it wrote
-/// for this forge, so a workflow kept for GitHub's own runners never starts
-/// here by surprise.
-const WORKFLOW_DIRS: [&str; 2] = [".gitea/workflows", ".github/workflows"];
+/// Directories holding Actions workflow files; see the shared definition for
+/// the order and why it is shared.
+const WORKFLOW_DIRS: [&str; 2] = rg_core::ci::WORKFLOW_DIRS;
 
 /// The workflow files committed at one commit, and the directory they came from.
 #[derive(Debug)]

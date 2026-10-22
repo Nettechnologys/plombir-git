@@ -87,6 +87,23 @@ const CI_JOB_TOKEN_MIN_LIFETIME_SECS: i64 = 60;
 /// `workflow_dispatch` is what that event is called everywhere else.
 pub const WORKFLOW_DISPATCH_EVENT: &str = "workflow_dispatch";
 
+/// Directories holding Actions workflow files, relative to the repo root, in
+/// the order they are looked for.
+///
+/// The first one a commit has is the one read, and the other is not merged in
+/// — Gitea's `WorkflowDirs` order. A repository brought over from GitHub runs
+/// its `.github/workflows` as it is; one that has both runs only what it wrote
+/// for this forge, so a workflow kept for GitHub's own runners never starts
+/// here by surprise.
+///
+/// Here rather than in `rg-ci`, which reads them, so the import receipt can
+/// tell a repository whose CI will not run here from one whose CI will by the
+/// same list the engine uses (card_5e13b87a247f).
+pub const WORKFLOW_DIRS: [&str; 2] = [".gitea/workflows", ".github/workflows"];
+
+/// The native CI file, read when a commit has none of [`WORKFLOW_DIRS`].
+pub const NATIVE_CI_FILES: [&str; 1] = [".plombir-git-ci.yml"];
+
 /// Largest `workflow_dispatch` input map a manual run may carry, counted as the
 /// JSON document `pipelines.dispatch_inputs` stores.
 ///

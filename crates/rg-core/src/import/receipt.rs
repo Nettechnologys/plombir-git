@@ -11,7 +11,9 @@
 //!
 //! What cannot be transferred at all — secret values, reactions, branch
 //! protection — is named as a checklist, so that its absence is a known item
-//! rather than a surprise a month later.
+//! rather than a surprise a month later. So is CI the imported default branch
+//! defines in a form this server does not run (`.gitlab-ci.yml`), which is the
+//! loss a moved project otherwise discovers only when no pipeline ever starts.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -59,7 +61,46 @@ pub struct ImportReceipt {
     pub refs: RefsReceipt,
     /// What no import can bring, to be set up by hand.
     pub not_transferable: Vec<&'static str>,
+    /// CI the imported default branch defines and this server will not run.
+    /// Absent when nothing was cloned, so there is no branch to look at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci: Option<CiReceipt>,
 }
+
+/// The CI of the imported default branch, as far as it will not run here.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CiReceipt {
+    /// Why the branch could not be looked at, when it could not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+    /// Each CI definition of the branch that will not run here, by path.
+    /// Empty when the branch has none, or has one this server runs.
+    pub not_run: Vec<CiNotRun>,
+}
+
+/// One CI definition that will not run here, and what to do instead.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CiNotRun {
+    pub path: &'static str,
+    pub reason: &'static str,
+}
+
+/// CI definitions of other forges that this server does not read, with what to
+/// write instead. Named in the receipt only when the branch has none of the
+/// sources the engine does read: a `.gitlab-ci.yml` kept beside a workflow is a
+/// choice, not a loss.
+const FOREIGN_CI: [(&str, &str); 2] = [
+    (
+        ".gitlab-ci.yml",
+        "GitLab CI is not run here: describe the pipeline as an Actions workflow under \
+         `.gitea/workflows/` or `.github/workflows/`, or in `.plombir-git-ci.yml`",
+    ),
+    (
+        ".forgejo/workflows",
+        "Forgejo's own workflow directory is not read here: move the workflows to \
+         `.gitea/workflows/`, which Forgejo reads as well",
+    ),
+];
 
 /// One kind of object: how many the source has, how many are here.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -282,6 +323,45 @@ fn refs_receipt(listing: &str, repository: &Path) -> anyhow::Result<RefsReceipt>
     })
 }
 
+/// The CI definitions at the head of `repository`'s default branch that will
+/// not run here — see [`FOREIGN_CI`]. An unborn branch has none.
+fn ci_not_run(repository: &Path) -> anyhow::Result<Vec<CiNotRun>> {
+    let repo = rg_git::repository::open(repository)
+        .map_err(|error| anyhow::anyhow!("failed to open the imported repository: {error}"))?;
+    let head = repo
+        .head()
+        .map_err(|error| anyhow::anyhow!("failed to read the imported HEAD: {error}"))?;
+    if head.is_unborn() {
+        return Ok(Vec::new());
+    }
+    let tree = repo
+        .head_commit()
+        .map_err(|error| anyhow::anyhow!("failed to read the imported head commit: {error}"))?
+        .tree()
+        .map_err(|error| anyhow::anyhow!("failed to read the imported head tree: {error}"))?;
+    let present = |path: &str| {
+        tree.lookup_entry_by_path(path)
+            .map(|entry| entry.is_some())
+            .map_err(|error| anyhow::anyhow!("failed to look up {path}: {error}"))
+    };
+
+    for path in crate::ci::WORKFLOW_DIRS
+        .iter()
+        .chain(crate::ci::NATIVE_CI_FILES.iter())
+    {
+        if present(path)? {
+            return Ok(Vec::new());
+        }
+    }
+    let mut not_run = Vec::new();
+    for (path, reason) in FOREIGN_CI {
+        if present(path)? {
+            not_run.push(CiNotRun { path, reason });
+        }
+    }
+    Ok(not_run)
+}
+
 /// The checklist of what no import brings, for `platform`.
 fn not_transferable(platform: &str) -> Vec<&'static str> {
     match platform {
@@ -421,6 +501,23 @@ pub(crate) async fn build(
     }
 
     let repository = repo_root.join(format!("{}/{}.git", target.0, target.1));
+    let ci = if stats.repo_cloned {
+        let repository = repository.clone();
+        Some(
+            crate::blocking::run_blocking_git("import receipt CI", move || ci_not_run(&repository))
+                .await
+                .map(|not_run| CiReceipt {
+                    unavailable: None,
+                    not_run,
+                })
+                .unwrap_or_else(|error| CiReceipt {
+                    unavailable: Some(format!("the imported branch could not be read: {error:#}")),
+                    not_run: Vec::new(),
+                }),
+        )
+    } else {
+        None
+    };
     let refs = match &inventory.refs {
         None => RefsReceipt {
             unavailable: Some(
@@ -449,6 +546,7 @@ pub(crate) async fn build(
         objects,
         refs,
         not_transferable: not_transferable(platform),
+        ci,
     })
 }
 
@@ -467,6 +565,110 @@ mod tests {
         assert_eq!(receipt.missing.len(), RECEIPT_NAME_SAMPLE);
         assert_eq!(receipt.missing_omitted, 1);
         assert_eq!(receipt.missing[0], "#10", "sorted by name, as listed");
+    }
+
+    /// A work tree with `files` committed on `main`; `None` leaves it unborn.
+    fn repository_with(files: Option<&[(&str, &str)]>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+        git.run_or_bail(
+            &["init", "-q", "-b", "main", dir.path().to_str().unwrap()],
+            None,
+        )
+        .unwrap();
+        let Some(files) = files else {
+            return dir;
+        };
+        for (path, contents) in files {
+            let file = dir.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, contents).unwrap();
+        }
+        git.run_or_bail(&["add", "."], Some(dir.path())).unwrap();
+        git.run_or_bail(
+            &[
+                "-c",
+                "user.name=receipt test",
+                "-c",
+                "user.email=receipt@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+            Some(dir.path()),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// card_5e13b87a247f: a project moved from GitLab keeps its
+    /// `.gitlab-ci.yml`, nothing here runs it, and the receipt has to say so.
+    #[test]
+    fn a_gitlab_ci_file_with_nothing_this_server_runs_is_named() {
+        let repo = repository_with(Some(&[(".gitlab-ci.yml", "build:\n  script: [make]\n")]));
+        assert_eq!(
+            ci_not_run(repo.path()).unwrap(),
+            [CiNotRun {
+                path: ".gitlab-ci.yml",
+                reason: FOREIGN_CI[0].1,
+            }]
+        );
+
+        let forgejo = repository_with(Some(&[(".forgejo/workflows/ci.yml", "on: push\n")]));
+        let named: Vec<&str> = ci_not_run(forgejo.path())
+            .unwrap()
+            .into_iter()
+            .map(|item| item.path)
+            .collect();
+        assert_eq!(named, [".forgejo/workflows"]);
+    }
+
+    /// Beside CI this server does run, a foreign file is somebody's choice, not
+    /// a loss — whichever source the engine reads is the one present.
+    #[test]
+    fn a_gitlab_ci_file_beside_ci_that_runs_here_is_not_named() {
+        for source in [
+            ".github/workflows/ci.yml",
+            ".gitea/workflows/ci.yml",
+            ".plombir-git-ci.yml",
+        ] {
+            let repo = repository_with(Some(&[
+                (".gitlab-ci.yml", "build:\n  script: [make]\n"),
+                (source, "on: push\n"),
+            ]));
+            let not_run = ci_not_run(repo.path()).unwrap();
+            assert!(not_run.is_empty(), "beside {source}: {not_run:?}");
+        }
+
+        assert!(ci_not_run(repository_with(None).path()).unwrap().is_empty());
+        let plain = repository_with(Some(&[("README.md", "hello\n")]));
+        assert!(ci_not_run(plain.path()).unwrap().is_empty());
+    }
+
+    /// The day the engine learns to read one of these, its entry here becomes
+    /// a claim that is false — and it would never fire, so nothing else says so.
+    /// The remedy names every source the engine does read.
+    #[test]
+    fn a_foreign_ci_source_is_one_the_engine_does_not_read() {
+        let read: Vec<&str> = crate::ci::WORKFLOW_DIRS
+            .iter()
+            .chain(crate::ci::NATIVE_CI_FILES.iter())
+            .copied()
+            .collect();
+        for (path, _) in FOREIGN_CI {
+            assert!(
+                !read.contains(&path),
+                "{path} is read by the engine now; drop it from FOREIGN_CI"
+            );
+        }
+        for source in read {
+            assert!(
+                FOREIGN_CI[0].1.contains(source),
+                "the GitLab remedy does not name {source}, a CI source the engine reads"
+            );
+        }
     }
 
     #[test]

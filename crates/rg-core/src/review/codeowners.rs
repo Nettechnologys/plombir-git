@@ -24,11 +24,16 @@ use rg_db::ops::{pr_reviewer_request_ops, user_ops};
 /// Forgejo keeps it; without it that file was silently not a policy
 /// (card_a96a2878c38c). Last, as Gitea itself tries it, so a repository that
 /// already carried a file at one of the other paths keeps the one it had.
+///
+/// `.gitlab/CODEOWNERS` is GitLab's third path. It is read only because the
+/// parser now understands GitLab's sections (card_8e1c5506d559): before that,
+/// opening it would have opened the way to a file executed by half.
 const CODEOWNERS_PATHS: &[&str] = &[
     ".github/CODEOWNERS",
     "CODEOWNERS",
     "docs/CODEOWNERS",
     ".gitea/CODEOWNERS",
+    ".gitlab/CODEOWNERS",
 ];
 
 /// The largest CODEOWNERS file this server will read in order to parse it.
@@ -52,6 +57,15 @@ pub struct CodeownerRule {
     pub line: usize,
     pub pattern: String,
     pub owners: Vec<String>,
+    /// The GitLab section the rule sits in: `0` for every rule above the first
+    /// `[Section]` heading (a file without headings is all section `0`), then
+    /// one index per distinct section name, in the order the names first
+    /// appear. The last matching rule wins *within* a section; the sections'
+    /// winners are then combined.
+    pub section: usize,
+    /// A `!pattern` line: a path it matches takes no owner from its section,
+    /// whatever else in that section matches it too.
+    pub exclusion: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,12 +99,58 @@ impl CodeownersDiagnostic {
 
 /// Parse a CODEOWNERS file, retaining every executable rule and explaining
 /// every non-comment declaration the engine cannot execute.
+///
+/// GitLab's dialect is part of the format, not a stranger to it: a
+/// `[Section] @owners` heading starts a section whose owners are the default
+/// for the lines under it that name none, `^[Section]` is the same heading
+/// marked optional, and `!pattern` excludes a path from its section. Read as a
+/// plain rule, a heading used to become a pattern nobody wrote and every line
+/// under it an ownerless rule that was dropped (card_8e1c5506d559).
 pub fn parse_codeowners(contents: &str) -> ParsedCodeowners {
     let mut parsed = ParsedCodeowners::default();
+    // Section names compared without case, as GitLab merges `[Docs]` and
+    // `[DOCS]` into one section; index 0 is the unnamed section above them.
+    let mut section_names: Vec<String> = Vec::new();
+    let mut section = 0;
+    let mut heading: Option<String> = None;
+    let mut default_owners: Vec<String> = Vec::new();
     for (index, source) in contents.lines().enumerate() {
         let line_number = index + 1;
         let line = strip_comment(source).trim();
         if line.is_empty() {
+            continue;
+        }
+
+        if let Some(found) = section_heading(line) {
+            let key = found.name.to_lowercase();
+            section = match section_names.iter().position(|name| *name == key) {
+                Some(at) => at + 1,
+                None => {
+                    section_names.push(key);
+                    section_names.len()
+                }
+            };
+            // GitLab counts code-owner approvals per section. Nothing here
+            // requires a code owner's approval at all, so a count has nothing
+            // to apply to — said by name rather than read as if it held.
+            if let Some(approvals) = found.approvals {
+                parsed.diagnostics.push(CodeownersDiagnostic::new(
+                    line_number,
+                    format!("[{}][{approvals}]", found.name),
+                    format!(
+                        "section `{}` sets an approval count, and no code-owner approval is \
+                         required here: CODEOWNERS only requests reviewers, so its owners are \
+                         requested and the count is not enforced",
+                        found.name
+                    ),
+                ));
+            }
+            default_owners = parse_owners(
+                line_number,
+                found.owners.split_whitespace(),
+                &mut parsed.diagnostics,
+            );
+            heading = Some(found.name.to_string());
             continue;
         }
 
@@ -115,46 +175,152 @@ pub fn parse_codeowners(contents: &str) -> ParsedCodeowners {
             continue;
         }
 
-        let mut owners = Vec::new();
-        let mut saw_owner = false;
-        for declaration in fields {
-            saw_owner = true;
-            match declaration.strip_prefix('@') {
-                Some(owner) if !owner.is_empty() => owners.push(owner.to_string()),
-                _ => parsed.diagnostics.push(CodeownersDiagnostic::new(
+        if let Some(excluded) = pattern.strip_prefix('!') {
+            if excluded.is_empty() {
+                parsed.diagnostics.push(CodeownersDiagnostic::new(
+                    line_number,
+                    pattern,
+                    "exclusion names no pattern",
+                ));
+                continue;
+            }
+            for declaration in fields {
+                parsed.diagnostics.push(CodeownersDiagnostic::new(
                     line_number,
                     declaration,
-                    format!("`{declaration}` is not an `@username` or `@org/team` owner"),
-                )),
+                    format!("`{pattern}` is an exclusion: it removes owners and assigns none"),
+                ));
             }
+            parsed.rules.push(CodeownerRule {
+                line: line_number,
+                pattern: excluded.to_string(),
+                owners: Vec::new(),
+                section,
+                exclusion: true,
+            });
+            continue;
         }
-        if !saw_owner {
-            parsed.diagnostics.push(CodeownersDiagnostic::new(
-                line_number,
-                pattern,
-                "rule names no owner",
-            ));
-        }
+
+        let mut declarations = fields.peekable();
+        let owners = if declarations.peek().is_none() {
+            if default_owners.is_empty() {
+                parsed.diagnostics.push(CodeownersDiagnostic::new(
+                    line_number,
+                    pattern,
+                    match &heading {
+                        Some(name) => {
+                            format!(
+                                "rule names no owner, and section `{name}` has no default owner"
+                            )
+                        }
+                        None => "rule names no owner".to_string(),
+                    },
+                ));
+            }
+            default_owners.clone()
+        } else {
+            parse_owners(line_number, declarations, &mut parsed.diagnostics)
+        };
         if !owners.is_empty() {
             parsed.rules.push(CodeownerRule {
                 line: line_number,
                 pattern: pattern.to_string(),
                 owners,
+                section,
+                exclusion: false,
             });
         }
     }
     parsed
 }
 
+/// The `@owner` declarations of one line; every other declaration is
+/// diagnosed and left out.
+fn parse_owners<'a>(
+    line: usize,
+    declarations: impl IntoIterator<Item = &'a str>,
+    diagnostics: &mut Vec<CodeownersDiagnostic>,
+) -> Vec<String> {
+    let mut owners = Vec::new();
+    for declaration in declarations {
+        match declaration.strip_prefix('@') {
+            Some(owner) if !owner.is_empty() => owners.push(owner.to_string()),
+            _ => diagnostics.push(CodeownersDiagnostic::new(
+                line,
+                declaration,
+                format!("`{declaration}` is not an `@username` or `@org/team` owner"),
+            )),
+        }
+    }
+    owners
+}
+
+/// A GitLab section heading: `[Name]`, optionally `^`-prefixed (optional
+/// section) and followed by `[n]` (approval count), then the default owners.
+struct SectionHeading<'a> {
+    name: &'a str,
+    approvals: Option<&'a str>,
+    owners: &'a str,
+}
+
+/// Read `line` as a section heading, or `None` when it is a rule.
+///
+/// The closing bracket has to end the token: `[id].tsx @web` is a rule for a
+/// file named with brackets, not a section called `id`. A rule that really
+/// starts with `[` — or with `!` — is written with a backslash in front.
+fn section_heading(line: &str) -> Option<SectionHeading<'_>> {
+    let rest = line.strip_prefix('^').unwrap_or(line).strip_prefix('[')?;
+    let close = rest.find(']')?;
+    let name = rest[..close].trim();
+    if name.is_empty() {
+        return None;
+    }
+    let mut rest = &rest[close + 1..];
+    let mut approvals = None;
+    if let Some(count) = rest.strip_prefix('[') {
+        let close = count.find(']')?;
+        approvals = Some(&count[..close]);
+        rest = &count[close + 1..];
+    }
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some(SectionHeading {
+        name,
+        approvals,
+        owners: rest,
+    })
+}
+
+/// Owners of the changed paths, each with the line of the rule that named it.
+///
+/// Per path and per section the last matching rule wins, unless an exclusion
+/// in that section matches the path — then the section gives it nobody, as in
+/// GitLab, where an excluded path cannot be included again further down. The
+/// sections' winners are combined in the order the sections first appear.
 fn owners_for_paths_with_lines(rules: &[CodeownerRule], paths: &[String]) -> Vec<(usize, String)> {
+    let sections = rules.iter().map(|rule| rule.section + 1).max().unwrap_or(0);
+    let mut excluded = vec![false; sections];
+    let mut winners: Vec<Option<&CodeownerRule>> = vec![None; sections];
     let mut seen = HashSet::new();
     let mut owners = Vec::new();
     for path in paths {
-        if let Some(rule) = rules
-            .iter()
-            .rev()
-            .find(|rule| pattern_matches(&rule.pattern, path))
-        {
+        excluded.fill(false);
+        winners.fill(None);
+        for rule in rules {
+            if excluded[rule.section] || !pattern_matches(&rule.pattern, path) {
+                continue;
+            }
+            if rule.exclusion {
+                excluded[rule.section] = true;
+            } else {
+                winners[rule.section] = Some(rule);
+            }
+        }
+        for (rule, excluded) in winners.iter().zip(&excluded) {
+            let Some(rule) = rule.filter(|_| !excluded) else {
+                continue;
+            };
             for owner in &rule.owners {
                 if seen.insert(owner.to_ascii_lowercase()) {
                     owners.push((rule.line, owner.clone()));
@@ -931,21 +1097,36 @@ mod tests {
     /// serve a real pull request.
     #[test]
     fn the_worked_example_resolves_to_the_owners_the_documentation_promises() {
-        let (name, content) = CODEOWNERS_DOCUMENTATION;
-        let rules = parse_codeowners(&fenced_block_after(
-            name,
-            content,
+        assert_worked_example(
             "<!-- example: codeowners-file -->",
-        ));
+            "<!-- examples: codeowners-resolution -->",
+            4,
+        );
+    }
+
+    /// The same, for the GitLab sections example: which section contributes
+    /// what is the part of that dialect no experiment on one rule shows.
+    #[test]
+    fn the_sections_example_resolves_to_the_owners_the_documentation_promises() {
+        assert_worked_example(
+            "<!-- example: codeowners-sections-file -->",
+            "<!-- examples: codeowners-sections-resolution -->",
+            5,
+        );
+    }
+
+    fn assert_worked_example(file_marker: &str, resolution_marker: &str, min_rules: usize) {
+        let (name, content) = CODEOWNERS_DOCUMENTATION;
+        let rules = parse_codeowners(&fenced_block_after(name, content, file_marker));
         assert!(
-            rules.rules.len() >= 4,
-            "{name}: only {} rules parsed out of the worked example — a rule the page shows is \
-             being dropped by the parser it is supposed to illustrate",
+            rules.rules.len() >= min_rules,
+            "{name}: only {} rules parsed out of the example after `{file_marker}` — a rule the \
+             page shows is being dropped by the parser it is supposed to illustrate",
             rules.rules.len()
         );
         assert!(rules.diagnostics.is_empty(), "{:?}", rules.diagnostics);
 
-        let rows = table_rows_after(name, content, "<!-- examples: codeowners-resolution -->");
+        let rows = table_rows_after(name, content, resolution_marker);
         for (line, cells) in &rows {
             assert!(
                 cells.len() == 2,
@@ -969,8 +1150,8 @@ mod tests {
 
         assert!(
             rows.len() >= 4,
-            "only {} resolution examples read out of {name} — the table scanner has stopped \
-             matching",
+            "only {} resolution examples read after `{resolution_marker}` in {name} — the table \
+             scanner has stopped matching",
             rows.len()
         );
     }
@@ -1161,6 +1342,141 @@ mod tests {
         assert_eq!(owners, ["api", "default"]);
     }
 
+    /// card_8e1c5506d559: a GitLab heading used to become the rule `[Docs]`
+    /// and every ownerless line under it a diagnostic, so `docs/` reached
+    /// nobody. The heading's owners are the default for the lines below it.
+    #[test]
+    fn a_gitlab_section_heading_is_a_default_owner_not_a_rule() {
+        let parsed = parse_codeowners("[Docs] @docs-team\ndocs/\n");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert!(
+            parsed.rules.iter().all(|rule| rule.pattern != "[Docs]"),
+            "the heading must not be a pattern: {:?}",
+            parsed.rules
+        );
+        assert_eq!(
+            owners_for_paths(&parsed.rules, &["docs/readme.md".into()]),
+            ["docs-team"]
+        );
+
+        // Owners written on the line win over the section's default.
+        let parsed = parse_codeowners("^[Docs] @docs-team\ndocs/ @alice\n*.md\n");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(
+            owners_for_paths(&parsed.rules, &["docs/guide.txt".into()]),
+            ["alice"]
+        );
+        assert_eq!(
+            owners_for_paths(&parsed.rules, &["README.md".into()]),
+            ["docs-team"]
+        );
+    }
+
+    /// GitLab's own worked example: the last match wins inside a section, and
+    /// the winners of every section — the unnamed one above the first heading
+    /// included — are combined.
+    #[test]
+    fn each_section_contributes_its_last_matching_rule() {
+        let parsed = parse_codeowners(
+            "* @admin\n\n[README Owners]\nREADME.md @user1 @user2\ninternal/README.md @user4\n\n\
+             [README other owners]\nREADME.md @user3\n",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(
+            owners_for_paths(&parsed.rules, &["internal/README.md".into()]),
+            ["admin", "user4", "user3"]
+        );
+        assert_eq!(
+            owners_for_paths(&parsed.rules, &["README.md".into()]),
+            ["admin", "user1", "user2", "user3"]
+        );
+        assert_eq!(
+            owners_for_paths(&parsed.rules, &["src/lib.rs".into()]),
+            ["admin"]
+        );
+    }
+
+    /// `[Docs]` and `[DOCS]` are one section, so the later line wins over the
+    /// earlier one instead of both being requested.
+    #[test]
+    fn section_names_are_one_section_whatever_their_case() {
+        let parsed = parse_codeowners("[Docs]\n*.md @writers\n[DOCS]\nguide.md @editor\n");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(
+            owners_for_paths(&parsed.rules, &["guide.md".into()]),
+            ["editor"]
+        );
+        assert_eq!(
+            owners_for_paths(&parsed.rules, &["notes.md".into()]),
+            ["writers"]
+        );
+    }
+
+    /// `!pattern` used to be a rule for a path that starts with `!`. In GitLab
+    /// it takes a path out of its section, and nothing later in that section
+    /// takes it back; other sections are unaffected.
+    #[test]
+    fn an_exclusion_takes_a_path_out_of_its_section_only() {
+        let parsed = parse_codeowners(
+            "* @admin\n!pom.xml\n[Ruby] @ruby-team\n*.rb\n!/config/**/*.rb\n/config/ @ops\n",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert!(owners_for_paths(&parsed.rules, &["pom.xml".into()]).is_empty());
+        assert_eq!(
+            owners_for_paths(&parsed.rules, &["lib/app.rb".into()]),
+            ["admin", "ruby-team"]
+        );
+        assert_eq!(
+            owners_for_paths(&parsed.rules, &["config/env/prod.rb".into()]),
+            ["admin"],
+            "excluded in `Ruby`, and the later `/config/` cannot include it again"
+        );
+
+        let literal = parse_codeowners("\\!important @alice\n");
+        assert!(literal.diagnostics.is_empty(), "{:?}", literal.diagnostics);
+        assert_eq!(
+            owners_for_paths(&literal.rules, &["!important".into()]),
+            ["alice"],
+            "an escaped `!` is a byte of the file name"
+        );
+    }
+
+    /// What a heading or exclusion cannot carry is said by name, and a token
+    /// that only looks like a heading stays a rule.
+    #[test]
+    fn what_a_section_cannot_execute_is_diagnosed_by_name() {
+        let parsed = parse_codeowners(
+            "[Docs][2] @writers\ndocs/\n[Empty]\nsrc/\n!vendor/ @bob\n!\n[id].tsx @web\n\\[Docs] @carol\n",
+        );
+        let reasons: Vec<(usize, &str, &str)> = parsed
+            .diagnostics
+            .iter()
+            .map(|d| (d.line, d.declaration.as_str(), d.reason.as_str()))
+            .collect();
+        assert_eq!(reasons.len(), 4, "{reasons:?}");
+        assert_eq!((reasons[0].0, reasons[0].1), (1, "[Docs][2]"));
+        assert!(reasons[0].2.contains("approval count"), "{reasons:?}");
+        assert_eq!((reasons[1].0, reasons[1].1), (4, "src/"));
+        assert!(reasons[1].2.contains("section `Empty`"), "{reasons:?}");
+        assert_eq!((reasons[2].0, reasons[2].1), (5, "@bob"));
+        assert!(reasons[2].2.contains("exclusion"), "{reasons:?}");
+        assert_eq!(reasons[3], (6, "!", "exclusion names no pattern"));
+
+        // The count is not enforced, but the section's owners still are requested.
+        assert_eq!(
+            owners_for_paths(&parsed.rules, &["docs/a.md".into()]),
+            ["writers"]
+        );
+        assert_eq!(
+            owners_for_paths(&parsed.rules, &["[id].tsx".into()]),
+            ["web"]
+        );
+        assert_eq!(
+            owners_for_paths(&parsed.rules, &["[Docs]".into()]),
+            ["carol"]
+        );
+    }
+
     #[test]
     fn glob_supports_anchored_directories_and_double_star() {
         assert!(pattern_matches("/docs/", "docs/guides/setup.md"));
@@ -1182,6 +1498,8 @@ mod tests {
                     line: 1,
                     pattern: "*.rs".into(),
                     owners: vec!["rust".into()],
+                    section: 0,
+                    exclusion: false,
                 }],
                 diagnostics: Vec::new(),
             })
@@ -1201,9 +1519,25 @@ mod tests {
                     line: 1,
                     pattern: "*.rs".into(),
                     owners: vec!["rust".into()],
+                    section: 0,
+                    exclusion: false,
                 }],
                 diagnostics: Vec::new(),
             })
+        );
+    }
+
+    /// card_8e1c5506d559: GitLab's third path, read together with its sections.
+    #[test]
+    fn a_gitlab_codeowners_file_is_the_policy_when_it_is_the_only_one() {
+        let (_dir, bare) =
+            bare_repository(Some((".gitlab/CODEOWNERS", "[Docs] @docs-team\ndocs/\n")));
+
+        let parsed = load_codeowners(&bare, "main").unwrap().expect("a policy");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(
+            owners_for_paths(&parsed.rules, &["docs/readme.md".into()]),
+            ["docs-team"]
         );
     }
 
@@ -1660,6 +1994,8 @@ mod tests {
                     line: 1,
                     pattern: "*.rs".into(),
                     owners: vec!["rust".into()],
+                    section: 0,
+                    exclusion: false,
                 }],
                 diagnostics: Vec::new(),
             })
