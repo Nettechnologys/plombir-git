@@ -16,10 +16,20 @@ use rg_db::ops::{pr_reviewer_request_ops, user_ops};
 /// Where a CODEOWNERS file may live, in priority order: the first path that
 /// exists on the base branch is the policy and the rest are not looked at.
 ///
-/// A list, not three literals inside the loop, so `docs/codeowners.md` has
+/// A list, not literals inside the loop, so `docs/codeowners.md` has
 /// something to be checked against — an author has no other way to learn the
 /// paths, and nothing in the product names them.
-const CODEOWNERS_PATHS: &[&str] = &[".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"];
+///
+/// `.gitea/CODEOWNERS` is where a repository that moved here from Gitea or
+/// Forgejo keeps it; without it that file was silently not a policy
+/// (card_a96a2878c38c). Last, as Gitea itself tries it, so a repository that
+/// already carried a file at one of the other paths keeps the one it had.
+const CODEOWNERS_PATHS: &[&str] = &[
+    ".github/CODEOWNERS",
+    "CODEOWNERS",
+    "docs/CODEOWNERS",
+    ".gitea/CODEOWNERS",
+];
 
 /// The largest CODEOWNERS file this server will read in order to parse it.
 ///
@@ -824,7 +834,7 @@ mod tests {
         cell.trim().trim_matches('`').trim().to_owned()
     }
 
-    /// The three paths are the whole of "where does this file go?", and none of
+    /// The paths are the whole of "where does this file go?", and none of
     /// them is discoverable: nothing in the UI names the file, and the order
     /// decides which copy wins when an author has committed two. Compared in
     /// both directions, and in order — the order *is* the priority rule.
@@ -1176,6 +1186,44 @@ mod tests {
                 diagnostics: Vec::new(),
             })
         );
+    }
+
+    /// card_a96a2878c38c: a repository that moved here from Gitea keeps its
+    /// file in `.gitea/`, and that file alone is the policy.
+    #[test]
+    fn a_gitea_codeowners_file_is_the_policy_when_it_is_the_only_one() {
+        let (_dir, bare) = bare_repository(Some((".gitea/CODEOWNERS", "*.rs @rust\n")));
+
+        assert_eq!(
+            load_codeowners(&bare, "main").unwrap(),
+            Some(ParsedCodeowners {
+                rules: vec![CodeownerRule {
+                    line: 1,
+                    pattern: "*.rs".into(),
+                    owners: vec!["rust".into()],
+                }],
+                diagnostics: Vec::new(),
+            })
+        );
+    }
+
+    /// Adding the Gitea path must not change which file wins in a repository
+    /// that already had one at a path read before it.
+    #[test]
+    fn a_gitea_codeowners_file_does_not_outrank_the_paths_read_before_it() {
+        let (_dir, bare) = bare_repository_with(&[
+            (".gitea/CODEOWNERS", "*.rs @gitea-owner\n"),
+            ("docs/CODEOWNERS", "*.rs @rust\n"),
+        ]);
+
+        let owners: Vec<String> = load_codeowners(&bare, "main")
+            .unwrap()
+            .expect("a policy")
+            .rules
+            .into_iter()
+            .flat_map(|rule| rule.owners)
+            .collect();
+        assert_eq!(owners, ["rust"]);
     }
 
     #[tokio::test]

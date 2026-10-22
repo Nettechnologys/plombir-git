@@ -52,7 +52,11 @@ rest are not looked at. There is no merging of two files.
 .github/CODEOWNERS
 CODEOWNERS
 docs/CODEOWNERS
+.gitea/CODEOWNERS
 ```
+
+`.gitea/CODEOWNERS` is the path Gitea and Forgejo read, so a repository moved
+here from either keeps requesting the reviewers it did there.
 
 **There is a size limit.** The file is matched line by line, so the whole of it
 has to be held in memory at once, and a file over the limit is refused before a
