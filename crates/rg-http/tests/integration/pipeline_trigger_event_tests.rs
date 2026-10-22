@@ -1254,3 +1254,107 @@ async fn a_pull_request_pipeline_retries_while_its_pull_request_is_open() {
         "a closed pull request's run must not reach the engine"
     );
 }
+
+/// card_6024c6294b94: the pipeline list shows a run without a `run-name:` under
+/// its commit's subject. The web page read `commit_message` for that from the
+/// first day, but no handler sent it, so every such row was `#<id>`.
+///
+/// A pipeline outlives its commit (force-push, then gc): that row answers
+/// `null` and the page around it still loads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pipeline_api_names_a_run_by_its_commit_subject() {
+    let h = harness("subj").await;
+    let client = reqwest::Client::new();
+
+    let written = client
+        .post(format!(
+            "{}/api/v1/repos/{}/trg-repo/contents/README.md",
+            h.base, h.owner
+        ))
+        .bearer_auth(&h.token)
+        .json(&serde_json::json!({
+            "content": "hello\n",
+            "message": "Ship the parser\n\nThe body is not the subject.",
+        }))
+        .send()
+        .await
+        .expect("write a file");
+    assert_eq!(written.status(), 200, "the fixture commit must land");
+    h.settle().await;
+
+    let triggered = client
+        .post(format!(
+            "{}/api/v1/repos/{}/trg-repo/pipelines",
+            h.base, h.owner
+        ))
+        .bearer_auth(&h.token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("trigger pipeline");
+    assert_eq!(triggered.status(), 201, "the fixture pipeline must start");
+    let live_id = triggered.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .expect("pipeline id");
+
+    let gone = rg_db::ops::pipeline_ops::create_pipeline_row(
+        &h.db,
+        rg_db::ops::pipeline_ops::NewPipeline {
+            repo_id: h.repo_id,
+            commit_sha: "0123456789abcdef0123456789abcdef01234567",
+            ref_name: "refs/heads/main",
+            trigger_type: "push",
+            triggered_by: None,
+            concurrency_group: None,
+            dispatch_inputs: None,
+            base_branch: None,
+            head_branch: None,
+            previous_sha: None,
+            schedule: None,
+            run_name: None,
+        },
+    )
+    .await
+    .expect("a pipeline whose commit the repository no longer holds");
+
+    let get = |path: String| {
+        let client = client.clone();
+        let token = h.token.clone();
+        async move {
+            let response = client
+                .get(path)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("GET");
+            assert_eq!(response.status(), 200);
+            response.json::<serde_json::Value>().await.unwrap()
+        }
+    };
+    let repo = format!("{}/api/v1/repos/{}/trg-repo", h.base, h.owner);
+
+    let list = get(format!("{repo}/pipelines")).await;
+    let listed = |id: i64| {
+        list["data"]
+            .as_array()
+            .expect("the pipeline list")
+            .iter()
+            .find(|pipeline| pipeline["id"] == id)
+            .unwrap_or_else(|| panic!("pipeline {id} is listed: {list}"))
+            .clone()
+    };
+    assert_eq!(
+        listed(live_id)["commit_message"],
+        "Ship the parser",
+        "{list}"
+    );
+    assert!(listed(gone.id)["commit_message"].is_null(), "{list}");
+
+    let detail = get(format!("{repo}/pipelines/{live_id}")).await;
+    assert_eq!(
+        detail["pipeline"]["commit_message"], "Ship the parser",
+        "{detail}"
+    );
+    let detail = get(format!("{repo}/pipelines/{}", gone.id)).await;
+    assert!(detail["pipeline"]["commit_message"].is_null(), "{detail}");
+}

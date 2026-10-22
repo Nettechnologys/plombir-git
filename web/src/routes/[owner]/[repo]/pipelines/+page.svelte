@@ -6,7 +6,7 @@
   import Modal from '$lib/components/Modal.svelte';
   import { artifacts, connectJobLogWebSocket, pipelines, repos } from '$lib/api/client.svelte';
   import type { CiArtifact } from '$lib/api/artifacts';
-  import type { WorkflowDispatchInput } from '$lib/api/pipelines';
+  import type { PipelineSummary, WorkflowDispatchInput } from '$lib/api/pipelines';
   import {
     LatestRepositoryRequestFence,
     LatestRepositoryResourceRequestFence,
@@ -31,7 +31,7 @@
   const permission = viewerPermission(() => owner, () => repo);
   const canWrite = $derived(permission.canWrite);
   const signedIn = $derived(Boolean(getUser()));
-  let pipelineList = $state<any[]>([]);
+  let pipelineList = $state<PipelineSummary[]>([]);
   let selectedPipeline = $state<any>(null);
   let selectedPipelineId = $state<number | null>(null);
   let loading = $state(true);
@@ -759,7 +759,7 @@
     logStreamError = '';
   }
 
-  function duration(start: string, end?: string) {
+  function duration(start: string | null, end?: string | null) {
     if (!start) return '-';
     const s = parseServerTime(start).getTime();
     const e = end ? parseServerTime(end).getTime() : Date.now();
@@ -934,7 +934,7 @@
             >
               <PipelineBadge status={p.status} />
               <div class="pipeline-info">
-                <div class="pipeline-msg truncate">{p.run_name || p.commit_message?.split('\n')[0] || '#' + p.id}</div>
+                <div class="pipeline-msg truncate">{p.run_name || p.commit_message || '#' + p.id}</div>
                 <div class="pipeline-meta">
                   <span class="mono">{p.commit_sha?.slice(0, 7)}</span>
                   <span>{duration(p.started_at, p.finished_at)}</span>

@@ -27,6 +27,11 @@ struct PipelineResponse {
     /// the run (`Deploy staging`) — what to show the run under. Absent when no
     /// workflow it runs has one.
     run_name: Option<String>,
+    /// The first line of the message of the commit the pipeline ran on — what
+    /// the pipeline list shows a run under when it has no `run_name`. Absent
+    /// when the repository no longer holds that commit (a force-push followed
+    /// by garbage collection) or the commit could not be read.
+    commit_message: Option<String>,
     started_at: Option<String>,
     finished_at: Option<String>,
     created_at: String,
@@ -318,11 +323,17 @@ pub async fn list_pipelines(
     .await
     {
         Ok((pipelines, total)) => {
+            let shas = pipelines.iter().map(|p| p.commit_sha.clone()).collect();
+            let subjects = match commit_subjects(&state, &repo, &owner, &name, shas).await {
+                Ok(subjects) => subjects,
+                Err(error) => return error.into_response(),
+            };
             let links = crate::html_url::Links::new(&state, &owner, &name);
             let resp: Vec<PipelineResponse> = pipelines
                 .into_iter()
                 .map(|p| PipelineResponse {
                     html_url: links.pipeline(p.id),
+                    commit_message: subjects.get(&p.commit_sha).cloned(),
                     id: p.id,
                     repo_id: p.repo_id,
                     commit_sha: p.commit_sha,
@@ -499,9 +510,23 @@ pub async fn get_pipeline(
         });
     }
 
+    let commit_message = match commit_subjects(
+        &state,
+        &repo,
+        &owner,
+        &name,
+        vec![pipeline.commit_sha.clone()],
+    )
+    .await
+    {
+        Ok(mut subjects) => subjects.remove(&pipeline.commit_sha),
+        Err(error) => return error.into_response(),
+    };
+
     let resp = PipelineDetailResponse {
         pipeline: PipelineResponse {
             html_url: crate::html_url::Links::new(&state, &owner, &name).pipeline(pipeline.id),
+            commit_message,
             id: pipeline.id,
             repo_id: pipeline.repo_id,
             commit_sha: pipeline.commit_sha,
@@ -1180,6 +1205,100 @@ async fn resolve_repo_storage_owner(
         .map_err(AppError::from)?
         .map(|user| user.username)
         .ok_or_else(|| AppError::internal("repository owner not found"))
+}
+
+/// The first line of each commit's message, keyed by the SHA asked for.
+///
+/// A pipeline outlives its commit: a force-push followed by garbage collection
+/// leaves the row pointing at an object the repository no longer holds, and
+/// the list has to keep answering for it. Such a SHA is simply absent from the
+/// map. The message is what a run is *shown* under, never what it is acted on,
+/// so a repository that cannot be opened or a commit that cannot be decoded is
+/// logged and leaves the run without a subject rather than taking down the page
+/// that is the only way to cancel or retry it. A database failure resolving
+/// the storage owner is still the caller's error.
+async fn commit_subjects(
+    state: &AppState,
+    repo: &rg_db::entities::repository::Model,
+    route_owner: &str,
+    name: &str,
+    mut shas: Vec<String>,
+) -> Result<std::collections::HashMap<String, String>, AppError> {
+    shas.sort_unstable();
+    shas.dedup();
+    if shas.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let owner = resolve_repo_storage_owner(state, repo, route_owner).await?;
+    let repo_path = state.repo_root.join(format!("{owner}/{name}.git"));
+    let read = rg_core::blocking::run_blocking_git("read pipeline commit subjects", {
+        let repo_path = repo_path.clone();
+        move || Ok(read_commit_subjects(&repo_path, &shas))
+    })
+    .await;
+    match read {
+        Ok(subjects) => Ok(subjects),
+        Err(error) => {
+            tracing::warn!(
+                repo = %repo_path.display(),
+                "pipeline commit subjects were not read: {error:#}"
+            );
+            Ok(std::collections::HashMap::new())
+        }
+    }
+}
+
+fn read_commit_subjects(
+    repo_path: &std::path::Path,
+    shas: &[String],
+) -> std::collections::HashMap<String, String> {
+    let mut subjects = std::collections::HashMap::with_capacity(shas.len());
+    let repo = match rg_git::repository::open(repo_path) {
+        Ok(repo) => repo,
+        Err(error) => {
+            tracing::warn!(
+                repo = %repo_path.display(),
+                "cannot open repository to read pipeline commit subjects: {error:#}"
+            );
+            return subjects;
+        }
+    };
+    for sha in shas {
+        match commit_subject(&repo, sha) {
+            Ok(Some(subject)) => {
+                subjects.insert(sha.clone(), subject);
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                repo = %repo_path.display(),
+                commit = %sha,
+                "cannot read a pipeline's commit subject: {error:#}"
+            ),
+        }
+    }
+    subjects
+}
+
+/// `None` when the repository does not hold `sha` (any more), or the commit's
+/// message is empty.
+fn commit_subject(repo: &gix::Repository, sha: &str) -> anyhow::Result<Option<String>> {
+    let id = gix::ObjectId::from_hex(sha.as_bytes())
+        .with_context(|| format!("pipeline commit SHA '{sha}' is not an object id"))?;
+    let Some(object) = repo
+        .try_find_object(id)
+        .context("looking up the pipeline commit")?
+    else {
+        return Ok(None);
+    };
+    let commit = object
+        .try_into_commit()
+        .context("the pipeline commit SHA names an object that is not a commit")?;
+    let message = commit
+        .message_raw()
+        .context("decoding the pipeline commit message")?;
+    let message = String::from_utf8_lossy(message);
+    let subject = message.lines().next().unwrap_or("").trim_end();
+    Ok((!subject.is_empty()).then(|| subject.to_string()))
 }
 
 /// Keep "this stage belongs elsewhere" separate from "the ownership lookup

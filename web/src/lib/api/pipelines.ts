@@ -32,9 +32,28 @@ export interface WorkflowDispatchSchemaResponse {
   workflows: WorkflowDispatchWorkflow[];
 }
 
+/** One pipeline as `GET /pipelines` and `GET /pipelines/{id}` send it (`PipelineResponse`). */
+export interface PipelineSummary {
+  id: number;
+  repo_id: number;
+  commit_sha: string;
+  ref_name: string;
+  status: string;
+  trigger_type: string;
+  triggered_by: number | null;
+  /** The workflow's `run-name:`, rendered for this run. */
+  run_name: string | null;
+  /** First line of the commit's message; `null` once the repository no longer holds it. */
+  commit_message: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+  html_url?: string;
+}
+
 export const pipelines = {
   list: (owner: string, repo: string, page?: number, perPage?: number) =>
-    request<PaginatedResponse<any>>(`${repoPath(owner, repo)}/pipelines${qs({ page, per_page: perPage })}`),
+    request<PaginatedResponse<PipelineSummary>>(`${repoPath(owner, repo)}/pipelines${qs({ page, per_page: perPage })}`),
   get: (owner: string, repo: string, id: number) =>
     request<any>(`${repoPath(owner, repo)}/pipelines/${id}`),
   workflowDispatchSchema: (owner: string, repo: string, ref?: string) =>

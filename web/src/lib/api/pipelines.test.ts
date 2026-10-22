@@ -26,7 +26,7 @@ import {
 	submit,
 	type RenderedComponent,
 } from '../test/render';
-import { pipelines } from './pipelines';
+import { pipelines, type PipelineSummary } from './pipelines';
 
 let rendered: RenderedComponent | undefined;
 
@@ -188,4 +188,45 @@ describe('manual pipeline trigger production wiring', () => {
 			expect(zhCN.pipeline).toHaveProperty(key);
 		},
 	);
+});
+
+// card_6024c6294b94: the row label reads fields the server really sends. Typed as
+// `PipelineSummary`, so a mock cannot hand the page a field no handler fills —
+// which is how `commit_message` stayed green here while every live row said `#id`.
+function listedPipeline(id: number, fields: Partial<PipelineSummary>): PipelineSummary {
+	return {
+		id,
+		repo_id: 1,
+		commit_sha: 'abcdef0123456789',
+		ref_name: 'refs/heads/main',
+		status: 'success',
+		trigger_type: 'push',
+		triggered_by: null,
+		run_name: null,
+		commit_message: null,
+		started_at: null,
+		finished_at: null,
+		created_at: '2026-08-24T10:00:00Z',
+		...fields,
+	};
+}
+
+describe('pipeline list rows', () => {
+	it('names a run by run-name, then its commit subject, then its number', async () => {
+		routePipelines.list.mockResolvedValue({
+			data: [
+				listedPipeline(3, { run_name: 'Deploy staging', commit_message: 'Ship the parser' }),
+				listedPipeline(2, { commit_message: 'Ship the parser' }),
+				listedPipeline(1, {}),
+			],
+			pagination: { total_pages: 1 },
+		});
+
+		rendered = await renderComponent(PipelinesPage);
+
+		const labels = [...rendered.container.querySelectorAll('.pipeline-msg')].map((row) =>
+			row.textContent?.trim(),
+		);
+		expect(labels).toEqual(['Deploy staging', 'Ship the parser', '#1']);
+	});
 });
