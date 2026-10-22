@@ -1,7 +1,8 @@
 <script lang="ts">
   // The receipt of a finished import, as the server built it: what the source
   // has beside what is here, by name where something is missing, the CI that
-  // will not run here, and what no import can bring (card_a8666ed4f317). The
+  // will not run here, the templates that will not be offered
+  // (card_04b603522857), and what no import can bring (card_a8666ed4f317). The
   // API answered it all along; the import page did not show it, so a person
   // who migrated through the form never learned their CI would not start.
   import type { ImportReceipt, RefKindReceipt } from '$lib/api/imports';
@@ -17,11 +18,13 @@
   );
 
   const notRun = $derived(receipt.ci?.not_run ?? []);
+  const notRead = $derived(receipt.templates?.not_read ?? []);
 
   const incomplete = $derived(
     receipt.objects.some((row) => row.not_imported > 0) ||
       refKinds.some(({ value }) => (value.missing?.length ?? 0) > 0 || (value.different?.length ?? 0) > 0) ||
-      notRun.length > 0,
+      notRun.length > 0 ||
+      notRead.length > 0,
   );
 
   function kindLabel(kind: string): string {
@@ -58,6 +61,23 @@
   {/if}
   {#if receipt.ci?.unavailable}
     <p class="muted">{t('imports.receipt.ci_unavailable')}: {receipt.ci.unavailable}</p>
+  {/if}
+
+  {#if notRead.length > 0}
+    <div class="receipt-templates">
+      <h4>{t('imports.receipt.templates_not_read')}</h4>
+      <ul>
+        {#each notRead as item (item.path)}
+          <li><code>{item.path}</code> — {item.reason}</li>
+        {/each}
+      </ul>
+      {#if receipt.templates?.not_read_omitted}
+        <p class="muted">{t('imports.receipt.and_more', { count: receipt.templates.not_read_omitted })}</p>
+      {/if}
+    </div>
+  {/if}
+  {#if receipt.templates?.unavailable}
+    <p class="muted">{t('imports.receipt.templates_unavailable')}: {receipt.templates.unavailable}</p>
   {/if}
 
   {#if receipt.objects.length > 0}
@@ -166,7 +186,8 @@
   }
 
   .receipt-flag.warn,
-  .receipt-ci h4 {
+  .receipt-ci h4,
+  .receipt-templates h4 {
     color: #d29922;
   }
 

@@ -6,10 +6,10 @@ forms. The format is the Gitea/GitHub Markdown one: a `.md` file whose optional
 YAML front matter names the template and the labels it applies.
 
 **Where the files go** is the awkward part, and it is why this page exists:
-Plombir Git reads nine different template directories, eight different chooser
-configuration paths and ten different pull-request template paths, and nothing
-in the UI tells you which. The complete inventories are below — copy a path
-from them rather than guessing.
+Plombir Git reads the template directories, chooser configuration paths and
+pull-request template paths of Forgejo, Gitea, GitHub and GitLab — over forty
+of them — and nothing in the UI tells you which. The complete inventories are
+below — copy a path from them rather than guessing.
 
 **Unknown keys are refused, not ignored.** The front matter block, the chooser
 configuration and each contact link carry a closed schema. A misspelled key
@@ -104,13 +104,15 @@ consequences worth knowing:
 ### Where issue templates are read from
 
 Every `.md` file directly inside any of these directories is a template. All
-nine directories are read, not just the first one that exists, so a repository
-carrying both a `.github` and a `.gitea` directory offers both sets.
+of the directories are read, not just the first one that exists, so a
+repository carrying both a `.github` and a `.gitea` directory offers both sets.
 
 <!-- inventory: issue-template-directories -->
 ```text
 ISSUE_TEMPLATE
 issue_template
+.forgejo/ISSUE_TEMPLATE
+.forgejo/issue_template
 .gitea/ISSUE_TEMPLATE
 .gitea/issue_template
 .github/ISSUE_TEMPLATE
@@ -118,15 +120,20 @@ issue_template
 .gitlab/ISSUE_TEMPLATE
 .gitlab/issue_template
 .gitlab/issue_templates
+docs/ISSUE_TEMPLATE
+docs/issue_template
 ```
 
-`.gitlab/issue_templates` is the directory GitLab uses, so a repository that
-moved here from GitLab keeps its templates where they are.
+`.gitlab/issue_templates` is the directory GitLab uses, and the `.forgejo/` and
+`docs/` directories are Forgejo's, so a repository that moved here from either
+keeps its templates where they are.
 
 Three rules apply to the files inside:
 
 - The name must end in `.md` (any capitalization). A `.yml` form template —
-  GitHub's issue *forms* — is not read; that format is not supported.
+  GitHub's issue *forms* — is not read; that format is not supported. An
+  import names every form it brings, in its receipt, as a template that will
+  not be offered.
 - Only files directly in the directory count. A template in a subdirectory is
   ignored.
 - A file larger than 1048576 bytes (1 MiB), or one that is not valid UTF-8, is
@@ -173,6 +180,10 @@ above: a `config.yml` in a bare `ISSUE_TEMPLATE/` directory, or under
 
 <!-- inventory: issue-config-paths -->
 ```text
+.forgejo/ISSUE_TEMPLATE/config.yaml
+.forgejo/ISSUE_TEMPLATE/config.yml
+.forgejo/issue_template/config.yaml
+.forgejo/issue_template/config.yml
 .gitea/ISSUE_TEMPLATE/config.yaml
 .gitea/ISSUE_TEMPLATE/config.yml
 .gitea/issue_template/config.yaml
@@ -181,6 +192,10 @@ above: a `config.yml` in a bare `ISSUE_TEMPLATE/` directory, or under
 .github/ISSUE_TEMPLATE/config.yml
 .github/issue_template/config.yaml
 .github/issue_template/config.yml
+docs/ISSUE_TEMPLATE/config.yaml
+docs/ISSUE_TEMPLATE/config.yml
+docs/issue_template/config.yaml
+docs/issue_template/config.yml
 ```
 
 A configuration that fails to parse or fails validation is an error for the
@@ -200,6 +215,8 @@ that exists wins.
 ```text
 PULL_REQUEST_TEMPLATE.md
 pull_request_template.md
+.forgejo/PULL_REQUEST_TEMPLATE.md
+.forgejo/pull_request_template.md
 .gitea/PULL_REQUEST_TEMPLATE.md
 .gitea/pull_request_template.md
 .github/PULL_REQUEST_TEMPLATE.md
@@ -217,6 +234,35 @@ not read here. GitLab quick actions in a template (`/label ~bug`, `/assign me`)
 are not run: they arrive as text in the description.
 
 The same 1048576-byte (1 MiB) ceiling and UTF-8 requirement apply.
+
+Gitea and Forgejo also accept a pull-request template written as a YAML form.
+That format is not read here: a file at one of these paths does not pre-fill
+anything, and an import names it in its receipt so the loss is not a surprise.
+Write the template as Markdown beside it.
+
+<!-- inventory: pull-request-forms-not-read -->
+```text
+PULL_REQUEST_TEMPLATE.yaml
+PULL_REQUEST_TEMPLATE.yml
+pull_request_template.yaml
+pull_request_template.yml
+.forgejo/PULL_REQUEST_TEMPLATE.yaml
+.forgejo/PULL_REQUEST_TEMPLATE.yml
+.forgejo/pull_request_template.yaml
+.forgejo/pull_request_template.yml
+.gitea/PULL_REQUEST_TEMPLATE.yaml
+.gitea/PULL_REQUEST_TEMPLATE.yml
+.gitea/pull_request_template.yaml
+.gitea/pull_request_template.yml
+.github/PULL_REQUEST_TEMPLATE.yaml
+.github/PULL_REQUEST_TEMPLATE.yml
+.github/pull_request_template.yaml
+.github/pull_request_template.yml
+docs/PULL_REQUEST_TEMPLATE.yaml
+docs/PULL_REQUEST_TEMPLATE.yml
+docs/pull_request_template.yaml
+docs/pull_request_template.yml
+```
 
 ## When a template does not appear
 

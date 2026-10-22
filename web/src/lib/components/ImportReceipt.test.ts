@@ -58,6 +58,15 @@ const gitlabReceipt: Receipt = {
 			},
 		],
 	},
+	templates: {
+		not_read: [
+			{
+				path: '.gitlab/issue_templates/bug.yml',
+				reason: 'Issue forms (YAML) are not offered here',
+			},
+		],
+		not_read_omitted: 2,
+	},
 };
 
 // card_a8666ed4f317: the receipt was answered by the API and shown nowhere, so
@@ -70,6 +79,12 @@ describe('import receipt', () => {
 		expect(text).toContain('CI that will not run here');
 		expect(text).toContain('.gitlab-ci.yml');
 		expect(text).toContain('GitLab CI is not run here');
+
+		// card_04b603522857: a template in a form not read here is named too.
+		expect(text).toContain('Templates that will not be offered here');
+		expect(text).toContain('.gitlab/issue_templates/bug.yml');
+		expect(text).toContain('Issue forms (YAML) are not offered here');
+		expect(text).toContain('and 2 more');
 
 		expect(text).toContain('Issues');
 		expect(text).toContain('#7, #9');
@@ -96,6 +111,7 @@ describe('import receipt', () => {
 				refs: { branches: { source: 1, imported: 1 } },
 				not_transferable: ['Webhooks and deploy keys: register them again'],
 				ci: { not_run: [] },
+				templates: { not_read: [] },
 			},
 		});
 		const text = rendered.container.textContent ?? '';
@@ -105,6 +121,7 @@ describe('import receipt', () => {
 		expect(text).toContain('LFS objects');
 		expect(text).not.toContain('CI that will not run here');
 		expect(rendered.container.querySelector('.receipt-ci')).toBeNull();
+		expect(rendered.container.querySelector('.receipt-templates')).toBeNull();
 	});
 });
 

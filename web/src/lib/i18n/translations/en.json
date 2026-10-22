@@ -2078,6 +2078,8 @@
       "incomplete": "something did not come over",
       "ci_not_run": "CI that will not run here",
       "ci_unavailable": "The CI of the imported branch could not be read",
+      "templates_not_read": "Templates that will not be offered here",
+      "templates_unavailable": "The templates of the imported branch could not be read",
       "object": "Object",
       "source": "Source",
       "here": "Here",

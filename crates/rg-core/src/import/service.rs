@@ -87,7 +87,8 @@ use crate::import::github_client::{
     GitHubRelease, GitHubReview, GitHubReviewComment,
 };
 use crate::import::gitlab_client::{
-    GitLabClient, GitLabIssue, GitLabLabel, GitLabMR, GitLabMilestone, GitLabNote, GitLabRelease,
+    GitLabClient, GitLabDiscussion, GitLabIssue, GitLabLabel, GitLabMR, GitLabMilestone,
+    GitLabNote, GitLabRelease,
 };
 use crate::platform::fs::{path_error, REPO_ROOT_HINT};
 
@@ -2380,13 +2381,13 @@ async fn run_gitlab_import(
         let total = mrs.len();
 
         for (i, mr) in mrs.iter().enumerate() {
-            let notes = client.list_mr_notes(&project_path, mr.iid).await?;
-            *stats.inventory.comments.get_or_insert(0) += notes.len();
+            let discussions = client.list_mr_discussions(&project_path, mr.iid).await?;
+            count_gitlab_mr_threads(&mut stats.inventory, &discussions);
             import_gitlab_mr(
                 db,
                 repo_id,
                 mr,
-                &notes,
+                &discussions,
                 task.user_id,
                 &origin,
                 &milestone_map,
@@ -4831,22 +4832,11 @@ async fn import_github_review_comments(
         {
             Some(review_id) => *review_id,
             None => {
-                let host = rg_db::entities::pr_review::ActiveModel {
-                    id: sea_orm::NotSet,
-                    pr_id: Set(pr_id),
-                    repo_id: Set(repo_id),
-                    reviewer_id: Set(author_id),
-                    action: Set("comment".to_string()),
-                    body: Set(None),
-                    commit_id: Set(None),
-                    created_at: Set(created_at),
-                    dismissed_at: Set(None),
-                    dismissed_by: Set(None),
-                    original_author: Set(byline.login.clone()),
-                    original_author_id: Set(byline.id),
-                    original_service: Set(byline.service.clone()),
-                };
-                match pr_review_ops::create(db, host).await {
+                match create_comment_review(
+                    db, repo_id, pr_id, author_id, &byline, None, created_at,
+                )
+                .await
+                {
                     Ok(host) => host.id,
                     Err(e) => {
                         stats
@@ -4908,6 +4898,67 @@ async fn import_github_review_comments(
     }
 }
 
+/// Count a GitLab merge request's notes into the source's listing: a thread on
+/// the diff is comments on lines, every other note a comment of the
+/// conversation. System notes are counted with the comments, as skipped.
+fn count_gitlab_mr_threads(
+    inventory: &mut crate::import::receipt::SourceInventory,
+    discussions: &[GitLabDiscussion],
+) {
+    for discussion in discussions {
+        let system = discussion.notes.iter().filter(|note| note.system).count();
+        let written = discussion.notes.len() - system;
+        *inventory.comments.get_or_insert(0) += system;
+        if gitlab_thread_position(discussion).is_some() {
+            *inventory.review_comments.get_or_insert(0) += written;
+        } else {
+            *inventory.comments.get_or_insert(0) += written;
+        }
+    }
+}
+
+/// The thread a GitLab merge request note belongs to is on the diff when one
+/// of its notes says where: the place of the comment that opened it.
+fn gitlab_thread_position(
+    discussion: &GitLabDiscussion,
+) -> Option<&crate::import::gitlab_client::GitLabNotePosition> {
+    discussion
+        .notes
+        .iter()
+        .find_map(|note| note.position.as_ref())
+}
+
+/// A comment-only review — no verdict, no commit — under `original`'s byline.
+async fn create_comment_review(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    pr_id: i64,
+    author_id: i64,
+    original: &OriginalAuthor,
+    body: Option<String>,
+    created_at: chrono::DateTime<Utc>,
+) -> Result<rg_db::entities::pr_review::Model> {
+    pr_review_ops::create(
+        db,
+        rg_db::entities::pr_review::ActiveModel {
+            id: sea_orm::NotSet,
+            pr_id: Set(pr_id),
+            repo_id: Set(repo_id),
+            reviewer_id: Set(author_id),
+            action: Set("comment".to_string()),
+            body: Set(body),
+            commit_id: Set(None),
+            created_at: Set(created_at),
+            dismissed_at: Set(None),
+            dismissed_by: Set(None),
+            original_author: Set(original.login.clone()),
+            original_author_id: Set(original.id),
+            original_service: Set(original.service.clone()),
+        },
+    )
+    .await
+}
+
 /// Write one comment of a pull request's conversation as a comment-only review
 /// — no verdict, no commit — and account for it in `stats`.
 #[allow(clippy::too_many_arguments)]
@@ -4922,22 +4973,17 @@ async fn import_pr_conversation_comment(
     source: String,
     stats: &mut ImportStats,
 ) {
-    let row = rg_db::entities::pr_review::ActiveModel {
-        id: sea_orm::NotSet,
-        pr_id: Set(pr_id),
-        repo_id: Set(repo_id),
-        reviewer_id: Set(author_id),
-        action: Set("comment".to_string()),
-        body: Set(Some(body)),
-        commit_id: Set(None),
-        created_at: Set(created_at),
-        dismissed_at: Set(None),
-        dismissed_by: Set(None),
-        original_author: Set(original.login.clone()),
-        original_author_id: Set(original.id),
-        original_service: Set(original.service.clone()),
-    };
-    match pr_review_ops::create(db, row).await {
+    match create_comment_review(
+        db,
+        repo_id,
+        pr_id,
+        author_id,
+        original,
+        Some(body),
+        created_at,
+    )
+    .await
+    {
         Ok(_) => stats.pr_comments_imported += 1,
         Err(e) => stats
             .comments_failed
@@ -5437,7 +5483,7 @@ async fn import_gitlab_mr(
     db: &DatabaseConnection,
     repo_id: i64,
     mr: &GitLabMR,
-    notes: &[GitLabNote],
+    discussions: &[GitLabDiscussion],
     author_id: i64,
     origin: &SourceOrigin,
     milestone_map: &HashMap<String, i64>,
@@ -5491,11 +5537,18 @@ async fn import_gitlab_mr(
         "merged_at",
         mr.merged_at.as_deref(),
     )?;
-    let note_timestamps = notes
+    // Every note of every thread, oldest first: the threads endpoint takes no
+    // order, and notes of one second are shown in the order they are written
+    // (card_ba4dab292b1c). The thread rides along by its index.
+    let mut notes = discussions
         .iter()
-        .filter(|note| !note.system)
-        .map(|note| {
+        .enumerate()
+        .flat_map(|(thread, discussion)| discussion.notes.iter().map(move |note| (thread, note)))
+        .filter(|(_, note)| !note.system)
+        .map(|(thread, note)| {
             Ok((
+                thread,
+                note,
                 parse_import_datetime(
                     "GitLab",
                     "merge request note",
@@ -5513,6 +5566,7 @@ async fn import_gitlab_mr(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
+    notes.sort_by_key(|(_, note, created_at, _)| (*created_at, note.id));
 
     let byline = OriginalAuthor::gitlab(origin, mr.author.as_ref());
     let model = rg_db::entities::pull_request::ActiveModel {
@@ -5585,27 +5639,102 @@ async fn import_gitlab_mr(
         .await;
     }
 
-    // Import MR notes (skip system notes) into the merge request's
-    // conversation — see `import_github_pr` for why not `issue_comments`.
-    for (note, (created_at, _updated_at)) in notes
+    // A thread on the diff comes over as comments on its lines, each under a
+    // comment-only review carrying its author, replies under the comment that
+    // opened the thread (card_1630e0eb32e9). Every other note goes into the
+    // merge request's conversation — see `import_github_pr` for why not
+    // `issue_comments`.
+    let positions = discussions
         .iter()
-        .filter(|note| !note.system)
-        .zip(note_timestamps)
-    {
-        import_pr_conversation_comment(
-            db,
-            repo_id,
-            saved.id,
-            author_id,
-            &OriginalAuthor::gitlab(origin, note.author.as_ref()),
-            note.body.clone().unwrap_or_default(),
-            created_at,
-            format!("merge request !{} note {}", mr.iid, note.id),
-            stats,
+        .map(gitlab_thread_position)
+        .collect::<Vec<_>>();
+    let mut opened: HashMap<usize, i64> = HashMap::new();
+    for (thread, note, created_at, updated_at) in notes {
+        let byline = OriginalAuthor::gitlab(origin, note.author.as_ref());
+        let body = note.body.clone().unwrap_or_default();
+        let Some(position) = positions[thread] else {
+            import_pr_conversation_comment(
+                db,
+                repo_id,
+                saved.id,
+                author_id,
+                &byline,
+                body,
+                created_at,
+                format!("merge request !{} note {}", mr.iid, note.id),
+                stats,
+            )
+            .await;
+            continue;
+        };
+        let source = format!("merge request !{} review comment {}", mr.iid, note.id);
+        let placement = note.position.as_ref().unwrap_or(position).placement();
+        if placement.path.is_empty() {
+            stats.comments_failed.push(ImportedObjectFailure {
+                source,
+                reason: "the comment names no file of the diff",
+            });
+            continue;
+        }
+        let review_id = match create_comment_review(
+            db, repo_id, saved.id, author_id, &byline, None, created_at,
         )
-        .await;
+        .await
+        {
+            Ok(review) => review.id,
+            Err(e) => {
+                stats
+                    .comments_failed
+                    .push(ImportedObjectFailure::insert_failed(
+                        source,
+                        ImportedObject::Comment,
+                        &e,
+                    ));
+                continue;
+            }
+        };
+        let row = rg_db::entities::review_comment::ActiveModel {
+            id: sea_orm::NotSet,
+            review_id: Set(review_id),
+            pr_id: Set(saved.id),
+            author_id: Set(author_id),
+            path: Set(placement.path),
+            position: Set(None),
+            line: Set(placement.line),
+            start_line: Set(placement.start_line),
+            side: Set(Some(placement.side.to_string())),
+            start_side: Set(placement.start_side.map(str::to_string)),
+            body: Set(body),
+            suggestion: Set(None),
+            suggestion_applied_at: Set(None),
+            suggestion_applied_by_id: Set(None),
+            suggestion_commit_sha: Set(None),
+            commit_id: Set(placement.commit_id),
+            reply_to_id: Set(opened.get(&thread).copied()),
+            resolved_at: Set(None),
+            resolved_by_id: Set(None),
+            created_at: Set(created_at),
+            updated_at: Set(updated_at),
+        };
+        match rg_db::ops::review_comment_ops::create(db, row).await {
+            Ok(row) => {
+                opened.entry(thread).or_insert(row.id);
+                stats.pr_review_comments_imported += 1;
+            }
+            Err(e) => stats
+                .comments_failed
+                .push(ImportedObjectFailure::insert_failed(
+                    source,
+                    ImportedObject::Comment,
+                    &e,
+                )),
+        }
     }
-    stats.system_notes_skipped += notes.iter().filter(|note| note.system).count();
+    stats.system_notes_skipped += discussions
+        .iter()
+        .flat_map(|discussion| &discussion.notes)
+        .filter(|note| note.system)
+        .count();
 
     Ok(())
 }
@@ -6192,12 +6321,25 @@ mod imported_issue_label_tests {
     fn gitlab_note(id: i64) -> GitLabNote {
         GitLabNote {
             id,
+            note_type: None,
             body: Some("note".to_string()),
             author: None,
             system: false,
             created_at: "2024-01-06T00:00:00Z".to_string(),
             updated_at: "2024-01-06T01:00:00Z".to_string(),
+            position: None,
         }
+    }
+
+    /// Each note a thread of its own, the way GitLab lists a plain note.
+    fn gitlab_threads(notes: impl IntoIterator<Item = GitLabNote>) -> Vec<GitLabDiscussion> {
+        notes
+            .into_iter()
+            .map(|note| GitLabDiscussion {
+                id: format!("thread-{}", note.id),
+                notes: vec![note],
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -7488,6 +7630,218 @@ mod tests {
         assert_eq!(host.original_author.as_deref(), Some("reviewer"));
     }
 
+    /// card_1630e0eb32e9: a GitLab merge request's comments on lines of the
+    /// diff come over on those lines — an added line on the new side, a
+    /// removed one on the old side of the old file — each under a comment-only
+    /// review with its author's byline, and a reply in the thread it answers.
+    /// A plain note stays in the conversation; a system note is skipped. The
+    /// receipt counts the comments on lines as `review_comments`.
+    #[tokio::test]
+    async fn gitlab_comments_on_diff_lines_come_over_on_their_lines() {
+        use crate::import::gitlab_client::{GitLabLineRange, GitLabNotePosition, GitLabRangeLine};
+        use rg_db::entities::{pr_review, review_comment};
+
+        const HEAD: &str = "2be7ddb704c7b6b83732fdd5b9f09d5a397b5f8f";
+        let db = test_db().await;
+        let mut stats = ImportStats::default();
+        let diff_note =
+            |id: i64, who: &str, body: &str, at: &str, position: GitLabNotePosition| GitLabNote {
+                note_type: Some("DiffNote".to_string()),
+                author: Some(gitlab_user(id, who)),
+                body: Some(body.to_string()),
+                created_at: at.to_string(),
+                updated_at: at.to_string(),
+                position: Some(position),
+                ..gitlab_note(id)
+            };
+        let added = GitLabNotePosition {
+            head_sha: Some(HEAD.to_string()),
+            old_path: Some("src/lib.rs".to_string()),
+            new_path: Some("src/lib.rs".to_string()),
+            new_line: Some(12),
+            line_range: Some(GitLabLineRange {
+                start: GitLabRangeLine {
+                    old_line: None,
+                    new_line: Some(10),
+                },
+                end: GitLabRangeLine {
+                    old_line: None,
+                    new_line: Some(12),
+                },
+            }),
+            ..GitLabNotePosition::default()
+        };
+        let removed = GitLabNotePosition {
+            head_sha: Some(HEAD.to_string()),
+            old_path: Some("src/gone.rs".to_string()),
+            new_path: Some("src/gone.rs".to_string()),
+            old_line: Some(7),
+            ..GitLabNotePosition::default()
+        };
+        let mut system = gitlab_note(805);
+        system.system = true;
+        let mut plain = gitlab_note(804);
+        plain.body = Some("looks good".to_string());
+        plain.created_at = "2024-01-06T00:00:03Z".to_string();
+        let discussions = [
+            GitLabDiscussion {
+                id: "on-an-added-line".to_string(),
+                // Listed out of order on purpose: the reply sorts after it.
+                notes: vec![
+                    diff_note(802, "dev", "done", "2024-01-06T00:00:04Z", added.clone()),
+                    diff_note(801, "rev", "rename this", "2024-01-06T00:00:01Z", added),
+                ],
+            },
+            GitLabDiscussion {
+                id: "on-a-removed-line".to_string(),
+                notes: vec![diff_note(
+                    803,
+                    "rev",
+                    "why remove this?",
+                    "2024-01-06T00:00:02Z",
+                    removed,
+                )],
+            },
+            GitLabDiscussion {
+                id: "plain".to_string(),
+                notes: vec![plain],
+            },
+            GitLabDiscussion {
+                id: "system".to_string(),
+                notes: vec![system],
+            },
+        ];
+        import_gitlab_mr(
+            &db,
+            1,
+            &gitlab_mr(),
+            &discussions,
+            IMPORTER_ID,
+            &SourceOrigin::gitlab_com(),
+            &HashMap::new(),
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert!(stats.comments_failed.is_empty(), "{stats:?}");
+        assert_eq!(stats.pr_review_comments_imported, 3, "{stats:?}");
+        assert_eq!(stats.pr_comments_imported, 1, "{stats:?}");
+        assert_eq!(stats.system_notes_skipped, 1, "{stats:?}");
+
+        let reviews = pr_review::Entity::find().all(&db).await.unwrap();
+        let rows = review_comment::Entity::find().all(&db).await.unwrap();
+        let by_body = |body: &str| {
+            rows.iter()
+                .find(|row| row.body == body)
+                .unwrap_or_else(|| panic!("no comment {body:?}: {rows:?}"))
+        };
+        let review_of = |row: &review_comment::Model| {
+            reviews
+                .iter()
+                .find(|review| review.id == row.review_id)
+                .expect("the comment's review")
+                .clone()
+        };
+
+        let opened = by_body("rename this");
+        assert_eq!(
+            (
+                opened.path.as_str(),
+                opened.line,
+                opened.side.as_deref(),
+                opened.start_line,
+                opened.start_side.as_deref(),
+                opened.commit_id.as_deref(),
+                opened.reply_to_id,
+            ),
+            (
+                "src/lib.rs",
+                Some(12),
+                Some("RIGHT"),
+                Some(10),
+                Some("RIGHT"),
+                Some(HEAD),
+                None
+            )
+        );
+        let answer = by_body("done");
+        assert_eq!(
+            answer.reply_to_id,
+            Some(opened.id),
+            "the reply stays in its thread"
+        );
+        assert_eq!(
+            (answer.line, answer.side.as_deref()),
+            (Some(12), Some("RIGHT"))
+        );
+
+        let gone = by_body("why remove this?");
+        assert_eq!(
+            (
+                gone.path.as_str(),
+                gone.line,
+                gone.side.as_deref(),
+                gone.reply_to_id
+            ),
+            ("src/gone.rs", Some(7), Some("LEFT"), None)
+        );
+
+        for (row, who) in [(opened, "rev"), (answer, "dev"), (gone, "rev")] {
+            let review = review_of(row);
+            assert_eq!(
+                (
+                    review.action.as_str(),
+                    review.body.as_deref(),
+                    review.original_author.as_deref(),
+                    review.original_service.as_deref(),
+                ),
+                ("comment", None, Some(who), Some("gitlab")),
+                "{}",
+                row.body
+            );
+        }
+        let conversation = reviews
+            .iter()
+            .filter_map(|review| review.body.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            conversation,
+            ["looks good"],
+            "only the plain note is conversation"
+        );
+
+        count_gitlab_mr_threads(&mut stats.inventory, &discussions);
+        stats.inventory.repo_id = Some(1);
+        let root = tempfile::tempdir().unwrap();
+        let receipt = crate::import::receipt::build(&db, root.path(), "gitlab", ("o", "r"), &stats)
+            .await
+            .unwrap();
+        let row = |kind: &str| {
+            receipt
+                .objects
+                .iter()
+                .find(|row| row.kind == kind)
+                .unwrap_or_else(|| panic!("no {kind} row: {receipt:?}"))
+                .clone()
+        };
+        let lines = row("review_comments");
+        assert_eq!(
+            (lines.source, lines.imported, lines.not_imported),
+            (Some(3), 3, 0)
+        );
+        let comments = row("comments");
+        assert_eq!(
+            (
+                comments.source,
+                comments.imported,
+                comments.skipped,
+                comments.not_imported
+            ),
+            (Some(2), 1, 1, 0)
+        );
+    }
+
     /// card_f6c67a05c6b0: who an issue and a pull request were on at the
     /// source comes over as bylines, by role — never as a local assignment.
     #[tokio::test]
@@ -7983,7 +8337,7 @@ mod tests {
             &db,
             1,
             &gitlab_mr(),
-            &[gitlab_note(911), system, refused],
+            &gitlab_threads([gitlab_note(911), system, refused]),
             IMPORTER_ID,
             &SourceOrigin::gitlab_com(),
             &HashMap::new(),

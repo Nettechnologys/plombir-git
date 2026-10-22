@@ -172,11 +172,113 @@ pub struct GitLabReleaseLink {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitLabNote {
     pub id: i64,
+    /// `DiffNote` for a comment on a line of a merge request's diff,
+    /// `DiscussionNote` for one in a thread elsewhere, absent for a plain note.
+    #[serde(rename = "type", default)]
+    pub note_type: Option<String>,
     pub body: Option<String>,
     pub author: Option<GitLabUser>,
     pub system: bool, // system-generated note (e.g., "closed this issue")
     pub created_at: String,
     pub updated_at: String,
+    /// Where a `DiffNote` sits in the diff.
+    #[serde(default)]
+    pub position: Option<GitLabNotePosition>,
+}
+
+/// The place of a `DiffNote`: the file on either side of the diff, the line on
+/// either side, and the commits the diff was taken between.
+///
+/// A line present on both sides — context the change did not touch — carries
+/// both numbers; an added line only `new_line`, a removed one only `old_line`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GitLabNotePosition {
+    #[serde(default)]
+    pub head_sha: Option<String>,
+    #[serde(default)]
+    pub old_path: Option<String>,
+    #[serde(default)]
+    pub new_path: Option<String>,
+    #[serde(default)]
+    pub old_line: Option<i64>,
+    #[serde(default)]
+    pub new_line: Option<i64>,
+    /// The range of a comment on several lines; `end` is the line above.
+    #[serde(default)]
+    pub line_range: Option<GitLabLineRange>,
+}
+
+/// The first and last line of a multi-line `DiffNote`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitLabLineRange {
+    pub start: GitLabRangeLine,
+    pub end: GitLabRangeLine,
+}
+
+/// One end of a [`GitLabLineRange`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GitLabRangeLine {
+    #[serde(default)]
+    pub old_line: Option<i64>,
+    #[serde(default)]
+    pub new_line: Option<i64>,
+}
+
+/// A thread of a merge request: its notes, oldest first. A plain note is a
+/// thread of one; a comment on the diff and its replies are one thread.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitLabDiscussion {
+    pub id: String,
+    #[serde(default)]
+    pub notes: Vec<GitLabNote>,
+}
+
+/// Where a `DiffNote` is drawn, in the shape a review comment stores.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitLabDiffPlacement {
+    pub path: String,
+    pub line: Option<i64>,
+    pub side: &'static str,
+    pub start_line: Option<i64>,
+    pub start_side: Option<&'static str>,
+    pub commit_id: Option<String>,
+}
+
+/// A line by its number on the new side when it has one, else on the old.
+fn gitlab_line(new_line: Option<i64>, old_line: Option<i64>) -> (Option<i64>, &'static str) {
+    match (new_line, old_line) {
+        (Some(line), _) => (Some(line), "RIGHT"),
+        (None, Some(line)) => (Some(line), "LEFT"),
+        (None, None) => (None, "RIGHT"),
+    }
+}
+
+impl GitLabNotePosition {
+    /// The file, line and side the comment is on, and the commit the line is
+    /// counted in. A removed line is on the old side, so its file is the old
+    /// path — the new one may not exist.
+    pub fn placement(&self) -> GitLabDiffPlacement {
+        let present = |value: &Option<String>| value.clone().filter(|value| !value.is_empty());
+        let (line, side) = gitlab_line(self.new_line, self.old_line);
+        let path = if side == "LEFT" {
+            present(&self.old_path).or_else(|| present(&self.new_path))
+        } else {
+            present(&self.new_path).or_else(|| present(&self.old_path))
+        };
+        let start = self
+            .line_range
+            .as_ref()
+            .map(|range| gitlab_line(range.start.new_line, range.start.old_line))
+            .filter(|start| start.0.is_some() && *start != (line, side));
+        GitLabDiffPlacement {
+            path: path.unwrap_or_default(),
+            line,
+            side,
+            start_line: start.and_then(|start| start.0),
+            start_side: start.map(|start| start.1),
+            commit_id: present(&self.head_sha),
+        }
+    }
 }
 
 impl GitLabClient {
@@ -299,13 +401,14 @@ impl GitLabClient {
         project_id: &str,
         issue_iid: i64,
     ) -> Result<Vec<GitLabNote>> {
-        // Filter out system notes for cleaner import.
+        // System notes included: the import skips them and the receipt counts
+        // them as skipped, which it cannot do with notes it never saw.
         //
         // Oldest first, said out loud: GitLab lists notes newest first by
         // default. The import writes them in the order they arrive, and notes
         // created in the same second are shown in that order, so the default
         // reversed them (card_ba4dab292b1c).
-        let all_notes: Vec<GitLabNote> = Self::paginate_all(
+        Self::paginate_all(
             &self.client,
             &format!(
                 "{}/projects/{}/issues/{}/notes?order_by=created_at&sort=asc&per_page=100",
@@ -314,24 +417,30 @@ impl GitLabClient {
                 issue_iid
             ),
         )
-        .await?;
-        Ok(all_notes.into_iter().filter(|n| !n.system).collect())
+        .await
     }
 
-    /// List notes (comments) for a merge request.
-    pub async fn list_mr_notes(&self, project_id: &str, mr_iid: i64) -> Result<Vec<GitLabNote>> {
-        // Oldest first, for the reason given in `list_issue_notes`.
-        let all_notes: Vec<GitLabNote> = Self::paginate_all(
+    /// List the threads of a merge request, system notes included.
+    ///
+    /// Threads rather than `/notes`: a note says where on the diff it sits but
+    /// not which comment it answers, so a reply on a line could not be kept in
+    /// its thread (card_1630e0eb32e9). The endpoint takes no order; the import
+    /// orders the notes itself.
+    pub async fn list_mr_discussions(
+        &self,
+        project_id: &str,
+        mr_iid: i64,
+    ) -> Result<Vec<GitLabDiscussion>> {
+        Self::paginate_all(
             &self.client,
             &format!(
-                "{}/projects/{}/merge_requests/{}/notes?order_by=created_at&sort=asc&per_page=100",
+                "{}/projects/{}/merge_requests/{}/discussions?per_page=100",
                 self.base_url,
                 urlencoding(project_id),
                 mr_iid
             ),
         )
-        .await?;
-        Ok(all_notes.into_iter().filter(|n| !n.system).collect())
+        .await
     }
 
     /// List releases for a project.
@@ -558,50 +667,128 @@ mod pagination_tests {
     /// otherwise, and the import writes them in the order they arrive. Two
     /// notes of the same second then showed up in our conversation the wrong
     /// way round, since the list breaks a tie on the order of insertion.
+    ///
+    /// A merge request is read by its threads instead (card_1630e0eb32e9),
+    /// which GitLab cannot be asked to order; the import orders those notes.
+    /// System notes come through either way: the receipt counts them skipped.
     #[tokio::test]
-    async fn issue_and_merge_request_notes_are_asked_for_oldest_first() {
+    async fn issue_notes_are_asked_for_oldest_first_and_merge_requests_by_thread() {
         const NOTES: &str = r#"[{"id":7,"body":"first","author":null,"system":false,
+            "created_at":"2024-01-02T00:00:00.000Z","updated_at":"2024-01-02T00:00:00.000Z"},
+            {"id":8,"body":"closed","author":null,"system":true,
             "created_at":"2024-01-02T00:00:00.000Z","updated_at":"2024-01-02T00:00:00.000Z"}]"#;
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("address");
         let server = tokio::spawn(serve(
             listener,
-            vec![respond(b"", NOTES), respond(b"", NOTES)],
+            vec![respond(b"", NOTES), respond(b"", DISCUSSIONS)],
         ));
 
         let client =
             GitLabClient::new_for_trusted_test("token".to_owned(), format!("http://{addr}"))
                 .expect("build client");
+        let notes = client.list_issue_notes("group/widgets", 3).await.unwrap();
         assert_eq!(
-            client
-                .list_issue_notes("group/widgets", 3)
-                .await
-                .unwrap()
-                .len(),
-            1
+            notes.iter().map(|note| note.system).collect::<Vec<_>>(),
+            [false, true]
         );
-        assert_eq!(
-            client
-                .list_mr_notes("group/widgets", 4)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+        let discussions = client
+            .list_mr_discussions("group/widgets", 4)
+            .await
+            .unwrap();
+        assert_eq!(discussions.len(), 2);
 
         let requests = server.await.expect("server");
         assert_eq!(requests.len(), 2);
-        for (request, path) in requests
-            .iter()
-            .zip(["/issues/3/notes?", "/merge_requests/4/notes?"])
-        {
-            let line = request.lines().next().unwrap_or_default();
-            assert!(line.contains(path), "{line}");
-            assert!(
-                line.contains("order_by=created_at") && line.contains("sort=asc"),
-                "notes must be asked for oldest first: {line}"
-            );
-        }
+        let line = |index: usize| {
+            requests[index]
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert!(line(0).contains("/issues/3/notes?"), "{}", line(0));
+        assert!(
+            line(0).contains("order_by=created_at") && line(0).contains("sort=asc"),
+            "notes must be asked for oldest first: {}",
+            line(0)
+        );
+        assert!(
+            line(1).contains("/merge_requests/4/discussions?"),
+            "{}",
+            line(1)
+        );
+    }
+
+    /// Two threads in the shape GitLab 17 answers `/discussions` with: a
+    /// comment on a removed line of the diff with its reply, and a plain note.
+    const DISCUSSIONS: &str = r#"[
+        {"id":"6a9c1750b37d513a43987b574953fceb50b03ce7","individual_note":false,"notes":[
+            {"id":1126,"type":"DiffNote","body":"why remove this?","attachment":null,
+             "author":{"id":5,"username":"rev","name":"Rev","email":null,"avatar_url":null},
+             "created_at":"2024-01-03T21:54:39.668Z","updated_at":"2024-01-03T21:54:39.668Z",
+             "system":false,"noteable_id":3,"noteable_type":"MergeRequest","resolvable":true,
+             "resolved":false,"resolved_by":null,
+             "position":{"base_sha":"b83d6e391c22777fca1ed3012fce84f633d7fed0",
+              "start_sha":"b83d6e391c22777fca1ed3012fce84f633d7fed0",
+              "head_sha":"2be7ddb704c7b6b83732fdd5b9f09d5a397b5f8f",
+              "old_path":"src/old.rs","new_path":"src/new.rs","position_type":"text",
+              "old_line":27,"new_line":null,
+              "line_range":{"start":{"line_code":"a_25_0","type":"old","old_line":25,"new_line":null},
+                            "end":{"line_code":"a_27_0","type":"old","old_line":27,"new_line":null}}}},
+            {"id":1129,"type":"DiffNote","body":"it was dead","attachment":null,
+             "author":{"id":6,"username":"dev","name":"Dev","email":null,"avatar_url":null},
+             "created_at":"2024-01-03T22:00:00.000Z","updated_at":"2024-01-03T22:00:00.000Z",
+             "system":false,"noteable_id":3,"noteable_type":"MergeRequest","resolvable":true,
+             "resolved":false,"resolved_by":null,
+             "position":{"base_sha":"b83d6e391c22777fca1ed3012fce84f633d7fed0",
+              "start_sha":"b83d6e391c22777fca1ed3012fce84f633d7fed0",
+              "head_sha":"2be7ddb704c7b6b83732fdd5b9f09d5a397b5f8f",
+              "old_path":"src/old.rs","new_path":"src/new.rs","position_type":"text",
+              "old_line":27,"new_line":null}}]},
+        {"id":"87805b7c09016a7058e91bdbe7b29d1f284a39e6","individual_note":true,"notes":[
+            {"id":1128,"type":null,"body":"looks good","attachment":null,"author":null,
+             "created_at":"2024-01-03T21:56:00.000Z","updated_at":"2024-01-03T21:56:00.000Z",
+             "system":false,"noteable_id":3,"noteable_type":"MergeRequest","resolvable":false}]}
+    ]"#;
+
+    /// card_1630e0eb32e9: the place of a comment on the diff is read off its
+    /// `position` — a removed line on the old side of the old file, an added
+    /// or untouched one on the new side, and a range from its first line.
+    #[test]
+    fn a_diff_note_is_placed_by_its_position() {
+        let discussions: Vec<GitLabDiscussion> =
+            serde_json::from_str(DISCUSSIONS).expect("the fixture parses");
+        let removed = &discussions[0].notes[0];
+        assert_eq!(removed.note_type.as_deref(), Some("DiffNote"));
+        assert_eq!(
+            removed.position.as_ref().expect("a position").placement(),
+            GitLabDiffPlacement {
+                path: "src/old.rs".to_owned(),
+                line: Some(27),
+                side: "LEFT",
+                start_line: Some(25),
+                start_side: Some("LEFT"),
+                commit_id: Some("2be7ddb704c7b6b83732fdd5b9f09d5a397b5f8f".to_owned()),
+            }
+        );
+        assert!(discussions[1].notes[0].position.is_none());
+
+        let untouched = GitLabNotePosition {
+            old_path: Some("src/old.rs".to_owned()),
+            new_path: Some("src/new.rs".to_owned()),
+            old_line: Some(9),
+            new_line: Some(11),
+            ..GitLabNotePosition::default()
+        };
+        let placement = untouched.placement();
+        assert_eq!(
+            (placement.path.as_str(), placement.line, placement.side),
+            ("src/new.rs", Some(11), "RIGHT"),
+            "a line on both sides is counted on the new one"
+        );
+        assert_eq!((placement.start_line, placement.start_side), (None, None));
+        assert_eq!(placement.commit_id, None);
     }
 }
 

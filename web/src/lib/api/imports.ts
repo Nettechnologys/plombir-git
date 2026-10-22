@@ -82,11 +82,23 @@ export interface CiReceipt {
   not_run: CiNotRun[];
 }
 
+export interface TemplateNotRead {
+  path: string;
+  reason: string;
+}
+
+export interface TemplatesReceipt {
+  unavailable?: string;
+  not_read: TemplateNotRead[];
+  not_read_omitted?: number;
+}
+
 export interface ImportReceipt {
   objects: ObjectReceipt[];
   refs: RefsReceipt;
   not_transferable: string[];
   ci?: CiReceipt;
+  templates?: TemplatesReceipt;
 }
 
 export const imports = {

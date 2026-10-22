@@ -2078,6 +2078,8 @@
       "incomplete": "有内容未能迁移",
       "ci_not_run": "不会在此运行的 CI",
       "ci_unavailable": "无法读取导入分支的 CI",
+      "templates_not_read": "此处不会提供的模板",
+      "templates_unavailable": "无法读取导入分支的模板",
       "object": "对象",
       "source": "来源",
       "here": "此处",

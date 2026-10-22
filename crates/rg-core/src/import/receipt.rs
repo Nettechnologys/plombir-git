@@ -14,6 +14,9 @@
 //! rather than a surprise a month later. So is CI the imported default branch
 //! defines in a form this server does not run (`.gitlab-ci.yml`), which is the
 //! loss a moved project otherwise discovers only when no pipeline ever starts.
+//! And so are issue and pull-request templates written as YAML forms, which
+//! this server does not offer — the new-issue page otherwise just stops
+//! suggesting them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -65,7 +68,39 @@ pub struct ImportReceipt {
     /// Absent when nothing was cloned, so there is no branch to look at.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ci: Option<CiReceipt>,
+    /// Templates the imported default branch holds in a form this server does
+    /// not offer. Absent when nothing was cloned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub templates: Option<TemplatesReceipt>,
 }
+
+/// The issue and pull-request templates of the imported default branch that
+/// will not be offered here (card_04b603522857).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct TemplatesReceipt {
+    /// Why the branch could not be looked at, when it could not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+    /// The first [`RECEIPT_NAME_SAMPLE`] of them, by path.
+    pub not_read: Vec<TemplateNotRead>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub not_read_omitted: usize,
+}
+
+/// One template that will not be offered here, and what to do instead.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TemplateNotRead {
+    pub path: String,
+    pub reason: &'static str,
+}
+
+const ISSUE_FORM_NOT_READ: &str =
+    "Issue forms (YAML) are not offered here: write the template as Markdown with front matter \
+     in the same directory";
+
+const PULL_REQUEST_FORM_NOT_READ: &str =
+    "A pull-request template in YAML is not read here: a new pull request starts from \
+     `PULL_REQUEST_TEMPLATE.md` instead, so write it as Markdown beside this file";
 
 /// The CI of the imported default branch, as far as it will not run here.
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -356,6 +391,66 @@ fn ci_not_run(repository: &Path) -> anyhow::Result<Vec<CiNotRun>> {
     Ok(not_run)
 }
 
+/// The templates at the head of `repository`'s default branch written in a form
+/// this server does not read. An unborn branch has none.
+fn templates_not_read(repository: &Path) -> anyhow::Result<Vec<TemplateNotRead>> {
+    let repo = rg_git::repository::open(repository)
+        .map_err(|error| anyhow::anyhow!("failed to open the imported repository: {error}"))?;
+    let head = repo
+        .head()
+        .map_err(|error| anyhow::anyhow!("failed to read the imported HEAD: {error}"))?;
+    if head.is_unborn() {
+        return Ok(Vec::new());
+    }
+    let tree = repo
+        .head_commit()
+        .map_err(|error| anyhow::anyhow!("failed to read the imported head commit: {error}"))?
+        .tree()
+        .map_err(|error| anyhow::anyhow!("failed to read the imported head tree: {error}"))?;
+    let lookup = |path: &str| {
+        tree.lookup_entry_by_path(path)
+            .map_err(|error| anyhow::anyhow!("failed to look up {path}: {error}"))
+    };
+
+    let mut not_read = Vec::new();
+    for directory in crate::issue_template::ISSUE_TEMPLATE_DIRS {
+        let Some(entry) = lookup(directory)? else {
+            continue;
+        };
+        if !entry.mode().is_tree() {
+            continue;
+        }
+        let listing = entry
+            .object()
+            .map_err(|error| anyhow::anyhow!("failed to read {directory}: {error}"))?
+            .try_into_tree()
+            .map_err(|_| anyhow::anyhow!("{directory} is committed as a directory, not a tree"))?;
+        let mut forms = Vec::new();
+        for item in listing.iter() {
+            let item =
+                item.map_err(|error| anyhow::anyhow!("failed to list {directory}: {error}"))?;
+            let name = item.filename().to_string();
+            if item.mode().is_blob() && crate::issue_template::is_issue_form_name(&name) {
+                forms.push(format!("{directory}/{name}"));
+            }
+        }
+        forms.sort();
+        not_read.extend(forms.into_iter().map(|path| TemplateNotRead {
+            path,
+            reason: ISSUE_FORM_NOT_READ,
+        }));
+    }
+    for path in crate::issue_template::PULL_REQUEST_FORM_TEMPLATES {
+        if lookup(path)?.is_some_and(|entry| entry.mode().is_blob()) {
+            not_read.push(TemplateNotRead {
+                path: (*path).to_owned(),
+                reason: PULL_REQUEST_FORM_NOT_READ,
+            });
+        }
+    }
+    Ok(not_read)
+}
+
 /// The checklist of what no import brings, for `platform`.
 fn not_transferable(platform: &str) -> Vec<&'static str> {
     match platform {
@@ -512,6 +607,31 @@ pub(crate) async fn build(
     } else {
         None
     };
+    let templates = if stats.repo_cloned {
+        let repository = repository.clone();
+        Some(
+            crate::blocking::run_blocking_git("import receipt templates", move || {
+                templates_not_read(&repository)
+            })
+            .await
+            .map(|not_read| {
+                let total = not_read.len();
+                let mut kept = not_read;
+                kept.truncate(RECEIPT_NAME_SAMPLE);
+                TemplatesReceipt {
+                    unavailable: None,
+                    not_read_omitted: total - kept.len(),
+                    not_read: kept,
+                }
+            })
+            .unwrap_or_else(|error| TemplatesReceipt {
+                unavailable: Some(format!("the imported branch could not be read: {error:#}")),
+                ..TemplatesReceipt::default()
+            }),
+        )
+    } else {
+        None
+    };
     let refs = match &inventory.refs {
         None => RefsReceipt {
             unavailable: Some(
@@ -541,6 +661,7 @@ pub(crate) async fn build(
         refs,
         not_transferable: not_transferable(platform),
         ci,
+        templates,
     })
 }
 
@@ -656,6 +777,45 @@ mod tests {
                 "the GitLab remedy does not name {source}, a CI source the engine reads"
             );
         }
+    }
+
+    /// card_04b603522857: issue forms and a YAML pull-request template are
+    /// named by path; the Markdown templates beside them, and the chooser
+    /// configuration, are not.
+    #[test]
+    fn templates_in_a_form_this_server_does_not_read_are_named() {
+        let repo = repository_with(Some(&[
+            (".github/ISSUE_TEMPLATE/bug.yml", "name: Bug\n"),
+            (".github/ISSUE_TEMPLATE/ask.md", "## Ask\n"),
+            (
+                ".github/ISSUE_TEMPLATE/config.yml",
+                "blank_issues_enabled: false\n",
+            ),
+            (".forgejo/issue_template/feature.yaml", "name: Feature\n"),
+            (".forgejo/PULL_REQUEST_TEMPLATE.yaml", "name: PR\n"),
+            (".gitea/PULL_REQUEST_TEMPLATE.md", "## PR\n"),
+        ]));
+        let named = templates_not_read(repo.path()).unwrap();
+        assert_eq!(
+            named
+                .iter()
+                .map(|item| (item.path.as_str(), item.reason))
+                .collect::<Vec<_>>(),
+            [
+                (".forgejo/issue_template/feature.yaml", ISSUE_FORM_NOT_READ),
+                (".github/ISSUE_TEMPLATE/bug.yml", ISSUE_FORM_NOT_READ),
+                (
+                    ".forgejo/PULL_REQUEST_TEMPLATE.yaml",
+                    PULL_REQUEST_FORM_NOT_READ
+                ),
+            ]
+        );
+
+        assert!(templates_not_read(repository_with(None).path())
+            .unwrap()
+            .is_empty());
+        let markdown = repository_with(Some(&[(".gitea/ISSUE_TEMPLATE/bug.md", "## Bug\n")]));
+        assert!(templates_not_read(markdown.path()).unwrap().is_empty());
     }
 
     #[test]

@@ -12,7 +12,7 @@ const MAX_TEMPLATE_SIZE: usize = 1024 * 1024;
 ///
 /// [`MAX_TEMPLATE_SIZE`] bounds one template and nothing else, while every body
 /// discovery finds stays in [`IssueTemplateDiscovery::templates`] until the
-/// endpoint has answered. How many files live under the nine candidate
+/// endpoint has answered. How many files live under the candidate
 /// directories is chosen by whoever can push, so a thousand templates a byte
 /// under the per-file ceiling cost a thousand times what that number promises.
 /// The same reasoning, and the same figure, as `MAX_WORKFLOW_TOTAL_BYTES` in
@@ -38,13 +38,20 @@ const MAX_TEMPLATE_FILE_COUNT: usize = 256;
 /// is refused before its listing enters heap.
 const ISSUE_TEMPLATE_LISTING_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Forgejo's list, in its order, plus GitLab's directory.
+///
 /// `.gitlab/issue_templates` is where GitLab keeps them — plural, unlike the
 /// two `.gitlab/` spellings above, which came over from Gitea's list and which
 /// GitLab itself never reads. Without it a repository that moved here from
-/// GitLab offered no templates at all (card_7c39212f8fff).
-const ISSUE_TEMPLATE_DIRS: &[&str] = &[
+/// GitLab offered no templates at all (card_7c39212f8fff). The `.forgejo/` and
+/// `docs/` directories are Forgejo's (`services/issue/template.go`); without
+/// them a repository that moved here from Forgejo lost its templates just as
+/// quietly (card_04b603522857).
+pub(crate) const ISSUE_TEMPLATE_DIRS: &[&str] = &[
     "ISSUE_TEMPLATE",
     "issue_template",
+    ".forgejo/ISSUE_TEMPLATE",
+    ".forgejo/issue_template",
     ".gitea/ISSUE_TEMPLATE",
     ".gitea/issue_template",
     ".github/ISSUE_TEMPLATE",
@@ -52,9 +59,17 @@ const ISSUE_TEMPLATE_DIRS: &[&str] = &[
     ".gitlab/ISSUE_TEMPLATE",
     ".gitlab/issue_template",
     ".gitlab/issue_templates",
+    "docs/ISSUE_TEMPLATE",
+    "docs/issue_template",
 ];
 
+/// The first that exists wins, in Forgejo's order — `.forgejo/` before
+/// `.gitea/`, `docs/` last (card_04b603522857).
 const ISSUE_CONFIGS: &[&str] = &[
+    ".forgejo/ISSUE_TEMPLATE/config.yaml",
+    ".forgejo/ISSUE_TEMPLATE/config.yml",
+    ".forgejo/issue_template/config.yaml",
+    ".forgejo/issue_template/config.yml",
     ".gitea/ISSUE_TEMPLATE/config.yaml",
     ".gitea/ISSUE_TEMPLATE/config.yml",
     ".gitea/issue_template/config.yaml",
@@ -63,15 +78,22 @@ const ISSUE_CONFIGS: &[&str] = &[
     ".github/ISSUE_TEMPLATE/config.yml",
     ".github/issue_template/config.yaml",
     ".github/issue_template/config.yml",
+    "docs/ISSUE_TEMPLATE/config.yaml",
+    "docs/ISSUE_TEMPLATE/config.yml",
+    "docs/issue_template/config.yaml",
+    "docs/issue_template/config.yml",
 ];
 
 /// The first that exists wins. The tail is where the other forges keep the
 /// file (card_7c39212f8fff): GitHub also looks in `docs/`, and GitLab fills a
 /// new merge request from `.gitlab/merge_request_templates/Default.md` — only
 /// that one; the directory's other files are offered in a menu we do not have.
+/// Forgejo looks in `.forgejo/` before `.gitea/` (card_04b603522857).
 const PULL_REQUEST_TEMPLATES: &[&str] = &[
     "PULL_REQUEST_TEMPLATE.md",
     "pull_request_template.md",
+    ".forgejo/PULL_REQUEST_TEMPLATE.md",
+    ".forgejo/pull_request_template.md",
     ".gitea/PULL_REQUEST_TEMPLATE.md",
     ".gitea/pull_request_template.md",
     ".github/PULL_REQUEST_TEMPLATE.md",
@@ -81,6 +103,43 @@ const PULL_REQUEST_TEMPLATES: &[&str] = &[
     ".gitlab/merge_request_templates/Default.md",
     ".gitlab/merge_request_templates/default.md",
 ];
+
+/// Where Gitea and Forgejo find a pull-request template written as a YAML
+/// form, beside the Markdown ones above. The form format is not read here, so
+/// these are not candidates: an import names the ones it brings, as a template
+/// a new pull request will not start from (card_04b603522857).
+pub(crate) const PULL_REQUEST_FORM_TEMPLATES: &[&str] = &[
+    "PULL_REQUEST_TEMPLATE.yaml",
+    "PULL_REQUEST_TEMPLATE.yml",
+    "pull_request_template.yaml",
+    "pull_request_template.yml",
+    ".forgejo/PULL_REQUEST_TEMPLATE.yaml",
+    ".forgejo/PULL_REQUEST_TEMPLATE.yml",
+    ".forgejo/pull_request_template.yaml",
+    ".forgejo/pull_request_template.yml",
+    ".gitea/PULL_REQUEST_TEMPLATE.yaml",
+    ".gitea/PULL_REQUEST_TEMPLATE.yml",
+    ".gitea/pull_request_template.yaml",
+    ".gitea/pull_request_template.yml",
+    ".github/PULL_REQUEST_TEMPLATE.yaml",
+    ".github/PULL_REQUEST_TEMPLATE.yml",
+    ".github/pull_request_template.yaml",
+    ".github/pull_request_template.yml",
+    "docs/PULL_REQUEST_TEMPLATE.yaml",
+    "docs/PULL_REQUEST_TEMPLATE.yml",
+    "docs/pull_request_template.yaml",
+    "docs/pull_request_template.yml",
+];
+
+/// Whether a file directly in one of [`ISSUE_TEMPLATE_DIRS`] is an issue form
+/// — GitHub's and Gitea's YAML template format, which is not read here. The
+/// chooser configuration shares the directory and the extension, and is not
+/// one.
+pub(crate) fn is_issue_form_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    (name.ends_with(".yml") || name.ends_with(".yaml"))
+        && !matches!(name.as_str(), "config.yml" | "config.yaml")
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct IssueTemplate {
@@ -153,7 +212,7 @@ pub fn discover_issue_templates(
     };
     let mut discovery = IssueTemplateDiscovery::default();
     // One budget for the whole discovery rather than one per directory: the
-    // nine candidate directories are all searched and everything found in them
+    // candidate directories are all searched and everything found in them
     // is held together, so bounding each of them separately would bound
     // nothing.
     let mut budget = TemplateSetBudget::new();
@@ -595,10 +654,10 @@ impl Default for IssueConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_issue_templates, parse_markdown_template, read_issue_config,
+        discover_issue_templates, is_issue_form_name, parse_markdown_template, read_issue_config,
         read_pull_request_template, split_front_matter, validate_config, IssueConfig,
         ISSUE_CONFIGS, ISSUE_TEMPLATE_DIRS, MAX_TEMPLATE_FILE_COUNT, MAX_TEMPLATE_SIZE,
-        MAX_TEMPLATE_TOTAL_BYTES, PULL_REQUEST_TEMPLATES,
+        MAX_TEMPLATE_TOTAL_BYTES, PULL_REQUEST_FORM_TEMPLATES, PULL_REQUEST_TEMPLATES,
     };
     use std::collections::BTreeSet;
 
@@ -1266,8 +1325,9 @@ struct IssueContactLink {
     }
 
     /// The paths are the other half of the contract, and the larger half: three
-    /// lists, twenty-seven entries, none of them guessable and none of them
-    /// visible anywhere in the product. Compared as sets in both directions —
+    /// lists of where to look and one of what is named and not read, none of
+    /// them guessable and none of them visible anywhere in the product.
+    /// Compared as sets in both directions —
     /// a path this server stopped opening must not stay in the document any
     /// more than a path it opens may be missing from it.
     #[test]
@@ -1289,6 +1349,11 @@ struct IssueContactLink {
                 "<!-- inventory: pull-request-templates -->",
                 PULL_REQUEST_TEMPLATES,
                 "path the pull-request template is read from",
+            ),
+            (
+                "<!-- inventory: pull-request-forms-not-read -->",
+                PULL_REQUEST_FORM_TEMPLATES,
+                "path a YAML pull-request form is named at",
             ),
         ] {
             let documented: BTreeSet<String> =
@@ -1898,5 +1963,85 @@ struct IssueContactLink {
                 "{files:?}"
             );
         }
+    }
+
+    /// card_04b603522857: a repository that moved here from Forgejo keeps its
+    /// templates under `.forgejo/` — and its pull-request template and chooser
+    /// configuration there too — which Forgejo reads before `.gitea/`.
+    #[test]
+    fn forgejo_templates_are_offered() {
+        let (_directory, repository) =
+            committed_repository(&[(".forgejo/ISSUE_TEMPLATE/bug.md", "## What happened\n")]);
+        let discovery = discover_issue_templates(&repository, "main").unwrap();
+        assert!(discovery.errors.is_empty(), "{:?}", discovery.errors);
+        assert_eq!(
+            discovery
+                .templates
+                .iter()
+                .map(|template| (template.file_name.as_str(), template.name.as_str()))
+                .collect::<Vec<_>>(),
+            [(".forgejo/ISSUE_TEMPLATE/bug.md", "bug.md")]
+        );
+
+        let (_directory, repository) = committed_repository(&[
+            (".forgejo/PULL_REQUEST_TEMPLATE.md", "## Forgejo\n"),
+            (".gitea/PULL_REQUEST_TEMPLATE.md", "## Gitea\n"),
+            (
+                ".forgejo/issue_template/config.yml",
+                "blank_issues_enabled: false\n",
+            ),
+            (
+                ".gitea/ISSUE_TEMPLATE/config.yml",
+                "blank_issues_enabled: true\n",
+            ),
+        ]);
+        let template = read_pull_request_template(&repository, "main")
+            .unwrap()
+            .expect("the Forgejo template is found");
+        assert_eq!(
+            (template.file_name.as_str(), template.content.as_str()),
+            (".forgejo/PULL_REQUEST_TEMPLATE.md", "## Forgejo\n"),
+            "Forgejo's own directory wins over `.gitea/`, as it does there"
+        );
+        assert!(
+            !read_issue_config(&repository, "main")
+                .unwrap()
+                .blank_issues_enabled,
+            "the `.forgejo/` configuration is the one read"
+        );
+    }
+
+    /// Forgejo also keeps issue templates under `docs/`.
+    #[test]
+    fn forgejo_docs_issue_templates_are_offered() {
+        let (_directory, repository) =
+            committed_repository(&[("docs/issue_template/question.md", "## Ask\n")]);
+        let discovery = discover_issue_templates(&repository, "main").unwrap();
+        assert_eq!(
+            discovery
+                .templates
+                .iter()
+                .map(|template| template.file_name.as_str())
+                .collect::<Vec<_>>(),
+            ["docs/issue_template/question.md"]
+        );
+    }
+
+    /// The YAML forms an import names are the files this module does not read:
+    /// none of them is a Markdown candidate, and a configuration is not a form.
+    #[test]
+    fn a_yaml_form_is_never_a_template_this_server_reads() {
+        for path in PULL_REQUEST_FORM_TEMPLATES {
+            assert!(
+                !PULL_REQUEST_TEMPLATES.contains(path),
+                "{path} is read now; drop it from PULL_REQUEST_FORM_TEMPLATES"
+            );
+            assert!(path.ends_with(".yaml") || path.ends_with(".yml"), "{path}");
+        }
+        assert!(is_issue_form_name("bug.yml"));
+        assert!(is_issue_form_name("Feature.YAML"));
+        assert!(!is_issue_form_name("config.yml"));
+        assert!(!is_issue_form_name("config.yaml"));
+        assert!(!is_issue_form_name("bug.md"));
     }
 }
