@@ -782,19 +782,36 @@ export function parsePageInventory(source, file, { includeDirectTransports = tru
   // everything only `$effect` / `onMount` / a `load` helper reaches. It is still
   // surface — a page that renders a private repo's data on load needs the same
   // access answer as a button that fetches it — so it is reported, separately.
-  const viaControls = new Set(elements.flatMap((element) => element.reaches));
-  const transportsViaControls = new Set(elements.flatMap((element) => element.transports));
-  const everything = new Set(moduleScopeCalls);
-  const everyTransport = new Set(moduleScopeTransports);
-  for (const symbols of directCalls.values()) {
-    for (const symbol of symbols) everything.add(symbol);
+  //
+  // Decided per caller, not per symbol: a call some declaration no control
+  // reaches makes is passive even when a control reaches the same symbol
+  // elsewhere. Per symbol, a Retry button that re-reads one thing the page
+  // loads on open — the README lookup re-reading `repos.tree` — erased the
+  // page's own load of it from the inventory, and the access sweep covering
+  // that load could no longer find it (card_68a6f79c5fe4).
+  const controlDecls = new Set();
+  let frontier = elements.flatMap((element) => element.handlerNames);
+  for (let hop = 0; hop <= MAX_HOPS && frontier.length; hop += 1) {
+    const next = [];
+    for (const name of frontier) {
+      if (controlDecls.has(name)) continue;
+      controlDecls.add(name);
+      next.push(...(localEdges.get(name) || []));
+    }
+    frontier = next;
   }
-  for (const rows of transportCalls.values()) {
-    for (const row of rows) everyTransport.add(row);
+  const passiveSet = new Set(moduleScopeCalls);
+  const passiveTransportSet = new Set(moduleScopeTransports);
+  for (const [owner, symbols] of directCalls) {
+    if (controlDecls.has(owner)) continue;
+    for (const symbol of symbols) passiveSet.add(symbol);
   }
-  const passiveCalls = [...everything].filter((symbol) => !viaControls.has(symbol));
-  const passiveTransports = [...everyTransport]
-    .filter((row) => !transportsViaControls.has(row));
+  for (const [owner, rows] of transportCalls) {
+    if (controlDecls.has(owner)) continue;
+    for (const row of rows) passiveTransportSet.add(row);
+  }
+  const passiveCalls = [...passiveSet];
+  const passiveTransports = [...passiveTransportSet];
 
   return {
     file,

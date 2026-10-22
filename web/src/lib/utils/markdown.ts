@@ -1,4 +1,5 @@
 import { marked } from 'marked';
+import { resolveRepositoryLinks, type RepositoryLinkTargets } from '$lib/repoReadme';
 
 const ALLOWED_TAGS = new Set([
   'a',
@@ -150,7 +151,12 @@ export function sanitizeHtml(html: string): string {
   return '';
 }
 
-export function renderMarkdown(content: string): string {
+/**
+ * Markdown to sanitized HTML. A file of a repository passes `links`, and its
+ * relative links and images are pointed into the repository before the
+ * sanitizer runs — so the addresses it writes are checked like any other.
+ */
+export function renderMarkdown(content: string, links?: RepositoryLinkTargets): string {
   const html = marked.parse(content || '', { async: false }) as string;
-  return sanitizeHtml(html);
+  return sanitizeHtml(links ? resolveRepositoryLinks(html, links) : html);
 }

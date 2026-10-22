@@ -11,6 +11,7 @@
   import { createT, formatDate } from '$lib/i18n';
   import { canWriteRepo } from '$lib/repoPermission';
   import { renderMarkdown } from '$lib/utils/markdown';
+  import { findReadme, readmeDirectories, type RepositoryLinkTargets } from '$lib/repoReadme';
 
   const t = createT();
   const RECENT_COMMITS = 5;
@@ -27,11 +28,17 @@
   let repoInfo = $state<any>(null);
   let readmeContent = $state<string | null>(null);
   let readmeName = $state<string | null>(null);
+  // The directory the README was found in: '' for the root, or `.gitea`,
+  // `.github`, `docs` (card_68a6f79c5fe4). Its relative links lead from there.
+  let readmeDirectory = $state('');
+  let readmePath = $derived(readmeDirectory ? `${readmeDirectory}/${readmeName ?? ''}` : (readmeName ?? ''));
   // The README is Markdown when its name says so, like any other blob; a bare
   // `README` is plain text. Rendered through the shared sanitizer, the same
   // path the file view and issues use.
   let readmeIsMarkdown = $derived(/\.(md|markdown)$/i.test(readmeName ?? ''));
-  let renderedReadme = $derived(readmeContent && readmeIsMarkdown ? renderMarkdown(readmeContent) : '');
+  let renderedReadme = $derived(
+    readmeContent && readmeIsMarkdown ? renderMarkdown(readmeContent, readmeLinks(readmeDirectory)) : '',
+  );
   let readmeLoading = $state(false);
   let readmeError = $state('');
   let codeQuery = $state('');
@@ -90,6 +97,14 @@
     return `/${owner}/${repo}/blob/${encodeRepoPath(filePath)}${buildRepoQuery(ref, '')}`;
   }
 
+  function readmeLinks(directory: string): RepositoryLinkTargets {
+    return {
+      directory,
+      page: (target, isDirectory) => (isDirectory ? buildTreeHref(ref, target) : buildBlobHref(target)),
+      image: (target) => repos.rawUrl(owner, repo, target, ref || undefined),
+    };
+  }
+
   function searchCode() {
     const terms = [codeQuery.trim(), `repo:${owner}/${repo}`].filter(Boolean).join(' ');
     goto(`/search?q=${encodeURIComponent(terms)}&type=code`);
@@ -128,6 +143,7 @@
     repoInfo = null;
     readmeContent = null;
     readmeName = null;
+    readmeDirectory = '';
     readmeLoading = false;
     readmeError = '';
     try {
@@ -181,26 +197,36 @@
     readmeLoading = true;
     readmeError = '';
     try {
-      // Try common README filenames
-      const readmeNames = ['README.md', 'README.markdown', 'README', 'readme.md', 'Readme.md'];
-      for (const name of readmeNames) {
-        const entry = expectedEntries.find((e: any) => e.name === name);
-        if (entry) {
-          try {
-            const data = await repos.blob(expectedOwner, expectedRepo, name, expectedRef || undefined);
-            if (ownsCurrentView()) {
-              readmeContent = data.content;
-              readmeName = name;
-            }
-            break;
-          } catch (e) {
-            // The tree and blob reads are separate snapshots. A 404 means this
-            // candidate disappeared between them, so another conventional name
-            // may still be present. Every other status is a failed read, not
-            // evidence that the repository has no README.
-            if (e instanceof ApiError && e.status === 404) continue;
-            throw e;
+      // Where Gitea and GitHub look, in Gitea's order: `.gitea/`, `.github/`,
+      // the root, `docs/`. A directory's listing is read only when the root
+      // has that directory.
+      for (const directory of readmeDirectories(expectedEntries)) {
+        try {
+          const listing = directory
+            ? (await repos.tree(expectedOwner, expectedRepo, expectedRef || undefined, directory)).entries || []
+            : expectedEntries;
+          if (!ownsCurrentView()) return;
+          const name = findReadme(listing);
+          if (!name) continue;
+          const data = await repos.blob(
+            expectedOwner,
+            expectedRepo,
+            directory ? `${directory}/${name}` : name,
+            expectedRef || undefined,
+          );
+          if (ownsCurrentView()) {
+            readmeContent = data.content;
+            readmeName = name;
+            readmeDirectory = directory;
           }
+          return;
+        } catch (e) {
+          // The tree and blob reads are separate snapshots. A 404 means this
+          // directory or README disappeared between them, so the next place
+          // may still hold one. Every other status is a failed read, not
+          // evidence that the repository has no README.
+          if (e instanceof ApiError && e.status === 404) continue;
+          throw e;
         }
       }
     } catch (e: any) {
@@ -436,7 +462,7 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
     {:else if !path && readmeContent}
       <div class="gh-card readme-section">
         <div class="readme-header">
-          <span>📄 README.md</span>
+          <span>📄 {readmePath}</span>
         </div>
         <div class="readme-body">
           {#if readmeIsMarkdown}

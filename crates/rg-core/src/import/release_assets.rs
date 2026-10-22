@@ -18,19 +18,72 @@
 //! followed here rather than by reqwest, so each one is checked by the same
 //! guard the API client was built through, and a hop to another origin is made
 //! without the credential and only over TLS.
+//!
+//! A GitLab release lists no files of its own, only links (card_aafa0452e8fd):
+//! any address its author typed. A link into a store of the source itself — a
+//! project upload, a package file, a job's artifacts — is that release's file
+//! and is fetched like the others, with `PRIVATE-TOKEN`. Any other link is not
+//! a file the source holds; it is kept as a link, never fetched.
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, LOCATION};
+use reqwest::header::{
+    HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_TYPE, LOCATION,
+};
 use sea_orm::DatabaseConnection;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 use crate::import::github_client::{ApiDialect, GitHubAsset};
+use crate::import::gitlab_client::GitLabReleaseLink;
 use crate::lfs::fetch::{send_with_retry, LfsSourceGuard};
 use crate::net::HttpOrigin;
+
+/// The API the release list came from, which decides where a file's bytes are
+/// and how the source's credential is presented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssetApi {
+    /// GitHub.com and GitHub Enterprise Server: `Authorization: Bearer …`.
+    GitHub,
+    /// Gitea and Forgejo: `Authorization: token …`.
+    Gitea,
+    /// GitLab: `PRIVATE-TOKEN: …`, as its API client sends it.
+    GitLab,
+}
+
+impl From<ApiDialect> for AssetApi {
+    fn from(dialect: ApiDialect) -> Self {
+        match dialect {
+            ApiDialect::GitHub => Self::GitHub,
+            ApiDialect::Gitea => Self::Gitea,
+        }
+    }
+}
+
+/// One file to bring over, however its source listed it.
+struct WantedFile<'w> {
+    name: &'w str,
+    content_type: &'w str,
+    /// What the source's listing says the file weighs. A GitLab link says
+    /// nothing; the answer's `Content-Length` is then the size held to the
+    /// budgets.
+    size: Option<u64>,
+    /// `sha256:<hex>`, when the listing names one.
+    digest: Option<&'w str>,
+    url: reqwest::Url,
+    accept: &'static str,
+}
+
+/// A link of an imported GitLab release that is not a file of the source, so
+/// the release keeps it as a link instead (card_aafa0452e8fd).
+#[derive(Debug, serde::Serialize)]
+pub struct ReleaseLinkKept {
+    pub tag_name: String,
+    pub name: String,
+    pub url: String,
+}
 
 /// Redirects one download may take. GitHub takes one; a few more leave room
 /// for a CDN in front of a self-hosted Gitea without letting a source loop the
@@ -47,10 +100,12 @@ pub(crate) struct AssetDestination<'a> {
 
 /// The source API the assets are listed by, and the credential it takes.
 pub(crate) struct AssetSource<'a> {
-    pub(crate) dialect: ApiDialect,
+    pub(crate) dialect: AssetApi,
     /// The API base the release list came from (`https://api.github.com`,
-    /// `https://gitea.example/api/v1`).
+    /// `https://gitea.example/api/v1`, `https://gitlab.example/api/v4`).
     pub(crate) api_base_url: &'a str,
+    /// The source repository's owner and name; GitLab's are unused, its
+    /// files are addressed by their links.
     pub(crate) owner: &'a str,
     pub(crate) repo: &'a str,
     /// The import's token; empty for a public source imported without one.
@@ -73,7 +128,7 @@ pub(crate) struct ReleaseAssetFetcher<'a> {
     destination: AssetDestination<'a>,
     source: AssetSource<'a>,
     source_origin: HttpOrigin,
-    authorization: Option<HeaderValue>,
+    credential: Option<(HeaderName, HeaderValue)>,
     guard: &'a dyn LfsSourceGuard,
     limits: crate::storage_quota::StorageLimits,
     pass_allowance: crate::clone_budget::PassAllowance,
@@ -94,17 +149,21 @@ impl<'a> ReleaseAssetFetcher<'a> {
     ) -> Result<Self> {
         let source_origin = HttpOrigin::from_target(source.api_base_url)
             .context("the import's API base has no HTTP(S) origin")?;
-        let authorization = (!source.token.is_empty())
+        let credential = (!source.token.is_empty())
             .then(|| {
-                let scheme = match source.dialect {
-                    ApiDialect::GitHub => "Bearer",
-                    ApiDialect::Gitea => "token",
+                let (name, value) = match source.dialect {
+                    AssetApi::GitHub => (AUTHORIZATION, format!("Bearer {}", source.token)),
+                    AssetApi::Gitea => (AUTHORIZATION, format!("token {}", source.token)),
+                    AssetApi::GitLab => (
+                        HeaderName::from_static("private-token"),
+                        source.token.to_owned(),
+                    ),
                 };
-                HeaderValue::from_str(&format!("{scheme} {}", source.token))
+                HeaderValue::from_str(&value)
                     .context("invalid import auth token: not a valid HTTP header value")
                     .map(|mut value| {
                         value.set_sensitive(true);
-                        value
+                        (name, value)
                     })
             })
             .transpose()?;
@@ -115,7 +174,7 @@ impl<'a> ReleaseAssetFetcher<'a> {
             destination,
             source,
             source_origin,
-            authorization,
+            credential,
             guard,
             limits,
             pass_allowance,
@@ -135,49 +194,98 @@ impl<'a> ReleaseAssetFetcher<'a> {
         stats: &mut crate::import::service::ImportStats,
     ) -> Result<()> {
         for asset in assets {
-            match self.fetch_one(release_id, asset).await? {
-                Ok(()) => stats.release_assets_imported += 1,
-                Err(reason) => {
-                    tracing::warn!(
-                        tag = %tag_name,
-                        asset = %asset.name,
-                        %reason,
-                        "a release asset was not imported"
-                    );
-                    stats.release_assets_failed.push(ReleaseAssetImportFailure {
-                        tag_name: tag_name.to_owned(),
-                        filename: asset.name.clone(),
-                        reason,
-                    });
-                }
-            }
+            let outcome = match self.listed_file(asset) {
+                Ok(wanted) => self.store(release_id, wanted).await?,
+                Err(reason) => Err(reason),
+            };
+            record(stats, tag_name, &asset.name, outcome);
         }
         Ok(())
     }
 
-    async fn fetch_one(
+    /// Whether a GitLab release link is a file the source itself stores: an
+    /// address on the source's own origin, under one of GitLab's file stores.
+    /// Anything else — another host, or a page of the source such as a wiki
+    /// page or a pipeline — is a link and stays one.
+    pub(crate) fn is_source_file(&self, link: &GitLabReleaseLink) -> bool {
+        let Ok(url) = reqwest::Url::parse(&link.url) else {
+            return false;
+        };
+        HttpOrigin::from_url(&url).is_some_and(|origin| origin == self.source_origin)
+            && is_gitlab_file_path(url.path())
+    }
+
+    /// Store the files a GitLab release links to, which
+    /// [`Self::is_source_file`] picked out, counting each in `stats` as
+    /// [`Self::import`] does.
+    pub(crate) async fn import_links(
         &mut self,
         release_id: i64,
-        asset: &GitHubAsset,
-    ) -> Result<std::result::Result<(), String>> {
+        tag_name: &str,
+        links: &[&GitLabReleaseLink],
+        stats: &mut crate::import::service::ImportStats,
+    ) -> Result<()> {
+        for link in links {
+            let name = link_filename(link);
+            let outcome = match reqwest::Url::parse(&link.url) {
+                Ok(url) => {
+                    self.store(
+                        release_id,
+                        WantedFile {
+                            name: &name,
+                            content_type: "",
+                            size: None,
+                            digest: None,
+                            url,
+                            accept: "*/*",
+                        },
+                    )
+                    .await?
+                }
+                Err(_) => Err("the source's download address is not a URL".to_owned()),
+            };
+            record(stats, tag_name, &name, outcome);
+        }
+        Ok(())
+    }
+
+    /// Where a listed asset's bytes are, or why it cannot be asked for.
+    fn listed_file<'w>(
+        &self,
+        asset: &'w GitHubAsset,
+    ) -> std::result::Result<WantedFile<'w>, String> {
         let Ok(size) = u64::try_from(asset.size) else {
-            return Ok(Err("the source declared a negative size".to_owned()));
+            return Err("the source declared a negative size".to_owned());
         };
-        if let Err(error) =
-            crate::platform::path::validate_upload_filename("release asset", &asset.name)
-        {
-            return refused_by_rule(error);
-        }
-        if let Some(max_assets) = self.limits.release_assets_max_per_release {
-            if rg_db::ops::release_ops::count_assets(self.db, release_id).await? >= max_assets {
-                return Ok(Err(format!(
-                    "the release already holds the maximum of {max_assets} asset(s) \
-                     ([limits].release_assets_max_per_release)"
-                )));
-            }
-        }
-        // Checked per asset, before a byte is fetched: everything stored before
-        // this one is already in the sum.
+        let (url, accept) = match self.source.dialect {
+            AssetApi::GitHub => (
+                format!(
+                    "{}/repos/{}/{}/releases/assets/{}",
+                    self.source.api_base_url.trim_end_matches('/'),
+                    self.source.owner,
+                    self.source.repo,
+                    asset.id
+                ),
+                "application/octet-stream",
+            ),
+            AssetApi::Gitea | AssetApi::GitLab => (asset.browser_download_url.clone(), "*/*"),
+        };
+        let Ok(url) = reqwest::Url::parse(&url) else {
+            return Err("the source's download address is not a URL".to_owned());
+        };
+        Ok(WantedFile {
+            name: &asset.name,
+            content_type: &asset.content_type,
+            size: Some(size),
+            digest: asset.digest.as_deref(),
+            url,
+            accept,
+        })
+    }
+
+    /// Whether `size` more bytes fit the repository's quota and what is left
+    /// of the import's budget.
+    async fn admit(&self, size: u64) -> Result<std::result::Result<(), String>> {
         match crate::storage_quota::check_room(
             self.db,
             self.destination.repo_id,
@@ -192,35 +300,78 @@ impl<'a> ReleaseAssetFetcher<'a> {
             }
             Err(crate::storage_quota::QuotaError::Db(error)) => return Err(error),
         }
-        if let Err(reason) = self.pass_allowance.admit(size) {
-            return Ok(Err(reason));
+        Ok(self.pass_allowance.admit(size))
+    }
+
+    async fn store(
+        &mut self,
+        release_id: i64,
+        wanted: WantedFile<'_>,
+    ) -> Result<std::result::Result<(), String>> {
+        if let Err(error) =
+            crate::platform::path::validate_upload_filename("release asset", wanted.name)
+        {
+            return refused_by_rule(error);
+        }
+        if let Some(max_assets) = self.limits.release_assets_max_per_release {
+            if rg_db::ops::release_ops::count_assets(self.db, release_id).await? >= max_assets {
+                return Ok(Err(format!(
+                    "the release already holds the maximum of {max_assets} asset(s) \
+                     ([limits].release_assets_max_per_release)"
+                )));
+            }
+        }
+        // Checked per asset, before a byte is fetched when the listing says
+        // how large the file is: everything stored before this one is
+        // already in the sum.
+        if let Some(size) = wanted.size {
+            if let Err(reason) = self.admit(size).await? {
+                return Ok(Err(reason));
+            }
         }
 
-        let (url, accept) = match self.source.dialect {
-            ApiDialect::GitHub => (
-                format!(
-                    "{}/repos/{}/{}/releases/assets/{}",
-                    self.source.api_base_url.trim_end_matches('/'),
-                    self.source.owner,
-                    self.source.repo,
-                    asset.id
-                ),
-                "application/octet-stream",
-            ),
-            ApiDialect::Gitea => (asset.browser_download_url.clone(), "*/*"),
-        };
-        let Ok(url) = reqwest::Url::parse(&url) else {
-            return Ok(Err("the source's download address is not a URL".to_owned()));
-        };
-        let response = match self.open(url, accept).await {
+        let response = match self.open(wanted.url, wanted.accept).await {
             Ok(response) => response,
             Err(reason) => return Ok(Err(reason)),
         };
-        if let Some(length) = response.content_length().filter(|length| *length != size) {
-            return Ok(Err(format!(
-                "the source announced {length} bytes; its release lists {size}"
-            )));
-        }
+        let size = match (wanted.size, response.content_length()) {
+            (Some(listed), Some(length)) if length != listed => {
+                return Ok(Err(format!(
+                    "the source announced {length} bytes; its release lists {listed}"
+                )));
+            }
+            (Some(listed), _) => listed,
+            // A link names no size, and nothing says what it leads to: an
+            // address that answers with one of the source's own pages — its
+            // sign-in page, when the file is not public to this token — is
+            // not the file, however well it downloads.
+            (None, _) if is_a_web_page(&response) => {
+                return Ok(Err(
+                    "the source answered with a web page instead of the file".to_owned(),
+                ));
+            }
+            (None, Some(length)) => {
+                if let Err(reason) = self.admit(length).await? {
+                    return Ok(Err(reason));
+                }
+                length
+            }
+            (None, None) => {
+                return Ok(Err(
+                    "the source did not say how large the file is".to_owned()
+                ));
+            }
+        };
+        let content_type = if wanted.content_type.is_empty() && wanted.size.is_none() {
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        } else {
+            wanted.content_type.to_owned()
+        };
 
         let spool_dir = crate::staging::StagingArea::ReleaseUploads.path_in(self.repo_root);
         tokio::fs::create_dir_all(&spool_dir)
@@ -234,9 +385,8 @@ impl<'a> ReleaseAssetFetcher<'a> {
             Ok(sha256) => sha256,
             Err(reason) => return Ok(Err(reason)),
         };
-        if let Some(expected) = asset
+        if let Some(expected) = wanted
             .digest
-            .as_deref()
             .and_then(|digest| digest.strip_prefix("sha256:"))
         {
             if !expected.eq_ignore_ascii_case(&sha256) {
@@ -253,8 +403,8 @@ impl<'a> ReleaseAssetFetcher<'a> {
             self.storage,
             self.destination.owner,
             self.destination.name,
-            &asset.name,
-            crate::platform::upload_type::passive_upload_type(&asset.content_type),
+            wanted.name,
+            crate::platform::upload_type::passive_upload_type(&content_type),
             self.destination.importer_id,
             spool.path(),
             size,
@@ -270,7 +420,7 @@ impl<'a> ReleaseAssetFetcher<'a> {
                 return Err(error).with_context(|| {
                     format!(
                         "failed to store release asset {} imported for {}/{}",
-                        asset.name, self.destination.owner, self.destination.name
+                        wanted.name, self.destination.owner, self.destination.name
                     )
                 });
             }
@@ -297,11 +447,11 @@ impl<'a> ReleaseAssetFetcher<'a> {
                 );
             }
             let client = self.client_for(&url, origin)?;
-            let authorization = self.authorization.clone().filter(|_| same_origin);
+            let credential = self.credential.clone().filter(|_| same_origin);
             let response = send_with_retry(|| {
                 let request = client.get(url.clone()).header(ACCEPT, accept);
-                match &authorization {
-                    Some(value) => request.header(AUTHORIZATION, value.clone()),
+                match &credential {
+                    Some((name, value)) => request.header(name.clone(), value.clone()),
                     None => request,
                 }
             })
@@ -367,6 +517,100 @@ impl<'a> ReleaseAssetFetcher<'a> {
         self.clients.insert(origin, client.clone());
         Ok(client)
     }
+}
+
+/// Count one file of the release tagged `tag_name` in `stats`: stored, or
+/// named with the reason it was not.
+fn record(
+    stats: &mut crate::import::service::ImportStats,
+    tag_name: &str,
+    filename: &str,
+    outcome: std::result::Result<(), String>,
+) {
+    match outcome {
+        Ok(()) => stats.release_assets_imported += 1,
+        Err(reason) => {
+            tracing::warn!(
+                tag = %tag_name,
+                asset = %filename,
+                %reason,
+                "a release asset was not imported"
+            );
+            stats.release_assets_failed.push(ReleaseAssetImportFailure {
+                tag_name: tag_name.to_owned(),
+                filename: filename.to_owned(),
+                reason,
+            });
+        }
+    }
+}
+
+/// The paths under which GitLab serves a file it stores for a project:
+///
+/// - `/<namespace>/<project>/uploads/<secret>/<file>` and, since GitLab 17,
+///   `/-/project/<id>/uploads/<secret>/<file>` — files attached in Markdown,
+///   which is how a release's binaries are usually uploaded;
+/// - `/<namespace>/<project>/-/package_files/<id>/download` — the package
+///   registry;
+/// - `/api/v4/projects/<id>/packages/generic/<package>/<version>/<file>` —
+///   the generic package registry release pipelines publish to;
+/// - `/<namespace>/<project>/-/jobs/<id>/artifacts/…` — a job's artifacts.
+fn is_gitlab_file_path(path: &str) -> bool {
+    let segments: Vec<&str> = path.split('/').collect();
+    let has = |run: &[&str]| segments.windows(run.len()).any(|window| window == run);
+    // `uploads/<secret>/<file>`: the secret is GitLab's random hex, which no
+    // page of the project is named after.
+    let upload = segments.windows(3).any(|window| {
+        window[0] == "uploads"
+            && window[1].len() >= 16
+            && window[1].bytes().all(|byte| byte.is_ascii_hexdigit())
+            && !window[2].is_empty()
+    });
+    upload
+        || has(&["-", "package_files"])
+        || has(&["packages", "generic"])
+        || (has(&["-", "jobs"]) && segments.contains(&"artifacts"))
+}
+
+/// The name a linked file is stored under: the last segment of its address,
+/// which is the file's own name in every store [`is_gitlab_file_path`] admits
+/// — except a package file, whose address ends in `download`, and whose link
+/// name is then the better guess. The link's name is a title (`Linux
+/// binary`), not a file name, and is only the fallback.
+fn link_filename(link: &GitLabReleaseLink) -> String {
+    reqwest::Url::parse(&link.url)
+        .ok()
+        .and_then(|url| {
+            let last = url.path_segments()?.next_back()?.to_owned();
+            let decoded = urlencoding::decode(&last).ok()?.into_owned();
+            (!decoded.is_empty() && decoded != "download").then_some(decoded)
+        })
+        .unwrap_or_else(|| link.name.clone())
+}
+
+/// Whether an answer is an HTML page served as one, rather than a file that
+/// happens to be HTML: GitLab serves a stored file as an attachment.
+fn is_a_web_page(response: &reqwest::Response) -> bool {
+    let headers = response.headers();
+    let html = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("text/html")
+        });
+    let attachment = headers
+        .get(CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("attachment")
+        });
+    html && !attachment
 }
 
 /// An asset a rule of this server refuses: the rule's own fixed text is the
@@ -578,7 +822,7 @@ mod tests {
                 importer_id: 2,
             },
             AssetSource {
-                dialect,
+                dialect: dialect.into(),
                 api_base_url: &api_base_url,
                 owner: "octo",
                 repo: "widgets",
@@ -763,6 +1007,154 @@ mod tests {
             header(&seen.lock().unwrap()[0], "authorization"),
             Some("token tok")
         );
+    }
+
+    fn link(name: &str, url: String) -> GitLabReleaseLink {
+        GitLabReleaseLink {
+            id: 1,
+            name: name.to_owned(),
+            url,
+            link_type: "package".to_owned(),
+        }
+    }
+
+    /// card_aafa0452e8fd: a GitLab release's link to a file the source stores
+    /// — a project upload, a generic package — is fetched with `PRIVATE-TOKEN`
+    /// and stored under the SHA-256 of what the source sent, named after its
+    /// address rather than the link's title. An address the source answers
+    /// with its sign-in page is named, not stored as the file. A link anywhere
+    /// else, on the source's host or another, is not one of its files.
+    #[tokio::test]
+    async fn a_gitlab_releases_linked_files_arrive_and_its_pages_do_not() {
+        let fixture = fixture().await;
+        let upload = b"uploaded with the release".to_vec();
+        let package = b"published by the release pipeline".to_vec();
+        let (upload_body, package_body) = (upload.clone(), package.clone());
+        let (source, seen) = serve(Arc::new(move |head: &str| match path_of(head) {
+            "/octo/widgets/uploads/0123456789abcdef0123456789abcdef/widgets.tgz" => {
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\n\
+                     Content-Disposition: attachment; filename=\"widgets.tgz\"\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    upload_body.len()
+                )
+                .into_bytes();
+                response.extend_from_slice(&upload_body);
+                response
+            }
+            "/api/v4/projects/7/packages/generic/widgets/5.0/widgets%20cli" => {
+                ok(&package_body, package_body.len())
+            }
+            "/octo/widgets/uploads/fedcba9876543210fedcba9876543210/private.bin" => {
+                status("302 Found", "Location: /users/sign_in\r\n")
+            }
+            "/users/sign_in" => {
+                let page = b"<html>Sign in</html>";
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    page.len()
+                )
+                .into_bytes();
+                response.extend_from_slice(page);
+                response
+            }
+            _ => status("404 Not Found", ""),
+        }))
+        .await;
+        let storage = crate::blob_storage::instance_blob_storage(fixture.root.path());
+        let guard =
+            crate::import::trust::TrustedImportOrigins::parse(std::slice::from_ref(&source))
+                .unwrap();
+        let api_base_url = format!("{source}/api/v4");
+        let mut fetcher = ReleaseAssetFetcher::new(
+            &fixture.db,
+            &storage,
+            fixture.root.path(),
+            AssetDestination {
+                repo_id: 1,
+                owner: "importer",
+                name: "imported",
+                importer_id: 2,
+            },
+            AssetSource {
+                dialect: AssetApi::GitLab,
+                api_base_url: &api_base_url,
+                owner: "octo/widgets",
+                repo: "octo/widgets",
+                token: "glpat-tok",
+            },
+            &guard,
+            crate::storage_quota::StorageLimits::default(),
+            crate::clone_budget::PassAllowance::unlimited(),
+        )
+        .unwrap();
+        let links = [
+            link(
+                "Linux build",
+                format!("{source}/octo/widgets/uploads/0123456789abcdef0123456789abcdef/widgets.tgz"),
+            ),
+            link(
+                "CLI",
+                format!("{source}/api/v4/projects/7/packages/generic/widgets/5.0/widgets%20cli"),
+            ),
+            link(
+                "Private build",
+                format!("{source}/octo/widgets/uploads/fedcba9876543210fedcba9876543210/private.bin"),
+            ),
+            link("Pipeline", format!("{source}/octo/widgets/-/pipelines/7")),
+            link("Wiki", format!("{source}/octo/widgets/-/wikis/uploads")),
+            link(
+                "Mirror",
+                "https://mirror.example.com/octo/widgets/uploads/0123456789abcdef0123456789abcdef/widgets.tgz"
+                    .to_owned(),
+            ),
+        ];
+        let (files, kept): (Vec<_>, Vec<_>) =
+            links.iter().partition(|link| fetcher.is_source_file(link));
+        assert_eq!(
+            kept.iter()
+                .map(|link| link.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Pipeline", "Wiki", "Mirror"]
+        );
+
+        let mut stats = crate::import::service::ImportStats::default();
+        fetcher
+            .import_links(fixture.release_id, "v1", &files, &mut stats)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.release_assets_imported, 2);
+        let failed: Vec<(&str, &str)> = stats
+            .release_assets_failed
+            .iter()
+            .map(|failure| (failure.filename.as_str(), failure.reason.as_str()))
+            .collect();
+        assert_eq!(
+            failed,
+            [(
+                "private.bin",
+                "the source answered with a web page instead of the file"
+            )]
+        );
+        assert_eq!(
+            stored(&fixture).await,
+            vec![
+                (
+                    "widgets cli".to_owned(),
+                    Some(sha256_hex(&package)),
+                    package
+                ),
+                ("widgets.tgz".to_owned(), Some(sha256_hex(&upload)), upload),
+            ]
+        );
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty());
+        for head in seen.iter() {
+            assert_eq!(header(head, "private-token"), Some("glpat-tok"), "{head}");
+            assert_eq!(header(head, "authorization"), None, "{head}");
+        }
     }
 
     /// Every asset the import cannot bring is named with its reason, nothing

@@ -329,6 +329,17 @@ const mutations = [
       'for (const symbol of []) {',
     ),
   },
+  // card_68a6f79c5fe4. A page load and a control sharing one symbol: the
+  // per-symbol rule this replaced dropped the load.
+  {
+    expected: 'a page load shared with a Retry control must stay passive',
+    apply: (fixture) => patch(
+      fixture,
+      'scripts/lib/ui-surface.mjs',
+      'const passiveCalls = [...passiveSet];',
+      'const passiveCalls = [...passiveSet].filter((symbol) => !elements.some((element) => element.reaches.includes(symbol)));',
+    ),
+  },
   {
     expected: 'attachment downloads must remain explicit response-link evidence',
     apply: (fixture) => patch(

@@ -148,6 +148,10 @@ pub struct ImportStats {
     /// Files an imported release lists and the import did not store, each
     /// with the release's tag and the reason.
     pub release_assets_failed: Vec<crate::import::release_assets::ReleaseAssetImportFailure>,
+    /// Links of imported GitLab releases that lead somewhere other than a file
+    /// the source stores, kept as links in the release's notes rather than
+    /// fetched (card_aafa0452e8fd).
+    pub release_links_kept: Vec<crate::import::release_assets::ReleaseLinkKept>,
     pub wiki_pages_imported: usize,
     /// LFS objects downloaded from the source and stored for the target.
     pub lfs_objects_imported: usize,
@@ -447,7 +451,7 @@ mod release_import_tests {
                 importer_id: 2,
             },
             crate::import::release_assets::AssetSource {
-                dialect: ApiDialect::GitHub,
+                dialect: crate::import::release_assets::AssetApi::GitHub,
                 api_base_url: "https://api.github.com",
                 owner: "octo",
                 repo: "widgets",
@@ -463,7 +467,11 @@ mod release_import_tests {
             1,
             2,
             &SourceOrigin::github_com(),
+            // Newest first, as the source lists them: the release with the
+            // byline is the oldest, so it is the one created.
             &[
+                github_release(""),
+                github_release("v1"),
                 GitHubRelease {
                     author: Some(crate::import::github_client::GitHubUser {
                         id: 51,
@@ -474,10 +482,7 @@ mod release_import_tests {
                     }),
                     ..github_release("v1")
                 },
-                github_release("v1"),
-                github_release(""),
             ],
-            Path::new("unused"),
             &mut assets,
             &mut stats,
         )
@@ -536,7 +541,7 @@ mod release_import_tests {
                 importer_id: 2,
             },
             crate::import::release_assets::AssetSource {
-                dialect: ApiDialect::GitHub,
+                dialect: crate::import::release_assets::AssetApi::GitHub,
                 api_base_url: "http://127.0.0.1:9",
                 owner: "octo",
                 repo: "widgets",
@@ -567,7 +572,6 @@ mod release_import_tests {
             2,
             &SourceOrigin::github_com(),
             &[release],
-            Path::new("unused"),
             &mut assets,
             &mut stats,
         )
@@ -584,17 +588,292 @@ mod release_import_tests {
         assert!(serde_json::to_value(&stats).unwrap()["release_assets_failed"].is_array());
     }
 
+    /// A fetcher for the test repository whose source is `api_base_url`; the
+    /// default guard refuses every address, so nothing is downloaded.
+    fn asset_fetcher<'a>(
+        db: &'a DatabaseConnection,
+        storage: &'a dyn crate::blob_storage::BlobStorage,
+        root: &'a Path,
+        guard: &'a crate::import::trust::TrustedImportOrigins,
+        dialect: crate::import::release_assets::AssetApi,
+        api_base_url: &'a str,
+    ) -> crate::import::release_assets::ReleaseAssetFetcher<'a> {
+        crate::import::release_assets::ReleaseAssetFetcher::new(
+            db,
+            storage,
+            root,
+            crate::import::release_assets::AssetDestination {
+                repo_id: 1,
+                owner: "importer",
+                name: "imported",
+                importer_id: 2,
+            },
+            crate::import::release_assets::AssetSource {
+                dialect,
+                api_base_url,
+                owner: "octo",
+                repo: "widgets",
+                token: "",
+            },
+            guard,
+            crate::storage_quota::StorageLimits::default(),
+            crate::clone_budget::PassAllowance::unlimited(),
+        )
+        .unwrap()
+    }
+
+    /// `(tag, created_at)` of the test repository's releases, in the order
+    /// the release list serves them.
+    async fn listed(db: &DatabaseConnection) -> Vec<(String, String)> {
+        let (releases, _) = rg_db::ops::release_ops::list_by_repo(db, 1, 0, 50)
+            .await
+            .unwrap();
+        releases
+            .into_iter()
+            .map(|release| (release.tag_name, release.created_at.to_rfc3339()))
+            .collect()
+    }
+
+    /// card_68e006f5a39c: imported releases keep the dates their source
+    /// published them on, and the release list shows the newest first — the
+    /// source lists them newest first, and created in that order and dated by
+    /// the import, the newest came out at the bottom. A draft has no
+    /// publication date yet and keeps its creation date; two releases of one
+    /// second keep the source's order.
+    #[tokio::test]
+    async fn imported_releases_keep_their_dates_and_list_newest_first() {
+        let db = test_db().await;
+        let mut stats = ImportStats::default();
+        let root = tempfile::tempdir().unwrap();
+        let storage = crate::blob_storage::instance_blob_storage(root.path());
+        let guard = crate::import::trust::TrustedImportOrigins::default();
+        let mut assets = asset_fetcher(
+            &db,
+            &storage,
+            root.path(),
+            &guard,
+            crate::import::release_assets::AssetApi::GitHub,
+            "https://api.github.com",
+        );
+        let published = |tag: &str, at: &str| GitHubRelease {
+            published_at: Some(at.to_string()),
+            ..github_release(tag)
+        };
+
+        import_github_releases(
+            &db,
+            1,
+            2,
+            &SourceOrigin::github_com(),
+            &[
+                GitHubRelease {
+                    draft: true,
+                    created_at: "2024-05-01T08:00:00Z".to_string(),
+                    ..github_release("v4-draft")
+                },
+                published("v3", "2024-03-01T10:00:00+02:00"),
+                published("v2", "2024-02-01T10:00:00Z"),
+                published("v1.1", "2024-01-01T10:00:00Z"),
+                published("v1", "2024-01-01T10:00:00Z"),
+            ],
+            &mut assets,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            stats.releases_failed.is_empty(),
+            "{:?}",
+            stats.releases_failed
+        );
+        assert_eq!(
+            listed(&db).await,
+            [
+                ("v4-draft", "2024-05-01T08:00:00+00:00"),
+                ("v3", "2024-03-01T08:00:00+00:00"),
+                ("v2", "2024-02-01T10:00:00+00:00"),
+                ("v1.1", "2024-01-01T10:00:00+00:00"),
+                ("v1", "2024-01-01T10:00:00+00:00"),
+            ]
+            .map(|(tag, at)| (tag.to_string(), at.to_string()))
+        );
+    }
+
+    /// A release whose date does not parse is named, not created at a date
+    /// made up by the import; the others still arrive.
+    #[tokio::test]
+    async fn a_release_with_an_unreadable_date_is_named() {
+        let db = test_db().await;
+        let mut stats = ImportStats::default();
+        let root = tempfile::tempdir().unwrap();
+        let storage = crate::blob_storage::instance_blob_storage(root.path());
+        let guard = crate::import::trust::TrustedImportOrigins::default();
+        let mut assets = asset_fetcher(
+            &db,
+            &storage,
+            root.path(),
+            &guard,
+            crate::import::release_assets::AssetApi::GitLab,
+            "https://gitlab.com/api/v4",
+        );
+
+        let count = import_gitlab_releases(
+            &db,
+            1,
+            2,
+            &SourceOrigin::gitlab_com(),
+            &[
+                GitLabRelease {
+                    released_at: Some("yesterday".to_string()),
+                    ..gitlab_release("v2")
+                },
+                gitlab_release("v1"),
+            ],
+            &mut assets,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            listed(&db).await,
+            [("v1".to_string(), "2024-01-01T00:00:00+00:00".to_string())]
+        );
+        let failed: Vec<(&str, &str)> = stats
+            .releases_failed
+            .iter()
+            .map(|failure| (failure.tag_name.as_str(), failure.reason))
+            .collect();
+        assert_eq!(
+            failed,
+            [(
+                "v2",
+                "the source gave the release a date that is not a valid timestamp"
+            )]
+        );
+    }
+
+    /// card_aafa0452e8fd: a GitLab release's link to a file the source stores
+    /// goes to the asset fetcher — refused here, as this server may not reach
+    /// the address, and named under its tag — while a link anywhere else is
+    /// kept as a link: in the release's notes and in the stats.
+    #[tokio::test]
+    async fn a_gitlab_releases_links_are_fetched_or_kept() {
+        let db = test_db().await;
+        let mut stats = ImportStats::default();
+        let root = tempfile::tempdir().unwrap();
+        let storage = crate::blob_storage::instance_blob_storage(root.path());
+        let guard = crate::import::trust::TrustedImportOrigins::default();
+        let mut assets = asset_fetcher(
+            &db,
+            &storage,
+            root.path(),
+            &guard,
+            crate::import::release_assets::AssetApi::GitLab,
+            "http://127.0.0.1:9/api/v4",
+        );
+        let link =
+            |id: i64, name: &str, url: &str| crate::import::gitlab_client::GitLabReleaseLink {
+                id,
+                name: name.to_string(),
+                url: url.to_string(),
+                link_type: "other".to_string(),
+            };
+        let mut release = GitLabRelease {
+            description: Some("Notes.".to_string()),
+            released_at: Some("2024-06-01T12:00:00Z".to_string()),
+            ..gitlab_release("v5")
+        };
+        release.assets.links = vec![
+            link(
+                1,
+                "Linux build",
+                "http://127.0.0.1:9/octo/widgets/uploads/0123456789abcdef0123456789abcdef/widgets.tgz",
+            ),
+            link(2, "Docs [site]", "https://docs.example.com/widgets/v5"),
+            link(3, "Pipeline", "http://127.0.0.1:9/octo/widgets/-/pipelines/7"),
+        ];
+
+        import_gitlab_releases(
+            &db,
+            1,
+            2,
+            &SourceOrigin::gitlab_com(),
+            &[release],
+            &mut assets,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        let failed: Vec<(&str, &str)> = stats
+            .release_assets_failed
+            .iter()
+            .map(|failure| (failure.tag_name.as_str(), failure.filename.as_str()))
+            .collect();
+        assert_eq!(failed, [("v5", "widgets.tgz")]);
+        let kept: Vec<(&str, &str, &str)> = stats
+            .release_links_kept
+            .iter()
+            .map(|kept| {
+                (
+                    kept.tag_name.as_str(),
+                    kept.name.as_str(),
+                    kept.url.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("v5", "Docs [site]", "https://docs.example.com/widgets/v5"),
+                (
+                    "v5",
+                    "Pipeline",
+                    "http://127.0.0.1:9/octo/widgets/-/pipelines/7"
+                ),
+            ]
+        );
+        let saved = rg_db::ops::release_ops::find_by_repo_and_tag(&db, 1, "v5")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.body.as_deref(),
+            Some(
+                "Notes.\n\n**Links on GitLab:**\n\n\
+                 - [Docs \\[site\\]](<https://docs.example.com/widgets/v5>)\n\
+                 - [Pipeline](<http://127.0.0.1:9/octo/widgets/-/pipelines/7>)"
+            )
+        );
+        assert_eq!(saved.created_at.to_rfc3339(), "2024-06-01T12:00:00+00:00");
+        assert!(serde_json::to_value(&stats).unwrap()["release_links_kept"].is_array());
+    }
+
     #[tokio::test]
     async fn gitlab_releases_belong_to_importer_and_name_failed_tags() {
         let db = test_db().await;
         let mut stats = ImportStats::default();
+        let root = tempfile::tempdir().unwrap();
+        let storage = crate::blob_storage::instance_blob_storage(root.path());
+        let guard = crate::import::trust::TrustedImportOrigins::default();
+        let mut assets = asset_fetcher(
+            &db,
+            &storage,
+            root.path(),
+            &guard,
+            crate::import::release_assets::AssetApi::GitLab,
+            "https://gitlab.com/api/v4",
+        );
         let count = import_gitlab_releases(
             &db,
             1,
             2,
             &SourceOrigin::gitlab_com(),
             &[gitlab_release("v2"), gitlab_release("v2")],
-            Path::new("unused"),
+            &mut assets,
             &mut stats,
         )
         .await
@@ -817,7 +1096,7 @@ pub const MAX_STORED_STATS_BYTES: usize = 48 * 1024;
 const MAX_STORED_FAILURE_FIELD_CHARS: usize = 512;
 
 /// The [`ImportStats`] fields whose length the source decides.
-const STORED_FAILURE_LISTS: [&str; 9] = [
+const STORED_FAILURE_LISTS: [&str; 10] = [
     "labels_failed",
     "milestones_failed",
     "issues_failed",
@@ -827,6 +1106,7 @@ const STORED_FAILURE_LISTS: [&str; 9] = [
     "releases_failed",
     "release_assets_failed",
     "lfs_objects_failed",
+    "release_links_kept",
 ];
 
 /// `value` with every string longer than [`MAX_STORED_FAILURE_FIELD_CHARS`]
@@ -1886,7 +2166,7 @@ async fn run_github_import(
                 importer_id: task.user_id,
             },
             crate::import::release_assets::AssetSource {
-                dialect,
+                dialect: dialect.into(),
                 api_base_url: &api_base_url,
                 owner: &gh_owner,
                 repo: &gh_repo,
@@ -1902,7 +2182,6 @@ async fn run_github_import(
             task.user_id,
             &origin,
             &releases,
-            repo_root,
             &mut assets,
             stats,
         )
@@ -2137,13 +2416,43 @@ async fn run_gitlab_import(
                 .map(|release| release.tag_name.clone())
                 .collect(),
         );
+        // The linked files are paid for out of what the clone left of the
+        // import's budget, as GitHub's release files are.
+        let repo_path = repo_root.join(format!("{}/{}.git", task.target_owner, task.target_name));
+        let git_written = crate::blocking::run_blocking_git("import release asset budget", {
+            let repo_path = repo_path.clone();
+            move || Ok(crate::clone_budget::CloneBudget::measure(&repo_path))
+        })
+        .await?;
+        let storage = crate::blob_storage::instance_blob_storage(repo_root);
+        let mut assets = crate::import::release_assets::ReleaseAssetFetcher::new(
+            db,
+            &storage,
+            repo_root,
+            crate::import::release_assets::AssetDestination {
+                repo_id,
+                owner: &task.target_owner,
+                name: &task.target_name,
+                importer_id: task.user_id,
+            },
+            crate::import::release_assets::AssetSource {
+                dialect: crate::import::release_assets::AssetApi::GitLab,
+                api_base_url: &api_base_url,
+                owner: &project_path,
+                repo: &project_path,
+                token,
+            },
+            trusted_origins,
+            storage_limits,
+            trusted_origins.clone_budget().remaining_after(git_written),
+        )?;
         stats.releases_imported = import_gitlab_releases(
             db,
             repo_id,
             task.user_id,
             &origin,
             &releases,
-            repo_root,
+            &mut assets,
             stats,
         )
         .await?;
@@ -4680,10 +4989,102 @@ async fn record_source_people(
     }
 }
 
+/// The source's releases, each with the date its source published it on, in
+/// the order the import creates them: oldest first (card_68e006f5a39c).
+///
+/// Every source lists releases newest first. Created in that order and dated
+/// by the import, the newest release got the earliest `created_at` and the
+/// lowest id, and the release list — newest `created_at` first, then highest
+/// id — showed the oldest release on top. The source's dates order the list
+/// by themselves; creating oldest first keeps the id tie-break agreeing with
+/// them when two releases share a second.
+///
+/// `dates` names a release's provider, tag, publication date and creation
+/// date; the publication date wins when there is one. A release whose date
+/// does not parse is not created at a date made up here — it is named in
+/// `stats.releases_failed`.
+fn oldest_first<'r, R>(
+    releases: &'r [R],
+    stats: &mut ImportStats,
+    dates: impl Fn(&'r R) -> (&'static str, &'r str, Option<&'r str>, &'r str),
+) -> Vec<(chrono::DateTime<Utc>, &'r R)> {
+    let mut dated = Vec::with_capacity(releases.len());
+    for release in releases.iter().rev() {
+        let (provider, tag, published_at, created_at) = dates(release);
+        let (field, value) = match published_at {
+            Some(published_at) => ("published_at", published_at),
+            None => ("created_at", created_at),
+        };
+        match chrono::DateTime::parse_from_rfc3339(value) {
+            Ok(date) => dated.push((date.with_timezone(&Utc), release)),
+            Err(error) => {
+                tracing::warn!(
+                    provider,
+                    tag,
+                    field,
+                    value,
+                    %error,
+                    "an imported release has a date that does not parse"
+                );
+                stats.releases_failed.push(ReleaseImportFailure {
+                    tag_name: tag.to_string(),
+                    reason: "the source gave the release a date that is not a valid timestamp",
+                });
+            }
+        }
+    }
+    // Stable: releases of one second keep the reversed source order.
+    dated.sort_by_key(|(date, _)| *date);
+    dated
+}
+
+/// A GitLab release's notes with the links it keeps as links listed under
+/// them, so the release still offers what its author attached
+/// (card_aafa0452e8fd). Notes that would grow past what a release body holds
+/// stay as they were; the links are named in the import's stats either way.
+fn with_kept_links(
+    description: Option<&str>,
+    kept: &[&crate::import::gitlab_client::GitLabReleaseLink],
+) -> Option<String> {
+    let lines: Vec<String> = kept
+        .iter()
+        .filter_map(|link| {
+            // The serialized URL has its spaces and angle brackets escaped,
+            // so it cannot close the `<…>` it is written in.
+            let url = reqwest::Url::parse(&link.url)
+                .ok()
+                .filter(|url| matches!(url.scheme(), "http" | "https"))?;
+            let text: String = link
+                .name
+                .chars()
+                .flat_map(|c| match c {
+                    '\\' | '[' | ']' => vec!['\\', c],
+                    '\r' | '\n' => vec![' '],
+                    _ => vec![c],
+                })
+                .collect();
+            Some(format!("- [{text}](<{url}>)"))
+        })
+        .collect();
+    if lines.is_empty() {
+        return description.map(str::to_owned);
+    }
+    let section = format!("**Links on GitLab:**\n\n{}", lines.join("\n"));
+    let body = match description.filter(|notes| !notes.trim().is_empty()) {
+        Some(notes) => format!("{notes}\n\n{section}"),
+        None => section,
+    };
+    if body.chars().count() > crate::text_limits::MAX_BODY_CHARS {
+        return description.map(str::to_owned);
+    }
+    Some(body)
+}
+
 /// Write the source's byline onto a release the import just created.
 ///
-/// Releases are made through [`crate::release::service::create_release`], which
-/// knows nothing of imports, so the byline is a second write. Not fatal: the
+/// Releases are made through
+/// [`crate::release::service::create_release_published_at`], which knows
+/// nothing of bylines, so the byline is a second write. Not fatal: the
 /// release is there and downloadable, and a byline that could not be written
 /// leaves it reading as the importer's, as every imported release did before.
 async fn record_release_byline(
@@ -4717,13 +5118,22 @@ async fn import_github_releases(
     importer_id: i64,
     origin: &SourceOrigin,
     releases: &[GitHubRelease],
-    repo_root: &Path,
     assets: &mut crate::import::release_assets::ReleaseAssetFetcher<'_>,
     stats: &mut ImportStats,
 ) -> Result<usize> {
     let mut count = 0;
 
-    for release in releases {
+    // GitHub dates `created_at` by the commit the tag points at, not by the
+    // release; a draft has no `published_at` yet.
+    let releases = oldest_first(releases, stats, |release| {
+        (
+            "GitHub",
+            release.tag_name.as_str(),
+            release.published_at.as_deref(),
+            release.created_at.as_str(),
+        )
+    });
+    for (published_at, release) in releases {
         let title = release
             .name
             .clone()
@@ -4731,7 +5141,7 @@ async fn import_github_releases(
         let is_draft = release.draft;
         let is_prerelease = release.prerelease;
 
-        match crate::release::service::create_release(
+        match crate::release::service::create_release_published_at(
             db,
             repo_id,
             importer_id,
@@ -4741,7 +5151,7 @@ async fn import_github_releases(
             &release.tag_name, // target_commitish defaults to tag
             is_draft,
             is_prerelease,
-            repo_root,
+            published_at,
         )
         .await
         {
@@ -5206,39 +5616,68 @@ async fn import_gitlab_releases(
     importer_id: i64,
     origin: &SourceOrigin,
     releases: &[GitLabRelease],
-    repo_root: &Path,
+    assets: &mut crate::import::release_assets::ReleaseAssetFetcher<'_>,
     stats: &mut ImportStats,
 ) -> Result<usize> {
     let mut count = 0;
 
-    for release in releases {
+    // `released_at` is when the release went out; GitLab sets it to the
+    // creation time unless its author chose another.
+    let releases = oldest_first(releases, stats, |release| {
+        (
+            "GitLab",
+            release.tag_name.as_str(),
+            release.released_at.as_deref(),
+            release.created_at.as_str(),
+        )
+    });
+    for (published_at, release) in releases {
         let title = release
             .name
             .clone()
             .unwrap_or_else(|| release.tag_name.clone());
+        // `assets.sources` are the archives GitLab builds from the tag; this
+        // server builds its own. `assets.links` are what the author attached.
+        let (files, kept): (Vec<_>, Vec<_>) = release
+            .assets
+            .links
+            .iter()
+            .partition(|link| assets.is_source_file(link));
+        let body = with_kept_links(release.description.as_deref(), &kept);
 
-        match crate::release::service::create_release(
+        match crate::release::service::create_release_published_at(
             db,
             repo_id,
             importer_id,
             &release.tag_name,
             &title,
-            release.description.as_deref(),
+            body.as_deref(),
             &release.tag_name,
             false, // is_draft — GitLab doesn't have drafts
             false, // is_prerelease — could parse from tag name, simplified
-            repo_root,
+            published_at,
         )
         .await
         {
             Ok(created) => {
                 count += 1;
+                let release_id = created.id;
                 record_release_byline(
                     db,
                     created,
                     OriginalAuthor::gitlab(origin, release.author.as_ref()),
                 )
                 .await;
+                stats.release_links_kept.extend(kept.iter().map(|link| {
+                    crate::import::release_assets::ReleaseLinkKept {
+                        tag_name: release.tag_name.clone(),
+                        name: link.name.clone(),
+                        url: link.url.clone(),
+                    }
+                }));
+                assets
+                    .import_links(release_id, &release.tag_name, &files, stats)
+                    .await?;
             }
             Err(e) => {
                 tracing::warn!(tag = %release.tag_name, error = %format!("{e:#}"), "failed to import release");

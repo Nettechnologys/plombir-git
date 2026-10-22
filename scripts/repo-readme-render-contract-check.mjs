@@ -10,7 +10,9 @@ import { productionTsSource } from './lib/ts-source.mjs';
 // fenced code came out as rules and paragraphs, and **bold** or `code` inside a
 // list item stayed raw. It now goes through the shared renderMarkdown, which
 // sanitizes what it renders, the same path the file view, issues and pull
-// requests use. This contract holds the page to that path.
+// requests use. This contract holds the page to that path. The second
+// argument, where the README's relative links lead (card_68a6f79c5fe4), is
+// applied before the sanitizer, so it does not open a way around it.
 
 const root = process.cwd();
 const repoPagePath = path.join(root, 'web/src/routes/[owner]/[repo]/+page.svelte');
@@ -22,7 +24,7 @@ if (!/import\s*\{[^}]*\brenderMarkdown\b[^}]*\}\s*from\s*['"]\$lib\/utils\/markd
   failures.push('Repository page must render the README with the shared renderMarkdown from $lib/utils/markdown');
 }
 
-if (!/renderMarkdown\(\s*readmeContent\s*\)/.test(repoPage)) {
+if (!/renderMarkdown\(\s*readmeContent\s*[,)]/.test(repoPage)) {
   failures.push('Repository page must pass the README content through renderMarkdown');
 }
 
@@ -36,7 +38,7 @@ if (!htmlSinks.includes('renderedReadme')) {
   failures.push('Repository page must render the README through {@html renderedReadme}');
 }
 
-if (!/renderedReadme\s*=\s*\$derived\([^;]*renderMarkdown\(\s*readmeContent\s*\)/.test(repoPage)) {
+if (!/renderedReadme\s*=\s*\$derived\([^;]*renderMarkdown\(\s*readmeContent\s*[,)]/.test(repoPage)) {
   failures.push('renderedReadme must be derived from renderMarkdown(readmeContent)');
 }
 

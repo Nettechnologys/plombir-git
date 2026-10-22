@@ -672,6 +672,29 @@ expect(
   `a.b.c() did not join to its API leaf: passive=${JSON.stringify(page.passiveCalls)}`,
 );
 
+// card_68a6f79c5fe4: whether a call is a page load is decided by who makes
+// it. The page below loads `repos.tree` on open and a Retry button re-reads
+// it; per symbol, the button erased the page's own load from the inventory.
+// A call only a control's own helper makes stays a control call.
+const sharedPage = parsePageInventory(`
+<script lang="ts">
+  import { repos } from '$lib/api/client.svelte';
+  async function load() { await repos.tree('o', 'r'); await retryHelper(); }
+  async function retryHelper() { await repos.tree('o', 'r', 'main', 'docs'); await repos.blob('o', 'r', 'x'); }
+  $effect(() => { load(); });
+</script>
+<button onclick={retryHelper}>Retry</button>
+`, 'fixture/+page.svelte');
+const sharedPageHolds = sharedPage.passiveCalls.includes('repos.tree')
+  && !sharedPage.passiveCalls.includes('repos.blob')
+  && sharedPage.elements[0]?.reaches.includes('repos.tree');
+const sharedPageMessage = 'a page load shared with a Retry control must stay passive, and the control\'s own call must not: '
+  + `passive=${JSON.stringify(sharedPage.passiveCalls)}`;
+// Said at once: on the real tree the same defect makes `buildInventory` below
+// throw on the access sweep's manifest before the summary is printed.
+if (!sharedPageHolds) console.error(`❌ ${sharedPageMessage}`);
+expect(sharedPageHolds, sharedPageMessage);
+
 const inventory = buildInventory();
 const archiveRoutes = inventory.routes.filter((row) => (
   row.method === 'GET'

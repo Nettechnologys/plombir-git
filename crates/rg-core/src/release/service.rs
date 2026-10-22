@@ -45,6 +45,39 @@ pub async fn create_release(
     is_prerelease: bool,
     _repo_path: &std::path::Path,
 ) -> Result<Release> {
+    create_release_published_at(
+        db,
+        repo_id,
+        author_id,
+        tag_name,
+        title,
+        body,
+        target_commitish,
+        is_draft,
+        is_prerelease,
+        Utc::now(),
+    )
+    .await
+}
+
+/// Create a release dated `published_at` rather than now — a release an
+/// import brings over keeps the date its source published it on
+/// (card_68e006f5a39c). The release list is ordered by this date, so a release
+/// dated by when the import ran would sort by the order the source listed
+/// them in, which is newest first: the latest release at the bottom.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_release_published_at(
+    db: &impl crate::db::DbPools,
+    repo_id: i64,
+    author_id: i64,
+    tag_name: &str,
+    title: &str,
+    body: Option<&str>,
+    target_commitish: &str,
+    is_draft: bool,
+    is_prerelease: bool,
+    published_at: chrono::DateTime<Utc>,
+) -> Result<Release> {
     let pools = db.owned();
     let db = pools.read();
     // Validate inputs
@@ -76,7 +109,6 @@ pub async fn create_release(
         return Err(already_exists());
     }
 
-    let now = Utc::now();
     let model = ReleaseActiveModel {
         repo_id: Set(repo_id),
         author_id: Set(Some(author_id)),
@@ -86,8 +118,8 @@ pub async fn create_release(
         target_commitish: Set(target_commitish.to_string()),
         is_draft: Set(is_draft),
         is_prerelease: Set(is_prerelease),
-        created_at: Set(now),
-        updated_at: Set(now),
+        created_at: Set(published_at),
+        updated_at: Set(published_at),
         ..Default::default()
     };
 

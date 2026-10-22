@@ -13,6 +13,7 @@
   import { createT } from '$lib/i18n';
   import { viewerPermission } from '$lib/viewerPermission.svelte';
   import { renderMarkdown } from '$lib/utils/markdown';
+  import type { RepositoryLinkTargets } from '$lib/repoReadme';
   import { formatLineHash, parseLineHash, selectLine, type LineRange } from '$lib/lineAnchors';
 
   const t = createT();
@@ -76,8 +77,10 @@
     Boolean(blobData && !blobData.lfs && !blobData.is_binary && blobData.encoding === 'utf-8'),
   );
   let canEdit = $derived(Boolean(isText && blobData && blobData.size <= MAX_EDITABLE_SIZE));
+  // Relative links and images lead from the file's own directory, as on
+  // GitHub and Gitea; without that they resolved against this page's URL.
   let renderedMarkdown = $derived(
-    isMarkdown && isText && blobData?.content ? renderMarkdown(blobData.content) : '',
+    isMarkdown && isText && blobData?.content ? renderMarkdown(blobData.content, fileLinks()) : '',
   );
   // The text the code view shows: an LFS object's own text, or the blob's.
   let sourceText = $derived(
@@ -159,6 +162,17 @@
     if (nextRef) params.set('ref', nextRef);
     const qs = params.toString();
     return `/${owner}/${repo}/blob/${encodeRepoPath(filePath)}${qs ? `?${qs}` : ''}`;
+  }
+
+  function fileLinks(): RepositoryLinkTargets {
+    const slash = filePath.lastIndexOf('/');
+    const query = buildRepoQuery(ref, '');
+    return {
+      directory: slash === -1 ? '' : filePath.slice(0, slash),
+      page: (target, isDirectory) =>
+        isDirectory ? buildRepoHref(ref, target) : `/${owner}/${repo}/blob/${encodeRepoPath(target)}${query}`,
+      image: (target) => repos.rawUrl(owner, repo, target, ref || undefined),
+    };
   }
 
   function buildEditHref() {
