@@ -107,6 +107,26 @@ pub async fn update_status(db: &impl ConnectionTrait, runner_id: i64, status: &s
     Ok(())
 }
 
+/// Mark a runner that is polling for work `online`, when it was `offline`.
+///
+/// Only the job lifecycle used to move the status: `busy` when a job starts,
+/// `online` when it finishes. A runner that registered — or came back after a
+/// stop ([`stop_runner`]) — and found nothing to do was listed `offline` for
+/// as long as it polled, which reads as "this machine is down" to the
+/// administrator looking at it. A poll is the runner saying it is here.
+/// `busy` is left alone: a poll does not finish the job it holds.
+pub async fn mark_polling_runner_online(db: &DatabaseConnection, runner_id: i64) -> Result<()> {
+    RunnerEntity::update_many()
+        .col_expr(Column::Status, Expr::value("online".to_string()))
+        .col_expr(Column::UpdatedAt, Expr::value(Utc::now().naive_utc()))
+        .filter(Column::Id.eq(runner_id))
+        .filter(Column::Status.eq("offline"))
+        .exec(db)
+        .await
+        .context("db: mark polling runner online")?;
+    Ok(())
+}
+
 /// Retire a runner the watchdog found unreachable: release the jobs it was
 /// holding and mark it `offline`, both or neither.
 ///
@@ -135,6 +155,46 @@ pub async fn retire_unreachable_runner(db: &DatabaseConnection, runner_id: i64) 
         .await
         .context("db: commit offline runner retirement")?;
     Ok(released)
+}
+
+/// Take a runner that is stopping on purpose out of rotation without
+/// forgetting it: hand its in-flight jobs back to the pool and mark it
+/// `offline`, both or neither.
+///
+/// This is what `POST /runners/{id}/deregister` does, and deliberately *not*
+/// what [`deregister_runner`] does. A runner calls that route on every
+/// `SIGTERM` — a unit restart, a host reboot, a container image bump — and
+/// comes back minutes later reading the same token from its config. Deleting
+/// the row took the token hash with it, so the restarted process was answered
+/// `401` on every poll until somebody re-registered it with an administrator's
+/// password (card_ffdc32984243). GitHub's self-hosted runner and `act_runner`
+/// keep their registration across a stop for the same reason; only an explicit
+/// removal — here `DELETE /admin/runners/{id}` — revokes it.
+///
+/// Returns `false` when no runner row matched, and rolls the reset back rather
+/// than leaving jobs reset in the name of a runner that was not there.
+pub async fn stop_runner(db: &DatabaseConnection, runner_id: i64) -> Result<bool> {
+    let txn = db.begin().await.context("db: begin runner stop")?;
+
+    crate::ops::pipeline_ops::reset_runner_jobs(&txn, runner_id).await?;
+
+    let stopped = RunnerEntity::update_many()
+        .col_expr(Column::Status, Expr::value("offline".to_string()))
+        .col_expr(Column::UpdatedAt, Expr::value(Utc::now().naive_utc()))
+        .filter(Column::Id.eq(runner_id))
+        .exec(&txn)
+        .await
+        .context("db: mark stopping runner offline")?
+        .rows_affected
+        > 0;
+
+    if !stopped {
+        txn.rollback().await.context("db: rollback runner stop")?;
+        return Ok(false);
+    }
+
+    txn.commit().await.context("db: commit runner stop")?;
+    Ok(true)
 }
 
 /// Find a runner by ID.

@@ -924,14 +924,21 @@ async fn finish_does_not_confirm_a_runner_that_could_not_be_marked_online() {
     );
 }
 
-/// Deregistration is two writes that are only correct together. Each half is
-/// refused in turn; neither may leave the other half committed.
+/// A runner's stop is two writes that are only correct together — its jobs go
+/// back to the pool and it goes `offline`. Each half is refused in turn;
+/// neither may leave the other half committed.
 async fn assert_deregistration_is_atomic(target: &str) {
     let (base, db) = spawn_test_app_with_db().await;
     let seeded = seed_job(&base, &db, &format!("deregister-{target}")).await;
     rg_db::ops::pipeline_ops::assign_job(&db, seeded.job_id, seeded.runner_id)
         .await
         .expect("assign job before deregistration");
+    // A registered runner starts `offline`; a runner holding a job is `busy`.
+    // Without this the `offline` half below would be asserted on a row that
+    // already said so.
+    rg_db::ops::runner_ops::update_status(&db, seeded.runner_id, "busy")
+        .await
+        .expect("mark the runner busy before it stops");
 
     let trigger = match target {
         // The job reset fails: the runner must survive, or its jobs are stranded
@@ -945,14 +952,15 @@ async fn assert_deregistration_is_atomic(target: &str) {
              END;",
             seeded.job_id
         ),
-        // The delete fails after the reset succeeded: the reset must roll back,
-        // or a live runner is left with the jobs it was executing taken away.
-        "delete" => format!(
-            "CREATE TRIGGER break_runner_delete\n\
-             BEFORE DELETE ON runners\n\
-             WHEN OLD.id = {}\n\
+        // Going offline fails after the reset succeeded: the reset must roll
+        // back, or a runner still listed as taking work has had the jobs it
+        // was executing taken away.
+        "offline" => format!(
+            "CREATE TRIGGER break_runner_offline\n\
+             BEFORE UPDATE OF status ON runners\n\
+             WHEN NEW.id = {} AND NEW.status = 'offline'\n\
              BEGIN\n\
-               SELECT RAISE(ABORT, 'runner delete refused');\n\
+               SELECT RAISE(ABORT, 'runner offline refused');\n\
              END;",
             seeded.runner_id
         ),
@@ -975,9 +983,12 @@ async fn assert_deregistration_is_atomic(target: &str) {
         response.status()
     );
 
-    assert!(
-        runner_row(&db, seeded.runner_id).await.is_some(),
-        "the runner was deleted although the {target} half never committed"
+    let runner = runner_row(&db, seeded.runner_id)
+        .await
+        .expect("a stop never deletes the runner");
+    assert_eq!(
+        runner.status, "busy",
+        "the runner went offline although the {target} half never committed"
     );
     let persisted = rg_db::ops::pipeline_ops::get_job(&db, seeded.job_id)
         .await
@@ -996,18 +1007,23 @@ async fn deregistration_never_commits_one_half_of_its_two_writes() {
     // Each case gets its own database: the triggers are deliberately
     // irreversible for the rows they name.
     assert_deregistration_is_atomic("reset").await;
-    assert_deregistration_is_atomic("delete").await;
+    assert_deregistration_is_atomic("offline").await;
 }
 
 /// The healthy path the fault-injection cases are measured against: the runner's
-/// job goes back to the pool and the runner row is gone, in one response.
+/// job goes back to the pool and the runner goes `offline`, in one response —
+/// and its registration survives, so the same token polls again after a
+/// restart instead of being answered `401` forever (card_ffdc32984243).
 #[tokio::test]
-async fn deregistration_returns_the_jobs_and_deletes_the_runner() {
+async fn a_stop_returns_the_jobs_and_keeps_the_registration() {
     let (base, db) = spawn_test_app_with_db().await;
     let seeded = seed_job(&base, &db, "deregister-healthy").await;
     rg_db::ops::pipeline_ops::assign_job(&db, seeded.job_id, seeded.runner_id)
         .await
         .expect("assign job before deregistration");
+    rg_db::ops::runner_ops::update_status(&db, seeded.runner_id, "busy")
+        .await
+        .expect("mark the runner busy before it stops");
 
     let client = reqwest::Client::new();
     let deregister_url = format!("{base}/api/v1/runners/{}/deregister", seeded.runner_id);
@@ -1019,13 +1035,43 @@ async fn deregistration_returns_the_jobs_and_deletes_the_runner() {
         .expect("deregister through the production router");
     assert_eq!(response.status(), StatusCode::OK);
 
-    assert!(runner_row(&db, seeded.runner_id).await.is_none());
+    let runner = runner_row(&db, seeded.runner_id)
+        .await
+        .expect("a stop must not delete the runner: its token hash goes with the row");
+    assert_eq!(runner.status, "offline");
     let persisted = rg_db::ops::pipeline_ops::get_job(&db, seeded.job_id)
         .await
         .expect("reload released job")
         .expect("released job still exists");
     assert_eq!(persisted.status, "pending");
     assert_eq!(persisted.runner_id, None);
+
+    // The process that comes back after the restart reads the same token.
+    let poll = client
+        .get(format!(
+            "{base}/api/v1/runners/{}/jobs/poll?timeout=1",
+            seeded.runner_id
+        ))
+        .bearer_auth(&seeded.runner_token)
+        .send()
+        .await
+        .expect("poll again after the stop");
+    assert_ne!(
+        poll.status(),
+        StatusCode::UNAUTHORIZED,
+        "the token of a runner that only stopped was revoked"
+    );
+    assert!(poll.status().is_success(), "{}", poll.status());
+    // And it is listed as back: the poll is the runner saying it is here,
+    // where only a finished job used to move it out of `offline`.
+    assert_ne!(
+        runner_row(&db, seeded.runner_id)
+            .await
+            .expect("the runner row")
+            .status,
+        "offline",
+        "a runner that came back and polls is listed as down"
+    );
 }
 
 /// The admin route removes the same lifecycle object as self-deregistration.
@@ -1077,10 +1123,23 @@ async fn admin_deletion_returns_assigned_and_running_jobs_before_deleting_the_ru
         .await
         .expect("repeat admin deletion for the missing-runner contract");
     assert_eq!(absent.status(), StatusCode::NOT_FOUND);
+
+    // Removal is the one door that revokes the credential: the deleted
+    // runner's token is refused from then on.
+    let revoked = client
+        .get(format!(
+            "{base}/api/v1/runners/{}/jobs/poll?timeout=1",
+            seeded.runner_id
+        ))
+        .bearer_auth(&seeded.runner_token)
+        .send()
+        .await
+        .expect("poll with the deleted runner's token");
+    assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// The admin route must not regress the transaction already used by runner
-/// self-deregistration: refusing either write leaves both rows untouched.
+/// Admin deletion is the same pair of writes with a delete in place of the
+/// stop's `offline`: refusing either write leaves both rows untouched.
 async fn assert_admin_deletion_is_atomic(target: &str) {
     let (base, db) = spawn_test_app_with_db().await;
     let seeded = seed_job(&base, &db, &format!("admin-delete-{target}")).await;

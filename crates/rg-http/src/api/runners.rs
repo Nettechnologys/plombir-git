@@ -428,7 +428,10 @@ pub async fn heartbeat(
 }
 
 /// POST /api/v1/runners/:id/deregister
-/// Deregister a runner — removes it from the pool.
+/// A runner announces it is stopping: its in-flight jobs go back to the pool
+/// and it is marked `offline`. The registration and its token survive, so the
+/// same runner may come back with the same config — the path keeps its old name
+/// because every runner already in the field calls it on `SIGTERM`.
 /// Auth handled by `authenticate_runner` middleware.
 #[utoipa::path(
     post,
@@ -438,74 +441,37 @@ pub async fn heartbeat(
         ("id" = i64, Path, description = "Runner ID"),
     ),
     responses(
-        (status = 200, description = "Runner deregistered"),
+        (status = 200, description = "Runner is offline; its jobs are back in the pool and its registration is kept"),
         (status = 404, description = "Runner not found"),
     ),
 )]
 pub async fn deregister(
     State(state): State<AppState>,
     Path(runner_id): Path<i64>,
-    headers: HeaderMap,
 ) -> impl IntoResponse {
-    // Read before the delete, for the same reason as on the admin route: after
-    // it there is nothing left that says which machine stopped being able to
-    // take jobs. A failed lookup is not fatal here — this request is the
-    // runner's own orderly exit and refusing it would leave the row behind —
-    // so the entry is written with what is known.
-    let runner = match rg_db::ops::runner_ops::find_by_id(&state.db, runner_id).await {
-        Ok(runner) => runner,
-        Err(error) => {
-            tracing::warn!(
-                runner_id,
-                error = %format!("{error:#}"),
-                "could not read the runner about to deregister itself; its journal entry will                  name the id and nothing else"
-            );
-            None
-        }
-    };
-
-    // Handing the runner's in-flight jobs back to the pool and deleting the
-    // runner row is one transaction, not two writes with a log line between
-    // them: deleting a runner whose jobs were not reset strands those jobs on a
-    // row that no longer exists. See `runner_ops::deregister_runner`.
-    match rg_db::ops::runner_ops::deregister_runner(&state.db, runner_id).await {
-        Ok(true) => {
-            // No account performed this: the request is authenticated by the
-            // runner's own token, so the actor columns stay `NULL` rather than
-            // naming whoever happened to register the machine months ago. The
-            // resource is what identifies it.
-            record_instance_credential(
-                &state,
-                &rg_core::audit::AuditActor::none(),
-                "runner.deregister",
-                InstanceResource {
-                    kind: "runner",
-                    id: runner_id,
-                    name: runner
-                        .as_ref()
-                        .map(|runner| runner.name.as_str())
-                        .unwrap_or_default(),
-                },
-                &headers,
-                match runner.as_ref() {
-                    Some(runner) => runner_details(runner),
-                    None => serde_json::json!({"runner_id": runner_id}),
-                },
-            )
-            .await;
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"status": "deregistered"})),
-            )
-                .into_response()
-        }
+    // A stop is not a revocation. This route used to delete the runner row, and
+    // the token hash with it: the runner calls it on every `SIGTERM`, so a unit
+    // restart or a host reboot left a process holding a token nobody knew, and
+    // every poll after it was a `401` until an administrator re-registered the
+    // machine (card_ffdc32984243). Only `DELETE /admin/runners/{id}` forgets a
+    // runner now, and it is the one that journals the revoked credential.
+    //
+    // Releasing the jobs and going offline is one transaction, as in the
+    // watchdog's retirement: a failure answers `5xx` with nothing half-done,
+    // and the runner, which does not retry, leaves the rest to that watchdog.
+    match rg_db::ops::runner_ops::stop_runner(&state.db, runner_id).await {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "offline"})),
+        )
+            .into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "runner not found"})),
         )
             .into_response(),
         Err(e) => {
-            tracing::error!(runner_id, error = %format!("{e:#}"), "Failed to deregister runner");
+            tracing::error!(runner_id, error = %format!("{e:#}"), "Failed to take a stopping runner offline");
             AppError::from(e).into_response()
         }
     }
@@ -898,6 +864,20 @@ async fn poll_scope(state: &AppState, runner_id: i64) -> Result<(i64, Vec<String
                 )
                 .into_response());
             };
+            // The status is what an administrator reads, and the poll is what
+            // makes it true; the work this request is for does not wait on it,
+            // so a refused write is logged rather than refusing the poll.
+            if runner.status == "offline" {
+                if let Err(error) =
+                    rg_db::ops::runner_ops::mark_polling_runner_online(&state.db, runner_id).await
+                {
+                    tracing::warn!(
+                        runner_id,
+                        error = %format!("{error:#}"),
+                        "poll_job: could not mark the polling runner online"
+                    );
+                }
+            }
             match serde_json::from_str(&runner.labels) {
                 Ok(labels) => Ok((repo_id, labels)),
                 Err(error) => {

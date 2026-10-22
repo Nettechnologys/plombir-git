@@ -130,9 +130,46 @@ pub struct IssueResponse {
     /// is unassigned and when the assigned account no longer resolves — the
     /// number stays in `assignee_id` either way.
     pub assignee: Option<String>,
+    /// Who the issue was assigned to on the platform it was imported from —
+    /// bylines, not local accounts (card_f6c67a05c6b0). Answered on the issue
+    /// itself, left out of listings.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub original_assignees: Vec<ImportedPerson>,
     /// The issue's page in the web app, when `external_url` is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub html_url: Option<String>,
+}
+
+/// A person an imported issue or pull request named on its source: a login on
+/// a platform, never an account here.
+#[derive(Serialize)]
+pub struct ImportedPerson {
+    pub login: String,
+    pub service: String,
+}
+
+/// The people `object` named on its source, by role: who it was assigned to,
+/// and — for a pull request — whose review it asked for.
+pub(crate) async fn imported_people(
+    db: &sea_orm::DatabaseConnection,
+    object: rg_db::ops::imported_assignment_ops::AssignedObject,
+) -> Result<(Vec<ImportedPerson>, Vec<ImportedPerson>), AppError> {
+    let mut assignees = Vec::new();
+    let mut reviewers = Vec::new();
+    for row in rg_db::ops::imported_assignment_ops::list_for(db, object)
+        .await
+        .map_err(AppError::from)?
+    {
+        let person = ImportedPerson {
+            login: row.login,
+            service: row.service,
+        };
+        match row.role.as_str() {
+            "requested_reviewer" => reviewers.push(person),
+            _ => assignees.push(person),
+        }
+    }
+    Ok((assignees, reviewers))
 }
 
 impl IssueResponse {
@@ -419,10 +456,20 @@ pub async fn get_issue(
 ) -> impl IntoResponse {
     match rg_core::issue::get_issue(&state.db, &owner, &repo, number).await {
         Ok(issue) => {
-            let issue = match issue_with_author(&state.db, issue).await {
+            let issue_id = issue.id;
+            let mut issue = match issue_with_author(&state.db, issue).await {
                 Ok(issue) => issue.linked(&crate::html_url::Links::new(&state, &owner, &repo)),
                 Err(error) => return error.into_response(),
             };
+            match imported_people(
+                &state.db,
+                rg_db::ops::imported_assignment_ops::AssignedObject::Issue(issue_id),
+            )
+            .await
+            {
+                Ok((assignees, _)) => issue.original_assignees = assignees,
+                Err(error) => return error.into_response(),
+            }
             (StatusCode::OK, Json(issue)).into_response()
         }
         Err(e) => AppError::from(e).into_response(),
@@ -804,6 +851,7 @@ async fn issue_with_author(
         author,
         author_bot_owner,
         assignee,
+        original_assignees: Vec::new(),
         html_url: None,
     })
 }
@@ -833,6 +881,7 @@ async fn issues_with_authors(
             author,
             author_bot_owner,
             assignee,
+            original_assignees: Vec::new(),
             html_url: None,
         });
     }

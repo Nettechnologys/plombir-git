@@ -40,6 +40,20 @@ pub async fn find_by_ids(db: &DatabaseConnection, ids: &[i64]) -> Result<Vec<Iss
         .context("db: find issues by ids")
 }
 
+/// The numbers every issue of a repository is filed under — what an import
+/// receipt compares with the numbers its source listed.
+pub async fn numbers_in_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<i64>> {
+    IssueEntity::find()
+        .select_only()
+        .column(issue::Column::Number)
+        .filter(issue::Column::RepoId.eq(repo_id))
+        .filter(issue::Column::DeletedAt.is_null())
+        .into_tuple()
+        .all(db)
+        .await
+        .context("db: list issue numbers of a repository")
+}
+
 /// Paginated list of issues for a repo.
 /// Returns (data, total) — SQL LIMIT/OFFSET pushed to the database.
 ///

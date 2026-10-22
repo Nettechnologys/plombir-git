@@ -1,7 +1,7 @@
 //! A runner that is told to stop must say so (card_3027b2187d42).
 //!
 //! `POST /runners/{id}/deregister` hands a runner's in-flight jobs back to the
-//! pool and drops it from the runner list, as one transaction. It is mounted
+//! pool and marks the runner `offline`, as one transaction. It is mounted
 //! behind `RUNNER_TOKEN`, so a runner is the *only* caller it can ever have —
 //! and `rg-runner` never called it. The agent had no stop path at all: no
 //! `SIGTERM` handler, no `SIGINT` handler, just a `poll → execute → finish` loop
@@ -29,6 +29,15 @@
 //! would prove the deregistration call happens, not that the job it was holding
 //! comes back — and "comes back *without the watchdog*" is the half an operator
 //! feels.
+//!
+//! ## Why the runner is started twice
+//!
+//! The route used to delete the runner row, token hash included, so the
+//! process that came back after a restart — reading the same token from the
+//! same `runner.toml` — was answered `401` on every poll, and CI stood still
+//! until somebody re-registered the machine (card_ffdc32984243). The second
+//! start below is that restart: same id, same token, and it has to take the job
+//! the first process handed back.
 
 use crate::common::{register_full, spawn_test_app_with_db};
 
@@ -138,7 +147,7 @@ async fn repo_with_a_blocking_job(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_stopping_runner_deregisters_and_hands_its_job_straight_back() {
+async fn a_stopping_runner_hands_its_job_back_and_restarts_with_the_same_token() {
     let (base, db) = spawn_test_app_with_db().await;
     let (repo_id, job_id) = repo_with_a_blocking_job(&base, &db, "stopping-owner").await;
     let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
@@ -153,18 +162,22 @@ async fn a_stopping_runner_deregisters_and_hands_its_job_straight_back() {
     .await
     .unwrap();
 
-    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let agent = tokio::spawn(rg_runner::run_jobs_until_shutdown(
-        reqwest::Client::new(),
-        base.clone(),
-        runner.id,
-        runner_token,
-        rg_runner::JobLimits::default(),
-        async {
-            // A dropped sender would mean the same thing; the test always sends.
-            drop(stopped.await);
-        },
-    ));
+    let start = |token: String| {
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let agent = tokio::spawn(rg_runner::run_jobs_until_shutdown(
+            reqwest::Client::new(),
+            base.clone(),
+            runner.id,
+            token,
+            rg_runner::JobLimits::default(),
+            async {
+                // A dropped sender would mean the same thing; the test always sends.
+                drop(stopped.await);
+            },
+        ));
+        (stop, agent)
+    };
+    let (stop, agent) = start(runner_token.clone());
 
     // The runner has to be *holding* the job when it is stopped, otherwise this
     // proves nothing about what happens to work in flight.
@@ -185,14 +198,15 @@ async fn a_stopping_runner_deregisters_and_hands_its_job_straight_back() {
         .expect("the runner never returned from its stop path")
         .expect("the runner's stop path panicked");
 
-    // (a) The deregistration landed: nothing but that route deletes a runner row.
-    assert!(
-        rg_db::ops::runner_ops::find_by_id(&db, runner.id)
-            .await
-            .expect("read the runner row")
-            .is_none(),
-        "the runner is still in the pool — it stopped without deregistering, so the server will \
-         keep offering it work until its heartbeat expires"
+    // (a) The stop landed, and it took the runner out of rotation without
+    // forgetting it: the row — and with it the token hash — is still there.
+    let stopped_runner = rg_db::ops::runner_ops::find_by_id(&db, runner.id)
+        .await
+        .expect("read the runner row")
+        .expect("the stop deleted the runner, so the restarted process is answered 401 forever");
+    assert_eq!(
+        stopped_runner.status, "offline",
+        "the runner stopped without telling the server, so it stays listed as taking work"
     );
 
     // (b) …and it took the job with it, back to the pool. Nothing else could
@@ -210,6 +224,26 @@ async fn a_stopping_runner_deregisters_and_hands_its_job_straight_back() {
     );
     assert_eq!(
         returned.runner_id, None,
-        "the job is pending but still points at a runner that no longer exists"
+        "the job is pending but still points at the runner that stopped"
     );
+
+    // (c) The restart: the same runner, the same token. It has to be accepted
+    // and take the job back — a revoked token would leave the job pending.
+    let (stop, agent) = start(runner_token);
+    wait_for_job_status(&db, job_id, "running").await;
+    let retaken = rg_db::ops::pipeline_ops::get_job(&db, job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retaken.runner_id,
+        Some(runner.id),
+        "the restarted runner did not take the job it handed back"
+    );
+    stop.send(())
+        .expect("the restarted runner is still listening");
+    tokio::time::timeout(SETTLE, agent)
+        .await
+        .expect("the restarted runner never returned from its stop path")
+        .expect("the restarted runner's stop path panicked");
 }

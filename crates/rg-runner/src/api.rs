@@ -304,8 +304,10 @@ pub async fn send_heartbeat(client: &reqwest::Client, server: &str, runner_id: i
 }
 
 /// Announce that this runner is stopping: the server hands whatever jobs it was
-/// holding back to the pool and drops it from the runner list, as one
-/// transaction (`runner_ops::deregister_runner`).
+/// holding back to the pool and marks it `offline`, as one transaction
+/// (`runner_ops::stop_runner`). The registration survives — the same token in
+/// the same config is accepted when the process comes back; only an
+/// administrator's `DELETE /admin/runners/{id}` revokes it.
 ///
 /// Fire-and-forget like the other reports, and for the stronger of the usual
 /// reasons: the process is already on its way out, so there is nothing left for

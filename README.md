@@ -135,7 +135,7 @@ cited in the row added it. Plombir Git's side is specified in full in
 | Branch, tag and path filters, `!` negation | ✅ GitHub globs; `+`, `?` and `[…]` refused rather than read differently | ✅ |
 | `concurrency` (workflow level) | ✅ `group`, `cancel-in-progress` | ✅ since 1.26 ([notes](https://blog.gitea.com/release-of-1.26.0/)) |
 | `jobs.<id>.timeout-minutes` | ✅ | ✅ with Runner 2.0 ([notes](https://blog.gitea.com/release-of-runner-2.0.0/)) |
-| `jobs.<id>.continue-on-error` | ✅ | ✅ with Runner 2.0 and Gitea ≥ 1.27 |
+| `jobs.<id>.continue-on-error` | ✅ also an expression rendered per matrix variant (`${{ matrix.experimental }}`); such a variant failing does not fail the pipeline or trip `fail-fast` | ✅ with Runner 2.0 and Gitea ≥ 1.27 |
 | `jobs.<id>.environment` | ✅ an existing environment; a protected one waits for a person's approval | ⚠️ ignored |
 | `needs`, `if`, `env`, `defaults.run.working-directory` | ✅ | ✅ |
 | `inputs.*` / `github.event.inputs.*` in `if:`, `run:`, `env:`, `with:` | ✅ typed as on GitHub (a boolean is `true` / `false`); an undeclared name refused | ✅ |
@@ -143,6 +143,7 @@ cited in the row added it. Plombir Git's side is specified in full in
 | `github.ref_name` in `run:`, `env:`, `with:` and job fields | ✅ `CI_REF_NAME`: `main`, `v1.2` | ✅ |
 | `actions/upload-artifact` `name:` / `path:` and `actions/cache` `path:` with expressions | ✅ rendered per matrix variant (`dist-${{ matrix.os }}`, `out-${{ matrix.os }}`); `artifact` without a name | ✅ |
 | `jobs.<id>.name`, step `name:` with expressions | ✅ rendered per matrix variant (`Build on ${{ matrix.os }}`), shown beside the job id | ✅ |
+| `run-name` | ✅ `github.*`, `inputs.*`, `github.event.inputs.*`, rendered when the run starts and shown in the pipeline list; `matrix.*`, `github.actor` refused by name; one event's workflows are one pipeline, named by each in file order | ✅ |
 | `always()` / `failure()` in a job's `if:` | ✅ answer for every job it needs, transitively; the pipeline stays failed; `cancelled()` refused — a canceled pipeline runs nothing more | ✅ |
 | `strategy.matrix` | ✅ static and dynamic (`fromJSON(needs.<job>.outputs.<name>)`), `include` / `exclude` | ✅ static and dynamic |
 | `strategy.fail-fast`, `strategy.max-parallel` | ✅ | ✅ |
@@ -287,7 +288,7 @@ Three finds from the history:
 | Notifications | In-app, email (SMTP), and real-time WebSocket delivery | [Notification delivery](crates/rg-core/src/notification/thread.rs) |
 | Registries | Package registry and OCI container registry | [Package API](crates/rg-http/src/api/packages/mod.rs) |
 | Search | Global search of repositories, issues, wiki, PRs, users and indexed code; repository code search in the browser and AI API (build a code index explicitly before the first search) | [Search API](crates/rg-http/src/api/search.rs) |
-| Import | Pull repositories, issues, PRs, labels, milestones, release records and wiki from GitHub / GitLab / Gitea / Forgejo; issues and PRs keep their source numbers, and every PR head commit is kept even when its branch is gone; release assets are not imported and imported release authorship belongs to the importing account | [Import service](crates/rg-core/src/import/service.rs) |
+| Import | Pull repositories, issues, PRs, labels, milestones, release records and wiki from GitHub / GitLab / Gitea / Forgejo; issues and PRs keep their source numbers, and every PR head commit is kept even when its branch is gone; a PR's comments on lines of the diff come over under the review they were written in, on the line, side and commit the source placed them; who an issue or PR was assigned to, and whose review it asked for, is kept as the source's logins beside it; release assets are not imported and imported release authorship belongs to the importing account; a finished import answers a `receipt` (`GET /api/v1/imports/{id}`) that sets the source's listing beside what the repository holds — branches and tags by SHA, the default branch by its head commit, issues, PRs, labels, milestones, releases, comments, reviews and LFS objects — names what is missing, and lists what no import can bring (secret values, branch protection, webhooks, reactions) | [Import service](crates/rg-core/src/import/service.rs) |
 | Operations | TLS/HTTPS, TOML config, rate limiting, log rotation, unified pagination, registered GPG/SSH commit-signature verification, audit log, health checks | [Server startup](crates/rg-cli/src/serve.rs) |
 | AI agents | Model Context Protocol built into the server (`POST /api/v1/mcp`) and as a stdio binary (`plombir-git-mcp`); bot accounts, narrowed tokens, per-bot rate limits and audit ([details](#mcp-over-http-and-agent-accounts)) | [MCP API](crates/rg-http/src/api/mcp.rs) |
 | Releases | Release assets with optional in-toto / DSSE attestations signed by the instance key | [Release API](crates/rg-http/src/api/releases.rs) |
@@ -959,10 +960,15 @@ scheme, host, and effective port.
 
 Stopping the runner is a first-class operation, not a kill: on `SIGTERM` (what
 `docker stop`, `docker compose down` and systemd send) or Ctrl-C it drops the job
-it is holding, removes that job's container, and deregisters itself. The server
-hands the job straight back to the pool, so the next runner picks it up
-immediately instead of it waiting out the stuck-job sweep. Give the container at
-least a few seconds of stop grace so this can finish.
+it is holding, removes that job's container, and tells the server it is going
+offline. The server hands the job straight back to the pool, so the next runner
+picks it up immediately instead of it waiting out the stuck-job sweep. Give the
+container at least a few seconds of stop grace so this can finish.
+
+A stop keeps the registration, as GitHub's self-hosted runner and `act_runner`
+do: after a restart or a reboot the runner starts again with the same
+`runner.toml` and the same token. Only an administrator removing the runner
+(`DELETE /api/v1/admin/runners/{id}`, or the admin page) revokes its token.
 
 ### `runner.toml`
 

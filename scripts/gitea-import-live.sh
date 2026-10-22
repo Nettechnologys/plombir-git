@@ -9,7 +9,8 @@
 # The repository `importer/moved` holds: two labels and a milestone; issue #1
 # with a comment by a second account; a pull request (#2, sharing the issue
 # numbering as Gitea does) whose branch is merged with a merge commit and then
-# deleted, with an approving review by that second account; a release `v1.0`;
+# deleted, with an approving review by that second account that comments on the
+# line the pull request adds; a release `v1.0`;
 # and a wiki page. Everything is written through Gitea's own API, so the shapes
 # are the ones a real server answers with.
 set -euo pipefail
@@ -71,7 +72,8 @@ api "$IMPORTER_TOKEN" POST /repos/importer/moved/contents/feature.txt \
   "{\"content\":\"${CONTENT}\",\"message\":\"the pull request's change\",\"branch\":\"main\",\"new_branch\":\"feature\"}" >/dev/null
 api "$IMPORTER_TOKEN" POST /repos/importer/moved/pulls \
   '{"title":"merged on Gitea","body":"the change","head":"feature","base":"main"}' >/dev/null
-api "$REVIEWER_TOKEN" POST /repos/importer/moved/pulls/2/reviews '{"event":"APPROVED","body":"looks good"}' >/dev/null
+api "$REVIEWER_TOKEN" POST /repos/importer/moved/pulls/2/reviews \
+  '{"event":"APPROVED","body":"looks good","comments":[{"path":"feature.txt","new_position":1,"body":"on the added line"}]}' >/dev/null
 api "$IMPORTER_TOKEN" POST /repos/importer/moved/pulls/2/merge '{"Do":"merge","delete_branch_after_merge":true}' >/dev/null
 curl -fsS -X DELETE -H "Authorization: token $IMPORTER_TOKEN" "${BASE}/api/v1/repos/importer/moved/branches/feature" >/dev/null 2>&1 || true
 

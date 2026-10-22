@@ -128,6 +128,12 @@ pub struct GitHubPR {
     #[serde(default, deserialize_with = "null_as_empty")]
     pub labels: Vec<GitHubLabel>,
     pub milestone: Option<GitHubMilestone>,
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub assignees: Vec<GitHubUser>,
+    /// The people whose review is still asked for; one who has reviewed is
+    /// a review, not a request.
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub requested_reviewers: Vec<GitHubUser>,
     pub created_at: String,
     pub updated_at: String,
     pub closed_at: Option<String>,
@@ -231,6 +237,112 @@ pub struct GitHubReview {
     pub state: String, // "APPROVED", "CHANGES_REQUESTED", "COMMENTED"
     pub body: Option<String>,
     pub submitted_at: Option<String>,
+}
+
+/// A comment on a line of a pull request's diff (card_f6c67a05c6b0).
+///
+/// GitHub (`/pulls/{n}/comments`) and Gitea (`/pulls/{n}/reviews/{id}/comments`)
+/// answer different shapes for the same thing, so every field either one
+/// leaves out defaults: GitHub places a comment by `line` / `side` on
+/// `commit_id` — or, once outdated, by `original_line` on `original_commit_id`
+/// — while Gitea sends the new-file line as `position` and the old-file one as
+/// `original_position`, the other of the pair `0`. [`Self::placement`] reads
+/// either.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubReviewComment {
+    pub id: i64,
+    #[serde(default)]
+    pub pull_request_review_id: Option<i64>,
+    pub user: Option<GitHubUser>,
+    pub body: Option<String>,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<i64>,
+    #[serde(default)]
+    pub original_line: Option<i64>,
+    #[serde(default)]
+    pub start_line: Option<i64>,
+    #[serde(default)]
+    pub original_start_line: Option<i64>,
+    #[serde(default)]
+    pub side: Option<String>,
+    #[serde(default)]
+    pub start_side: Option<String>,
+    #[serde(default)]
+    pub commit_id: Option<String>,
+    #[serde(default)]
+    pub original_commit_id: Option<String>,
+    #[serde(default)]
+    pub position: Option<i64>,
+    #[serde(default)]
+    pub original_position: Option<i64>,
+    #[serde(default)]
+    pub in_reply_to_id: Option<i64>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Where a [`GitHubReviewComment`] sits: the line it is on, which side of the
+/// diff, the start of a multi-line range, and the commit the line is counted in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlinePlacement {
+    pub line: Option<i64>,
+    pub side: &'static str,
+    pub start_line: Option<i64>,
+    pub start_side: Option<&'static str>,
+    pub commit_id: Option<String>,
+}
+
+fn diff_side(side: Option<&str>) -> &'static str {
+    match side {
+        Some("LEFT") => "LEFT",
+        _ => "RIGHT",
+    }
+}
+
+impl GitHubReviewComment {
+    /// Where the comment sits, in either dialect's spelling.
+    pub fn placement(&self, dialect: ApiDialect) -> InlinePlacement {
+        let commit = |sha: &Option<String>| sha.clone().filter(|sha| !sha.is_empty());
+        match dialect {
+            ApiDialect::GitHub => {
+                // A comment whose line is gone from the current diff keeps the
+                // line it was written on, in the commit it was written on.
+                let current = self.line.is_some();
+                InlinePlacement {
+                    line: self.line.or(self.original_line),
+                    side: diff_side(self.side.as_deref()),
+                    start_line: if current {
+                        self.start_line
+                    } else {
+                        self.original_start_line
+                    },
+                    start_side: self.start_side.as_deref().map(|side| diff_side(Some(side))),
+                    commit_id: if current {
+                        commit(&self.commit_id)
+                    } else {
+                        commit(&self.original_commit_id).or_else(|| commit(&self.commit_id))
+                    },
+                }
+            }
+            ApiDialect::Gitea => {
+                let new_line = self.position.filter(|line| *line > 0);
+                let old_line = self.original_position.filter(|line| *line > 0);
+                InlinePlacement {
+                    line: new_line.or(old_line),
+                    side: if new_line.is_none() && old_line.is_some() {
+                        "LEFT"
+                    } else {
+                        "RIGHT"
+                    },
+                    start_line: None,
+                    start_side: None,
+                    commit_id: commit(&self.commit_id).or_else(|| commit(&self.original_commit_id)),
+                }
+            }
+        }
+    }
 }
 
 impl GitHubClient {
@@ -427,6 +539,61 @@ impl GitHubClient {
             self.dialect.page_size()
         ))
         .await
+    }
+
+    /// List the comments on lines of a pull request's diff.
+    ///
+    /// GitHub lists them for the whole pull request; Gitea has no such route
+    /// (`/pulls/{n}/comments` answers `404`) and lists them per review, so
+    /// there they are read review by review from `reviews`. A review that is
+    /// only a request for one (`REQUEST_REVIEW`) or an unsubmitted draft holds
+    /// none worth asking for.
+    pub async fn list_pr_review_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: i64,
+        reviews: &[GitHubReview],
+    ) -> Result<Vec<GitHubReviewComment>> {
+        match self.dialect {
+            ApiDialect::GitHub => {
+                self.paginate_all(&format!(
+                    "{}/repos/{}/{}/pulls/{}/comments?{}{}",
+                    self.base_url,
+                    owner,
+                    repo,
+                    pr_number,
+                    self.dialect.page_size(),
+                    self.dialect.oldest_first()
+                ))
+                .await
+            }
+            ApiDialect::Gitea => {
+                let mut comments = Vec::new();
+                for review in reviews
+                    .iter()
+                    .filter(|review| !matches!(review.state.as_str(), "PENDING" | "REQUEST_REVIEW"))
+                {
+                    let mut listed: Vec<GitHubReviewComment> = self
+                        .paginate_all(&format!(
+                            "{}/repos/{}/{}/pulls/{}/reviews/{}/comments?{}",
+                            self.base_url,
+                            owner,
+                            repo,
+                            pr_number,
+                            review.id,
+                            self.dialect.page_size()
+                        ))
+                        .await?;
+                    for comment in &mut listed {
+                        comment.pull_request_review_id.get_or_insert(review.id);
+                    }
+                    comments.extend(listed);
+                }
+                comments.sort_by_key(|comment| comment.id);
+                Ok(comments)
+            }
+        }
     }
 
     /// List releases for a repository.

@@ -22,6 +22,7 @@ pub mod deploy_key;
 pub mod email_confirmation;
 pub mod encryption_key_check;
 pub mod import_task;
+pub mod imported_assignment;
 pub mod instance_settings;
 pub mod instance_signing_key;
 pub mod issue;

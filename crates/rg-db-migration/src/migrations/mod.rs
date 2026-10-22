@@ -173,6 +173,8 @@ pub mod m20261021_000003_pipeline_head_branch;
 pub mod m20261021_000004_pipeline_job_display_name;
 pub mod m20261021_000005_pull_request_base_sha;
 pub mod m20261022_000001_imported_original_author;
+pub mod m20261022_000002_pipeline_run_name;
+pub mod m20261022_000003_imported_assignments;
 
 use sea_orm_migration::prelude::*;
 
@@ -436,6 +438,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261021_000004_pipeline_job_display_name::Migration),
             Box::new(m20261021_000005_pull_request_base_sha::Migration),
             Box::new(m20261022_000001_imported_original_author::Migration),
+            Box::new(m20261022_000002_pipeline_run_name::Migration),
+            Box::new(m20261022_000003_imported_assignments::Migration),
         ]
     }
 }

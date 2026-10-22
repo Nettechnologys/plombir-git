@@ -386,6 +386,7 @@ async fn finished_pipeline(
             head_branch: None,
             previous_sha: None,
             schedule: None,
+            run_name: None,
         },
     )
     .await

@@ -23,6 +23,10 @@ struct PipelineResponse {
     status: String,
     trigger_type: String,
     triggered_by: Option<i64>,
+    /// The `run-name:` of the Actions workflow this run executes, rendered for
+    /// the run (`Deploy staging`) — what to show the run under. Absent when no
+    /// workflow it runs has one.
+    run_name: Option<String>,
     started_at: Option<String>,
     finished_at: Option<String>,
     created_at: String,
@@ -326,6 +330,7 @@ pub async fn list_pipelines(
                     status: p.status,
                     trigger_type: p.trigger_type,
                     triggered_by: p.triggered_by,
+                    run_name: p.run_name,
                     started_at: p.started_at.map(|t| t.to_string()),
                     finished_at: p.finished_at.map(|t| t.to_string()),
                     created_at: p.created_at.to_string(),
@@ -504,6 +509,7 @@ pub async fn get_pipeline(
             status: pipeline.status,
             trigger_type: pipeline.trigger_type,
             triggered_by: pipeline.triggered_by,
+            run_name: pipeline.run_name,
             started_at: pipeline.started_at.map(|t| t.to_string()),
             finished_at: pipeline.finished_at.map(|t| t.to_string()),
             created_at: pipeline.created_at.to_string(),

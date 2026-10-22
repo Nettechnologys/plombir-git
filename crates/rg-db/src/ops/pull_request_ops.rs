@@ -45,6 +45,19 @@ pub async fn find_by_repo_and_number(
         .context("db: find PR by repo and number")
 }
 
+/// The numbers every pull request of a repository is filed under — what an import
+/// receipt compares with the numbers its source listed.
+pub async fn numbers_in_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<i64>> {
+    PrEntity::find()
+        .select_only()
+        .column(pull_request::Column::Number)
+        .filter(pull_request::Column::RepoId.eq(repo_id))
+        .into_tuple()
+        .all(db)
+        .await
+        .context("db: list pull request numbers of a repository")
+}
+
 /// Paginated list of PRs for a repo. Returns (data, total).
 ///
 /// Ordered by `created_at` **and** `id`. Imported pull requests carry the

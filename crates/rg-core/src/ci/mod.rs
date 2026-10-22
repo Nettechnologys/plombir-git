@@ -721,6 +721,7 @@ pub async fn publish_configuration_failure(
                 head_branch,
                 previous_sha,
                 schedule: schedule.map(|run| (run.workflow, run.cron)),
+                run_name: None,
             },
         )
         .await?;

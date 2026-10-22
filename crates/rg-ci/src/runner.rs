@@ -3192,6 +3192,7 @@ mod tests {
                 head_branch: None,
                 previous_sha: None,
                 schedule: Some(("nightly.yml", "0 3 * * *")),
+                run_name: None,
             },
         )
         .await

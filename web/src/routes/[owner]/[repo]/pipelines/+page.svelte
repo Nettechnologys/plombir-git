@@ -934,7 +934,7 @@
             >
               <PipelineBadge status={p.status} />
               <div class="pipeline-info">
-                <div class="pipeline-msg truncate">{p.commit_message?.split('\n')[0] || '#' + p.id}</div>
+                <div class="pipeline-msg truncate">{p.run_name || p.commit_message?.split('\n')[0] || '#' + p.id}</div>
                 <div class="pipeline-meta">
                   <span class="mono">{p.commit_sha?.slice(0, 7)}</span>
                   <span>{duration(p.started_at, p.finished_at)}</span>

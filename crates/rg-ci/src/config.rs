@@ -70,6 +70,13 @@ pub struct CiConfig {
     /// instance has to refuse when it has no labelled runners to route to.
     #[serde(skip)]
     pub actions_workflow: bool,
+
+    /// The name this run is shown under, from the `run-name:` of the Actions
+    /// workflows it runs — `None` when none of them has one, and for every
+    /// native file. `#[serde(skip)]` for the reason [`Self::actions_workflow`]
+    /// is: `.plombir-git-ci.yml` has no such key.
+    #[serde(skip)]
+    pub run_name: Option<String>,
 }
 
 /// A single CI job configuration.
@@ -223,6 +230,11 @@ pub(crate) struct ActionJobTemplates {
     /// or a template such as `Build on ${{ matrix.os }}`.
     #[serde(default)]
     pub(crate) display_name: Option<ActionTemplate>,
+    /// `jobs.<id>.continue-on-error` when it is an expression —
+    /// `${{ matrix.experimental }}` — which each variant renders to `true` or
+    /// `false`. The job's `allow_failure` is `false` until it does.
+    #[serde(default)]
+    pub(crate) allow_failure: Option<ActionTemplate>,
 }
 
 impl ActionJobTemplates {
@@ -234,6 +246,7 @@ impl ActionJobTemplates {
             && self.artifact_paths.is_none()
             && self.cache_paths.is_none()
             && self.display_name.is_none()
+            && self.allow_failure.is_none()
     }
 }
 
@@ -257,6 +270,24 @@ impl ActionTemplate {
             .filter_map(|part| match part {
                 ActionTemplatePart::Expression(ActionExpression::Unsupported(name)) => {
                     Some(name.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// What `run-name:` cannot read of this template: everything
+    /// [`Self::unsupported_expressions`] names, and `matrix.*`, which belongs
+    /// to a job's variant while a run's name is rendered once for the run.
+    pub(crate) fn run_name_unsupported_expressions(&self) -> Vec<String> {
+        self.parts
+            .iter()
+            .filter_map(|part| match part {
+                ActionTemplatePart::Expression(ActionExpression::Unsupported(name)) => {
+                    Some(name.clone())
+                }
+                ActionTemplatePart::Expression(expression @ ActionExpression::Matrix(_)) => {
+                    Some(expression.source_name())
                 }
                 _ => None,
             })

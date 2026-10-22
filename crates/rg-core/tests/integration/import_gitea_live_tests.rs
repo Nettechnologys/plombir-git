@@ -9,7 +9,9 @@
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 
-use rg_db::entities::{issue, issue_comment, label, milestone, pr_review, pull_request, release};
+use rg_db::entities::{
+    issue, issue_comment, label, milestone, pr_review, pull_request, release, review_comment,
+};
 
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| {
@@ -165,6 +167,30 @@ async fn a_gitea_repository_imports_with_its_history() {
         reviews.iter().any(|review| review.action == "approve"
             && review.original_author.as_deref() == Some("reviewer")),
         "{reviews:?}"
+    );
+    // card_f6c67a05c6b0: the approving review's comment on the added line,
+    // read from Gitea's per-review route, sits on that line of the diff.
+    let inline = review_comment::Entity::find()
+        .filter(review_comment::Column::PrId.eq(merged.id))
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(inline.len(), 1, "{inline:?}");
+    assert_eq!(
+        (
+            inline[0].path.as_str(),
+            inline[0].line,
+            inline[0].side.as_deref(),
+            inline[0].body.as_str()
+        ),
+        ("feature.txt", Some(1), Some("RIGHT"), "on the added line")
+    );
+    assert!(inline[0].commit_id.is_some(), "{inline:?}");
+    assert!(
+        reviews
+            .iter()
+            .any(|review| review.id == inline[0].review_id && review.action == "approve"),
+        "the comment sits under the review it was written in: {reviews:?}"
     );
 
     // The merged pull request's branch is gone; its head is kept and its

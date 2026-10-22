@@ -109,6 +109,12 @@ async fn spawn_fake_github() -> String {
         .route(
             "/api/v3/repos/{owner}/{repo}/pulls/{number}/reviews",
             axum::routing::get(move || async move { empty() }),
+        )
+        // The comments on diff lines (card_f6c67a05c6b0), which GitHub
+        // serves for every pull request.
+        .route(
+            "/api/v3/repos/{owner}/{repo}/pulls/{number}/comments",
+            axum::routing::get(move || async move { empty() }),
         );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

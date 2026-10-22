@@ -39,6 +39,7 @@ pub async fn create_pipeline(
             head_branch: None,
             previous_sha: None,
             schedule: None,
+            run_name: None,
         },
     )
     .await
@@ -81,6 +82,9 @@ pub struct NewPipeline<'a> {
     /// The workflow file and `- cron:` entry a `schedule` run fired for. See
     /// [`pipeline::Model::schedule_workflow`].
     pub schedule: Option<(&'a str, &'a str)>,
+    /// What the run is shown under, from `run-name:`. See
+    /// [`pipeline::Model::run_name`].
+    pub run_name: Option<&'a str>,
 }
 
 /// Create a pipeline row recording the full provenance of its run.
@@ -106,6 +110,7 @@ pub async fn create_pipeline_row(
         previous_sha: Set(new.previous_sha.map(str::to_string)),
         schedule_workflow: Set(new.schedule.map(|(workflow, _)| workflow.to_string())),
         schedule_cron: Set(new.schedule.map(|(_, cron)| cron.to_string())),
+        run_name: Set(new.run_name.map(str::to_string)),
         started_at: Set(None),
         finished_at: Set(None),
         created_at: Set(now),

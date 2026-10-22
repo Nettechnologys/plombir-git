@@ -208,7 +208,20 @@ pub async fn get_import_status(
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     match import_task_of_user(&state, user_id, id).await {
-        Ok(task) => (StatusCode::OK, Json(serde_json::json!(task))).into_response(),
+        Ok(task) => {
+            let mut body = serde_json::json!(task);
+            // The receipt is stored inside `stats` with the rest of the
+            // import's outcome; it is answered as a block of its own because
+            // it is the one part a person reads to know nothing was lost
+            // (card_29def7a1e172). `null` until the import has finished.
+            body["receipt"] = task
+                .stats
+                .as_deref()
+                .and_then(|stats| serde_json::from_str::<serde_json::Value>(stats).ok())
+                .and_then(|mut stats| stats.get_mut("receipt").map(serde_json::Value::take))
+                .unwrap_or(serde_json::Value::Null);
+            (StatusCode::OK, Json(body)).into_response()
+        }
         Err(e) => e.into_response(),
     }
 }

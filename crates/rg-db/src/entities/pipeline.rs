@@ -71,6 +71,11 @@ pub struct Model {
     /// For a `schedule` run: the `- cron:` value that fired, as the file spells
     /// it — also what the job reads as `github.event.schedule`.
     pub schedule_cron: Option<String>,
+    /// What the run is shown under in the pipeline list: the `run-name:` of
+    /// its Actions workflow, rendered for the run (`Deploy staging`). `None`
+    /// when no workflow it runs has one, and for every native pipeline — those
+    /// are shown as before (card_9f345eccf1e3).
+    pub run_name: Option<String>,
     pub started_at: Option<DateTime>,
     pub finished_at: Option<DateTime>,
     pub created_at: DateTime,

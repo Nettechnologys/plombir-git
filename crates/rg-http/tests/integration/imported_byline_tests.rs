@@ -37,6 +37,21 @@ async fn imported_issues_comments_pull_requests_and_reviews_carry_their_source_a
     .insert(&db)
     .await
     .expect("seed the imported issue");
+    // card_f6c67a05c6b0: who it was on at the source, as bylines.
+    use rg_db::ops::imported_assignment_ops::{record, AssignedObject, SourcePerson};
+    let person = |login: &'static str, id: i64, service: &'static str| SourcePerson {
+        login,
+        source_user_id: Some(id),
+        service,
+    };
+    record(
+        &db,
+        AssignedObject::Issue(issue.id),
+        "assignee",
+        &[person("erin", 11, "github")],
+    )
+    .await
+    .expect("seed the issue's source assignee");
     rg_db::entities::issue_comment::ActiveModel {
         id: NotSet,
         issue_id: Set(issue.id),
@@ -64,6 +79,11 @@ async fn imported_issues_comments_pull_requests_and_reviews_carry_their_source_a
     assert_eq!(issue_json["author"], "byline-host", "{issue_json}");
     assert_eq!(issue_json["original_author"], "alice", "{issue_json}");
     assert_eq!(issue_json["original_service"], "github", "{issue_json}");
+    assert_eq!(
+        issue_json["original_assignees"],
+        serde_json::json!([{ "login": "erin", "service": "github" }]),
+        "{issue_json}"
+    );
 
     let comments: Vec<serde_json::Value> = reqwest::Client::new()
         .get(format!(
@@ -116,6 +136,22 @@ async fn imported_issues_comments_pull_requests_and_reviews_carry_their_source_a
     .insert(&db)
     .await
     .expect("seed the imported pull request");
+    record(
+        &db,
+        AssignedObject::PullRequest(pr.id),
+        "assignee",
+        &[person("frank", 12, "gitlab")],
+    )
+    .await
+    .expect("seed the pull request's source assignee");
+    record(
+        &db,
+        AssignedObject::PullRequest(pr.id),
+        "requested_reviewer",
+        &[person("grace", 13, "gitlab")],
+    )
+    .await
+    .expect("seed the pull request's requested reviewer");
     rg_db::entities::pr_review::ActiveModel {
         id: NotSet,
         pr_id: Set(pr.id),
@@ -134,6 +170,44 @@ async fn imported_issues_comments_pull_requests_and_reviews_carry_their_source_a
     .insert(&db)
     .await
     .expect("seed the imported review");
+    // A comment on a line of the diff, written in that review.
+    let imported_review_id = {
+        use rg_db::sea_orm::EntityTrait;
+        rg_db::entities::pr_review::Entity::find()
+            .all(&db)
+            .await
+            .expect("read the review back")
+            .into_iter()
+            .find(|review| review.pr_id == pr.id)
+            .expect("the imported review")
+            .id
+    };
+    rg_db::entities::review_comment::ActiveModel {
+        id: NotSet,
+        review_id: Set(imported_review_id),
+        pr_id: Set(pr.id),
+        author_id: Set(importer_id),
+        path: Set("src/lib.rs".to_string()),
+        position: Set(None),
+        line: Set(Some(3)),
+        start_line: Set(None),
+        side: Set(Some("RIGHT".to_string())),
+        start_side: Set(None),
+        body: Set("on this line".to_string()),
+        suggestion: Set(None),
+        suggestion_applied_at: Set(None),
+        suggestion_applied_by_id: Set(None),
+        suggestion_commit_sha: Set(None),
+        commit_id: Set(None),
+        reply_to_id: Set(None),
+        resolved_at: Set(None),
+        resolved_by_id: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&db)
+    .await
+    .expect("seed the imported diff comment");
 
     let pr_json: serde_json::Value = reqwest::Client::new()
         .get(format!("{base}/api/v1/repos/byline-host/moved/pulls/8"))
@@ -145,6 +219,17 @@ async fn imported_issues_comments_pull_requests_and_reviews_carry_their_source_a
         .await
         .expect("pull request body");
     assert_eq!(pr_json["original_author"], "carol", "{pr_json}");
+    assert_eq!(
+        (
+            &pr_json["original_assignees"],
+            &pr_json["original_reviewers"]
+        ),
+        (
+            &serde_json::json!([{ "login": "frank", "service": "gitlab" }]),
+            &serde_json::json!([{ "login": "grace", "service": "gitlab" }])
+        ),
+        "{pr_json}"
+    );
 
     let timeline: Vec<serde_json::Value> = reqwest::Client::new()
         .get(format!(
@@ -171,6 +256,19 @@ async fn imported_issues_comments_pull_requests_and_reviews_carry_their_source_a
     assert_eq!(
         byline("review_comment"),
         serde_json::json!({ "login": "dave", "service": "gitlab" })
+    );
+    let on_the_line = timeline
+        .iter()
+        .find(|event| {
+            event["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("comment:"))
+        })
+        .unwrap_or_else(|| panic!("no diff comment in {timeline:?}"));
+    assert_eq!(
+        on_the_line["original_author"],
+        serde_json::json!({ "login": "dave", "service": "gitlab" }),
+        "a diff comment is written by whoever wrote its review"
     );
 }
 

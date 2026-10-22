@@ -37,6 +37,13 @@ pub struct GiteaWorkflow {
     /// Workflow name (optional, defaults to filename).
     pub name: Option<String>,
 
+    /// `run-name:`, what a run of this workflow is shown under in the pipeline
+    /// list instead of the workflow's name — `Deploy ${{ inputs.target }}`.
+    /// Reads `github.*`, `inputs.*` and `github.event.inputs.*`, rendered once
+    /// per run by [`GiteaWorkflow::render_run_name`] (card_9f345eccf1e3).
+    #[serde(rename = "run-name")]
+    pub run_name: Option<String>,
+
     /// Event triggers.
     pub on: WorkflowTriggers,
 
@@ -381,6 +388,10 @@ fn schedule_crons(value: &serde_json::Value) -> std::result::Result<Vec<String>,
 /// declares the file reusable rather than asking for a run, so a workflow that
 /// names only it is correct even though nothing will ever trigger it directly.
 const WORKFLOW_CALL_TRIGGER: &str = "workflow_call";
+
+/// Longest `run-name:` a run is shown under, after rendering — the length of a
+/// job's `name:`, which is shown the same way.
+const RUN_NAME_MAX: usize = 255;
 /// The `on:` spelling of [`rg_core::ci::pull_request::PULL_REQUEST_EVENT`].
 const PULL_REQUEST_TRIGGER: &str = "pull_request";
 /// The `on:` spelling of the merge queue's speculative-merge event.
@@ -676,8 +687,11 @@ pub struct GiteaJob {
     #[serde(rename = "timeout-minutes")]
     pub timeout_minutes: Option<u64>,
 
+    /// `true`, `false`, or an expression rendered for each matrix variant —
+    /// `${{ matrix.experimental }}` — that has to come out `true` or `false`
+    /// ([`job_continue_on_error`]).
     #[serde(rename = "continue-on-error", default)]
-    pub continue_on_error: bool,
+    pub continue_on_error: Option<serde_json::Value>,
 
     /// Deployment environment, either a scalar name or `{ name: ... }`.
     pub environment: Option<GiteaEnvironment>,
@@ -1776,10 +1790,32 @@ fn unsupported_job_field_expression_sites(workflow: &GiteaWorkflow) -> Vec<Strin
         }
     };
 
-    let mut step_fields = Vec::new();
+    // A run has no matrix variant: `matrix.*` is a job's context, and the
+    // run's name is rendered once, before any job exists.
+    let mut step_fields = workflow
+        .run_name
+        .as_deref()
+        .and_then(compile_action_template)
+        .map(|template| {
+            template
+                .run_name_unsupported_expressions()
+                .into_iter()
+                .map(|expression| format!("run-name expression `{expression}`"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     for (job_name, job) in &workflow.jobs {
         if let Some(name) = &job.name {
             inspect(format!("{job_name}: name"), name);
+        }
+        match job_continue_on_error(job) {
+            Ok((_, Some(template))) => {
+                step_fields.extend(template.unsupported_expressions().into_iter().map(
+                    |expression| format!("{job_name}: continue-on-error expression `{expression}`"),
+                ))
+            }
+            Ok((_, None)) => {}
+            Err(reason) => step_fields.push(format!("{job_name}: {reason}")),
         }
         match &job.runs_on {
             Some(GiteaRunsOn::Label(value)) => {
@@ -3054,6 +3090,10 @@ impl GiteaWorkflow {
                 }
                 None => (None, None),
             };
+            // Refused by `validate_supported_actions` before a workflow is
+            // translated, so an unreadable value cannot reach this point.
+            let (continue_on_error, continue_on_error_template) =
+                job_continue_on_error(job).unwrap_or_default();
             let action_templates = ActionJobTemplates {
                 image: image_template,
                 tags: tag_templates,
@@ -3065,6 +3105,7 @@ impl GiteaWorkflow {
                     compile_action_template(name)
                         .unwrap_or_else(|| ActionTemplate::literal(name.clone()))
                 }),
+                allow_failure: continue_on_error_template,
             };
             let action_templates = (!action_templates.is_empty()).then_some(action_templates);
 
@@ -3086,7 +3127,7 @@ impl GiteaWorkflow {
                     when: None,
                     condition: job.condition.clone(),
                     environment,
-                    allow_failure: Some(job.continue_on_error),
+                    allow_failure: Some(continue_on_error),
                     // Saturating on both hops on purpose: an absurd
                     // `timeout-minutes` has to arrive at the validator as an
                     // absurd number of seconds and be refused by name. A
@@ -3125,6 +3166,7 @@ impl GiteaWorkflow {
             }),
             jobs: job_configs,
             actions_workflow: true,
+            run_name: None,
         }
     }
 
@@ -3769,8 +3811,11 @@ fn expand_reusable_jobs(
         // workflow-level field must make an explicit survive-or-refuse choice.
         // `on` is checked above, `jobs`, `env`, and working-directory defaults
         // are consumed by the recursion, and `concurrency` is refused below.
+        // `run-name` names a run, and a called workflow is not one: GitHub
+        // ignores it there, and so does this.
         let GiteaWorkflow {
             name: _,
+            run_name: _,
             on: _,
             jobs: _,
             concurrency,
@@ -4587,6 +4632,34 @@ fn valid_step_id(id: &str) -> bool {
 /// The longest `timeout-minutes` a step may ask for: the longest a job may run.
 const MAX_STEP_TIMEOUT_MINUTES: u64 = rg_core::ci::JOB_TIMEOUT_MAX_SECS as u64 / 60;
 
+/// A job's `continue-on-error:`: the value, or the template a matrix variant
+/// renders it from (card_1aab0da14713).
+///
+/// A step's cannot be a template ([`step_continue_on_error`]); a job's can,
+/// because its fields are rendered per variant when the graph is written —
+/// GitHub's own example is `continue-on-error: ${{ matrix.experimental }}`.
+/// What the template renders to is judged there: anything but `true` or
+/// `false` refuses the job by name.
+fn job_continue_on_error(
+    job: &GiteaJob,
+) -> std::result::Result<(bool, Option<ActionTemplate>), String> {
+    match &job.continue_on_error {
+        None => Ok((false, None)),
+        Some(serde_json::Value::Bool(value)) => Ok((*value, None)),
+        Some(serde_json::Value::String(value)) if value == "true" => Ok((true, None)),
+        Some(serde_json::Value::String(value)) if value == "false" => Ok((false, None)),
+        Some(serde_json::Value::String(value)) => match compile_action_template(value) {
+            Some(template) => Ok((false, Some(template))),
+            None => Err(format!(
+                "continue-on-error must be true, false or an expression, got `{value}`"
+            )),
+        },
+        Some(other) => Err(format!(
+            "continue-on-error must be true, false or an expression, got `{other}`"
+        )),
+    }
+}
+
 /// A step's `continue-on-error:`, which has to be a boolean here: an
 /// expression would need a value the workflow does not have when it is read.
 fn step_continue_on_error(step: &GiteaStep) -> std::result::Result<bool, String> {
@@ -5119,6 +5192,88 @@ impl GiteaWorkflow {
         names.sort();
         names.dedup();
         names
+    }
+
+    /// The name this run is shown under, from `run-name:` — `None` without one,
+    /// or when it renders empty, and the run is shown under its workflow's name
+    /// as before (card_9f345eccf1e3).
+    ///
+    /// Rendered once, after the dispatch inputs are resolved: `github.*` from
+    /// the run, `inputs.*` from this workflow's resolved inputs and
+    /// `github.event.inputs.*` from the dispatch, both `''` on a run that was
+    /// not started by hand, as on GitHub. An input neither `workflow_dispatch`
+    /// nor `workflow_call` declares is refused by name, as it is in an `if:`.
+    /// Anything else — `matrix.*`, `github.actor`, `secrets.*` — never reaches
+    /// here: [`Self::validate_supported_actions`] refused it when the file was
+    /// read.
+    pub(crate) fn render_run_name(
+        &self,
+        ctx: &WorkflowContext,
+    ) -> std::result::Result<Option<String>, String> {
+        let Some(text) = self.run_name.as_deref() else {
+            return Ok(None);
+        };
+        let declared = self.declared_input_names(&["workflow_dispatch", WORKFLOW_CALL_TRIGGER]);
+        let dispatch_declared = self.declared_input_names(&["workflow_dispatch"]);
+        let find = |declared: &[String], name: &str| {
+            declared
+                .iter()
+                .find(|candidate| candidate.eq_ignore_ascii_case(name))
+                .cloned()
+        };
+        for (context, names) in [
+            ("inputs", &declared),
+            ("github.event.inputs", &dispatch_declared),
+        ] {
+            for name in context_references(text, context) {
+                if find(names, &name).is_none() {
+                    return Err(format!(
+                        "run-name reads {context}.{name}, which the workflow does not declare"
+                    ));
+                }
+            }
+        }
+        let dispatched = ctx.event == rg_core::ci::WORKFLOW_DISPATCH_EVENT;
+        let input = |names: &[String], name: &str, event: bool| {
+            find(names, name)
+                .and_then(|declared| self.resolved_inputs.get(&declared))
+                .filter(|_| dispatched || !event)
+                .map(GiteaInputValue::as_string)
+                .unwrap_or_default()
+        };
+        let rendered = match compile_action_template(text) {
+            None => text.to_owned(),
+            Some(template) => template
+                .render(|expression| match expression {
+                    ActionExpression::GithubRef => Some(ctx.ref_name.clone()),
+                    ActionExpression::GithubRefName => {
+                        Some(crate::condition::ref_name_short(&ctx.ref_name).to_owned())
+                    }
+                    ActionExpression::GithubSha => Some(ctx.sha.clone()),
+                    ActionExpression::GithubEventName => Some(ctx.event.clone()),
+                    ActionExpression::GithubRepository => Some(ctx.repository()),
+                    ActionExpression::GithubRepositoryOwner => Some(ctx.repo_owner.clone()),
+                    ActionExpression::Input(name) => Some(input(&declared, name, false)),
+                    ActionExpression::EventInput(name) => {
+                        Some(input(&dispatch_declared, name, true))
+                    }
+                    ActionExpression::Matrix(_) | ActionExpression::Unsupported(_) => None,
+                })
+                .map_err(|expression| {
+                    format!("run-name expression `{expression}` has no value for a run")
+                })?,
+        };
+        let rendered = rendered.trim();
+        if rendered.is_empty() {
+            return Ok(None);
+        }
+        if rendered.chars().count() > RUN_NAME_MAX || rendered.chars().any(char::is_control) {
+            return Err(format!(
+                "run-name renders to an unusable name: it must be at most {RUN_NAME_MAX} \
+                 characters, without control characters"
+            ));
+        }
+        Ok(Some(rendered.to_owned()))
     }
 
     /// Read `inputs.*` in every job's and step's `if:` (card_28ac32f9c069) and

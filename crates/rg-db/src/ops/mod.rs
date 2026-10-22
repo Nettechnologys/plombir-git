@@ -14,6 +14,7 @@ pub mod deploy_key_ops;
 pub mod email_confirmation_ops;
 pub mod encryption_key_check_ops;
 pub mod import_task_ops;
+pub mod imported_assignment_ops;
 pub mod instance_settings_ops;
 pub mod instance_signing_key_ops;
 pub mod issue_comment_ops;

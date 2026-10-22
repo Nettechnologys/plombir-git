@@ -88,6 +88,7 @@ probed_entities!(
     email_confirmation,
     encryption_key_check,
     import_task,
+    imported_assignment,
     instance_settings,
     instance_signing_key,
     issue,

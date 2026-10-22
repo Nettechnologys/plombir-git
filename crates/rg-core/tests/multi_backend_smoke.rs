@@ -3058,6 +3058,7 @@ async fn dispatch_inputs_at_the_ceiling_fit_the_pipeline_row() {
             head_branch: None,
             previous_sha: None,
             schedule: None,
+            run_name: None,
         },
     )
     .await
@@ -3395,6 +3396,7 @@ async fn free_text_at_the_ceiling_round_trips() {
             head_branch: None,
             previous_sha: None,
             schedule: None,
+            run_name: None,
         },
     )
     .await
@@ -3437,6 +3439,7 @@ async fn free_text_at_the_ceiling_round_trips() {
             head_branch: None,
             previous_sha: None,
             schedule: None,
+            run_name: None,
         },
     )
     .await

@@ -286,6 +286,50 @@ async fn an_import_brings_its_lfs_objects_and_names_the_one_the_source_lacks() {
     assert_eq!(failed.len(), 1, "{stats}");
     assert_eq!(failed[0]["oid"], lost_oid.as_str());
     assert_eq!(failed[0]["path"], "assets/lost.bin");
+
+    // card_29def7a1e172: the receipt, as its own block of the answer. The
+    // branches compare by SHA with what the source advertises, the default
+    // branch by the commit it points at, and the missing object by oid.
+    let receipt = &task["receipt"];
+    let branches = &receipt["refs"]["branches"];
+    assert_eq!(
+        (&branches["source"], &branches["imported"]),
+        (&serde_json::json!(1), &serde_json::json!(1)),
+        "{receipt}"
+    );
+    let default_branch = &receipt["refs"]["default_branch"];
+    assert_eq!(default_branch["name"], "main", "{receipt}");
+    assert!(default_branch["source_sha"].is_string(), "{receipt}");
+    assert_eq!(
+        default_branch["source_sha"], default_branch["imported_sha"],
+        "{receipt}"
+    );
+    assert_eq!(
+        default_branch["commits"], 5,
+        "the initial commit and four files: {receipt}"
+    );
+    let lfs = receipt["objects"]
+        .as_array()
+        .expect("object rows")
+        .iter()
+        .find(|row| row["kind"] == "lfs_objects")
+        .unwrap_or_else(|| panic!("no LFS row: {receipt}"));
+    assert_eq!(
+        (&lfs["source"], &lfs["imported"], &lfs["not_imported"]),
+        (
+            &serde_json::json!(3),
+            &serde_json::json!(2),
+            &serde_json::json!(1)
+        ),
+        "{receipt}"
+    );
+    assert_eq!(lfs["missing"], serde_json::json!([lost_oid]), "{receipt}");
+    assert!(
+        receipt["not_transferable"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "{receipt}"
+    );
     assert!(
         failed[0]["reason"]
             .as_str()

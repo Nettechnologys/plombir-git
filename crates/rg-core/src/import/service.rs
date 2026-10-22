@@ -77,13 +77,14 @@ use tokio_util::sync::CancellationToken;
 
 use rg_db::entities::import_task::{self, Model as ImportTask};
 use rg_db::entities::{issue, label, milestone};
+use rg_db::ops::imported_assignment_ops::{self, AssignedObject, SourcePerson};
 use rg_db::ops::{
     import_task_ops, issue_comment_ops, label_ops, milestone_ops, org_ops, pr_review_ops, user_ops,
 };
 
 use crate::import::github_client::{
     ApiDialect, GitHubClient, GitHubComment, GitHubIssue, GitHubLabel, GitHubMilestone, GitHubPR,
-    GitHubRelease, GitHubReview,
+    GitHubRelease, GitHubReview, GitHubReviewComment,
 };
 use crate::import::gitlab_client::{
     GitLabClient, GitLabIssue, GitLabLabel, GitLabMR, GitLabMilestone, GitLabNote, GitLabRelease,
@@ -130,6 +131,10 @@ pub struct ImportStats {
     /// reason as [`Self::issues_failed`].
     pub prs_failed: Vec<ImportedObjectFailure>,
     pub pr_reviews_imported: usize,
+    /// Comments on lines of a pull request's diff, written under the review
+    /// they belong to (card_f6c67a05c6b0). Their failures are counted with the
+    /// other comments in [`Self::comments_failed`].
+    pub pr_review_comments_imported: usize,
     /// Reviews the target could not write, or that carry no time they were
     /// submitted at. Unsubmitted (`PENDING`) GitHub drafts are not reviews
     /// yet and appear in neither list.
@@ -144,6 +149,12 @@ pub struct ImportStats {
     /// each with a path it is committed under and the reason. The clone holds
     /// their pointers, so these are the files `git lfs pull` will fail on.
     pub lfs_objects_failed: Vec<crate::lfs::fetch::LfsFetchFailure>,
+    /// The source's listing beside what the target holds, built once the
+    /// import is done ([`crate::import::receipt`], card_29def7a1e172).
+    pub receipt: Option<crate::import::receipt::ImportReceipt>,
+    /// What the source listed, gathered for the receipt as it is read.
+    #[serde(skip)]
+    pub inventory: crate::import::receipt::SourceInventory,
 }
 
 /// The source platform's record of who wrote an imported object, kept as a
@@ -931,6 +942,25 @@ pub async fn run_import(
         other => anyhow::bail!("unsupported platform: {other}"),
     }
 
+    // A receipt that cannot be built costs the receipt, not an import that
+    // has already written everything it could.
+    match crate::import::receipt::build(
+        db,
+        repo_root,
+        &task.platform,
+        (&task.target_owner, &task.target_name),
+        &stats,
+    )
+    .await
+    {
+        Ok(receipt) => stats.receipt = Some(receipt),
+        Err(error) => tracing::warn!(
+            task_id = task.id,
+            error = %format!("{error:#}"),
+            "the import finished but its receipt could not be built"
+        ),
+    }
+
     Ok(stats)
 }
 
@@ -1151,6 +1181,7 @@ async fn clone_into_target_with_destination(
     let ClonedRepository {
         outcome,
         pull_heads,
+        source_refs,
     } = clone_repo_with_pull_heads(
         destination,
         repo_root,
@@ -1160,6 +1191,7 @@ async fn clone_into_target_with_destination(
         SourcePullHeads::for_task(task),
     )
     .await?;
+    stats.inventory.refs = source_refs;
     match pull_heads {
         Some(PullHeadsFetch::Fetched(count)) => stats.pull_request_heads_imported = count,
         Some(PullHeadsFetch::Failed(reason)) => stats.pull_request_heads_failed = Some(reason),
@@ -1388,6 +1420,7 @@ async fn run_git_import(
     import_task_ops::set_repo_id(db, task.id, repo_id)
         .await
         .context("failed to link the import task to its target repository")?;
+    stats.inventory.repo_id = Some(repo_id);
 
     if task.import_repo {
         clone_into_target(
@@ -1548,6 +1581,7 @@ async fn run_github_import(
     import_task_ops::set_repo_id(db, task.id, repo_id)
         .await
         .context("failed to link the import task to its target repository")?;
+    stats.inventory.repo_id = Some(repo_id);
 
     // Step 1: Clone repository
     if task.import_repo {
@@ -1574,6 +1608,7 @@ async fn run_github_import(
     if task.import_labels {
         update_stage(db, task.id, "importing", 15, "Importing labels...").await?;
         let labels = client.list_labels(&gh_owner, &gh_repo).await?;
+        stats.inventory.labels = Some(labels.iter().map(|label| label.name.clone()).collect());
         stats.labels_imported = import_github_labels(db, repo_id, &labels, stats).await?;
         update_stage(
             db,
@@ -1595,6 +1630,12 @@ async fn run_github_import(
     if task.import_milestones {
         update_stage(db, task.id, "importing", 25, "Importing milestones...").await?;
         let milestones = client.list_milestones(&gh_owner, &gh_repo).await?;
+        stats.inventory.milestones = Some(
+            milestones
+                .iter()
+                .map(|milestone| milestone.title.clone())
+                .collect(),
+        );
         stats.milestones_imported =
             import_github_milestones(db, repo_id, &milestones, &mut milestone_map, stats).await?;
         update_stage(
@@ -1612,11 +1653,13 @@ async fn run_github_import(
         update_stage(db, task.id, "importing", 35, "Importing issues...").await?;
         let issues = client.list_issues(&gh_owner, &gh_repo).await?;
         let total = issues.len();
+        stats.inventory.issues = Some(issues.iter().map(|issue| issue.number).collect());
 
         for (i, issue) in issues.iter().enumerate() {
             let comments = client
                 .list_issue_comments(&gh_owner, &gh_repo, issue.number)
                 .await?;
+            *stats.inventory.comments.get_or_insert(0) += comments.len();
             import_github_issue(
                 db,
                 repo_id,
@@ -1649,6 +1692,7 @@ async fn run_github_import(
         update_stage(db, task.id, "importing", 60, "Importing pull requests...").await?;
         let prs = client.list_pull_requests(&gh_owner, &gh_repo).await?;
         let total = prs.len();
+        stats.inventory.pull_requests = Some(prs.iter().map(|pr| pr.number).collect());
 
         for (i, pr) in prs.iter().enumerate() {
             let comments = client
@@ -1657,12 +1701,38 @@ async fn run_github_import(
             let reviews = client
                 .list_pr_reviews(&gh_owner, &gh_repo, pr.number)
                 .await?;
-            import_github_pr(
+            let review_comments = client
+                .list_pr_review_comments(&gh_owner, &gh_repo, pr.number, &reviews)
+                .await?;
+            *stats.inventory.comments.get_or_insert(0) += comments.len();
+            // An unsubmitted draft is not a review yet, here or at the source.
+            let submitted = |review: &&GitHubReview| {
+                !matches!(review.state.as_str(), "PENDING" | "REQUEST_REVIEW")
+            };
+            *stats.inventory.reviews.get_or_insert(0) += reviews.iter().filter(submitted).count();
+            let drafts = reviews
+                .iter()
+                .filter(|review| review.state == "PENDING")
+                .map(|review| review.id)
+                .collect::<HashSet<_>>();
+            *stats.inventory.review_comments.get_or_insert(0) += review_comments
+                .iter()
+                .filter(|comment| {
+                    !comment
+                        .pull_request_review_id
+                        .is_some_and(|review| drafts.contains(&review))
+                })
+                .count();
+            import_github_pr_with_review_comments(
                 db,
                 repo_id,
                 pr,
-                &comments,
-                &reviews,
+                PullRequestThread {
+                    comments: &comments,
+                    reviews: &reviews,
+                    review_comments: &review_comments,
+                    dialect,
+                },
                 task.user_id,
                 &origin,
                 &milestone_map,
@@ -1686,6 +1756,12 @@ async fn run_github_import(
     if task.import_releases {
         update_stage(db, task.id, "importing", 80, "Importing releases...").await?;
         let releases = client.list_releases(&gh_owner, &gh_repo).await?;
+        stats.inventory.releases = Some(
+            releases
+                .iter()
+                .map(|release| release.tag_name.clone())
+                .collect(),
+        );
         stats.releases_imported = import_github_releases(
             db,
             repo_id,
@@ -1769,6 +1845,7 @@ async fn run_gitlab_import(
     import_task_ops::set_repo_id(db, task.id, repo_id)
         .await
         .context("failed to link the import task to its target repository")?;
+    stats.inventory.repo_id = Some(repo_id);
 
     // Step 1: Clone repository
     if task.import_repo {
@@ -1804,6 +1881,7 @@ async fn run_gitlab_import(
     if task.import_labels {
         update_stage(db, task.id, "importing", 15, "Importing labels...").await?;
         let labels = client.list_labels(&project_path).await?;
+        stats.inventory.labels = Some(labels.iter().map(|label| label.name.clone()).collect());
         stats.labels_imported = import_gitlab_labels(db, repo_id, &labels, stats).await?;
         update_stage(
             db,
@@ -1825,6 +1903,12 @@ async fn run_gitlab_import(
     if task.import_milestones {
         update_stage(db, task.id, "importing", 25, "Importing milestones...").await?;
         let milestones = client.list_milestones(&project_path).await?;
+        stats.inventory.milestones = Some(
+            milestones
+                .iter()
+                .map(|milestone| milestone.title.clone())
+                .collect(),
+        );
         stats.milestones_imported =
             import_gitlab_milestones(db, repo_id, &milestones, &mut milestone_map, stats).await?;
         update_stage(
@@ -1841,10 +1925,12 @@ async fn run_gitlab_import(
     if task.import_issues {
         update_stage(db, task.id, "importing", 35, "Importing issues...").await?;
         let issues = client.list_issues(&project_path).await?;
+        stats.inventory.issues = Some(issues.iter().map(|issue| issue.iid).collect());
         let total = issues.len();
 
         for (i, issue) in issues.iter().enumerate() {
             let notes = client.list_issue_notes(&project_path, issue.iid).await?;
+            *stats.inventory.comments.get_or_insert(0) += notes.len();
             import_gitlab_issue(
                 db,
                 repo_id,
@@ -1876,10 +1962,12 @@ async fn run_gitlab_import(
     if task.import_pull_requests {
         update_stage(db, task.id, "importing", 60, "Importing merge requests...").await?;
         let mrs = client.list_merge_requests(&project_path).await?;
+        stats.inventory.pull_requests = Some(mrs.iter().map(|mr| mr.iid).collect());
         let total = mrs.len();
 
         for (i, mr) in mrs.iter().enumerate() {
             let notes = client.list_mr_notes(&project_path, mr.iid).await?;
+            *stats.inventory.comments.get_or_insert(0) += notes.len();
             import_gitlab_mr(
                 db,
                 repo_id,
@@ -1908,6 +1996,12 @@ async fn run_gitlab_import(
     if task.import_releases {
         update_stage(db, task.id, "importing", 80, "Importing releases...").await?;
         let releases = client.list_releases(&project_path).await?;
+        stats.inventory.releases = Some(
+            releases
+                .iter()
+                .map(|release| release.tag_name.clone())
+                .collect(),
+        );
         stats.releases_imported = import_gitlab_releases(
             db,
             repo_id,
@@ -2110,6 +2204,9 @@ enum PullHeadsFetch {
 struct ClonedRepository {
     outcome: CloneOutcome,
     pull_heads: Option<PullHeadsFetch>,
+    /// What `ls-remote` advertised right after the clone, for the receipt;
+    /// `None` when nothing was cloned.
+    source_refs: Option<std::result::Result<String, String>>,
 }
 
 /// What the clone step did with `<owner>/<name>.git`.
@@ -2419,6 +2516,26 @@ async fn clone_repo_with_pull_heads(
                 Some(budget) => budget.explain(error),
                 None => error,
             })?;
+        // What the source advertises, for the receipt to compare the clone
+        // with by name and SHA. Asked right after the clone, by the same pinned
+        // invocation; a refusal costs the comparison, never the import.
+        let source_refs = invocation
+            .run(git, &["ls-remote", "--heads", "--tags", remote.url()], None)
+            .and_then(|output| {
+                output
+                    .ensure_success()
+                    .context("git ls-remote --heads --tags")?;
+                Ok(output.stdout_str().to_string())
+            })
+            .map_err(|error| {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "the import could not list the source's refs; its receipt will not compare them"
+                );
+                "the source's branches and tags could not be listed to compare with the clone; \
+                 ask the instance operator to check the server log"
+                    .to_owned()
+            });
         let pull_heads = pull_heads.map(|source| {
             fetch_source_pull_heads(
                 git,
@@ -2429,10 +2546,10 @@ async fn clone_repo_with_pull_heads(
                 source,
             )
         });
-        Ok(Some((import_lock, staged_clone, pull_heads)))
+        Ok(Some((import_lock, staged_clone, pull_heads, source_refs)))
     })
     .await?;
-    let (_import_lock, mut staged_clone, pull_heads) = match prepared {
+    let (_import_lock, mut staged_clone, pull_heads, source_refs) = match prepared {
         Some(prepared) => prepared,
         None => {
             tracing::info!(
@@ -2442,6 +2559,7 @@ async fn clone_repo_with_pull_heads(
             return Ok(ClonedRepository {
                 outcome: CloneOutcome::Skipped,
                 pull_heads: None,
+                source_refs: None,
             });
         }
     };
@@ -2515,6 +2633,7 @@ async fn clone_repo_with_pull_heads(
     Ok(ClonedRepository {
         outcome: CloneOutcome::Cloned,
         pull_heads,
+        source_refs: Some(source_refs),
     })
 }
 
@@ -3812,6 +3931,17 @@ async fn import_github_issue(
         return Ok(());
     };
     stats.issues_imported += 1;
+    record_source_people(
+        db,
+        AssignedObject::Issue(saved.id),
+        ASSIGNEE_ROLE,
+        issue
+            .assignees
+            .iter()
+            .map(|user| OriginalAuthor::github(origin, Some(user))),
+        format!("issue #{}", issue.number),
+    )
+    .await;
 
     // Import comments
     for (comment, (created_at, updated_at)) in comments.iter().zip(comment_timestamps) {
@@ -3844,6 +3974,21 @@ async fn import_github_issue(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Everything the source says was written on one pull request: its
+/// conversation, its reviews, and the comments on lines of its diff.
+#[derive(Clone, Copy)]
+struct PullRequestThread<'a> {
+    comments: &'a [GitHubComment],
+    reviews: &'a [GitHubReview],
+    review_comments: &'a [GitHubReviewComment],
+    /// Which spelling `review_comments` place themselves in.
+    dialect: ApiDialect,
+}
+
+/// [`import_github_pr_with_review_comments`] for a pull request without
+/// comments on its diff lines.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 async fn import_github_pr(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -3855,6 +4000,38 @@ async fn import_github_pr(
     milestone_map: &HashMap<String, i64>,
     stats: &mut ImportStats,
 ) -> Result<()> {
+    import_github_pr_with_review_comments(
+        db,
+        repo_id,
+        pr,
+        PullRequestThread {
+            comments,
+            reviews,
+            review_comments: &[],
+            dialect: ApiDialect::GitHub,
+        },
+        author_id,
+        origin,
+        milestone_map,
+        stats,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn import_github_pr_with_review_comments(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    pr: &GitHubPR,
+    thread: PullRequestThread<'_>,
+    author_id: i64,
+    origin: &SourceOrigin,
+    milestone_map: &HashMap<String, i64>,
+    stats: &mut ImportStats,
+) -> Result<()> {
+    let PullRequestThread {
+        comments, reviews, ..
+    } = thread;
     let label_names: Vec<String> = pr.labels.iter().map(|l| l.name.clone()).collect();
     let labels_json = if label_names.is_empty() {
         None
@@ -4021,6 +4198,21 @@ async fn import_github_pr(
         return Ok(());
     };
     stats.prs_imported += 1;
+    for (role, people) in [
+        (ASSIGNEE_ROLE, &pr.assignees),
+        (REQUESTED_REVIEWER_ROLE, &pr.requested_reviewers),
+    ] {
+        record_source_people(
+            db,
+            AssignedObject::PullRequest(saved.id),
+            role,
+            people
+                .iter()
+                .map(|user| OriginalAuthor::github(origin, Some(user))),
+            format!("pull request #{}", pr.number),
+        )
+        .await;
+    }
 
     // The pull request's conversation. ForgeKeep has no comment table for
     // pull requests; a comment-only review is how its own UI and API record
@@ -4042,7 +4234,9 @@ async fn import_github_pr(
         .await;
     }
 
-    // Import reviews
+    // Import reviews, keeping which local review each source one became: the
+    // comments on diff lines are written under them.
+    let mut imported_reviews: HashMap<i64, i64> = HashMap::new();
     for (review, submitted_at) in reviews.iter().zip(review_timestamps) {
         let Some(submitted_at) = submitted_at else {
             continue;
@@ -4082,7 +4276,10 @@ async fn import_github_pr(
         };
 
         match pr_review_ops::create(db, rv).await {
-            Ok(_) => stats.pr_reviews_imported += 1,
+            Ok(created) => {
+                stats.pr_reviews_imported += 1;
+                imported_reviews.insert(review.id, created.id);
+            }
             Err(e) => stats
                 .pr_reviews_failed
                 .push(ImportedObjectFailure::insert_failed(
@@ -4093,7 +4290,178 @@ async fn import_github_pr(
         }
     }
 
+    import_github_review_comments(
+        db,
+        repo_id,
+        pr.number,
+        saved.id,
+        thread,
+        &imported_reviews,
+        author_id,
+        origin,
+        stats,
+    )
+    .await;
+
     Ok(())
+}
+
+/// Write the comments on lines of a pull request's diff, each under the review
+/// it was written in, placed by path, line and side on the commit the line is
+/// counted in (card_f6c67a05c6b0).
+///
+/// They are where most of a code review is: the reviews alone carry a verdict
+/// and a summary, and a pull request moved without these reads as approved
+/// without a word on the code. A comment whose review was not imported — its
+/// submission time was unreadable, its insert was refused — gets a
+/// comment-only review of its own rather than being dropped; one in an
+/// unsubmitted draft is not written, as the draft is not. A reply keeps its
+/// thread: the source lists comments oldest first, so the comment it answers
+/// is already written when it is.
+#[allow(clippy::too_many_arguments)]
+async fn import_github_review_comments(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    pr_number: i64,
+    pr_id: i64,
+    thread: PullRequestThread<'_>,
+    imported_reviews: &HashMap<i64, i64>,
+    author_id: i64,
+    origin: &SourceOrigin,
+    stats: &mut ImportStats,
+) {
+    let drafts = thread
+        .reviews
+        .iter()
+        .filter(|review| review.state == "PENDING")
+        .map(|review| review.id)
+        .collect::<HashSet<_>>();
+    let mut ordered = thread.review_comments.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|comment| comment.id);
+    let mut written: HashMap<i64, i64> = HashMap::new();
+    for comment in ordered {
+        if comment
+            .pull_request_review_id
+            .is_some_and(|review| drafts.contains(&review))
+        {
+            continue;
+        }
+        let source = format!("pull request #{pr_number} review comment {}", comment.id);
+        let refuse = |stats: &mut ImportStats, reason: &'static str| {
+            stats.comments_failed.push(ImportedObjectFailure {
+                source: source.clone(),
+                reason,
+            })
+        };
+        let parsed = parse_import_datetime(
+            "GitHub",
+            "pull request review comment",
+            comment.id,
+            "created_at",
+            &comment.created_at,
+        )
+        .and_then(|created| {
+            Ok((
+                created,
+                parse_import_datetime(
+                    "GitHub",
+                    "pull request review comment",
+                    comment.id,
+                    "updated_at",
+                    &comment.updated_at,
+                )?,
+            ))
+        });
+        let Ok((created_at, updated_at)) = parsed else {
+            refuse(stats, "the comment has no valid time it was written at");
+            continue;
+        };
+        if comment.path.is_empty() {
+            refuse(stats, "the comment names no file of the diff");
+            continue;
+        }
+        let byline = OriginalAuthor::github(origin, comment.user.as_ref());
+        let review_id = match comment
+            .pull_request_review_id
+            .and_then(|review| imported_reviews.get(&review))
+        {
+            Some(review_id) => *review_id,
+            None => {
+                let host = rg_db::entities::pr_review::ActiveModel {
+                    id: sea_orm::NotSet,
+                    pr_id: Set(pr_id),
+                    repo_id: Set(repo_id),
+                    reviewer_id: Set(author_id),
+                    action: Set("comment".to_string()),
+                    body: Set(None),
+                    commit_id: Set(None),
+                    created_at: Set(created_at),
+                    dismissed_at: Set(None),
+                    dismissed_by: Set(None),
+                    original_author: Set(byline.login.clone()),
+                    original_author_id: Set(byline.id),
+                    original_service: Set(byline.service.clone()),
+                };
+                match pr_review_ops::create(db, host).await {
+                    Ok(host) => host.id,
+                    Err(e) => {
+                        stats
+                            .comments_failed
+                            .push(ImportedObjectFailure::insert_failed(
+                                source,
+                                ImportedObject::Comment,
+                                &e,
+                            ));
+                        continue;
+                    }
+                }
+            }
+        };
+        let placement = comment.placement(thread.dialect);
+        let row = rg_db::entities::review_comment::ActiveModel {
+            id: sea_orm::NotSet,
+            review_id: Set(review_id),
+            pr_id: Set(pr_id),
+            author_id: Set(author_id),
+            path: Set(comment.path.clone()),
+            // GitHub's own, deprecated diff offset; Gitea's `position` is a
+            // line number and is already in `line`.
+            position: Set(match thread.dialect {
+                ApiDialect::GitHub => comment.position,
+                ApiDialect::Gitea => None,
+            }),
+            line: Set(placement.line),
+            start_line: Set(placement.start_line),
+            side: Set(Some(placement.side.to_string())),
+            start_side: Set(placement.start_side.map(str::to_string)),
+            body: Set(comment.body.clone().unwrap_or_default()),
+            suggestion: Set(None),
+            suggestion_applied_at: Set(None),
+            suggestion_applied_by_id: Set(None),
+            suggestion_commit_sha: Set(None),
+            commit_id: Set(placement.commit_id),
+            reply_to_id: Set(comment
+                .in_reply_to_id
+                .and_then(|answered| written.get(&answered).copied())),
+            resolved_at: Set(None),
+            resolved_by_id: Set(None),
+            created_at: Set(created_at),
+            updated_at: Set(updated_at),
+        };
+        match rg_db::ops::review_comment_ops::create(db, row).await {
+            Ok(row) => {
+                written.insert(comment.id, row.id);
+                stats.pr_review_comments_imported += 1;
+            }
+            Err(e) => stats
+                .comments_failed
+                .push(ImportedObjectFailure::insert_failed(
+                    source,
+                    ImportedObject::Comment,
+                    &e,
+                )),
+        }
+    }
 }
 
 /// Write one comment of a pull request's conversation as a comment-only review
@@ -4134,6 +4502,46 @@ async fn import_pr_conversation_comment(
                 ImportedObject::Comment,
                 &e,
             )),
+    }
+}
+
+/// The role of a person an imported issue or pull request was assigned to.
+const ASSIGNEE_ROLE: &str = "assignee";
+/// The role of a person whose review an imported pull request asked for.
+const REQUESTED_REVIEWER_ROLE: &str = "requested_reviewer";
+
+/// Record who `object` was assigned to — or whose review it asked for — on its
+/// source, as bylines (card_f6c67a05c6b0).
+///
+/// Never a local assignment: the source's `alice` is not this instance's, for
+/// the reason `author_id` stays the importer. Not fatal either, as a release's
+/// byline is not: the issue or pull request is there, and losing who was on it
+/// is worth a warning naming it, not an import reported as failed.
+async fn record_source_people(
+    db: &DatabaseConnection,
+    object: AssignedObject,
+    role: &str,
+    people: impl Iterator<Item = OriginalAuthor>,
+    what: String,
+) {
+    let people = people.collect::<Vec<_>>();
+    let named = people
+        .iter()
+        .filter_map(|person| {
+            Some(SourcePerson {
+                login: person.login.as_deref()?,
+                source_user_id: person.id,
+                service: person.service.as_deref()?,
+            })
+        })
+        .collect::<Vec<_>>();
+    if let Err(error) = imported_assignment_ops::record(db, object, role, &named).await {
+        tracing::warn!(
+            object = %what,
+            role,
+            error = %format!("{error:#}"),
+            "the import wrote this object, but not who it was assigned to on its source"
+        );
     }
 }
 
@@ -4426,6 +4834,17 @@ async fn import_gitlab_issue(
         return Ok(());
     };
     stats.issues_imported += 1;
+    record_source_people(
+        db,
+        AssignedObject::Issue(saved.id),
+        ASSIGNEE_ROLE,
+        issue
+            .assignees
+            .iter()
+            .map(|user| OriginalAuthor::gitlab(origin, Some(user))),
+        format!("issue #{}", issue.iid),
+    )
+    .await;
 
     // Import notes (skip system notes)
     for (note, (created_at, updated_at)) in notes
@@ -4599,6 +5018,21 @@ async fn import_gitlab_mr(
         return Ok(());
     };
     stats.prs_imported += 1;
+    for (role, people) in [
+        (ASSIGNEE_ROLE, &mr.assignees),
+        (REQUESTED_REVIEWER_ROLE, &mr.reviewers),
+    ] {
+        record_source_people(
+            db,
+            AssignedObject::PullRequest(saved.id),
+            role,
+            people
+                .iter()
+                .map(|user| OriginalAuthor::gitlab(origin, Some(user))),
+            format!("merge request !{}", mr.iid),
+        )
+        .await;
+    }
 
     // Import MR notes (skip system notes) into the merge request's
     // conversation — see `import_github_pr` for why not `issue_comments`.
@@ -5128,6 +5562,8 @@ mod imported_issue_label_tests {
             base: git_ref("main", "2222222222222222222222222222222222222222"),
             labels: Vec::new(),
             milestone: None,
+            assignees: Vec::new(),
+            requested_reviewers: Vec::new(),
             created_at: "2024-01-03T00:00:00Z".to_string(),
             updated_at: "2024-01-03T01:00:00Z".to_string(),
             closed_at: None,
@@ -5152,6 +5588,8 @@ mod imported_issue_label_tests {
             target_project_id: 1,
             labels: Vec::new(),
             milestone: None,
+            assignees: Vec::new(),
+            reviewers: Vec::new(),
             created_at: "2024-01-04T00:00:00Z".to_string(),
             updated_at: "2024-01-04T01:00:00Z".to_string(),
             closed_at: None,
@@ -6199,6 +6637,345 @@ mod tests {
             assert_eq!(labels.len(), 1);
             assert_eq!(labels[0].name, label.name);
         }
+    }
+
+    /// card_29def7a1e172: the receipt compares the source's listing with what
+    /// the target *holds*, read back from the tables — a label the target had
+    /// before the import counts as there, and what neither the import nor the
+    /// target has is named.
+    #[tokio::test]
+    async fn the_receipt_names_what_the_source_has_and_the_target_does_not() {
+        let db = test_db().await;
+        let bug = create_label(&db, 10, "bug").await;
+        let label_map = load_label_map(&db, 1).await.unwrap();
+        import_github_issue(
+            &db,
+            1,
+            "importer",
+            "imported",
+            &github_issue(GitHubLabel {
+                id: 10,
+                name: bug.name.clone(),
+                color: "ee0701".to_string(),
+                description: None,
+            }),
+            &[],
+            IMPORTER_ID,
+            &SourceOrigin::github_com(),
+            &HashMap::new(),
+            Some(&label_map),
+            &mut ImportStats::default(),
+        )
+        .await
+        .unwrap();
+
+        let mut stats = ImportStats {
+            // Comments are compared by count: the source listed three.
+            issue_comments_imported: 2,
+            ..ImportStats::default()
+        };
+        stats.inventory = crate::import::receipt::SourceInventory {
+            repo_id: Some(1),
+            labels: Some(vec!["bug".into(), "wontfix".into()]),
+            issues: Some(vec![41, 42]),
+            comments: Some(3),
+            ..Default::default()
+        };
+        let root = tempfile::tempdir().unwrap();
+        let receipt = crate::import::receipt::build(&db, root.path(), "github", ("o", "r"), &stats)
+            .await
+            .unwrap();
+        let row = |kind: &str| {
+            receipt
+                .objects
+                .iter()
+                .find(|row| row.kind == kind)
+                .unwrap_or_else(|| panic!("no {kind} row: {receipt:?}"))
+        };
+        assert_eq!((row("labels").source, row("labels").imported), (Some(2), 1));
+        assert_eq!(row("labels").missing, ["wontfix"]);
+        assert_eq!((row("issues").source, row("issues").imported), (Some(2), 1));
+        assert_eq!(row("issues").missing, ["#42"]);
+        assert_eq!(row("comments").not_imported, 1, "three listed, two written");
+        assert!(
+            receipt
+                .objects
+                .iter()
+                .all(|row| row.kind != "pull_requests"),
+            "a kind the import was not asked for has no row"
+        );
+        assert!(
+            receipt.refs.unavailable.is_some(),
+            "nothing was cloned, so no refs were compared: {receipt:?}"
+        );
+        assert!(receipt
+            .not_transferable
+            .iter()
+            .any(|item| item.starts_with("CI secret values")));
+    }
+
+    fn review_comment(
+        id: i64,
+        review: Option<i64>,
+        body: &str,
+    ) -> crate::import::github_client::GitHubReviewComment {
+        crate::import::github_client::GitHubReviewComment {
+            id,
+            pull_request_review_id: review,
+            user: Some(github_user(77, "reviewer")),
+            body: Some(body.to_string()),
+            path: "src/lib.rs".to_string(),
+            line: Some(12),
+            original_line: Some(12),
+            start_line: None,
+            original_start_line: None,
+            side: Some("RIGHT".to_string()),
+            start_side: None,
+            commit_id: Some("1111111111111111111111111111111111111111".to_string()),
+            original_commit_id: Some("1111111111111111111111111111111111111111".to_string()),
+            position: Some(4),
+            original_position: Some(4),
+            in_reply_to_id: None,
+            created_at: "2024-01-03T02:00:00Z".to_string(),
+            updated_at: "2024-01-03T02:00:00Z".to_string(),
+        }
+    }
+
+    /// card_f6c67a05c6b0: the comments on lines of the diff come over under
+    /// the review they were written in, on the line, side and commit the
+    /// source places them on, with replies kept in their thread. One in an
+    /// unsubmitted draft is not written; one whose review did not come over
+    /// gets a comment-only review of its own instead of being dropped.
+    #[tokio::test]
+    async fn the_comments_on_diff_lines_come_over_under_their_reviews() {
+        use rg_db::entities::{pr_review, review_comment};
+
+        let db = test_db().await;
+        let mut stats = ImportStats::default();
+        let review = |id: i64, state: &str| GitHubReview {
+            id,
+            user: Some(github_user(77, "reviewer")),
+            state: state.to_string(),
+            body: Some(format!("review {id}")),
+            submitted_at: (state != "PENDING").then(|| "2024-01-03T02:00:00Z".to_string()),
+        };
+        let reviews = [review(900, "COMMENTED"), review(901, "PENDING")];
+        let mut outdated = review_comment(11, Some(900), "this line moved since");
+        outdated.line = None;
+        outdated.original_line = Some(7);
+        outdated.side = Some("LEFT".to_string());
+        outdated.original_commit_id = Some("3333333333333333333333333333333333333333".into());
+        let mut reply = review_comment(12, Some(900), "agreed");
+        reply.in_reply_to_id = Some(10);
+        let review_comments = [
+            reply,
+            review_comment(10, Some(900), "rename this"),
+            outdated,
+            review_comment(13, Some(901), "a draft nobody submitted"),
+            review_comment(14, Some(999), "its review never came over"),
+        ];
+        import_github_pr_with_review_comments(
+            &db,
+            1,
+            &github_pr(),
+            PullRequestThread {
+                comments: &[],
+                reviews: &reviews,
+                review_comments: &review_comments,
+                dialect: ApiDialect::GitHub,
+            },
+            IMPORTER_ID,
+            &SourceOrigin::github_com(),
+            &HashMap::new(),
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.pr_review_comments_imported, 4, "{stats:?}");
+        assert!(stats.comments_failed.is_empty(), "{stats:?}");
+        let reviews = pr_review::Entity::find().all(&db).await.unwrap();
+        let rows = review_comment::Entity::find().all(&db).await.unwrap();
+        let by_body = |body: &str| {
+            rows.iter()
+                .find(|row| row.body == body)
+                .unwrap_or_else(|| panic!("no comment {body:?}: {rows:?}"))
+        };
+        let parent = by_body("rename this");
+        let submitted = reviews
+            .iter()
+            .find(|row| row.body.as_deref() == Some("review 900"))
+            .expect("the submitted review");
+        assert_eq!(parent.review_id, submitted.id);
+        assert_eq!(
+            (parent.path.as_str(), parent.line, parent.side.as_deref()),
+            ("src/lib.rs", Some(12), Some("RIGHT"))
+        );
+        assert_eq!(
+            parent.commit_id.as_deref(),
+            Some("1111111111111111111111111111111111111111")
+        );
+        assert_eq!(by_body("agreed").reply_to_id, Some(parent.id));
+
+        let moved = by_body("this line moved since");
+        assert_eq!((moved.line, moved.side.as_deref()), (Some(7), Some("LEFT")));
+        assert_eq!(
+            moved.commit_id.as_deref(),
+            Some("3333333333333333333333333333333333333333"),
+            "an outdated comment is placed on the commit it was written on"
+        );
+
+        assert!(rows
+            .iter()
+            .all(|row| row.body != "a draft nobody submitted"));
+        let orphan = by_body("its review never came over");
+        let host = reviews
+            .iter()
+            .find(|row| row.id == orphan.review_id)
+            .expect("the comment's own review");
+        assert_eq!(host.action, "comment");
+        assert_eq!(host.original_author.as_deref(), Some("reviewer"));
+    }
+
+    /// card_f6c67a05c6b0: who an issue and a pull request were on at the
+    /// source comes over as bylines, by role — never as a local assignment.
+    #[tokio::test]
+    async fn assignees_and_requested_reviewers_come_over_as_bylines() {
+        use rg_db::ops::imported_assignment_ops::{list_for, AssignedObject};
+
+        let db = test_db().await;
+        let mut stats = ImportStats::default();
+        let mut issue = github_issue(GitHubLabel {
+            id: 10,
+            name: "bug".to_string(),
+            color: "ee0701".to_string(),
+            description: None,
+        });
+        issue.labels.clear();
+        issue.assignees = vec![github_user(31, "alice"), github_user(32, "bob")];
+        import_github_issue(
+            &db,
+            1,
+            "importer",
+            "imported",
+            &issue,
+            &[],
+            IMPORTER_ID,
+            &SourceOrigin::github_com(),
+            &HashMap::new(),
+            None,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+        let mut pr = github_pr();
+        pr.assignees = vec![github_user(33, "carol")];
+        pr.requested_reviewers = vec![github_user(34, "dave")];
+        import_github_pr(
+            &db,
+            1,
+            &pr,
+            &[],
+            &[],
+            IMPORTER_ID,
+            &SourceOrigin::github_com(),
+            &HashMap::new(),
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        let saved_issue = rg_db::ops::issue_ops::find_by_repo_and_number(&db, 1, issue.number)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved_issue.assignee_id, None,
+            "no local account is assigned"
+        );
+        let people = |rows: Vec<rg_db::entities::imported_assignment::Model>| {
+            rows.into_iter()
+                .map(|row| (row.role, row.login, row.source_user_id, row.service))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            people(
+                list_for(&db, AssignedObject::Issue(saved_issue.id))
+                    .await
+                    .unwrap()
+            ),
+            [
+                ("assignee".into(), "alice".into(), Some(31), "github".into()),
+                ("assignee".into(), "bob".into(), Some(32), "github".into()),
+            ]
+        );
+        let saved_pr = rg_db::ops::pull_request_ops::find_by_repo_and_number(&db, 1, pr.number)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            people(
+                list_for(&db, AssignedObject::PullRequest(saved_pr.id))
+                    .await
+                    .unwrap()
+            ),
+            [
+                ("assignee".into(), "carol".into(), Some(33), "github".into()),
+                (
+                    "requested_reviewer".into(),
+                    "dave".into(),
+                    Some(34),
+                    "github".into()
+                ),
+            ]
+        );
+    }
+
+    /// Gitea's shape, as a live Gitea 1.22.6 answered
+    /// `/pulls/{n}/reviews/{id}/comments` for one comment on each side of a
+    /// hunk: the new-file line in `position`, the old-file one in
+    /// `original_position`, the other `0`, and an empty `original_commit_id`.
+    #[test]
+    fn a_gitea_review_comment_is_placed_by_its_position_pair() {
+        let comments: Vec<crate::import::github_client::GitHubReviewComment> =
+            serde_json::from_str(
+                r#"[
+                {"id": 11, "body": "on old line 1", "user": {"id": 1, "login": "importer"},
+                 "resolver": null, "pull_request_review_id": 2,
+                 "created_at": "2026-10-22T04:48:00Z", "updated_at": "2026-10-22T04:48:00Z",
+                 "path": "README.md", "commit_id": "ae1e6919be38b7c845fee9e00c5071637aef85df",
+                 "original_commit_id": "", "diff_hunk": "@@ -1,2 +1,3 @@\n-# moved",
+                 "position": 0, "original_position": 1},
+                {"id": 10, "body": "on new line 2", "user": {"id": 1, "login": "importer"},
+                 "resolver": null, "pull_request_review_id": 2,
+                 "created_at": "2026-10-22T04:48:00Z", "updated_at": "2026-10-22T04:48:00Z",
+                 "path": "README.md", "commit_id": "ae1e6919be38b7c845fee9e00c5071637aef85df",
+                 "original_commit_id": "", "diff_hunk": "@@ -1,2 +1,3 @@",
+                 "position": 2, "original_position": 0}
+            ]"#,
+            )
+            .expect("Gitea's review comments deserialize");
+        let commit = Some("ae1e6919be38b7c845fee9e00c5071637aef85df".to_string());
+        assert_eq!(
+            comments[0].placement(ApiDialect::Gitea),
+            crate::import::github_client::InlinePlacement {
+                line: Some(1),
+                side: "LEFT",
+                start_line: None,
+                start_side: None,
+                commit_id: commit.clone(),
+            }
+        );
+        assert_eq!(
+            comments[1].placement(ApiDialect::Gitea),
+            crate::import::github_client::InlinePlacement {
+                line: Some(2),
+                side: "RIGHT",
+                start_line: None,
+                start_side: None,
+                commit_id: commit,
+            }
+        );
     }
 
     /// Make the target refuse one insert, the way a constraint or a full disk

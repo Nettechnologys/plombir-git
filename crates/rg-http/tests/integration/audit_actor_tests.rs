@@ -1514,8 +1514,9 @@ async fn second_factor_events_are_journalled_and_the_factor_itself_is_not() {
     }
 }
 
-/// The runner token: issued, used to deregister, and revoked — with the token
-/// itself nowhere in the journal (card_2e514de7eefa).
+/// The runner token: issued and revoked — with the token itself nowhere in the
+/// journal (card_2e514de7eefa). A runner's own stop revokes nothing, so it
+/// writes no revocation entry (card_ffdc32984243).
 ///
 /// A long-lived machine credential, and one that once had no journal at all. A
 /// runner polls its repository's queue and `poll_job` decrypts that
@@ -1560,7 +1561,7 @@ async fn runner_token_events_are_journalled_and_the_token_itself_is_not() {
     };
 
     let (revoked_id, revoked_token) = issue("build-box").await;
-    let (self_removed_id, self_removed_token) = issue("scratch-box").await;
+    let (stopped_id, stopped_token) = issue("scratch-box").await;
 
     // The admin's revocation.
     let deleted = client
@@ -1571,17 +1572,15 @@ async fn runner_token_events_are_journalled_and_the_token_itself_is_not() {
         .expect("revoke the runner");
     assert_eq!(deleted.status(), 204, "{}", deleted.text().await.unwrap());
 
-    // And the runner's own orderly exit, which revokes the same credential
-    // through a different door — authenticated by the runner token itself, so
-    // no account performed it.
+    // And the runner's own orderly exit. It used to delete the runner — the
+    // same revocation through a different door — and now only takes it
+    // offline: the token outlives the stop, so there is nothing to journal.
     let left = client
-        .post(format!(
-            "{base}/api/v1/runners/{self_removed_id}/deregister"
-        ))
-        .bearer_auth(&self_removed_token)
+        .post(format!("{base}/api/v1/runners/{stopped_id}/deregister"))
+        .bearer_auth(&stopped_token)
         .send()
         .await
-        .expect("deregister the runner");
+        .expect("stop the runner");
     assert_eq!(left.status(), 200, "{}", left.text().await.unwrap());
 
     let rows = journal(&base, &token).await;
@@ -1614,7 +1613,6 @@ async fn runner_token_events_are_journalled_and_the_token_itself_is_not() {
     for (action, name) in [
         ("admin.register_runner", "build-box"),
         ("admin.delete_runner", "build-box"),
-        ("runner.deregister", "scratch-box"),
     ] {
         let details = details_of(action, name);
         assert_eq!(details["name"], name);
@@ -1627,9 +1625,7 @@ async fn runner_token_events_are_journalled_and_the_token_itself_is_not() {
         assert_eq!(details["arch"], "x86_64");
     }
 
-    // The admin's two entries name the admin; the runner's own exit names
-    // nobody, because nobody performed it — a blank actor is the honest answer
-    // there, and naming whoever registered the machine months ago would not be.
+    // The admin's entries name the admin.
     let row_of = |action: &str, resource_name: &str| -> serde_json::Value {
         rows.iter()
             .find(|row| row["action"] == action && row["resource_name"] == resource_name)
@@ -1643,10 +1639,14 @@ async fn runner_token_events_are_journalled_and_the_token_itself_is_not() {
     ] {
         assert_actor_is(&row_of(action, name), "runner-admin", actor_id);
     }
-    let self_exit = row_of("runner.deregister", "scratch-box");
     assert!(
-        self_exit["username"].is_null() && self_exit["user_id"].is_null(),
-        "the runner authenticated as itself, so no account may be named: {self_exit}"
+        !rows.iter().any(|row| row["resource_type"] == "runner"
+            && row["resource_name"] == "scratch-box"
+            && row["action"] != "admin.register_runner"),
+        "a runner's stop revokes nothing, yet the journal recorded a credential event for it: {:?}",
+        rows.iter()
+            .filter(|row| row["resource_name"] == "scratch-box")
+            .collect::<Vec<_>>()
     );
 
     // The half that makes the other half safe, asserted over the whole journal:
@@ -1654,10 +1654,7 @@ async fn runner_token_events_are_journalled_and_the_token_itself_is_not() {
     let whole = serde_json::to_string(&rows).expect("the journal serializes");
     for (what, secret) in [
         ("the revoked runner's token", revoked_token.as_str()),
-        (
-            "the self-removed runner's token",
-            self_removed_token.as_str(),
-        ),
+        ("the stopped runner's token", stopped_token.as_str()),
     ] {
         assert!(
             !whole.contains(secret),

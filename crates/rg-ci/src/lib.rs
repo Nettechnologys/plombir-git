@@ -1155,6 +1155,7 @@ impl PipelineGraph<'_> {
                 head_branch: self.head_branch,
                 previous_sha: self.previous_sha,
                 schedule: self.schedule.map(|run| (run.workflow, run.cron)),
+                run_name: self.config.run_name.as_deref(),
             },
         )
         .await?;
@@ -1385,7 +1386,10 @@ async fn create_variant_jobs(
             job_config.cache.as_ref().map(|cache| cache.key.as_str()),
             cache_paths_json.as_deref(),
             artifacts_json.as_deref(),
-            job_config.allow_failure.unwrap_or(DEFAULT_ALLOW_FAILURE),
+            fields
+                .allow_failure
+                .or(job_config.allow_failure)
+                .unwrap_or(DEFAULT_ALLOW_FAILURE),
             job_config.timeout_seconds,
             job_when(job_config),
             job_config.condition.as_deref(),
@@ -2537,6 +2541,9 @@ struct ResolvedActionJobFields {
     /// `jobs.<id>.name` as this variant shows it; `None` without one, or when
     /// it rendered empty — the job is then shown by its id, as on GitHub.
     display_name: Option<String>,
+    /// `jobs.<id>.continue-on-error` as this variant renders it, when it was an
+    /// expression; `None` leaves the job's own `allow_failure`.
+    allow_failure: Option<bool>,
 }
 
 struct ActionTemplateContext<'value, 'repo> {
@@ -2629,6 +2636,7 @@ fn resolve_action_job_fields(
             artifact_paths: None,
             cache_paths: None,
             display_name: None,
+            allow_failure: None,
         });
     };
     let context = ActionTemplateContext {
@@ -2708,6 +2716,24 @@ fn resolve_action_job_fields(
         }
     }
 
+    let allow_failure = templates
+        .allow_failure
+        .as_ref()
+        .map(|template| {
+            let rendered =
+                render_action_template(job_name, "continue-on-error", template, &context)?;
+            match rendered.trim() {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                other => Err(rg_core::error::invalid_request(format!(
+                    "job '{job_name}' continue-on-error must be true or false, and `{}` \
+                     renders to `{other}`",
+                    template.shape()
+                ))),
+            }
+        })
+        .transpose()?;
+
     Ok(ResolvedActionJobFields {
         image,
         tags,
@@ -2716,6 +2742,7 @@ fn resolve_action_job_fields(
         artifact_paths,
         cache_paths,
         display_name,
+        allow_failure,
     })
 }
 
@@ -3464,6 +3491,9 @@ fn try_read_gitea_workflows(
     // declared a `concurrency:` block. See `merge_concurrency` for why the list
     // is kept rather than folded as it goes.
     let mut declared_concurrency: Vec<(String, config::ConcurrencyConfig)> = Vec::new();
+    // `(rendered run-name, label)` of every triggered workflow, in file order.
+    // See below for why a pipeline of several workflows is named by all of them.
+    let mut run_titles: Vec<(Option<String>, String)> = Vec::new();
 
     // A tick is for one `- cron:` entry of one file, and nothing else runs for
     // it — not the other workflows that also declare `schedule`, not a second
@@ -3563,6 +3593,15 @@ fn try_read_gitea_workflows(
 
         let mut wf_config = workflow.to_ci_config(&ctx);
 
+        let label = workflow
+            .name
+            .clone()
+            .unwrap_or_else(|| workflow_prefix(&name).to_string());
+        let run_name = workflow.render_run_name(&ctx).map_err(|reason| {
+            rg_core::error::invalid_request(format!("unsupported workflow {dir}/{name}: {reason}"))
+        })?;
+        run_titles.push((run_name, label));
+
         // `concurrency.group` is expanded here rather than at trigger time: it
         // is built from `${{ github.* }}`, and only this loop still holds the
         // workflow that `github.workflow` names.
@@ -3617,11 +3656,28 @@ fn try_read_gitea_workflows(
         return Ok(GiteaWorkflows::NoneTriggered { dir });
     }
 
+    // GitHub shows each workflow's run under its own `run-name:`; here every
+    // workflow one event triggers is one pipeline, so its name is theirs in file
+    // order — `Deploy staging · CI` — with a workflow that has no `run-name:`
+    // standing under its `name:`. A pipeline none of them names keeps no name,
+    // and is shown as before.
+    let run_name = run_titles
+        .iter()
+        .any(|(run_name, _)| run_name.is_some())
+        .then(|| {
+            run_titles
+                .into_iter()
+                .map(|(run_name, label)| run_name.unwrap_or(label))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        });
+
     Ok(GiteaWorkflows::Config(CiConfig {
         stages: Some(all_stages),
         concurrency: merge_concurrency(dir, declared_concurrency)?,
         jobs: all_jobs,
         actions_workflow: true,
+        run_name,
     }))
 }
 
@@ -5542,6 +5598,7 @@ mod matrix_tests {
                 head_branch: None,
                 previous_sha: None,
                 schedule: None,
+                run_name: None,
             },
         )
         .await
@@ -5699,6 +5756,7 @@ mod matrix_tests {
                 head_branch: None,
                 previous_sha: None,
                 schedule: None,
+                run_name: None,
             },
         )
         .await
@@ -5932,6 +5990,7 @@ mod matrix_tests {
                         head_branch: None,
                         previous_sha: None,
                         schedule: None,
+                        run_name: None,
                     },
                 )
                 .await
@@ -8236,6 +8295,7 @@ mod matrix_tests {
                 concurrency: None,
                 jobs: HashMap::from([("deploy".into(), job)]),
                 actions_workflow: false,
+                run_name: None,
             }
         };
 
@@ -8304,6 +8364,7 @@ mod matrix_tests {
             concurrency: None,
             jobs: HashMap::new(),
             actions_workflow: false,
+            run_name: None,
         };
         assert!(
             validate_execution_semantics(&jobless).is_err(),
@@ -8320,6 +8381,7 @@ mod matrix_tests {
             concurrency: None,
             jobs: HashMap::from([("deploy".into(), job.clone())]),
             actions_workflow: false,
+            run_name: None,
         };
         validate_execution_semantics(&config).unwrap();
         job.when = Some("delayed".into());
@@ -8328,6 +8390,7 @@ mod matrix_tests {
             concurrency: None,
             jobs: HashMap::from([("deploy".into(), job.clone())]),
             actions_workflow: false,
+            run_name: None,
         };
         assert!(validate_execution_semantics(&invalid_when).is_err());
         job.when = None;
@@ -8337,6 +8400,7 @@ mod matrix_tests {
             concurrency: None,
             jobs: HashMap::from([("deploy".into(), job)]),
             actions_workflow: false,
+            run_name: None,
         };
         assert!(validate_execution_semantics(&config).is_err());
     }
@@ -8356,6 +8420,7 @@ mod matrix_tests {
                 concurrency: None,
                 jobs: HashMap::from([("deploy".into(), job)]),
                 actions_workflow,
+                run_name: None,
             }
         };
 
@@ -8415,6 +8480,7 @@ mod matrix_tests {
             concurrency: None,
             jobs: HashMap::from([("deploy".into(), job)]),
             actions_workflow: true,
+            run_name: None,
         };
 
         validate_runner_routing(&translated, false, &rg_core::ci::default_runner_labels())
@@ -8431,6 +8497,7 @@ mod matrix_tests {
             concurrency: None,
             jobs: HashMap::from([("deploy".into(), elsewhere)]),
             actions_workflow: true,
+            run_name: None,
         };
         validate_runner_routing(&translated, false, &rg_core::ci::default_runner_labels()).expect(
             "an unhonourable `runs-on:` is the runner's refusal to give, not the trigger's",
@@ -8445,6 +8512,7 @@ mod matrix_tests {
             concurrency: None,
             jobs: HashMap::from([("deploy".into(), job)]),
             actions_workflow: false,
+            run_name: None,
         }
     }
 
@@ -8721,9 +8789,11 @@ mod matrix_tests {
     fn unknown_gitea_wrapper_keys_are_reported_with_their_file_and_supported_fields() {
         for (key, workflow, supported) in [
             (
-                "run-name",
-                "on: push\nrun-name: deploy\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
-                &["name", "on", "jobs", "concurrency", "env", "defaults", "permissions"] as &[&str],
+                // `run-name` itself is a key now (card_9f345eccf1e3); a typo of
+                // it is still refused, naming the spelling that would work.
+                "runname",
+                "on: push\nrunname: deploy\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
+                &["name", "run-name", "on", "jobs", "concurrency", "env", "defaults", "permissions"] as &[&str],
             ),
             (
                 "cancel-inprogress",
@@ -13052,6 +13122,142 @@ jobs:
         );
     }
 
+    /// The name the pipeline `workflows` publish for `event` is shown under.
+    async fn run_name_of(
+        workflows: &[(&str, &str)],
+        event: TestEvent<'_>,
+    ) -> Result<Option<String>> {
+        let (db, pipeline_id, _, _temp) = publish_workflows_for(workflows, &[], event).await?;
+        Ok(rg_db::ops::pipeline_ops::get_pipeline(&db, pipeline_id)
+            .await
+            .unwrap()
+            .expect("the published pipeline")
+            .run_name)
+    }
+
+    const DEPLOY: &str = "name: Deploy\nRUN_NAMEon:\n  push:\n  workflow_dispatch:\n    inputs:\n      target:\n        type: string\n        default: dev\njobs:\n  d:\n    steps:\n      - run: echo\n";
+
+    fn deploy_named(run_name: &str) -> String {
+        DEPLOY.replace("RUN_NAME", &format!("run-name: {run_name}\n"))
+    }
+
+    /// card_9f345eccf1e3: `run-name:` is accepted instead of failing the whole
+    /// file as an unknown key, rendered once for the run, and stored on the
+    /// pipeline. An input the run was not given reads as `''`, as on GitHub.
+    #[tokio::test]
+    async fn a_run_name_names_the_pipeline_rendered_for_the_run() {
+        let staging = [("target", "staging")];
+        let dispatch = TestEvent::on("workflow_dispatch", Some(&staging));
+        let defaulted = TestEvent::on("workflow_dispatch", Some(&[]));
+        let push = TestEvent::on("push", None);
+        for (run_name, event, expected) in [
+            (
+                "Deploy ${{ inputs.target }}",
+                dispatch,
+                Some("Deploy staging"),
+            ),
+            (
+                "Deploy ${{ github.event.inputs.target }} from ${{ github.ref_name }}",
+                dispatch,
+                Some("Deploy staging from main"),
+            ),
+            ("Deploy ${{ inputs.target }}", defaulted, Some("Deploy dev")),
+            ("Deploy ${{ inputs.target }}", push, Some("Deploy")),
+            (
+                "${{ github.event_name }} of ${{ github.repository }}",
+                push,
+                Some("push of step-owner/steps"),
+            ),
+            ("Nightly", push, Some("Nightly")),
+            ("${{ inputs.target }}", push, None),
+        ] {
+            let shown = run_name_of(&[("deploy.yml", &deploy_named(run_name))], event)
+                .await
+                .unwrap_or_else(|error| panic!("{run_name}: {error:#}"));
+            assert_eq!(shown.as_deref(), expected, "{run_name} on {event:?}");
+        }
+        assert_eq!(
+            run_name_of(&[("deploy.yml", &DEPLOY.replace("RUN_NAME", ""))], push)
+                .await
+                .unwrap(),
+            None,
+            "a workflow without run-name keeps the pipeline unnamed"
+        );
+    }
+
+    /// What a run's name cannot read is refused by key and expression when the
+    /// file is read: `matrix.*` belongs to a job, `github.actor` and
+    /// `secrets.*` have no value here, an undeclared input is a typo.
+    #[tokio::test]
+    async fn a_run_name_refuses_an_expression_it_has_no_value_for() {
+        for (run_name, expected) in [
+            ("Build ${{ matrix.os }}", "run-name expression `matrix.os`"),
+            (
+                "By ${{ github.actor }}",
+                "run-name expression `github.actor`",
+            ),
+            (
+                "With ${{ secrets.TOKEN }}",
+                "run-name expression `secrets.TOKEN`",
+            ),
+            (
+                "For ${{ inputs.tagret }}",
+                "run-name reads inputs.tagret, which the workflow does not declare",
+            ),
+            (
+                "For ${{ github.event.inputs.tagret }}",
+                "run-name reads github.event.inputs.tagret, which the workflow does not declare",
+            ),
+        ] {
+            let error = run_name_of(
+                &[("deploy.yml", &deploy_named(run_name))],
+                TestEvent::on("push", None),
+            )
+            .await
+            .expect_err("the run name must be refused");
+            let message = format!("{error:#}");
+            assert!(message.contains(expected), "{run_name}: {message}");
+            assert!(
+                error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "the workflow's mistake, not the server's: {message}"
+            );
+        }
+    }
+
+    /// One event's workflows are one pipeline here, so its name is each
+    /// workflow's run name in file order, a workflow without one standing
+    /// under its `name:`. A called workflow's `run-name:` names no run, and is
+    /// ignored as on GitHub.
+    #[tokio::test]
+    async fn a_pipeline_of_several_workflows_is_named_by_each() {
+        let push = TestEvent::on("push", None);
+        let ci = "name: CI\non: push\njobs:\n  t:\n    steps:\n      - run: echo\n";
+        assert_eq!(
+            run_name_of(
+                &[
+                    ("a-deploy.yml", &deploy_named("Ship ${{ github.ref_name }}")),
+                    ("b-ci.yml", ci)
+                ],
+                push,
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("Ship main · CI")
+        );
+
+        let called = "run-name: Called ${{ inputs.target }}\non:\n  workflow_call:\n    inputs:\n      target:\n        type: string\njobs:\n  c:\n    steps:\n      - run: echo\n";
+        let caller = "on: push\njobs:\n  shared:\n    uses: ./.gitea/workflows/called.yml\n    with:\n      target: prod\n";
+        assert_eq!(
+            run_name_of(&[("build.yml", caller), ("called.yml", called)], push)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
     /// card_71a3e7424faa: the pre-2022 spelling of a dispatch input, in a
     /// step's `run:` and `env:` and a job's `env:`, and in a job a reusable
     /// workflow brings, whose own `inputs.target` is a different value —
@@ -13808,6 +14014,98 @@ jobs:
             [status(&jobs, "a"), status(&jobs, "b"), status(&jobs, "c")],
             ["failed", "success", "success"]
         );
+    }
+
+    /// card_1aab0da14713: a job's `continue-on-error` reads the matrix
+    /// variant, as in GitHub's own example. Only the experimental leg may
+    /// fail: it does not fail the pipeline, and it does not cancel its
+    /// neighbours under `fail-fast`, which is on.
+    #[tokio::test]
+    async fn an_experimental_variant_may_fail_without_failing_its_matrix() {
+        let (db, pipeline_id, _temp) = run_pipeline(
+            "on: push\njobs:\n  test:\n    continue-on-error: ${{ matrix.experimental }}\n    strategy:\n      matrix:\n        leg: [nightly, stable, beta]\n        include:\n          - leg: nightly\n            experimental: true\n          - leg: stable\n            experimental: false\n          - leg: beta\n            experimental: false\n    steps:\n      - run: test \"${{ matrix.experimental }}\" = false\n",
+        )
+        .await;
+        let jobs = rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&db, pipeline_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|job| (job.name.clone(), (job.allow_failure, job.status)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        // The built-in runner runs the legs in matrix order, so the nightly
+        // leg fails first: were it not allowed to, fail-fast would cancel the
+        // other two.
+        let expected = [
+            (
+                "build/test [leg=beta, experimental=false]",
+                (false, "success"),
+            ),
+            (
+                "build/test [leg=stable, experimental=false]",
+                (false, "success"),
+            ),
+            (
+                "build/test [leg=nightly, experimental=true]",
+                (true, "failed"),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, (allowed, status))| (name.to_owned(), (allowed, status.to_owned())))
+        .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(jobs, expected);
+        let pipeline = rg_db::ops::pipeline_ops::get_pipeline(&db, pipeline_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pipeline.status, "success",
+            "the experimental leg was allowed to fail"
+        );
+    }
+
+    /// What a job's `continue-on-error` cannot read is refused by job and
+    /// expression when the file is read; a variant whose value is no boolean
+    /// is refused by job name when the pipeline is written.
+    #[tokio::test]
+    async fn a_jobs_continue_on_error_must_render_to_a_boolean() {
+        for (value, matrix, expected) in [
+            (
+                "${{ secrets.X }}",
+                "",
+                "test: continue-on-error expression `secrets.X`",
+            ),
+            (
+                "${{ steps.a.outputs.b }}",
+                "",
+                "test: continue-on-error expression `steps.a.outputs.b`",
+            ),
+            (
+                "sometimes",
+                "",
+                "test: continue-on-error must be true, false or an expression, got `sometimes`",
+            ),
+            (
+                "${{ matrix.level }}",
+                "    strategy:\n      matrix:\n        level: [maybe]\n",
+                "job 'build/test' continue-on-error must be true or false, and \
+                 `${{ matrix.level }}` renders to `maybe`",
+            ),
+        ] {
+            let workflow = format!(
+                "on: push\njobs:\n  test:\n    continue-on-error: {value}\n{matrix}    steps:\n      - run: echo\n"
+            );
+            let error = job_rows_of(&[("build.yml", &workflow)])
+                .await
+                .expect_err("the value must be refused");
+            let message = format!("{error:#}");
+            assert!(message.contains(expected), "{value}: {message}");
+            assert!(
+                error
+                    .downcast_ref::<rg_core::error::InvalidRequest>()
+                    .is_some(),
+                "the workflow's mistake, not the server's: {message}"
+            );
+        }
     }
 
     /// `matrix.<key>` reads the variant's coordinate even when the key is no

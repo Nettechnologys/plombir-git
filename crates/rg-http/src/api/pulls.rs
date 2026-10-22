@@ -44,6 +44,14 @@ pub struct PullRequestResponse {
     /// When the author is a bot, the person it acts for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author_bot_owner: Option<String>,
+    /// Who the pull request was assigned to on the platform it was imported
+    /// from, and whose review it was still asking for there — bylines, not
+    /// local accounts (card_f6c67a05c6b0). Answered on the pull request
+    /// itself, left out of listings.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub original_assignees: Vec<super::issues::ImportedPerson>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub original_reviewers: Vec<super::issues::ImportedPerson>,
     /// The pull request's page in the web app, when `external_url` is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub html_url: Option<String>,
@@ -66,6 +74,8 @@ async fn prs_with_authors(
             pr,
             author,
             author_bot_owner,
+            original_assignees: Vec::new(),
+            original_reviewers: Vec::new(),
         });
     }
     Ok(responses)
@@ -226,16 +236,32 @@ pub async fn get_pr(
     RepoRead { .. }: RepoRead,
 ) -> impl IntoResponse {
     match rg_core::pull_request::get_pr(&state.db, &owner, &repo, number).await {
-        Ok(pr) => match pr_with_author(
-            &state.db,
-            &crate::html_url::Links::new(&state, &owner, &repo),
-            pr,
-        )
-        .await
-        {
-            Ok(pr) => (StatusCode::OK, Json(pr)).into_response(),
-            Err(error) => error.into_response(),
-        },
+        Ok(pr) => {
+            let pr_id = pr.id;
+            let mut pr = match pr_with_author(
+                &state.db,
+                &crate::html_url::Links::new(&state, &owner, &repo),
+                pr,
+            )
+            .await
+            {
+                Ok(pr) => pr,
+                Err(error) => return error.into_response(),
+            };
+            match super::issues::imported_people(
+                &state.db,
+                rg_db::ops::imported_assignment_ops::AssignedObject::PullRequest(pr_id),
+            )
+            .await
+            {
+                Ok((assignees, reviewers)) => {
+                    pr.original_assignees = assignees;
+                    pr.original_reviewers = reviewers;
+                }
+                Err(error) => return error.into_response(),
+            }
+            (StatusCode::OK, Json(pr)).into_response()
+        }
         // `AppError::from`, not `not_found`: only a `rg_core::error::NotFound`
         // means the PR is absent. A failed lookup stays a 5xx and keeps its
         // detail in the operator log instead of in the response body.

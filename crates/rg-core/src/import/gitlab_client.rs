@@ -86,6 +86,10 @@ pub struct GitLabMR {
     pub target_project_id: i64,
     pub labels: Vec<String>,
     pub milestone: Option<GitLabMilestone>,
+    #[serde(default)]
+    pub assignees: Vec<GitLabUser>,
+    #[serde(default)]
+    pub reviewers: Vec<GitLabUser>,
     pub created_at: String,
     pub updated_at: String,
     pub closed_at: Option<String>,

@@ -33,6 +33,19 @@ pub async fn find_by_repo_and_tag(
         .context("db: find release by repo and tag")
 }
 
+/// The tag every release of a repository is published under — what an import
+/// receipt compares with the releases its source listed.
+pub async fn tag_names_in_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<String>> {
+    ReleaseEntity::find()
+        .select_only()
+        .column(release::Column::TagName)
+        .filter(release::Column::RepoId.eq(repo_id))
+        .into_tuple()
+        .all(db)
+        .await
+        .context("db: list release tags of a repository")
+}
+
 /// List releases for a repo with pagination.
 pub async fn list_by_repo(
     db: &DatabaseConnection,

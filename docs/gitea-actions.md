@@ -149,6 +149,7 @@ jobs:
 | Key | Type | Meaning |
 |-----|------|---------|
 | `name` | string | Workflow label. Defaults to the file name. |
+| `run-name` | string | What a run is shown under in the pipeline list. See [Run name](#run-name). |
 | `on` | string, list or mapping | The events that trigger it. **Required.** |
 | `jobs` | mapping | The jobs, keyed by id. **Required.** |
 | `concurrency` | block | Pipeline-level serialization. See [Concurrency](#concurrency). |
@@ -156,8 +157,42 @@ jobs:
 | `defaults` | block | `run:` defaults every job inherits. See [Defaults](#defaults). |
 | `permissions` | `read-all`, `write-all` or map scope→level | What every job's `CI_JOB_TOKEN` may do. See [Permissions](#permissions). |
 
-Anything else at the root — `run-name` and the rest of the Actions vocabulary —
-is an unknown key and fails the file.
+Anything else at the root is an unknown key and fails the file.
+
+### Run name
+
+`run-name:` names the run in the pipeline list and in the pipeline's API
+(`run_name`) instead of its commit, as GitHub shows it in the list of runs:
+
+```yaml
+name: Deploy
+run-name: Deploy ${{ inputs.target }} from ${{ github.ref_name }}
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        type: choice
+        options: [staging, production]
+jobs:
+  deploy:
+    steps:
+      - run: ./deploy.sh ${{ inputs.target }}
+```
+
+It is rendered once, when the run starts, and may read `github.ref`,
+`github.ref_name`, `github.sha`, `github.event_name`, `github.repository`,
+`github.repository_owner`, `inputs.*` and `github.event.inputs.*`. An input the
+run was not given — the workflow ran on `push`, not by hand — is `''`, as on
+GitHub; a name that renders empty leaves the run unnamed. Anything else is
+refused by key and expression when the file is read: `matrix.*` (a run has no
+matrix variant, only its jobs do), `github.actor`, `secrets.*`, and an input
+neither `workflow_dispatch` nor `workflow_call` declares.
+
+Every workflow one event triggers runs as one pipeline here, so the pipeline is
+named by each of them in file order — `Deploy staging · CI` — a workflow without
+`run-name:` standing under its `name:` (or file name). A pipeline none of them
+names keeps no name. The `run-name:` of a reusable workflow is ignored, as on
+GitHub: a called workflow is part of its caller's run.
 
 ## `on:` — triggers
 
@@ -506,7 +541,7 @@ quietly win.
 | `strategy` | block | `matrix`, `fail-fast` and `max-parallel`. See [Matrix](#matrix). |
 | `environment` | string or `{ name: … }` | A deployment environment **the repository already has**; a protected one holds the job for approval, and only jobs that declare it read its [secrets](ci.md#secrets-and-workload-identity). |
 | `timeout-minutes` | integer | Per-job timeout. Converted to seconds, and the result must land in `1`–`86400` — so `1`–`1440` minutes. |
-| `continue-on-error` | bool | A failure of this job does not fail the pipeline. |
+| `continue-on-error` | bool or expression | A failure of this job does not fail the pipeline. An expression is rendered for each matrix variant and must come out `true` or `false`. See [`fail-fast` and `max-parallel`](#fail-fast-and-max-parallel). |
 | `outputs` | map string→string | What the job leaves for the jobs that need it, read from its steps after the last one. See [Outputs](#outputs). |
 | `permissions` | `read-all`, `write-all` or map scope→level | What this job's `CI_JOB_TOKEN` may do, instead of the workflow's. See [Permissions](#permissions). |
 | `uses` / `with` / `secrets` | — | Reusable workflow invocation. See [Reusable workflows](#reusable-workflows). |
@@ -833,7 +868,7 @@ jobs:
 
 | Key | Why it is refused |
 |-----|-------------------|
-| step `continue-on-error` from an expression | It needs a value the workflow does not have when it is read. Write `true` or `false`. |
+| step `continue-on-error` from an expression | It needs a value the workflow does not have when it is read. Write `true` or `false`. A *job's* `continue-on-error` may be an expression: it is rendered per matrix variant. |
 | step `shell`, `continue-on-error`, `timeout-minutes`, `working-directory` without `run` | They would apply to nothing. |
 | `container.options` | Raw `docker run` flags would let a committed workflow undo the sandbox the runner builds around the job — the dropped capabilities, `no-new-privileges`, the pid/memory/cpu limits. There is no honest partial support. A job that needs more memory or CPUs gets them from the operator: `[ci]` `job_memory` / `job_cpus` / `job_pids` for the built-in runner, `--job-memory` / `--job-cpus` / `--job-pids` on an external runner the job selects with `runs-on:`. |
 
@@ -1494,6 +1529,33 @@ job fails with the reason in its log, and the pipeline fails with it.
   variant fails, the variants of the same job that have not finished are
   canceled, with a line in their log saying which one failed. A variant that
   fails under the job's `continue-on-error: true` does not trigger it.
+
+The job's `continue-on-error` may read the variant, as in GitHub's own example:
+an experimental leg that is allowed to fail without failing the pipeline or
+canceling its neighbours.
+
+```yaml
+name: CI
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      matrix:
+        toolchain: [stable]
+        experimental: [false]
+        include:
+          - toolchain: nightly
+            experimental: true
+    steps:
+      - run: cargo +${{ matrix.toolchain }} test
+```
+
+It may read `matrix.*`, `inputs.*`, `github.event.inputs.*` and the `github.*`
+values job fields read; anything else (`secrets.*`, `steps.*`) is refused by job
+and expression when the file is read, and a variant whose value is not `true`
+or `false` is refused by job name when the pipeline is written.
 - `max-parallel` — at most that many variants of the job are handed to
   runners at once; the next one waits until one of them finishes. The built-in
   runner runs the jobs of a stage one after another anyway.

@@ -1315,3 +1315,52 @@ async fn the_job_page_shows_a_jobs_name_beside_its_id() {
         "{detail}"
     );
 }
+
+/// card_9f345eccf1e3: a run's `run-name:` reaches the API on the pipeline
+/// itself — in the list and in the detail — so the pipeline list can show it;
+/// a pipeline whose workflows named nothing answers `null`.
+#[tokio::test]
+async fn the_pipeline_api_shows_a_runs_name() {
+    use sea_orm::ConnectionTrait;
+
+    let (base, db) = spawn_test_app_with_db().await;
+    let seeded = seed(&base, &db, "run-named").await;
+    let client = reqwest::Client::new();
+    let get = |path: String| {
+        let client = client.clone();
+        let token = seeded.owner_token.clone();
+        async move {
+            client
+                .get(path)
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let repo = format!("{base}/api/v1/repos/{owner}/{owner}", owner = seeded.owner);
+    let detail_url = format!("{repo}/pipelines/{}", seeded.pipeline_id);
+
+    let unnamed = get(detail_url.clone()).await;
+    assert!(unnamed["pipeline"]["run_name"].is_null(), "{unnamed}");
+
+    db.execute_unprepared(&format!(
+        "UPDATE pipelines SET run_name = 'Deploy staging' WHERE id = {}",
+        seeded.pipeline_id
+    ))
+    .await
+    .unwrap();
+    let detail = get(detail_url).await;
+    assert_eq!(detail["pipeline"]["run_name"], "Deploy staging", "{detail}");
+    let list = get(format!("{repo}/pipelines")).await;
+    let listed = list["data"]
+        .as_array()
+        .expect("the pipeline list")
+        .iter()
+        .find(|pipeline| pipeline["id"] == seeded.pipeline_id)
+        .unwrap_or_else(|| panic!("the pipeline is listed: {list}"));
+    assert_eq!(listed["run_name"], "Deploy staging", "{list}");
+}

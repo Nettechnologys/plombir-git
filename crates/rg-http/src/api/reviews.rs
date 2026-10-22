@@ -828,9 +828,24 @@ fn build_review_timeline(data: TimelineData) -> Vec<ReviewTimelineEvent> {
         queue_entry,
         users,
     } = data;
+    // An imported comment on a diff line is written by whoever wrote the
+    // review it sits under, so it carries that review's byline.
+    let review_bylines = reviews
+        .iter()
+        .filter_map(|review| {
+            Some((
+                review.id,
+                (
+                    review.original_author.clone()?,
+                    review.original_service.clone()?,
+                ),
+            ))
+        })
+        .collect();
     let mut builder = TimelineBuilder {
         persisted_events,
         users,
+        review_bylines,
         timeline: Vec::new(),
     };
     builder.push_opened(&pr);
@@ -846,6 +861,8 @@ fn build_review_timeline(data: TimelineData) -> Vec<ReviewTimelineEvent> {
 struct TimelineBuilder {
     persisted_events: Vec<(pr_event::Model, serde_json::Value)>,
     users: HashMap<i64, (String, Option<String>)>,
+    /// Source login and platform of each imported review, by review id.
+    review_bylines: HashMap<i64, (String, String)>,
     timeline: Vec<ReviewTimelineEvent>,
 }
 
@@ -922,11 +939,18 @@ impl TimelineBuilder {
             };
             if !self.has_resource_event(comment_kind, "comment_id", comment.id) {
                 let actor = self.actor(comment.author_id);
+                let original_author =
+                    self.review_bylines
+                        .get(&comment.review_id)
+                        .map(|(login, service)| OriginalAuthor {
+                            login: login.clone(),
+                            service: service.clone(),
+                        });
                 self.timeline.push(ReviewTimelineEvent {
                     id: format!("comment:{}", comment.id),
                     kind: comment_kind.to_string(),
                     actor,
-                    original_author: None,
+                    original_author,
                     created_at: comment.created_at,
                     body: Some(comment.body.clone()),
                     metadata: serde_json::json!({
