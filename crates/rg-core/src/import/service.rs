@@ -87,8 +87,8 @@ use crate::import::github_client::{
     GitHubRelease, GitHubReview, GitHubReviewComment,
 };
 use crate::import::gitlab_client::{
-    GitLabClient, GitLabDiscussion, GitLabIssue, GitLabLabel, GitLabMR, GitLabMilestone,
-    GitLabNote, GitLabRelease,
+    GitLabApproval, GitLabClient, GitLabDiscussion, GitLabIssue, GitLabLabel, GitLabMR,
+    GitLabMilestone, GitLabNote, GitLabRelease,
 };
 use crate::platform::fs::{path_error, REPO_ROOT_HINT};
 
@@ -2383,11 +2383,17 @@ async fn run_gitlab_import(
         for (i, mr) in mrs.iter().enumerate() {
             let discussions = client.list_mr_discussions(&project_path, mr.iid).await?;
             count_gitlab_mr_threads(&mut stats.inventory, &discussions);
+            let approvals = client
+                .get_mr_approvals(&project_path, mr.iid)
+                .await?
+                .approved_by;
+            *stats.inventory.reviews.get_or_insert(0) += approvals.len();
             import_gitlab_mr(
                 db,
                 repo_id,
                 mr,
                 &discussions,
+                &approvals,
                 task.user_id,
                 &origin,
                 &milestone_map,
@@ -4762,7 +4768,9 @@ async fn import_github_pr_with_review_comments(
 /// comment-only review of its own rather than being dropped; one in an
 /// unsubmitted draft is not written, as the draft is not. A reply keeps its
 /// thread: the source lists comments oldest first, so the comment it answers
-/// is already written when it is.
+/// is already written when it is. Gitea names no comment a reply answers; it
+/// shows the comments on one line of one side as one conversation, so that is
+/// how its replies are threaded here (card_9b59c352384c).
 #[allow(clippy::too_many_arguments)]
 async fn import_github_review_comments(
     db: &DatabaseConnection,
@@ -4784,6 +4792,8 @@ async fn import_github_review_comments(
     let mut ordered = thread.review_comments.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|comment| comment.id);
     let mut written: HashMap<i64, i64> = HashMap::new();
+    // Gitea's conversations: the first comment written on a line of a side.
+    let mut conversations: HashMap<(String, i64, &'static str), i64> = HashMap::new();
     for comment in ordered {
         if comment
             .pull_request_review_id
@@ -4852,6 +4862,17 @@ async fn import_github_review_comments(
             }
         };
         let placement = comment.placement(thread.dialect);
+        let conversation = placement
+            .line
+            .map(|line| (comment.path.clone(), line, placement.side));
+        let reply_to_id = match thread.dialect {
+            ApiDialect::GitHub => comment
+                .in_reply_to_id
+                .and_then(|answered| written.get(&answered).copied()),
+            ApiDialect::Gitea => conversation
+                .as_ref()
+                .and_then(|key| conversations.get(key).copied()),
+        };
         let row = rg_db::entities::review_comment::ActiveModel {
             id: sea_orm::NotSet,
             review_id: Set(review_id),
@@ -4874,9 +4895,7 @@ async fn import_github_review_comments(
             suggestion_applied_by_id: Set(None),
             suggestion_commit_sha: Set(None),
             commit_id: Set(placement.commit_id),
-            reply_to_id: Set(comment
-                .in_reply_to_id
-                .and_then(|answered| written.get(&answered).copied())),
+            reply_to_id: Set(reply_to_id),
             resolved_at: Set(None),
             resolved_by_id: Set(None),
             created_at: Set(created_at),
@@ -4885,6 +4904,9 @@ async fn import_github_review_comments(
         match rg_db::ops::review_comment_ops::create(db, row).await {
             Ok(row) => {
                 written.insert(comment.id, row.id);
+                if let Some(key) = conversation {
+                    conversations.entry(key).or_insert(row.id);
+                }
                 stats.pr_review_comments_imported += 1;
             }
             Err(e) => stats
@@ -5484,6 +5506,7 @@ async fn import_gitlab_mr(
     repo_id: i64,
     mr: &GitLabMR,
     discussions: &[GitLabDiscussion],
+    approvals: &[GitLabApproval],
     author_id: i64,
     origin: &SourceOrigin,
     milestone_map: &HashMap<String, i64>,
@@ -5567,6 +5590,17 @@ async fn import_gitlab_mr(
         })
         .collect::<Result<Vec<_>>>()?;
     notes.sort_by_key(|(_, note, created_at, _)| (*created_at, note.id));
+    // An approval without a time is placed at the merge request's last
+    // update: the latest it can have been given.
+    let approval_times = approvals
+        .iter()
+        .map(|approval| match approval.approved_at.as_deref() {
+            Some(at) => {
+                parse_import_datetime("GitLab", "merge request approval", mr.id, "approved_at", at)
+            }
+            None => Ok(updated_at),
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let byline = OriginalAuthor::gitlab(origin, mr.author.as_ref());
     let model = rg_db::entities::pull_request::ActiveModel {
@@ -5637,6 +5671,41 @@ async fn import_gitlab_mr(
             format!("merge request !{}", mr.iid),
         )
         .await;
+    }
+
+    // Who approved, as approvals under their bylines (card_9e786df82fd9). Like
+    // every imported verdict they are history: `current_approvers` skips a
+    // review with an `original_service`, so none of them authorizes a merge.
+    for (approval, approved_at) in approvals.iter().zip(approval_times) {
+        let byline = OriginalAuthor::gitlab(origin, Some(&approval.user));
+        let row = rg_db::entities::pr_review::ActiveModel {
+            id: sea_orm::NotSet,
+            pr_id: Set(saved.id),
+            repo_id: Set(repo_id),
+            reviewer_id: Set(author_id),
+            action: Set("approve".to_string()),
+            body: Set(None),
+            commit_id: Set(None),
+            created_at: Set(approved_at),
+            dismissed_at: Set(None),
+            dismissed_by: Set(None),
+            original_author: Set(byline.login.clone()),
+            original_author_id: Set(byline.id),
+            original_service: Set(byline.service.clone()),
+        };
+        match pr_review_ops::create(db, row).await {
+            Ok(_) => stats.pr_reviews_imported += 1,
+            Err(e) => stats
+                .pr_reviews_failed
+                .push(ImportedObjectFailure::insert_failed(
+                    format!(
+                        "merge request !{} approval by {}",
+                        mr.iid, approval.user.username
+                    ),
+                    ImportedObject::Review,
+                    &e,
+                )),
+        }
     }
 
     // A thread on the diff comes over as comments on its lines, each under a
@@ -6880,6 +6949,7 @@ mod imported_issue_label_tests {
             1,
             &mr,
             &[],
+            &[],
             IMPORTER_ID,
             &SourceOrigin::gitlab_com(),
             &HashMap::new(),
@@ -7131,6 +7201,7 @@ mod imported_issue_label_tests {
             &db,
             1,
             &mr,
+            &[],
             &[],
             IMPORTER_ID,
             &SourceOrigin::gitlab_com(),
@@ -7716,6 +7787,7 @@ mod tests {
             1,
             &gitlab_mr(),
             &discussions,
+            &[],
             IMPORTER_ID,
             &SourceOrigin::gitlab_com(),
             &HashMap::new(),
@@ -7839,6 +7911,182 @@ mod tests {
                 comments.not_imported
             ),
             (Some(2), 1, 1, 0)
+        );
+    }
+
+    /// card_9b59c352384c: Gitea names no comment a reply answers. It shows the
+    /// comments on one line of one side as one conversation, and so do we:
+    /// each later comment there answers the first. Another line, the other
+    /// side of the same line, or another file is a conversation of its own.
+    #[tokio::test]
+    async fn gitea_comments_on_one_line_come_over_as_one_thread() {
+        use rg_db::entities::review_comment;
+
+        let db = test_db().await;
+        let mut stats = ImportStats::default();
+        let reviews = [GitHubReview {
+            id: 900,
+            user: Some(github_user(77, "reviewer")),
+            state: "COMMENT".to_string(),
+            body: Some("review 900".to_string()),
+            submitted_at: Some("2024-01-03T02:00:00Z".to_string()),
+        }];
+        // Gitea's spelling: `position` is the new side's line, `original_position`
+        // the old side's, the other of the pair `0`.
+        let at = |id: i64, body: &str, path: &str, new_line: i64, old_line: i64| {
+            let mut comment = review_comment(id, Some(900), body);
+            comment.path = path.to_string();
+            comment.position = Some(new_line);
+            comment.original_position = Some(old_line);
+            comment.line = None;
+            comment.side = None;
+            comment
+        };
+        let review_comments = [
+            at(21, "answer", "src/lib.rs", 4, 0),
+            at(20, "question", "src/lib.rs", 4, 0),
+            at(22, "old side", "src/lib.rs", 0, 4),
+            at(23, "other line", "src/lib.rs", 9, 0),
+            at(24, "other file", "src/main.rs", 4, 0),
+            at(25, "on the old side too", "src/lib.rs", 0, 4),
+        ];
+        import_github_pr_with_review_comments(
+            &db,
+            1,
+            &github_pr(),
+            PullRequestThread {
+                comments: &[],
+                reviews: &reviews,
+                review_comments: &review_comments,
+                dialect: ApiDialect::Gitea,
+            },
+            IMPORTER_ID,
+            &SourceOrigin::github_com(),
+            &HashMap::new(),
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.pr_review_comments_imported, 6, "{stats:?}");
+        let rows = review_comment::Entity::find().all(&db).await.unwrap();
+        let id_of = |body: &str| {
+            rows.iter()
+                .find(|row| row.body == body)
+                .unwrap_or_else(|| panic!("no comment {body:?}: {rows:?}"))
+        };
+        let threads = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.body.as_str(),
+                    row.reply_to_id
+                        .map(|parent| rows.iter().find(|r| r.id == parent).unwrap().body.as_str()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            threads,
+            [
+                ("answer", Some("question")),
+                ("question", None),
+                ("old side", None),
+                ("other line", None),
+                ("other file", None),
+                ("on the old side too", Some("old side")),
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(id_of("old side").side.as_deref(), Some("LEFT"));
+    }
+
+    /// card_9e786df82fd9: who approved a GitLab merge request comes over as
+    /// approvals under their bylines, at the time each was given — or at the
+    /// merge request's last update when the source does not say. Like every
+    /// imported verdict, none of them is a current approval here.
+    #[tokio::test]
+    async fn gitlab_approvals_come_over_as_approvals_under_their_bylines() {
+        use crate::import::gitlab_client::GitLabApproval;
+        use rg_db::entities::pr_review;
+
+        let db = test_db().await;
+        let mut stats = ImportStats::default();
+        let approvals = [
+            GitLabApproval {
+                user: gitlab_user(51, "alice"),
+                approved_at: Some("2024-01-04T10:00:00Z".to_string()),
+            },
+            GitLabApproval {
+                user: gitlab_user(52, "bob"),
+                approved_at: None,
+            },
+        ];
+        let mr = gitlab_mr();
+        import_gitlab_mr(
+            &db,
+            1,
+            &mr,
+            &[],
+            &approvals,
+            IMPORTER_ID,
+            &SourceOrigin::gitlab_com(),
+            &HashMap::new(),
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.pr_reviews_imported, 2, "{stats:?}");
+        assert!(stats.pr_reviews_failed.is_empty(), "{stats:?}");
+        let mut reviews = pr_review::Entity::find().all(&db).await.unwrap();
+        reviews.sort_by_key(|review| review.id);
+        let mr_updated =
+            parse_import_datetime("GitLab", "mr", 0, "updated_at", &mr.updated_at).unwrap();
+        assert_eq!(
+            reviews
+                .iter()
+                .map(|review| (
+                    review.action.as_str(),
+                    review.original_author.as_deref(),
+                    review.original_author_id,
+                    review.original_service.as_deref(),
+                    review.created_at,
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "approve",
+                    Some("alice"),
+                    Some(51),
+                    Some("gitlab"),
+                    parse_import_datetime("GitLab", "t", 0, "t", "2024-01-04T10:00:00Z").unwrap(),
+                ),
+                ("approve", Some("bob"), Some(52), Some("gitlab"), mr_updated),
+            ]
+        );
+        assert!(
+            rg_db::ops::pr_review_ops::current_approvers(&db, reviews[0].pr_id, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an approval given on GitLab authorizes nothing here"
+        );
+
+        stats.inventory.repo_id = Some(1);
+        stats.inventory.reviews = Some(approvals.len());
+        let root = tempfile::tempdir().unwrap();
+        let receipt = crate::import::receipt::build(&db, root.path(), "gitlab", ("o", "r"), &stats)
+            .await
+            .unwrap();
+        let row = receipt
+            .objects
+            .iter()
+            .find(|row| row.kind == "reviews")
+            .unwrap_or_else(|| panic!("no reviews row: {receipt:?}"));
+        assert_eq!(
+            (row.source, row.imported, row.not_imported),
+            (Some(2), 2, 0)
         );
     }
 
@@ -8338,6 +8586,7 @@ mod tests {
             1,
             &gitlab_mr(),
             &gitlab_threads([gitlab_note(911), system, refused]),
+            &[],
             IMPORTER_ID,
             &SourceOrigin::gitlab_com(),
             &HashMap::new(),

@@ -141,6 +141,20 @@ Three rules apply to the files inside:
 
 Within a directory the templates are listed in file-name order.
 
+GitHub's older single-file template — one `ISSUE_TEMPLATE.md` outside any
+template directory — is not read. An import names it in its receipt; move it
+into one of the directories above.
+
+<!-- inventory: legacy-issue-templates-not-read -->
+```text
+ISSUE_TEMPLATE.md
+issue_template.md
+docs/ISSUE_TEMPLATE.md
+docs/issue_template.md
+.github/ISSUE_TEMPLATE.md
+.github/issue_template.md
+```
+
 ## The chooser configuration
 
 `config.yml` sits beside the templates and controls the chooser page itself:

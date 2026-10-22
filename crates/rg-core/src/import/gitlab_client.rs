@@ -224,6 +224,23 @@ pub struct GitLabRangeLine {
     pub new_line: Option<i64>,
 }
 
+/// Who approved a merge request (`/merge_requests/:iid/approvals`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GitLabApprovals {
+    #[serde(default)]
+    pub approved_by: Vec<GitLabApproval>,
+}
+
+/// One approval of a merge request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitLabApproval {
+    pub user: GitLabUser,
+    /// When it was given. The field is documented for current GitLab; an
+    /// answer without it is read as an approval of unknown time.
+    #[serde(default)]
+    pub approved_at: Option<String>,
+}
+
 /// A thread of a merge request: its notes, oldest first. A plain note is a
 /// thread of one; a comment on the diff and its replies are one thread.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -441,6 +458,24 @@ impl GitLabClient {
             ),
         )
         .await
+    }
+
+    /// Who approved a merge request (card_9e786df82fd9). One object, not a
+    /// paginated list.
+    pub async fn get_mr_approvals(&self, project_id: &str, mr_iid: i64) -> Result<GitLabApprovals> {
+        let url = format!(
+            "{}/projects/{}/merge_requests/{}/approvals",
+            self.base_url,
+            urlencoding(project_id),
+            mr_iid
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("get merge request approvals")?;
+        Self::handle_response(resp).await
     }
 
     /// List releases for a project.
@@ -718,6 +753,45 @@ mod pagination_tests {
             "{}",
             line(1)
         );
+    }
+
+    /// card_9e786df82fd9: who approved a merge request is asked of
+    /// `/approvals`, in the shape GitLab documents for it — a user without an
+    /// `email`, and the time of each approval beside it.
+    #[tokio::test]
+    async fn merge_request_approvals_are_read_with_their_times() {
+        const APPROVALS: &str = r#"{"id":5,"iid":5,"project_id":1,"approved":true,
+            "approved_by":[
+              {"user":{"id":1,"username":"root","public_email":"","name":"Administrator",
+                "state":"active","locked":false,"avatar_url":null,"web_url":"http://localhost:3000/root"},
+               "approved_at":"2016-06-09T01:45:21.720Z"},
+              {"user":{"id":2,"username":"ryley","name":"Ryley","state":"active"}}]}"#;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let server = tokio::spawn(serve(listener, vec![respond(b"", APPROVALS)]));
+
+        let client =
+            GitLabClient::new_for_trusted_test("token".to_owned(), format!("http://{addr}"))
+                .expect("build client");
+        let approvals = client
+            .get_mr_approvals("group/widgets", 4)
+            .await
+            .unwrap()
+            .approved_by;
+        assert_eq!(
+            approvals
+                .iter()
+                .map(|approval| (
+                    approval.user.username.as_str(),
+                    approval.approved_at.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            [("root", Some("2016-06-09T01:45:21.720Z")), ("ryley", None)]
+        );
+
+        let requests = server.await.expect("server");
+        let line = requests[0].lines().next().unwrap_or_default();
+        assert!(line.contains("/merge_requests/4/approvals"), "{line}");
     }
 
     /// Two threads in the shape GitLab 17 answers `/discussions` with: a

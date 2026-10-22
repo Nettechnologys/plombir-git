@@ -14,9 +14,9 @@
 //! rather than a surprise a month later. So is CI the imported default branch
 //! defines in a form this server does not run (`.gitlab-ci.yml`), which is the
 //! loss a moved project otherwise discovers only when no pipeline ever starts.
-//! And so are issue and pull-request templates written as YAML forms, which
-//! this server does not offer — the new-issue page otherwise just stops
-//! suggesting them.
+//! And so are issue and pull-request templates written as YAML forms, and
+//! GitHub's single-file issue template, which this server does not offer — the
+//! new-issue page otherwise just stops suggesting them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -97,6 +97,10 @@ pub struct TemplateNotRead {
 const ISSUE_FORM_NOT_READ: &str =
     "Issue forms (YAML) are not offered here: write the template as Markdown with front matter \
      in the same directory";
+
+const LEGACY_ISSUE_TEMPLATE_NOT_READ: &str =
+    "A single-file issue template is not read here: move it into `.github/ISSUE_TEMPLATE/` \
+     (or `.gitea/`, `.forgejo/`) as a Markdown template";
 
 const PULL_REQUEST_FORM_NOT_READ: &str =
     "A pull-request template in YAML is not read here: a new pull request starts from \
@@ -440,12 +444,23 @@ fn templates_not_read(repository: &Path) -> anyhow::Result<Vec<TemplateNotRead>>
             reason: ISSUE_FORM_NOT_READ,
         }));
     }
-    for path in crate::issue_template::PULL_REQUEST_FORM_TEMPLATES {
-        if lookup(path)?.is_some_and(|entry| entry.mode().is_blob()) {
-            not_read.push(TemplateNotRead {
-                path: (*path).to_owned(),
-                reason: PULL_REQUEST_FORM_NOT_READ,
-            });
+    for (paths, reason) in [
+        (
+            crate::issue_template::LEGACY_ISSUE_TEMPLATES,
+            LEGACY_ISSUE_TEMPLATE_NOT_READ,
+        ),
+        (
+            crate::issue_template::PULL_REQUEST_FORM_TEMPLATES,
+            PULL_REQUEST_FORM_NOT_READ,
+        ),
+    ] {
+        for path in paths {
+            if lookup(path)?.is_some_and(|entry| entry.mode().is_blob()) {
+                not_read.push(TemplateNotRead {
+                    path: (*path).to_owned(),
+                    reason,
+                });
+            }
         }
     }
     Ok(not_read)
@@ -780,8 +795,9 @@ mod tests {
     }
 
     /// card_04b603522857: issue forms and a YAML pull-request template are
-    /// named by path; the Markdown templates beside them, and the chooser
-    /// configuration, are not.
+    /// named by path, and so is GitHub's single-file issue template
+    /// (card_0ccf64d88692); the Markdown templates in template directories,
+    /// and the chooser configuration, are not.
     #[test]
     fn templates_in_a_form_this_server_does_not_read_are_named() {
         let repo = repository_with(Some(&[
@@ -794,6 +810,7 @@ mod tests {
             (".forgejo/issue_template/feature.yaml", "name: Feature\n"),
             (".forgejo/PULL_REQUEST_TEMPLATE.yaml", "name: PR\n"),
             (".gitea/PULL_REQUEST_TEMPLATE.md", "## PR\n"),
+            (".github/ISSUE_TEMPLATE.md", "## Old style\n"),
         ]));
         let named = templates_not_read(repo.path()).unwrap();
         assert_eq!(
@@ -804,6 +821,7 @@ mod tests {
             [
                 (".forgejo/issue_template/feature.yaml", ISSUE_FORM_NOT_READ),
                 (".github/ISSUE_TEMPLATE/bug.yml", ISSUE_FORM_NOT_READ),
+                (".github/ISSUE_TEMPLATE.md", LEGACY_ISSUE_TEMPLATE_NOT_READ),
                 (
                     ".forgejo/PULL_REQUEST_TEMPLATE.yaml",
                     PULL_REQUEST_FORM_NOT_READ

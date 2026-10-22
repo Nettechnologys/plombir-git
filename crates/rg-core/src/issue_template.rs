@@ -131,6 +131,19 @@ pub(crate) const PULL_REQUEST_FORM_TEMPLATES: &[&str] = &[
     "docs/pull_request_template.yml",
 ];
 
+/// GitHub's single-file issue template from before the template directory:
+/// one `ISSUE_TEMPLATE.md` in the root, `docs/` or `.github/`. Not read here —
+/// a template is a file inside one of [`ISSUE_TEMPLATE_DIRS`] — so an import
+/// names the one it brings (card_0ccf64d88692).
+pub(crate) const LEGACY_ISSUE_TEMPLATES: &[&str] = &[
+    "ISSUE_TEMPLATE.md",
+    "issue_template.md",
+    "docs/ISSUE_TEMPLATE.md",
+    "docs/issue_template.md",
+    ".github/ISSUE_TEMPLATE.md",
+    ".github/issue_template.md",
+];
+
 /// Whether a file directly in one of [`ISSUE_TEMPLATE_DIRS`] is an issue form
 /// — GitHub's and Gitea's YAML template format, which is not read here. The
 /// chooser configuration shares the directory and the extension, and is not
@@ -656,8 +669,9 @@ mod tests {
     use super::{
         discover_issue_templates, is_issue_form_name, parse_markdown_template, read_issue_config,
         read_pull_request_template, split_front_matter, validate_config, IssueConfig,
-        ISSUE_CONFIGS, ISSUE_TEMPLATE_DIRS, MAX_TEMPLATE_FILE_COUNT, MAX_TEMPLATE_SIZE,
-        MAX_TEMPLATE_TOTAL_BYTES, PULL_REQUEST_FORM_TEMPLATES, PULL_REQUEST_TEMPLATES,
+        ISSUE_CONFIGS, ISSUE_TEMPLATE_DIRS, LEGACY_ISSUE_TEMPLATES, MAX_TEMPLATE_FILE_COUNT,
+        MAX_TEMPLATE_SIZE, MAX_TEMPLATE_TOTAL_BYTES, PULL_REQUEST_FORM_TEMPLATES,
+        PULL_REQUEST_TEMPLATES,
     };
     use std::collections::BTreeSet;
 
@@ -1351,6 +1365,11 @@ struct IssueContactLink {
                 "path the pull-request template is read from",
             ),
             (
+                "<!-- inventory: legacy-issue-templates-not-read -->",
+                LEGACY_ISSUE_TEMPLATES,
+                "path a single-file issue template is named at",
+            ),
+            (
                 "<!-- inventory: pull-request-forms-not-read -->",
                 PULL_REQUEST_FORM_TEMPLATES,
                 "path a YAML pull-request form is named at",
@@ -2037,6 +2056,13 @@ struct IssueContactLink {
                 "{path} is read now; drop it from PULL_REQUEST_FORM_TEMPLATES"
             );
             assert!(path.ends_with(".yaml") || path.ends_with(".yml"), "{path}");
+        }
+        for path in LEGACY_ISSUE_TEMPLATES {
+            let directory = path.rsplit_once('/').map_or("", |(directory, _)| directory);
+            assert!(
+                !ISSUE_TEMPLATE_DIRS.contains(&directory),
+                "{path} sits in a template directory and is read as a template there"
+            );
         }
         assert!(is_issue_form_name("bug.yml"));
         assert!(is_issue_form_name("Feature.YAML"));
