@@ -26061,7 +26061,7 @@
         {
           "tag": "button",
           "label": "i18n:imports.refresh",
-          "line": 219,
+          "line": 220,
           "via": null,
           "href": null,
           "handler": "refreshImports",
@@ -26086,7 +26086,7 @@
         {
           "tag": "form",
           "label": "GitHub GitLab Gitea / Forgejo Git",
-          "line": 231,
+          "line": 232,
           "via": null,
           "href": null,
           "handler": "startImport",
@@ -26125,17 +26125,7 @@
         {
           "tag": "select",
           "label": "GitHub GitLab Gitea / Forgejo Git",
-          "line": 234,
-          "via": null,
-          "href": null,
-          "handler": null,
-          "calls": [],
-          "unresolved": false
-        },
-        {
-          "tag": "input",
-          "label": "",
-          "line": 264,
+          "line": 235,
           "via": null,
           "href": null,
           "handler": null,
@@ -26203,9 +26193,19 @@
           "unresolved": false
         },
         {
+          "tag": "input",
+          "label": "",
+          "line": 271,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
           "tag": "button",
           "label": "i18n:imports.starting",
-          "line": 274,
+          "line": 275,
           "via": null,
           "href": null,
           "handler": null,
@@ -26215,7 +26215,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 309,
+          "line": 310,
           "via": null,
           "href": "task.source_url",
           "handler": null,
@@ -26225,7 +26225,7 @@
         {
           "tag": "a",
           "label": "/",
-          "line": 318,
+          "line": 322,
           "via": null,
           "href": "taskHref(task)",
           "handler": null,
@@ -26235,7 +26235,7 @@
         {
           "tag": "button",
           "label": "i18n:imports.deleting",
-          "line": 328,
+          "line": 332,
           "via": null,
           "href": null,
           "handler": "() => deleteImport(task.id)",

@@ -330,6 +330,25 @@ async fn an_import_brings_its_lfs_objects_and_names_the_one_the_source_lacks() {
             .is_some_and(|items| !items.is_empty()),
         "{receipt}"
     );
+
+    // card_a8666ed4f317: the import page is drawn from the listing, so the
+    // listing carries the same receipt the single read does.
+    let listed: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/api/v1/imports"))
+        .bearer_auth(&importer_token)
+        .send()
+        .await
+        .expect("list imports")
+        .json()
+        .await
+        .expect("listing JSON");
+    let listed_task = listed
+        .as_array()
+        .expect("a listing is an array")
+        .iter()
+        .find(|row| row["id"] == task["id"])
+        .unwrap_or_else(|| panic!("the import is not listed: {listed}"));
+    assert_eq!(listed_task["receipt"], *receipt, "{listed_task}");
     assert!(
         failed[0]["reason"]
             .as_str()

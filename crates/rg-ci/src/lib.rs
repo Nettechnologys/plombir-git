@@ -1,7 +1,7 @@
 //! Plombir Git CI/CD Engine.
 //!
 //! Parses `.plombir-git-ci.yml` or `.gitea/workflows/*.yml` (Gitea Actions format;
-//! `.github/workflows/*.yml` when a commit has no `.gitea/workflows`) from the
+//! `.forgejo/workflows/*.yml` in front of it, `.github/workflows/*.yml` behind) from the
 //! repository and executes pipelines.
 //!
 //! ## Native format (`.plombir-git-ci.yml`)
@@ -2905,8 +2905,8 @@ struct WorkflowInvocation<'a> {
 /// Read CI configuration from the repo at the given commit.
 ///
 /// Tries formats in order:
-/// 1. `.gitea/workflows/*.yml`, or `.github/workflows/*.yml` when the commit
-///    has no `.gitea/workflows` (Actions format, see [`WORKFLOW_DIRS`])
+/// 1. `*.yml` of the first of `.forgejo/workflows`, `.gitea/workflows` and
+///    `.github/workflows` the commit has (Actions format, see [`WORKFLOW_DIRS`])
 /// 2. `.plombir-git-ci.yml` (native format)
 ///
 /// For Gitea Actions workflows, multiple files are merged into a single `CiConfig`.
@@ -2984,8 +2984,10 @@ fn read_ci_config_with_inputs(
             .map(|run| match untriggered_dir {
                 Some(dir) => format!("{dir}/{} with `- cron: '{}'`", run.workflow, run.cron),
                 None => format!(
-                    "{} with `- cron: '{}'` (it has neither {} nor {})",
-                    run.workflow, run.cron, WORKFLOW_DIRS[0], WORKFLOW_DIRS[1]
+                    "{} with `- cron: '{}'` (it has none of {})",
+                    run.workflow,
+                    run.cron,
+                    WORKFLOW_DIRS.join(", ")
                 ),
             })
             .unwrap_or_else(|| "no workflow file at all".to_string());
@@ -3037,8 +3039,9 @@ fn read_ci_config_with_inputs(
                     ),
                 )),
                 None => rg_core::error::invalid_request(format!(
-                    "no CI config found ({}/*.yml, {}/*.yml or .plombir-git-ci.yml) at commit {}",
-                    WORKFLOW_DIRS[0], WORKFLOW_DIRS[1], commit_sha
+                    "no CI config found ({}/*.yml or .plombir-git-ci.yml) at commit {}",
+                    WORKFLOW_DIRS.join("/*.yml, "),
+                    commit_sha
                 )),
             }
         })?;
@@ -3223,7 +3226,7 @@ fn tree_at_commit<'repo>(
 
 /// Directories holding Actions workflow files; see the shared definition for
 /// the order and why it is shared.
-const WORKFLOW_DIRS: [&str; 2] = rg_core::ci::WORKFLOW_DIRS;
+const WORKFLOW_DIRS: [&str; 3] = rg_core::ci::WORKFLOW_DIRS;
 
 /// The workflow files committed at one commit, and the directory they came from.
 #[derive(Debug)]
@@ -3721,12 +3724,12 @@ fn merge_concurrency(
 /// Read every `*.yml` / `*.yaml` blob under the first of [`WORKFLOW_DIRS`]
 /// that `commit_sha` has.
 ///
-/// `None` means neither directory is in this commit at all — the one outcome
-/// that legitimately falls back to the native config. A first directory that
-/// is there is the one read even when it holds no workflow, the way Gitea
-/// reads it: the second is a fallback for a repository that has not written
-/// anything for this forge, not a place a file is looked for when the first
-/// lacks it. Everything else that goes
+/// `None` means none of the directories is in this commit at all — the one
+/// outcome that legitimately falls back to the native config. A first directory
+/// that is there is the one read even when it holds no workflow, the way Gitea
+/// and Forgejo read it: a later one is a fallback for a repository that has not
+/// written anything for this forge, not a place a file is looked for when an
+/// earlier one lacks it. Everything else that goes
 /// wrong is an `Err` naming the file: a workflow that exists but cannot be read
 /// must never be mistaken for "no CI config here".
 ///
@@ -6646,6 +6649,49 @@ mod matrix_tests {
             (
                 ".gitea/workflows/forge.yml",
                 b"on: push\njobs:\n  here:\n    steps:\n      - run: echo gitea\n" as &[u8],
+            ),
+            (
+                ".github/workflows/hosted.yml",
+                b"on: push\njobs:\n  there:\n    steps:\n      - run: echo github\n",
+            ),
+        ]);
+
+        let config =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .unwrap();
+
+        assert_eq!(job_names(&config), vec!["forge/here".to_string()]);
+    }
+
+    /// A repository brought over from Forgejo keeps its workflows where
+    /// Forgejo's documentation puts them, and they run as they are — without
+    /// renaming the directory first (card_ee0b5e755a56).
+    #[test]
+    fn a_commit_with_only_forgejo_workflows_runs_them() {
+        let (temp, sha) = commit_repo(&[(
+            ".forgejo/workflows/ci.yml",
+            b"on: push\njobs:\n  test:\n    steps:\n      - run: echo forgejo\n" as &[u8],
+        )]);
+
+        let config =
+            read_ci_config_for_test(temp.path(), &sha, "refs/heads/main", "push", None, None)
+                .expect("`.forgejo/workflows` is read like the other workflow directories");
+
+        assert_eq!(job_names(&config), vec!["ci/test".to_string()]);
+    }
+
+    /// Forgejo's order puts its own directory first: a repository that has it
+    /// beside `.gitea/workflows` runs what it wrote for Forgejo, and only that.
+    #[test]
+    fn forgejo_workflows_win_over_gitea_and_github_workflows() {
+        let (temp, sha) = commit_repo(&[
+            (
+                ".forgejo/workflows/forge.yml",
+                b"on: push\njobs:\n  here:\n    steps:\n      - run: echo forgejo\n" as &[u8],
+            ),
+            (
+                ".gitea/workflows/gitea.yml",
+                b"on: push\njobs:\n  gitea:\n    steps:\n      - run: echo gitea\n",
             ),
             (
                 ".github/workflows/hosted.yml",

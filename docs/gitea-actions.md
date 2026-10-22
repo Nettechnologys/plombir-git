@@ -1,7 +1,7 @@
 # Gitea Actions workflows — the supported subset
 
 Plombir Git reads `.gitea/workflows/*.yml` in the Gitea/GitHub Actions format —
-or `.github/workflows/*.yml`, when the commit has no `.gitea/workflows` — and
+or `.forgejo/workflows/*.yml` and `.github/workflows/*.yml`, in the order below — and
 implements a **subset** of it. This page is that subset's boundary.
 
 Reaching for GitHub's own documentation instead will mislead you, which is why
@@ -22,13 +22,14 @@ The one thing you must not read into that: a refusal means *no pipeline*, so a
 workflow that has never run is worth checking against this page before assuming
 the event did not fire.
 
-**Which directory.** `.gitea/workflows/` is read when the commit has it, and
-`.github/workflows/` only when it does not — the order Gitea uses. The two are
-never merged: a repository brought over from GitHub runs its workflows as they
-are, and one that has both runs only `.gitea/workflows/`, so a workflow kept for
-GitHub's own runners does not start here as well. The first directory counts by
-being there, even when nothing in it is triggered by the event. Below, "the
-workflow directory" is whichever of the two the commit is read from.
+**Which directory.** The first of `.forgejo/workflows/`, `.gitea/workflows/` and
+`.github/workflows/` the commit has is read — the order Forgejo uses, and
+Gitea's with Forgejo's own directory in front. They are never merged: a
+repository brought over from Forgejo or GitHub runs its workflows as they are,
+and one that has several runs only the first, so a workflow kept for GitHub's
+own runners does not start here as well. The first directory counts by being
+there, even when nothing in it is triggered by the event. Below, "the workflow
+directory" is whichever one the commit is read from.
 
 **Which format wins.** The workflow directory is tried first. The native
 [`.plombir-git-ci.yml`](ci.md) is used when this directory is absent at the commit
@@ -1677,7 +1678,8 @@ jobs:
 The rules:
 
 - `uses:` must be `./<workflow directory>/<file>` — `./.gitea/workflows/<file>`,
-  or `./.github/workflows/<file>` in a repository read from `.github/workflows`.
+  or `./.forgejo/workflows/<file>` / `./.github/workflows/<file>` in a repository
+  read from that directory.
   A repository-local path with no subdirectory and no `..`; a call into the
   other directory is refused by name, since that directory is not read. A remote
   `owner/repo/.gitea/workflows/x.yml@ref` is refused; there is no fetcher for it.

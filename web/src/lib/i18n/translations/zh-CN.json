@@ -2071,7 +2071,43 @@
       "progress": "进度",
       "updated": "更新时间"
     },
-    "deleting": "正在删除..."
+    "deleting": "正在删除...",
+    "receipt": {
+      "title": "导入回执",
+      "complete": "没有缺失",
+      "incomplete": "有内容未能迁移",
+      "ci_not_run": "不会在此运行的 CI",
+      "ci_unavailable": "无法读取导入分支的 CI",
+      "object": "对象",
+      "source": "来源",
+      "here": "此处",
+      "not_imported": "未导入",
+      "and_more": "以及另外 {count} 个",
+      "skipped": "{count} 个按设计跳过",
+      "refs_unavailable": "无法比较分支和标签",
+      "branches": "分支",
+      "tags": "标签",
+      "refs_count": "{imported} / {source} 与来源处于同一提交",
+      "refs_missing": "缺失",
+      "refs_different": "位于其他提交",
+      "default_branch": "默认分支",
+      "same_commit": "与来源为同一提交（{sha}）",
+      "other_commit": "来源为 {source}，此处为 {imported}",
+      "commits": "{count} 个提交",
+      "not_transferable": "需要手动设置 —— 任何导入都无法迁移这些",
+      "kind": {
+        "labels": "标签",
+        "milestones": "里程碑",
+        "issues": "议题",
+        "pull_requests": "合并请求",
+        "comments": "评论",
+        "reviews": "评审",
+        "review_comments": "评审评论",
+        "releases": "发布",
+        "lfs_objects": "LFS 对象",
+        "wiki_pages": "Wiki 页面"
+      }
+    }
   },
   "help": {
     "title": "帮助",

@@ -8,6 +8,22 @@ This project records user-facing changes here. The format follows
 
 ### Added
 
+- CI of a repository brought over from Forgejo runs as it is: workflows in
+  `.forgejo/workflows` are read, first of the three directories in Forgejo's
+  order (`.forgejo/workflows`, `.gitea/workflows`, `.github/workflows`), never
+  merged with the others.
+
+- `.gitea/CODEOWNERS` and `.forgejo/CODEOWNERS` are read in Gitea's dialect:
+  regular expressions anchored at both ends, every matching rule adding its
+  owners, `!` as negation. A pattern that does not compile here — Gitea's
+  lookaround, or a glob such as `*.rs` — is logged by its line instead of
+  silently requesting nobody.
+
+- The **Imports** page shows each finished import's receipt: what the source
+  had beside what came over, by name where something is missing, the CI that
+  will not run here (`.gitlab-ci.yml`), and the checklist of what no import
+  brings. `GET /api/v1/imports` carries the `receipt` block too.
+
 - Importing from Gitea or Forgejo brings what importing from GitHub does —
   labels, milestones, issues with their comments, pull requests with their
   reviews and head commits, releases and the wiki — instead of the repository

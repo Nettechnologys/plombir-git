@@ -1127,10 +1127,10 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:imports.refresh | :219 | `GET /api/v1/imports` | `User` | rust+web |
-| GitHub GitLab Gitea / Forgejo Git | :231 | `POST /api/v1/imports` | `User` | rust+web |
-| GitHub GitLab Gitea / Forgejo Git | :231 | `GET /api/v1/imports` | `User` | rust+web |
-| i18n:imports.deleting | :328 | `DELETE /api/v1/imports/{id}` | `User` | rust+web |
+| i18n:imports.refresh | :220 | `GET /api/v1/imports` | `User` | rust+web |
+| GitHub GitLab Gitea / Forgejo Git | :232 | `POST /api/v1/imports` | `User` | rust+web |
+| GitHub GitLab Gitea / Forgejo Git | :232 | `GET /api/v1/imports` | `User` | rust+web |
+| i18n:imports.deleting | :332 | `DELETE /api/v1/imports/{id}` | `User` | rust+web |
 
 ### `/login`
 

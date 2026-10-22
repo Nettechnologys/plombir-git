@@ -208,22 +208,28 @@ pub async fn get_import_status(
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     match import_task_of_user(&state, user_id, id).await {
-        Ok(task) => {
-            let mut body = serde_json::json!(task);
-            // The receipt is stored inside `stats` with the rest of the
-            // import's outcome; it is answered as a block of its own because
-            // it is the one part a person reads to know nothing was lost
-            // (card_29def7a1e172). `null` until the import has finished.
-            body["receipt"] = task
-                .stats
-                .as_deref()
-                .and_then(|stats| serde_json::from_str::<serde_json::Value>(stats).ok())
-                .and_then(|mut stats| stats.get_mut("receipt").map(serde_json::Value::take))
-                .unwrap_or(serde_json::Value::Null);
-            (StatusCode::OK, Json(body)).into_response()
-        }
+        Ok(task) => (StatusCode::OK, Json(import_task_body(&task))).into_response(),
         Err(e) => e.into_response(),
     }
+}
+
+/// One import task as both the single read and the listing answer it.
+///
+/// The receipt is stored inside `stats` with the rest of the import's outcome;
+/// it is answered as a block of its own because it is the one part a person
+/// reads to know nothing was lost (card_29def7a1e172). `null` until the import
+/// has finished. The listing carries it too: the import page is drawn from the
+/// listing, and a receipt only the single read answered was one no person in
+/// the browser ever saw (card_a8666ed4f317).
+fn import_task_body(task: &rg_db::entities::import_task::Model) -> serde_json::Value {
+    let mut body = serde_json::json!(task);
+    body["receipt"] = task
+        .stats
+        .as_deref()
+        .and_then(|stats| serde_json::from_str::<serde_json::Value>(stats).ok())
+        .and_then(|mut stats| stats.get_mut("receipt").map(serde_json::Value::take))
+        .unwrap_or(serde_json::Value::Null);
+    body
 }
 
 /// GET /api/v1/imports
@@ -243,7 +249,13 @@ pub async fn list_imports(
     AuthUser(user_id): AuthUser,
 ) -> impl IntoResponse {
     match rg_db::ops::import_task_ops::find_by_user(&state.db, user_id, 20).await {
-        Ok(tasks) => (StatusCode::OK, Json(serde_json::json!(tasks))).into_response(),
+        Ok(tasks) => (
+            StatusCode::OK,
+            Json(serde_json::Value::Array(
+                tasks.iter().map(import_task_body).collect(),
+            )),
+        )
+            .into_response(),
         Err(e) => AppError::from(e).into_response(),
     }
 }

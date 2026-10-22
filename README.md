@@ -87,8 +87,8 @@ already issued (see [Secrets and rotation](#secrets-and-rotation)).
 
 ### 3. CI that runs what you wrote, or refuses by name
 
-Plombir Git runs `.gitea/workflows/*.yml` — or `.github/workflows/*.yml` as it
-came from GitHub, when there is no `.gitea/workflows` — as a **strict subset** of Actions. A key
+Plombir Git runs `.gitea/workflows/*.yml` — or `.forgejo/workflows/*.yml` and
+`.github/workflows/*.yml` as they came from Forgejo and GitHub, in Forgejo's order — as a **strict subset** of Actions. A key
 it accepts is executed; a key, trigger or action it does not implement fails the
 whole workflow with a message naming the file, the job and the key. It is never
 quietly dropped, so you never get a green run of a shortened workflow. A
@@ -129,6 +129,7 @@ cited in the row added it. Plombir Git's side is specified in full in
 | Workflow syntax | Plombir Git | Gitea 28 |
 |-----------------|-----------|----------|
 | `.github/workflows/` when there is no `.gitea/workflows/` | ✅ the same order, the two never merged | ✅ `[actions] WORKFLOW_DIRS` |
+| `.forgejo/workflows/`, ahead of `.gitea/workflows/` | ✅ Forgejo's order, never merged | ❌ read by Forgejo, not Gitea |
 | `on:` `push`, `pull_request`, `workflow_dispatch`, `workflow_call` | ✅ | ✅ |
 | `on: schedule` | ✅ cron in UTC, from the default branch; one run per tick, missed ticks not caught up | ✅ |
 | `on:` `pull_request_target`; `on.<event>.types` | ❌ refused by name | ✅ |
@@ -283,7 +284,7 @@ Three finds from the history:
 | Pull requests | Diff, three merge strategies (merge / squash / rebase), cross-repo (fork) PRs, code review (approve / request changes / inline comments), branch protection, repository pull-request template ([reference](docs/issue-templates.md#pull-request-templates)), CODEOWNERS auto-review ([reference](docs/codeowners.md)) | [PR API](crates/rg-http/src/api/pulls.rs) |
 | Wiki | Markdown page CRUD with revision history stored in the database (no `.wiki.git` repository) | [Wiki API](crates/rg-http/src/api/wiki.rs) |
 | Git LFS | Batch API, object upload/download, zstd compression; works from both the HTTPS and the SSH clone URL ([details](#git-lfs)) | [LFS API](crates/rg-http/src/api/lfs.rs) |
-| CI/CD | Native `.plombir-git-ci.yml` pipelines ([schema reference](docs/ci.md)) and Gitea Actions (`.gitea/workflows/*.yml`, or `.github/workflows/*.yml` without it, [supported subset](docs/gitea-actions.md)); embedded or external runners, optional Docker execution, artifacts, live job logs over WebSocket | [CI API](crates/rg-http/src/api/ci.rs) |
+| CI/CD | Native `.plombir-git-ci.yml` pipelines ([schema reference](docs/ci.md)) and Gitea Actions (`.forgejo/workflows/*.yml`, `.gitea/workflows/*.yml` or `.github/workflows/*.yml`, the first the commit has, [supported subset](docs/gitea-actions.md)); embedded or external runners, optional Docker execution, artifacts, live job logs over WebSocket | [CI API](crates/rg-http/src/api/ci.rs) |
 | Webhooks | Registration, delivery, HMAC-SHA256 signatures, delivery history | [Webhook API](crates/rg-http/src/api/webhooks.rs) |
 | Notifications | In-app, email (SMTP), and real-time WebSocket delivery | [Notification delivery](crates/rg-core/src/notification/thread.rs) |
 | Registries | Package registry and OCI container registry | [Package API](crates/rg-http/src/api/packages/mod.rs) |

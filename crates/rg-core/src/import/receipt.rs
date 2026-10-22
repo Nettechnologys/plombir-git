@@ -89,18 +89,12 @@ pub struct CiNotRun {
 /// write instead. Named in the receipt only when the branch has none of the
 /// sources the engine does read: a `.gitlab-ci.yml` kept beside a workflow is a
 /// choice, not a loss.
-const FOREIGN_CI: [(&str, &str); 2] = [
-    (
-        ".gitlab-ci.yml",
-        "GitLab CI is not run here: describe the pipeline as an Actions workflow under \
-         `.gitea/workflows/` or `.github/workflows/`, or in `.plombir-git-ci.yml`",
-    ),
-    (
-        ".forgejo/workflows",
-        "Forgejo's own workflow directory is not read here: move the workflows to \
-         `.gitea/workflows/`, which Forgejo reads as well",
-    ),
-];
+const FOREIGN_CI: [(&str, &str); 1] = [(
+    ".gitlab-ci.yml",
+    "GitLab CI is not run here: describe the pipeline as an Actions workflow under \
+     `.forgejo/workflows/`, `.gitea/workflows/` or `.github/workflows/`, or in \
+     `.plombir-git-ci.yml`",
+)];
 
 /// One kind of object: how many the source has, how many are here.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -615,14 +609,6 @@ mod tests {
                 reason: FOREIGN_CI[0].1,
             }]
         );
-
-        let forgejo = repository_with(Some(&[(".forgejo/workflows/ci.yml", "on: push\n")]));
-        let named: Vec<&str> = ci_not_run(forgejo.path())
-            .unwrap()
-            .into_iter()
-            .map(|item| item.path)
-            .collect();
-        assert_eq!(named, [".forgejo/workflows"]);
     }
 
     /// Beside CI this server does run, a foreign file is somebody's choice, not
@@ -630,6 +616,7 @@ mod tests {
     #[test]
     fn a_gitlab_ci_file_beside_ci_that_runs_here_is_not_named() {
         for source in [
+            ".forgejo/workflows/ci.yml",
             ".github/workflows/ci.yml",
             ".gitea/workflows/ci.yml",
             ".plombir-git-ci.yml",

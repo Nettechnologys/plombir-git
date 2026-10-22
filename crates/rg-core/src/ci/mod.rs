@@ -90,16 +90,21 @@ pub const WORKFLOW_DISPATCH_EVENT: &str = "workflow_dispatch";
 /// Directories holding Actions workflow files, relative to the repo root, in
 /// the order they are looked for.
 ///
-/// The first one a commit has is the one read, and the other is not merged in
-/// — Gitea's `WorkflowDirs` order. A repository brought over from GitHub runs
-/// its `.github/workflows` as it is; one that has both runs only what it wrote
-/// for this forge, so a workflow kept for GitHub's own runners never starts
-/// here by surprise.
+/// The first one a commit has is the one read, and the others are not merged
+/// in — Forgejo's `ListWorkflows` order, which is Gitea's `WorkflowDirs` with
+/// Forgejo's own directory in front. A repository brought over from Forgejo or
+/// GitHub runs its `.forgejo/workflows` or `.github/workflows` as it is
+/// (card_ee0b5e755a56); one that has several runs only the first, so a
+/// workflow kept for GitHub's own runners never starts here by surprise.
 ///
 /// Here rather than in `rg-ci`, which reads them, so the import receipt can
 /// tell a repository whose CI will not run here from one whose CI will by the
 /// same list the engine uses (card_5e13b87a247f).
-pub const WORKFLOW_DIRS: [&str; 2] = [".gitea/workflows", ".github/workflows"];
+pub const WORKFLOW_DIRS: [&str; 3] = [
+    ".forgejo/workflows",
+    ".gitea/workflows",
+    ".github/workflows",
+];
 
 /// The native CI file, read when a commit has none of [`WORKFLOW_DIRS`].
 pub const NATIVE_CI_FILES: [&str; 1] = [".plombir-git-ci.yml"];
@@ -986,7 +991,7 @@ pub trait CiTrigger: Send + Sync {
 /// for just as long — so a repository using Gitea Actions was told its perfectly
 /// valid config did not exist.
 pub const NO_CI_CONFIG_MESSAGE: &str =
-    "no CI config found at this commit — expected `.plombir-git-ci.yml`, `.gitea/workflows/*.yml` or `.github/workflows/*.yml`";
+    "no CI config found at this commit — expected `.plombir-git-ci.yml`, `.forgejo/workflows/*.yml`, `.gitea/workflows/*.yml` or `.github/workflows/*.yml`";
 
 /// Check if a repo has any CI config at the given commit.
 ///
@@ -1047,15 +1052,12 @@ pub fn has_ci_config_checked(repo_path: &Path, commit_sha: &str) -> Result<bool>
         .peel_to_tree()
         .with_context(|| format!("failed to read CI tree at commit {commit_sha}"))?;
 
-    // Both Actions directories: the engine reads `.github/workflows` when a
-    // commit has no `.gitea/workflows`, so a gate that knew only the first
-    // kept every repository brought over from GitHub from reaching it — no
-    // pipeline and no refusal either.
-    for path in [
-        ".gitea/workflows",
-        ".github/workflows",
-        ".plombir-git-ci.yml",
-    ] {
+    // Every source the engine reads, from the engine's own lists: a gate that
+    // knew only `.gitea/workflows` kept every repository brought over from
+    // GitHub from reaching it — no pipeline and no refusal either — and a copy
+    // of the list here would do the same to the next directory the engine
+    // learns (card_ee0b5e755a56).
+    for path in WORKFLOW_DIRS.iter().chain(NATIVE_CI_FILES.iter()) {
         if commit
             .lookup_entry_by_path(path)
             .with_context(|| format!("failed to look up {path} at commit {commit_sha}"))?
@@ -1283,7 +1285,9 @@ mod timeout_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_ci_config, has_ci_config_checked, NO_CI_CONFIG_MESSAGE};
+    use super::{
+        has_ci_config, has_ci_config_checked, NATIVE_CI_FILES, NO_CI_CONFIG_MESSAGE, WORKFLOW_DIRS,
+    };
 
     /// The bug: an unopenable repository was indistinguishable from one that
     /// simply has no pipeline definition, and nothing was logged either way.
@@ -1396,40 +1400,49 @@ mod tests {
     /// driving CI from `.gitea/workflows/` was told its config did not exist.
     #[test]
     fn the_operator_message_names_every_accepted_location() {
-        assert!(NO_CI_CONFIG_MESSAGE.contains(".plombir-git-ci.yml"));
-        assert!(NO_CI_CONFIG_MESSAGE.contains(".gitea/workflows"));
-        assert!(NO_CI_CONFIG_MESSAGE.contains(".github/workflows"));
+        for source in WORKFLOW_DIRS.iter().chain(NATIVE_CI_FILES.iter()) {
+            assert!(
+                NO_CI_CONFIG_MESSAGE.contains(source),
+                "the message does not name {source}, a source the engine reads"
+            );
+        }
     }
 
     /// A repository brought over from GitHub keeps its workflows in
     /// `.github/workflows`, and the engine reads them there. The gate in front
     /// of it knew only `.gitea/workflows`, so every trigger path returned
     /// before the engine was asked: no pipeline, and no refusal saying why.
+    ///
+    /// The same held for a repository brought over from Forgejo, whose
+    /// workflows live in `.forgejo/workflows` (card_ee0b5e755a56): every
+    /// directory the engine reads has to pass the gate on its own.
     #[test]
-    fn a_commit_with_only_github_workflows_has_a_ci_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo_path = dir.path().join("work");
-        let git = rg_git::cli_gateway::GitCommandGateway::new().expect("git must be installed");
-        git.run_or_bail(&["init", "-q", repo_path.to_str().unwrap()], None)
+    fn a_commit_with_only_one_workflow_directory_has_a_ci_config() {
+        for workflow_dir in WORKFLOW_DIRS {
+            let dir = tempfile::tempdir().unwrap();
+            let repo_path = dir.path().join("work");
+            let git = rg_git::cli_gateway::GitCommandGateway::new().expect("git must be installed");
+            git.run_or_bail(&["init", "-q", repo_path.to_str().unwrap()], None)
+                .unwrap();
+            std::fs::create_dir_all(repo_path.join(workflow_dir)).unwrap();
+            std::fs::write(
+                repo_path.join(workflow_dir).join("ci.yml"),
+                "on: push\njobs:\n  test:\n    steps:\n      - run: echo ok\n",
+            )
             .unwrap();
-        std::fs::create_dir_all(repo_path.join(".github/workflows")).unwrap();
-        std::fs::write(
-            repo_path.join(".github/workflows/ci.yml"),
-            "on: push\njobs:\n  test:\n    steps:\n      - run: echo ok\n",
-        )
-        .unwrap();
-        for args in [
-            vec!["config", "user.email", "ci@example.com"],
-            vec!["config", "user.name", "CI"],
-            vec!["add", "."],
-            vec!["-c", "commit.gpgsign=false", "commit", "-qm", "ci"],
-        ] {
-            git.run_or_bail(&args, Some(&repo_path)).unwrap();
-        }
+            for args in [
+                vec!["config", "user.email", "ci@example.com"],
+                vec!["config", "user.name", "CI"],
+                vec!["add", "."],
+                vec!["-c", "commit.gpgsign=false", "commit", "-qm", "ci"],
+            ] {
+                git.run_or_bail(&args, Some(&repo_path)).unwrap();
+            }
 
-        assert!(
-            has_ci_config_checked(&repo_path, "HEAD").expect("an openable repo must not error"),
-            "`.github/workflows` must let the commit reach the workflow engine"
-        );
+            assert!(
+                has_ci_config_checked(&repo_path, "HEAD").expect("an openable repo must not error"),
+                "`{workflow_dir}` must let the commit reach the workflow engine"
+            );
+        }
     }
 }

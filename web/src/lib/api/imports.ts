@@ -28,8 +28,65 @@ export interface ImportTask {
   stage: string | null;
   error: string | null;
   stats: string | null;
+  /** The receipt of a finished import; `null` until it has finished. */
+  receipt?: ImportReceipt | null;
   created_at: string;
   updated_at: string;
+}
+
+// The shape `crates/rg-core/src/import/receipt.rs` serializes (`ImportReceipt`).
+// Optional fields are the ones the server leaves out when they are empty.
+
+export interface ObjectReceipt {
+  kind: string;
+  /** What the source listed; `null` where it has no listing to compare with. */
+  source: number | null;
+  imported: number;
+  skipped?: number;
+  skipped_reason?: string;
+  not_imported: number;
+  missing?: string[];
+  missing_omitted?: number;
+}
+
+export interface RefKindReceipt {
+  source: number;
+  imported: number;
+  missing?: string[];
+  missing_omitted?: number;
+  different?: string[];
+  different_omitted?: number;
+}
+
+export interface DefaultBranchReceipt {
+  name: string;
+  source_sha: string | null;
+  imported_sha: string | null;
+  commits: number | null;
+}
+
+export interface RefsReceipt {
+  unavailable?: string;
+  branches?: RefKindReceipt;
+  tags?: RefKindReceipt;
+  default_branch?: DefaultBranchReceipt;
+}
+
+export interface CiNotRun {
+  path: string;
+  reason: string;
+}
+
+export interface CiReceipt {
+  unavailable?: string;
+  not_run: CiNotRun[];
+}
+
+export interface ImportReceipt {
+  objects: ObjectReceipt[];
+  refs: RefsReceipt;
+  not_transferable: string[];
+  ci?: CiReceipt;
 }
 
 export const imports = {

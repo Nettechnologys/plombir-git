@@ -23,7 +23,9 @@ use rg_db::ops::{pr_reviewer_request_ops, user_ops};
 /// `.gitea/CODEOWNERS` is where a repository that moved here from Gitea or
 /// Forgejo keeps it; without it that file was silently not a policy
 /// (card_a96a2878c38c). Last, as Gitea itself tries it, so a repository that
-/// already carried a file at one of the other paths keeps the one it had.
+/// already carried a file at one of the other paths keeps the one it had. It is
+/// read in Gitea's own dialect, [`GITEA_DIALECT_PATHS`], and so is
+/// `.forgejo/CODEOWNERS`, which Forgejo reads right after it.
 ///
 /// `.gitlab/CODEOWNERS` is GitLab's third path. It is read only because the
 /// parser now understands GitLab's sections (card_8e1c5506d559): before that,
@@ -33,6 +35,7 @@ const CODEOWNERS_PATHS: &[&str] = &[
     "CODEOWNERS",
     "docs/CODEOWNERS",
     ".gitea/CODEOWNERS",
+    ".forgejo/CODEOWNERS",
     ".gitlab/CODEOWNERS",
 ];
 
@@ -52,6 +55,36 @@ const MAX_CODEOWNERS_SIZE: u64 = 1024 * 1024;
 /// Bound the pattern factor of matching even when the whole file is below 1 MiB.
 const MAX_CODEOWNERS_PATTERN_BYTES: usize = 4096;
 
+/// The CODEOWNERS paths whose dialect the path itself decides.
+///
+/// Gitea and Forgejo write every pattern as a regular expression, and so does
+/// whoever wrote a file for them: `.*\.go @alice`. Read with the glob matcher,
+/// that line meant "a dot-file ending in `go`" and requested nobody, with no
+/// diagnostic either (card_a2c33f464bfd). Gitea reads `CODEOWNERS` and
+/// `docs/CODEOWNERS` as regular expressions too, but GitHub and GitLab read
+/// them as globs, so only these two paths — Forgejo also reads
+/// `.forgejo/CODEOWNERS` — say which dialect their author wrote in.
+const GITEA_DIALECT_PATHS: &[&str] = &[".gitea/CODEOWNERS", ".forgejo/CODEOWNERS"];
+
+/// Ceiling on the compiled program of one Gitea pattern.
+///
+/// The pattern is at most [`MAX_CODEOWNERS_PATTERN_BYTES`], but a counted
+/// repetition multiplies what that compiles to; a rule nobody writes by hand
+/// is refused by name instead of costing what it asks for.
+const GITEA_PATTERN_SIZE_LIMIT: usize = 256 * 1024;
+
+/// How the patterns of a CODEOWNERS file are read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CodeownersDialect {
+    /// GitHub's globs with GitLab's sections: the last matching rule of each
+    /// section wins.
+    #[default]
+    Glob,
+    /// Gitea's and Forgejo's regular expressions: every rule that matches a
+    /// changed path contributes its owners, and there is no "last one wins".
+    Gitea,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodeownerRule {
     pub line: usize,
@@ -66,6 +99,9 @@ pub struct CodeownerRule {
     /// A `!pattern` line: a path it matches takes no owner from its section,
     /// whatever else in that section matches it too.
     pub exclusion: bool,
+    /// A Gitea `!pattern` line, which is not an exclusion: it assigns its
+    /// owners when a changed path does **not** match the pattern.
+    pub negated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,6 +115,18 @@ pub struct CodeownersDiagnostic {
 pub struct ParsedCodeowners {
     pub rules: Vec<CodeownerRule>,
     pub diagnostics: Vec<CodeownersDiagnostic>,
+    pub dialect: CodeownersDialect,
+}
+
+impl ParsedCodeowners {
+    /// Owners of the changed paths, each with the line of the rule that named
+    /// it, by the rules of this file's dialect.
+    fn owners_for_paths(&self, paths: &[String]) -> Vec<(usize, String)> {
+        match self.dialect {
+            CodeownersDialect::Glob => owners_for_paths_with_lines(&self.rules, paths),
+            CodeownersDialect::Gitea => gitea_owners_for_paths(&self.rules, paths),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -197,6 +245,7 @@ pub fn parse_codeowners(contents: &str) -> ParsedCodeowners {
                 owners: Vec::new(),
                 section,
                 exclusion: true,
+                negated: false,
             });
             continue;
         }
@@ -228,10 +277,185 @@ pub fn parse_codeowners(contents: &str) -> ParsedCodeowners {
                 owners,
                 section,
                 exclusion: false,
+                negated: false,
             });
         }
     }
     parsed
+}
+
+/// Parse a `.gitea/CODEOWNERS` file the way Gitea and Forgejo read it.
+///
+/// A line is split into tokens by Gitea's own tokenizer: a backslash takes the
+/// next character literally *and is dropped* — so the documented `.*\.go` is
+/// the expression `.*.go` — an unescaped `#` ends the line, and a space or tab
+/// ends a token. The first token is the pattern, compiled as `^<pattern>$`
+/// after a leading `!` (negation) and then a leading `/` (Gitea's, for a path
+/// that never starts with one) are taken off. The `^` and `$` are glued on, not
+/// grouped, exactly as Gitea does, so `a|b` reads as `^a|b$`. The rest are
+/// owners, the `@` optional.
+///
+/// The expression syntax is RE2's, which Forgejo compiles with. Gitea's
+/// `regexp2` adds lookaround and backreferences; a pattern that uses them does
+/// not compile here and is diagnosed by line, never read as something else.
+pub fn parse_gitea_codeowners(contents: &str) -> ParsedCodeowners {
+    let mut parsed = ParsedCodeowners {
+        dialect: CodeownersDialect::Gitea,
+        ..ParsedCodeowners::default()
+    };
+    for (index, source) in contents.lines().enumerate() {
+        let line_number = index + 1;
+        let tokens = gitea_tokens(source);
+        let Some((declared, owner_tokens)) = tokens.split_first() else {
+            continue;
+        };
+        if declared.len() > MAX_CODEOWNERS_PATTERN_BYTES {
+            parsed.diagnostics.push(CodeownersDiagnostic::new(
+                line_number,
+                declared.as_str(),
+                format!("pattern exceeds the {MAX_CODEOWNERS_PATTERN_BYTES}-byte CODEOWNERS limit"),
+            ));
+            continue;
+        }
+        if owner_tokens.is_empty() {
+            parsed.diagnostics.push(CodeownersDiagnostic::new(
+                line_number,
+                declared.as_str(),
+                "rule names no owner",
+            ));
+            continue;
+        }
+        let negated = declared.starts_with('!');
+        let pattern = declared.strip_prefix('!').unwrap_or(declared);
+        let pattern = pattern.strip_prefix('/').unwrap_or(pattern);
+        // `^*.rs$` compiles here, as it does in Forgejo's RE2: the `*` repeats
+        // the empty `^` and the rule matches three-character paths ending in
+        // `rs`. Gitea refuses it, and nobody means it — it is a glob.
+        if let Some(operator) = pattern
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '*' | '+' | '?'))
+        {
+            parsed.diagnostics.push(CodeownersDiagnostic::new(
+                line_number,
+                declared.as_str(),
+                format!(
+                    "`{pattern}` starts with `{operator}`, which repeats nothing: patterns in \
+                     .gitea/ and .forgejo/ CODEOWNERS are regular expressions, not globs (`.*` matches \
+                     any run of characters)"
+                ),
+            ));
+            continue;
+        }
+        if let Err(error) = gitea_pattern(pattern) {
+            parsed.diagnostics.push(CodeownersDiagnostic::new(
+                line_number,
+                declared.as_str(),
+                format!(
+                    "`^{pattern}$` is not a regular expression this server can run: {}",
+                    regex_error_summary(&error)
+                ),
+            ));
+            continue;
+        }
+
+        let mut owners = Vec::new();
+        for declaration in owner_tokens {
+            match declaration.strip_prefix('@').unwrap_or(declaration) {
+                "" => parsed.diagnostics.push(CodeownersDiagnostic::new(
+                    line_number,
+                    declaration.as_str(),
+                    format!("`{declaration}` is not a `username` or `org/team` owner"),
+                )),
+                owner => owners.push(owner.to_string()),
+            }
+        }
+        if !owners.is_empty() {
+            parsed.rules.push(CodeownerRule {
+                line: line_number,
+                pattern: pattern.to_string(),
+                owners,
+                section: 0,
+                exclusion: false,
+                negated,
+            });
+        }
+    }
+    parsed
+}
+
+/// Gitea's `TokenizeCodeOwnersLine`, character for character.
+fn gitea_tokens(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut escape = false;
+    for char in line.trim().chars() {
+        if escape {
+            token.push(char);
+            escape = false;
+        } else if char == '\\' {
+            escape = true;
+        } else if char == '#' {
+            break;
+        } else if char == ' ' || char == '\t' {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+        } else {
+            token.push(char);
+        }
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+}
+
+/// The compiled form of one Gitea pattern, built the same way when the file
+/// is parsed and when it is matched, so a rule that parsed always matches.
+fn gitea_pattern(pattern: &str) -> std::result::Result<regex::Regex, regex::Error> {
+    regex::RegexBuilder::new(&format!("^{pattern}$"))
+        .size_limit(GITEA_PATTERN_SIZE_LIMIT)
+        .build()
+}
+
+/// The last line of a `regex` error: its syntax errors carry the pattern and a
+/// caret diagram above the reason, and a diagnostic is one line in a log.
+fn regex_error_summary(error: &regex::Error) -> String {
+    let text = error.to_string();
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("invalid pattern")
+        .trim_start_matches("error: ")
+        .to_string()
+}
+
+/// Owners of the changed paths by Gitea's rule: every rule that a changed
+/// path satisfies — matches it, or for a negated rule fails to — contributes
+/// all of its owners, in the order the rules are written.
+fn gitea_owners_for_paths(rules: &[CodeownerRule], paths: &[String]) -> Vec<(usize, String)> {
+    let mut seen = HashSet::new();
+    let mut owners = Vec::new();
+    for rule in rules {
+        // Every rule here compiled once already, in `parse_gitea_codeowners`.
+        let Ok(pattern) = gitea_pattern(&rule.pattern) else {
+            continue;
+        };
+        if !paths
+            .iter()
+            .any(|path| pattern.is_match(path) != rule.negated)
+        {
+            continue;
+        }
+        for owner in &rule.owners {
+            if seen.insert(owner.to_ascii_lowercase()) {
+                owners.push((rule.line, owner.clone()));
+            }
+        }
+    }
+    owners
 }
 
 /// The `@owner` declarations of one line; every other declaration is
@@ -367,7 +591,12 @@ pub fn load_codeowners(repo_path: &Path, base_branch: &str) -> Result<Option<Par
         output
             .ensure_success()
             .with_context(|| format!("read CODEOWNERS candidate `{candidate}`"))?;
-        return Ok(Some(parse_codeowners(&output.stdout_str())));
+        let contents = output.stdout_str();
+        return Ok(Some(if GITEA_DIALECT_PATHS.contains(&candidate) {
+            parse_gitea_codeowners(&contents)
+        } else {
+            parse_codeowners(&contents)
+        }));
     }
     Ok(None)
 }
@@ -396,7 +625,7 @@ pub async fn request_codeowners(
         let Some(parsed) = load_codeowners(&repo_path, &base_branch)? else {
             return Ok::<_, anyhow::Error>(None);
         };
-        let owners = owners_for_paths_with_lines(&parsed.rules, &changed_paths);
+        let owners = parsed.owners_for_paths(&changed_paths);
         Ok(Some((parsed, owners)))
     })
     .await??
@@ -1098,6 +1327,7 @@ mod tests {
     #[test]
     fn the_worked_example_resolves_to_the_owners_the_documentation_promises() {
         assert_worked_example(
+            parse_codeowners,
             "<!-- example: codeowners-file -->",
             "<!-- examples: codeowners-resolution -->",
             4,
@@ -1109,15 +1339,33 @@ mod tests {
     #[test]
     fn the_sections_example_resolves_to_the_owners_the_documentation_promises() {
         assert_worked_example(
+            parse_codeowners,
             "<!-- example: codeowners-sections-file -->",
             "<!-- examples: codeowners-sections-resolution -->",
             5,
         );
     }
 
-    fn assert_worked_example(file_marker: &str, resolution_marker: &str, min_rules: usize) {
+    /// The same, for the Gitea example: adding rules up and negating them are
+    /// what an author coming from Gitea has to see resolved to believe.
+    #[test]
+    fn the_gitea_example_resolves_to_the_owners_the_documentation_promises() {
+        assert_worked_example(
+            parse_gitea_codeowners,
+            "<!-- example: codeowners-gitea-file -->",
+            "<!-- examples: codeowners-gitea-resolution -->",
+            4,
+        );
+    }
+
+    fn assert_worked_example(
+        parse: fn(&str) -> ParsedCodeowners,
+        file_marker: &str,
+        resolution_marker: &str,
+        min_rules: usize,
+    ) {
         let (name, content) = CODEOWNERS_DOCUMENTATION;
-        let rules = parse_codeowners(&fenced_block_after(name, content, file_marker));
+        let rules = parse(&fenced_block_after(name, content, file_marker));
         assert!(
             rules.rules.len() >= min_rules,
             "{name}: only {} rules parsed out of the example after `{file_marker}` — a rule the \
@@ -1140,9 +1388,13 @@ mod tests {
                 .map(|owner| code_cell(owner).trim_start_matches('@').to_owned())
                 .collect();
 
+            let owners: Vec<String> = rules
+                .owners_for_paths(std::slice::from_ref(&path))
+                .into_iter()
+                .map(|(_, owner)| owner)
+                .collect();
             assert_eq!(
-                owners_for_paths(&rules.rules, std::slice::from_ref(&path)),
-                expected,
+                owners, expected,
                 "{name}:{line}: the document promises that `{path}` goes to {expected:?}, and the \
                  resolver disagrees"
             );
@@ -1500,30 +1752,155 @@ mod tests {
                     owners: vec!["rust".into()],
                     section: 0,
                     exclusion: false,
+                    negated: false,
                 }],
                 diagnostics: Vec::new(),
+                dialect: CodeownersDialect::Glob,
             })
         );
     }
 
     /// card_a96a2878c38c: a repository that moved here from Gitea keeps its
-    /// file in `.gitea/`, and that file alone is the policy.
+    /// file in `.gitea/`, and that file alone is the policy — read as the
+    /// regular expressions it was written in (card_a2c33f464bfd).
     #[test]
     fn a_gitea_codeowners_file_is_the_policy_when_it_is_the_only_one() {
-        let (_dir, bare) = bare_repository(Some((".gitea/CODEOWNERS", "*.rs @rust\n")));
+        let (_dir, bare) = bare_repository(Some((".gitea/CODEOWNERS", ".*\\.rs @rust\n")));
 
+        let parsed = load_codeowners(&bare, "main").unwrap().expect("a policy");
         assert_eq!(
-            load_codeowners(&bare, "main").unwrap(),
-            Some(ParsedCodeowners {
+            parsed,
+            ParsedCodeowners {
                 rules: vec![CodeownerRule {
                     line: 1,
-                    pattern: "*.rs".into(),
+                    pattern: ".*.rs".into(),
                     owners: vec!["rust".into()],
                     section: 0,
                     exclusion: false,
+                    negated: false,
                 }],
                 diagnostics: Vec::new(),
-            })
+                dialect: CodeownersDialect::Gitea,
+            }
+        );
+        assert_eq!(
+            parsed.owners_for_paths(&["src/main.rs".into()]),
+            [(1, "rust".to_string())]
+        );
+    }
+
+    /// The example Gitea's own documentation gives: `.*\\.go` names every Go
+    /// file at any depth. Read as a glob it was a dot-file ending in `go`, and
+    /// nobody was requested.
+    #[test]
+    fn a_gitea_regular_expression_assigns_the_paths_it_matches() {
+        let parsed = parse_gitea_codeowners(".*\\.go @alice\nfrontend/src/.* @web\n");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+
+        let owners = |paths: &[&str]| -> Vec<String> {
+            let paths: Vec<String> = paths.iter().map(|path| (*path).to_owned()).collect();
+            parsed
+                .owners_for_paths(&paths)
+                .into_iter()
+                .map(|(_, owner)| owner)
+                .collect()
+        };
+        assert_eq!(owners(&["src/main.go"]), ["alice"]);
+        assert_eq!(owners(&["frontend/src/app/main.ts"]), ["web"]);
+        assert!(owners(&["src/main.rs"]).is_empty());
+        // Anchored at both ends, as Gitea compiles `^<pattern>$`.
+        assert!(owners(&["frontend/src"]).is_empty());
+        assert!(owners(&["vendor/frontend/src/a.ts"]).is_empty());
+    }
+
+    /// Gitea adds up every matching rule — there is no "last one wins" — and a
+    /// `!` rule assigns its owners to the paths it does *not* match.
+    #[test]
+    fn gitea_rules_add_up_and_a_negated_rule_takes_what_it_does_not_match() {
+        let parsed = parse_gitea_codeowners(
+            ".* @everyone\n/docs/.* @docs\n!.*\\.md @code\ndocs/.*\\.md @writers # note\n",
+        );
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let owners = |path: &str| -> Vec<String> {
+            parsed
+                .owners_for_paths(&[path.to_owned()])
+                .into_iter()
+                .map(|(_, owner)| owner)
+                .collect()
+        };
+
+        assert_eq!(owners("docs/guide.md"), ["everyone", "docs", "writers"]);
+        assert_eq!(owners("docs/build.sh"), ["everyone", "docs", "code"]);
+        assert_eq!(owners("README.md"), ["everyone"]);
+        assert_eq!(owners("src/lib.rs"), ["everyone", "code"]);
+    }
+
+    /// A pattern this engine cannot compile — Gitea's `regexp2` lookaround, or
+    /// a glob left over from another forge — is refused by its line, not read
+    /// as something else and not dropped without a word.
+    #[test]
+    fn a_gitea_pattern_that_does_not_compile_is_diagnosed_by_line() {
+        let parsed =
+            parse_gitea_codeowners("*.rs @rust\n(?!vendor/).*\\.go @go\nlib/.* @lib\nlonely\n");
+
+        let lines: Vec<(usize, &str)> = parsed
+            .diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.line, diagnostic.declaration.as_str()))
+            .collect();
+        assert_eq!(lines, [(1, "*.rs"), (2, "(?!vendor/).*.go"), (4, "lonely")]);
+        assert!(
+            parsed.diagnostics[0].reason.contains("not globs"),
+            "{:?}",
+            parsed.diagnostics[0]
+        );
+        assert!(
+            parsed.diagnostics[1]
+                .reason
+                .contains("not a regular expression this server can run"),
+            "{:?}",
+            parsed.diagnostics[1]
+        );
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.reason.contains('\n')),
+            "{:?}",
+            parsed.diagnostics
+        );
+        assert_eq!(parsed.rules.len(), 1);
+        assert_eq!(parsed.rules[0].pattern, "lib/.*");
+    }
+
+    /// Forgejo reads `.forgejo/CODEOWNERS` too, right after `.gitea/`, in the
+    /// same dialect; a repository brought over with it is not left without a
+    /// policy.
+    #[test]
+    fn a_forgejo_codeowners_file_is_read_as_regular_expressions() {
+        let (_dir, bare) = bare_repository(Some((".forgejo/CODEOWNERS", ".*\\.go @gophers\n")));
+        let parsed = load_codeowners(&bare, "main").unwrap().expect("a policy");
+
+        assert_eq!(parsed.dialect, CodeownersDialect::Gitea);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(
+            parsed.owners_for_paths(&["cmd/main.go".into()]),
+            [(1, "gophers".to_string())]
+        );
+    }
+
+    /// The same file anywhere but `.gitea/` or `.forgejo/` is a glob file:
+    /// only those paths say their author wrote for Gitea.
+    #[test]
+    fn only_the_gitea_path_is_read_as_regular_expressions() {
+        let (_dir, bare) = bare_repository(Some(("CODEOWNERS", "*.rs @rust\n")));
+        let parsed = load_codeowners(&bare, "main").unwrap().expect("a policy");
+
+        assert_eq!(parsed.dialect, CodeownersDialect::Glob);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(
+            parsed.owners_for_paths(&["src/main.rs".into()]),
+            [(1, "rust".to_string())]
         );
     }
 
@@ -1996,8 +2373,10 @@ mod tests {
                     owners: vec!["rust".into()],
                     section: 0,
                     exclusion: false,
+                    negated: false,
                 }],
                 diagnostics: Vec::new(),
+                dialect: CodeownersDialect::Glob,
             })
         );
     }

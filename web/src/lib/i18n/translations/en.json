@@ -2071,7 +2071,43 @@
       "progress": "Progress",
       "updated": "Updated"
     },
-    "deleting": "Deleting..."
+    "deleting": "Deleting...",
+    "receipt": {
+      "title": "Receipt",
+      "complete": "nothing missing",
+      "incomplete": "something did not come over",
+      "ci_not_run": "CI that will not run here",
+      "ci_unavailable": "The CI of the imported branch could not be read",
+      "object": "Object",
+      "source": "Source",
+      "here": "Here",
+      "not_imported": "Not imported",
+      "and_more": "and {count} more",
+      "skipped": "{count} left out on purpose",
+      "refs_unavailable": "Branches and tags could not be compared",
+      "branches": "Branches",
+      "tags": "Tags",
+      "refs_count": "{imported} of {source} at the source's commit",
+      "refs_missing": "missing",
+      "refs_different": "at another commit",
+      "default_branch": "Default branch",
+      "same_commit": "same commit as the source ({sha})",
+      "other_commit": "source at {source}, here at {imported}",
+      "commits": "{count} commits",
+      "not_transferable": "Set up by hand — no import brings these",
+      "kind": {
+        "labels": "Labels",
+        "milestones": "Milestones",
+        "issues": "Issues",
+        "pull_requests": "Pull requests",
+        "comments": "Comments",
+        "reviews": "Reviews",
+        "review_comments": "Review comments",
+        "releases": "Releases",
+        "lfs_objects": "LFS objects",
+        "wiki_pages": "Wiki pages"
+      }
+    }
   },
   "help": {
     "title": "Help",

@@ -40,6 +40,9 @@ tar = { workspace = true }
 zip = { workspace = true }
 toml = { workspace = true }
 serde-saphyr = { workspace = true }
+# `.gitea/CODEOWNERS` patterns are regular expressions (Forgejo compiles them
+# with Go's RE2, which this crate implements without backtracking).
+regex = { workspace = true }
 
 # Auth / SSO / 2FA
 base64 = { workspace = true }

@@ -5,6 +5,7 @@
   import { isLoggedIn, getUser } from '$lib/stores/auth.svelte';
   import { createT, formatDateTime } from '$lib/i18n';
   import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import ImportReceipt from '$lib/components/ImportReceipt.svelte';
   import { createConfirmer } from '$lib/confirm.svelte';
   import { isHttpUrl } from '$lib/utils/url';
 
@@ -313,6 +314,9 @@
                   </div>
                   {#if task.error}
                     <div class="task-error">{task.error}</div>
+                  {/if}
+                  {#if task.receipt}
+                    <ImportReceipt receipt={task.receipt} />
                   {/if}
                 </td>
                 <td><a href={taskHref(task)}>{task.target_owner}/{task.target_name}</a></td>

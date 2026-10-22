@@ -54,16 +54,20 @@ rest are not looked at. There is no merging of two files.
 CODEOWNERS
 docs/CODEOWNERS
 .gitea/CODEOWNERS
+.forgejo/CODEOWNERS
 .gitlab/CODEOWNERS
 ```
 
-`.gitea/CODEOWNERS` is the path Gitea and Forgejo read, and
+`.gitea/CODEOWNERS` is the path Gitea and Forgejo read, `.forgejo/CODEOWNERS`
+the one Forgejo reads after it, and
 `.gitlab/CODEOWNERS` the one GitLab reads besides `CODEOWNERS` and
 `docs/CODEOWNERS`. A GitLab file is read with its sections (see
-[GitLab sections](#gitlab-sections)). A Gitea or Forgejo file is **not** read
-in its own dialect: Gitea writes patterns as regular expressions
-(`.*\.go`), and here every pattern is the glob described below, so a Gitea
-pattern has to be rewritten (`*.go`) before it requests anybody.
+[GitLab sections](#gitlab-sections)). `.gitea/CODEOWNERS` and
+`.forgejo/CODEOWNERS` are read in Gitea's own dialect, **regular expressions**
+— see [Gitea and Forgejo](#gitea-and-forgejo-giteacodeowners). Every other path is
+read as the globs described below, including `CODEOWNERS` and
+`docs/CODEOWNERS` brought over from Gitea, whose patterns then have to be
+rewritten (`.*\.go` as `*.go`), or the file moved to `.gitea/CODEOWNERS`.
 
 **There is a size limit.** The file is matched line by line, so the whole of it
 has to be held in memory at once, and a file over the limit is refused before a
@@ -216,6 +220,52 @@ rule that starts with `[`, escape it: `\[Docs] @alice`.
 `/docs/api/` is the last rule of `[Docs]` that matches it — `*.md` above it
 changes nothing — and `docs/drafts/plan.md` gets nobody from `[Docs]` at all,
 because the exclusion takes it out of that section.
+
+## Gitea and Forgejo: `.gitea/CODEOWNERS`
+
+A file at `.gitea/CODEOWNERS` or `.forgejo/CODEOWNERS` is read the way Gitea
+and Forgejo read it, so a
+repository brought over from either keeps the file it had. Its patterns are
+**regular expressions**, not globs, and its rules work differently:
+
+- The pattern is the whole path, anchored at both ends: `docs/.*` is compiled
+  as `^docs/.*$`. A leading `/` is dropped, as Gitea drops it, since a changed
+  path never starts with one. The anchors are glued on, not grouped, exactly
+  as Gitea does it, so `a|b` means `^a|b$`.
+- **Every** matching rule contributes its owners. There is no "last rule
+  wins" and there are no sections.
+- `!pattern` is a **negation**, not an exclusion: the rule assigns its owners
+  when a changed path does *not* match the pattern.
+- A backslash takes the next character literally and is then dropped, before
+  the pattern is compiled. Gitea's documented example `.*\.go` is therefore
+  the expression `.*.go`; to put a backslash into the expression, write two.
+  A space escaped this way (`docs\ dir/.*`) stays in the pattern. An unescaped
+  `#` starts a comment.
+- An owner is written with or without the `@`.
+- The syntax is RE2's, which Forgejo compiles with. Lookaround and
+  backreferences, which Gitea's engine adds, do not compile here: such a line,
+  like any pattern that is not a valid expression (a glob such as `*.rs`), is
+  logged as a `CODEOWNERS declaration ignored` line naming the line and the
+  reason, and the rest of the file still applies.
+
+<!-- example: codeowners-gitea-file -->
+```text
+.* @admin
+.*\.go @gophers
+/docs/.* @tech-writers
+!docs/.* @reviewers
+```
+
+<!-- examples: codeowners-gitea-resolution -->
+| Changed path | Owners requested |
+|--------------|------------------|
+| `cmd/main.go` | `@admin`, `@gophers`, `@reviewers` |
+| `docs/setup.md` | `@admin`, `@tech-writers` |
+| `docs/tools/gen.go` | `@admin`, `@gophers`, `@tech-writers` |
+| `README.md` | `@admin`, `@reviewers` |
+
+`docs/tools/gen.go` gets both the Go owners and the writers because both rules
+match it, and nobody from the negated rule, because it matches `docs/.*`.
 
 ## Who the owners can be
 
