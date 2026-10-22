@@ -7,6 +7,7 @@ pub mod github_client;
 pub mod gitlab_client;
 pub mod reattribution;
 pub mod receipt;
+pub mod release_assets;
 pub mod service;
 pub mod trust;
 

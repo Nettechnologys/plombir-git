@@ -142,6 +142,12 @@ pub struct ImportStats {
     pub releases_imported: usize,
     /// Releases the source listed but the target could not create.
     pub releases_failed: Vec<ReleaseImportFailure>,
+    /// Files of imported releases, downloaded from the source and stored
+    /// (card_e5197b84a524).
+    pub release_assets_imported: usize,
+    /// Files an imported release lists and the import did not store, each
+    /// with the release's tag and the reason.
+    pub release_assets_failed: Vec<crate::import::release_assets::ReleaseAssetImportFailure>,
     pub wiki_pages_imported: usize,
     /// LFS objects downloaded from the source and stored for the target.
     pub lfs_objects_imported: usize,
@@ -427,6 +433,31 @@ mod release_import_tests {
     async fn github_releases_belong_to_importer_and_name_failed_tags() {
         let db = test_db().await;
         let mut stats = ImportStats::default();
+        let root = tempfile::tempdir().unwrap();
+        let storage = crate::blob_storage::instance_blob_storage(root.path());
+        let guard = crate::import::trust::TrustedImportOrigins::default();
+        let mut assets = crate::import::release_assets::ReleaseAssetFetcher::new(
+            &db,
+            &storage,
+            root.path(),
+            crate::import::release_assets::AssetDestination {
+                repo_id: 1,
+                owner: "importer",
+                name: "imported",
+                importer_id: 2,
+            },
+            crate::import::release_assets::AssetSource {
+                dialect: ApiDialect::GitHub,
+                api_base_url: "https://api.github.com",
+                owner: "octo",
+                repo: "widgets",
+                token: "",
+            },
+            &guard,
+            crate::storage_quota::StorageLimits::default(),
+            crate::clone_budget::PassAllowance::unlimited(),
+        )
+        .unwrap();
         let count = import_github_releases(
             &db,
             1,
@@ -447,6 +478,7 @@ mod release_import_tests {
                 github_release(""),
             ],
             Path::new("unused"),
+            &mut assets,
             &mut stats,
         )
         .await
@@ -480,6 +512,76 @@ mod release_import_tests {
         );
         assert!(stats.completion_stage().contains("2 release(s)"));
         assert!(serde_json::to_value(&stats).unwrap()["releases_failed"].is_array());
+    }
+
+    /// card_e5197b84a524: a created release hands its listed files to the
+    /// asset fetcher. The address here is one this server may not reach, so the
+    /// file is refused without a connection — and named under its release's
+    /// tag, which only the release step knows.
+    #[tokio::test]
+    async fn a_github_releases_files_go_through_the_asset_fetcher() {
+        let db = test_db().await;
+        let mut stats = ImportStats::default();
+        let root = tempfile::tempdir().unwrap();
+        let storage = crate::blob_storage::instance_blob_storage(root.path());
+        let guard = crate::import::trust::TrustedImportOrigins::default();
+        let mut assets = crate::import::release_assets::ReleaseAssetFetcher::new(
+            &db,
+            &storage,
+            root.path(),
+            crate::import::release_assets::AssetDestination {
+                repo_id: 1,
+                owner: "importer",
+                name: "imported",
+                importer_id: 2,
+            },
+            crate::import::release_assets::AssetSource {
+                dialect: ApiDialect::GitHub,
+                api_base_url: "http://127.0.0.1:9",
+                owner: "octo",
+                repo: "widgets",
+                token: "",
+            },
+            &guard,
+            crate::storage_quota::StorageLimits::default(),
+            crate::clone_budget::PassAllowance::unlimited(),
+        )
+        .unwrap();
+        let release = GitHubRelease {
+            assets: vec![crate::import::github_client::GitHubAsset {
+                id: 1,
+                name: "widgets.tgz".to_string(),
+                content_type: String::new(),
+                size: 3,
+                download_count: 0,
+                browser_download_url: String::new(),
+                created_at: "2024-01-01T00:00:00Z".to_string(),
+                digest: None,
+            }],
+            ..github_release("v3")
+        };
+
+        import_github_releases(
+            &db,
+            1,
+            2,
+            &SourceOrigin::github_com(),
+            &[release],
+            Path::new("unused"),
+            &mut assets,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        let failed: Vec<(&str, &str)> = stats
+            .release_assets_failed
+            .iter()
+            .map(|failure| (failure.tag_name.as_str(), failure.filename.as_str()))
+            .collect();
+        assert_eq!(failed, [("v3", "widgets.tgz")]);
+        assert!(stats.completion_stage().contains("1 release asset(s)"));
+        assert!(serde_json::to_value(&stats).unwrap()["release_assets_failed"].is_array());
     }
 
     #[tokio::test]
@@ -605,6 +707,7 @@ impl ImportStats {
             (self.comments_failed.len(), "comment"),
             (self.pr_reviews_failed.len(), "review"),
             (self.releases_failed.len(), "release"),
+            (self.release_assets_failed.len(), "release asset"),
         ]
         .into_iter()
         .filter(|(count, _)| *count > 0)
@@ -714,7 +817,7 @@ pub const MAX_STORED_STATS_BYTES: usize = 48 * 1024;
 const MAX_STORED_FAILURE_FIELD_CHARS: usize = 512;
 
 /// The [`ImportStats`] fields whose length the source decides.
-const STORED_FAILURE_LISTS: [&str; 8] = [
+const STORED_FAILURE_LISTS: [&str; 9] = [
     "labels_failed",
     "milestones_failed",
     "issues_failed",
@@ -722,6 +825,7 @@ const STORED_FAILURE_LISTS: [&str; 8] = [
     "comments_failed",
     "pr_reviews_failed",
     "releases_failed",
+    "release_assets_failed",
     "lfs_objects_failed",
 ];
 
@@ -1762,6 +1866,36 @@ async fn run_github_import(
                 .map(|release| release.tag_name.clone())
                 .collect(),
         );
+        // The release files are paid for out of what the clone left of the
+        // import's budget, as the LFS objects are.
+        let repo_path = repo_root.join(format!("{}/{}.git", task.target_owner, task.target_name));
+        let git_written = crate::blocking::run_blocking_git("import release asset budget", {
+            let repo_path = repo_path.clone();
+            move || Ok(crate::clone_budget::CloneBudget::measure(&repo_path))
+        })
+        .await?;
+        let storage = crate::blob_storage::instance_blob_storage(repo_root);
+        let mut assets = crate::import::release_assets::ReleaseAssetFetcher::new(
+            db,
+            &storage,
+            repo_root,
+            crate::import::release_assets::AssetDestination {
+                repo_id,
+                owner: &task.target_owner,
+                name: &task.target_name,
+                importer_id: task.user_id,
+            },
+            crate::import::release_assets::AssetSource {
+                dialect,
+                api_base_url: &api_base_url,
+                owner: &gh_owner,
+                repo: &gh_repo,
+                token,
+            },
+            trusted_origins,
+            storage_limits,
+            trusted_origins.clone_budget().remaining_after(git_written),
+        )?;
         stats.releases_imported = import_github_releases(
             db,
             repo_id,
@@ -1769,6 +1903,7 @@ async fn run_github_import(
             &origin,
             &releases,
             repo_root,
+            &mut assets,
             stats,
         )
         .await?;
@@ -4575,6 +4710,7 @@ async fn record_release_byline(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn import_github_releases(
     db: &DatabaseConnection,
     repo_id: i64,
@@ -4582,6 +4718,7 @@ async fn import_github_releases(
     origin: &SourceOrigin,
     releases: &[GitHubRelease],
     repo_root: &Path,
+    assets: &mut crate::import::release_assets::ReleaseAssetFetcher<'_>,
     stats: &mut ImportStats,
 ) -> Result<usize> {
     let mut count = 0;
@@ -4610,12 +4747,16 @@ async fn import_github_releases(
         {
             Ok(created) => {
                 count += 1;
+                let release_id = created.id;
                 record_release_byline(
                     db,
                     created,
                     OriginalAuthor::github(origin, release.author.as_ref()),
                 )
                 .await;
+                assets
+                    .import(release_id, &release.tag_name, &release.assets, stats)
+                    .await?;
             }
             Err(e) => {
                 tracing::warn!(tag = %release.tag_name, error = %format!("{e:#}"), "failed to import release");

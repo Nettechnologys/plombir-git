@@ -828,6 +828,46 @@ pub async fn upload_asset_from_file(
     Ok(asset)
 }
 
+/// [`upload_asset_from_file`] for a caller that holds a repository rather than
+/// a release `api/releases.rs` resolved for it — the importer, storing the
+/// files of a release it has just created.
+///
+/// The release must belong to `repo_id`, and that is checked here, not left to
+/// the caller: an id taken on its own could name any repository's release
+/// (`global_id_anchor_guard`). A release of another repository answers the
+/// same `NotFound` a missing one does.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_asset_to_repository_release(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    release_id: i64,
+    storage: &dyn crate::blob_storage::BlobStorage,
+    owner: &str,
+    repo_name: &str,
+    filename: &str,
+    content_type: &str,
+    uploader_id: i64,
+    source: &Path,
+    size: u64,
+) -> Result<Asset> {
+    if get_release(db, release_id).await?.repo_id != repo_id {
+        return Err(crate::error::not_found("release"));
+    }
+    upload_asset_from_file(
+        db,
+        release_id,
+        storage,
+        owner,
+        repo_name,
+        filename,
+        content_type,
+        uploader_id,
+        source,
+        size,
+    )
+    .await
+}
+
 async fn hash_release_asset_file(path: &Path) -> Result<String> {
     let mut file = tokio::fs::File::open(path).await?;
     let mut hasher = Sha256::new();

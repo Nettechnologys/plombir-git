@@ -217,6 +217,11 @@ pub struct GitHubAsset {
     pub download_count: i64,
     pub browser_download_url: String,
     pub created_at: String,
+    /// `sha256:<hex>` of the file, which GitHub lists for an asset; absent from
+    /// older GitHub answers and from Gitea. Checked against what is downloaded
+    /// when present.
+    #[serde(default)]
+    pub digest: Option<String>,
 }
 
 /// Issue/PR comment from GitHub API.

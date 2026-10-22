@@ -48,9 +48,10 @@ function requireSource(file, pattern, message) {
 }
 
 requireClaim('Wiki', /revision history stored in the database.*no `\.wiki\.git`/i, 'describe database revisions and the absent Git mirror');
-requireClaim('Import', /release assets are not imported.*authorship belongs to the importing account/i, 'state both release import limits');
+requireClaim('Import', /release brings its files.*GitLab release's links are not fetched.*authorship belongs to the importing account/i, 'state which releases bring their files, and both release import limits');
 requireClaim('Search', /PRs, users and indexed code.*build a code index explicitly/i, 'describe browser search and the index prerequisite');
 requireSource('crates/rg-core/src/wiki/service.rs', /wiki_revision_ops/, 'wiki revision writer is missing');
+requireSource('crates/rg-core/src/import/service.rs', /\.import\(release_id, &release\.tag_name, &release\.assets, stats\)/, 'GitHub/Gitea release import no longer hands its files to the asset fetcher');
 requireSource('crates/rg-core/src/search/service.rs', /"pulls"\s*=>[\s\S]*"users"\s*=>[\s\S]*"code"\s*=>/, 'global search needs PR, user and code branches');
 requireSource('web/src/routes/search/+page.svelte', /key: 'code'/, 'browser code tab is missing');
 requireSource('crates/rg-http/src/routes.rs', /api::repo_content::get_blame/, 'file blame route is missing');

@@ -75,10 +75,10 @@ pub(crate) const LFS_MEDIA_TYPE: &str = "application/vnd.git-lfs+json";
 /// the source's to choose up to [`LFS_OBJECT_MAX_BYTES`], so the request-wide
 /// outbound timeout cannot apply; [`DOWNLOAD_IDLE_TIMEOUT`] is what catches a
 /// source that has stopped sending.
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+pub(crate) const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// How long a download may go without receiving a byte.
-const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Tries per request before a transient refusal — a connection that failed,
 /// `429`, `5xx` — counts as the object's failure.
