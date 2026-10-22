@@ -1122,17 +1122,27 @@ async fn creating_pr_requests_matching_codeowner_user() {
         .await
         .unwrap();
     assert_eq!(queue_approval.status(), 201);
-    let queued_pr = client
-        .get(format!(
-            "{base}/api/v1/repos/owners-owner/owned-code/pulls/2"
-        ))
-        .bearer_auth(&owner_token)
-        .send()
-        .await
-        .unwrap()
-        .json::<serde_json::Value>()
-        .await
-        .unwrap();
+    // The approval runs the queue, but the pass that merges may be one the
+    // post-push maintenance above already started: it holds the entry as
+    // `running` and finishes after this `201`. The merge is the contract, not
+    // that it lands inside the review's response, so wait for it.
+    let pr_url = format!("{base}/api/v1/repos/owners-owner/owned-code/pulls/2");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let queued_pr = loop {
+        let pr = client
+            .get(&pr_url)
+            .bearer_auth(&owner_token)
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap();
+        if pr["state"] == "merged" || std::time::Instant::now() >= deadline {
+            break pr;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
     let queue_pr = rg_core::pull_request::get_pr(&db, "owners-owner", "owned-code", 2)
         .await
         .unwrap();
