@@ -59,6 +59,10 @@ export const NOT_RUN_BY_CI = new Map([
   ['rg-http session_gate_cost_tests::session_gate_lookup_cost',
     'a measurement that prints a cost and asserts nothing; run by hand when tuning the session gate'],
   // External services the CI runner does not provide.
+  // A live Gitea in Docker, started and filled by scripts/gitea-import-live.sh
+  // (card_64ae115d5bd6); no Regression job runs a Gitea server.
+  ['rg-core import_gitea_live_tests::a_gitea_repository_imports_with_its_history',
+    'needs a live Gitea server: scripts/gitea-import-live.sh up, then the two exported variables'],
   ['rg-http npm_live_client_tests::npm_publish_beta_and_install_by_tag_round_trip',
     'drives the stock npm client; the CI image has no npm on the Rust job and the registry contract is covered by the in-process npm tests'],
   ['rg-http npm_live_client_tests::npm_publish_with_public_provenance_bundle_round_trips',

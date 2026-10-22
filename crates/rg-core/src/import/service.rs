@@ -1,6 +1,6 @@
 //! Import pipeline service — orchestrates full repository migration.
 //!
-//! Supports importing from GitHub and GitLab, including:
+//! Supports importing from GitHub, GitLab, Gitea and Forgejo, including:
 //! - Repository cloning (git clone --bare) + Plombir Git DB registration
 //! - Labels and milestones
 //! - Issues with comments
@@ -8,7 +8,8 @@
 //! - Releases
 //! - Wiki pages, cloned from the source's `<repo>.wiki.git`
 //!
-//! Generic Git and Gitea imports currently clone the repository only.
+//! Gitea and Forgejo are imported through the same steps as GitHub, whose API
+//! they answer under `/api/v1`. A generic Git import clones the repository only.
 //!
 //! The import runs asynchronously and updates progress in the
 //! import_tasks database table.
@@ -81,7 +82,7 @@ use rg_db::ops::{
 };
 
 use crate::import::github_client::{
-    GitHubClient, GitHubComment, GitHubIssue, GitHubLabel, GitHubMilestone, GitHubPR,
+    ApiDialect, GitHubClient, GitHubComment, GitHubIssue, GitHubLabel, GitHubMilestone, GitHubPR,
     GitHubRelease, GitHubReview,
 };
 use crate::import::gitlab_client::{
@@ -222,6 +223,14 @@ impl SourceOrigin {
     /// From the GitLab API base [`parse_gitlab_url`] derived.
     fn gitlab(api_base_url: &str) -> Result<Self> {
         Self::from_api(api_base_url, "gitlab", "gitlab.com")
+    }
+
+    /// From the Gitea / Forgejo API base [`parse_gitea_url`] derived. There is
+    /// no public instance whose sign-in this server can vouch for, so the host
+    /// is always spelled out — `gitea:codeberg.org` — and no byline from one is
+    /// ever re-attributed.
+    fn gitea(api_base_url: &str) -> Result<Self> {
+        Self::from_api(api_base_url, "gitea", "")
     }
 
     fn from_api(api_base_url: &str, platform: &str, public_host: &str) -> Result<Self> {
@@ -876,6 +885,22 @@ pub async fn run_import(
                 &mut stats,
                 trusted_origins,
                 storage_limits,
+                ApiDialect::GitHub,
+            )
+            .await?
+        }
+        // Gitea and Forgejo answer GitHub's calls in GitHub's shapes under
+        // `/api/v1`, so they take the same steps (card_64ae115d5bd6).
+        "gitea" => {
+            run_github_import(
+                db,
+                task,
+                repo_root,
+                auth_token,
+                &mut stats,
+                trusted_origins,
+                storage_limits,
+                ApiDialect::Gitea,
             )
             .await?
         }
@@ -891,7 +916,7 @@ pub async fn run_import(
             )
             .await?
         }
-        "gitea" | "git" => {
+        "git" => {
             run_git_import(
                 db,
                 task,
@@ -1475,6 +1500,9 @@ fn skip_taken_number<T>(
 // GitHub import
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Import from GitHub, or — with [`ApiDialect::Gitea`] — from a Gitea or
+/// Forgejo server, whose API is GitHub's under `/api/v1`.
+#[allow(clippy::too_many_arguments)]
 async fn run_github_import(
     db: &DatabaseConnection,
     task: &ImportTask,
@@ -1483,6 +1511,7 @@ async fn run_github_import(
     stats: &mut ImportStats,
     trusted_origins: &crate::import::trust::TrustedImportOrigins,
     storage_limits: crate::storage_quota::StorageLimits,
+    dialect: ApiDialect,
 ) -> Result<()> {
     // Parse the repository identity and its API host together. Computing only
     // owner/repo here used to leave the client's optional base URL at `None`,
@@ -1491,10 +1520,19 @@ async fn run_github_import(
         owner: gh_owner,
         repo: gh_repo,
         api_base_url,
-    } = parse_github_url(&task.source_url)?;
-    let origin = SourceOrigin::github(&api_base_url)?;
+    } = match dialect {
+        ApiDialect::GitHub => parse_github_url(&task.source_url)?,
+        ApiDialect::Gitea => parse_gitea_url(&task.source_url)?,
+    };
+    let origin = match dialect {
+        ApiDialect::GitHub => SourceOrigin::github(&api_base_url)?,
+        ApiDialect::Gitea => SourceOrigin::gitea(&api_base_url)?,
+    };
     let api_destination = trusted_origins.api_destination(&api_base_url)?;
-    let client = GitHubClient::new(token.to_string(), api_destination)?;
+    let client = match dialect {
+        ApiDialect::GitHub => GitHubClient::new(token.to_string(), api_destination)?,
+        ApiDialect::Gitea => GitHubClient::new_gitea(token.to_string(), api_destination)?,
+    };
 
     // Resolve (or create) the target repo in Plombir Git DB
     let repo_id = resolve_or_create_target_repo(
@@ -2043,14 +2081,14 @@ enum SourcePullHeads {
 impl SourcePullHeads {
     /// The heads worth fetching for `task`: only when its pull requests are
     /// imported, and only from a platform whose pull requests the import
-    /// writes. Gitea has the refs too, but its pull requests are not imported
-    /// yet, so there would be no row for a head to belong to.
+    /// writes.
     fn for_task(task: &ImportTask) -> Option<Self> {
         if !task.import_pull_requests {
             return None;
         }
         match task.platform.as_str() {
-            "github" => Some(Self::GitHub),
+            // Gitea and Forgejo keep GitHub's `refs/pull/<n>/head`.
+            "github" | "gitea" => Some(Self::GitHub),
             "gitlab" => Some(Self::GitLab),
             _ => None,
         }
@@ -3240,6 +3278,37 @@ fn parse_github_url(raw: &str) -> Result<GitHubImportSource> {
     })
 }
 
+/// A Gitea or Forgejo repository URL — `https://host/owner/repo`, or under a
+/// path prefix when the server is installed in one (`https://host/git/owner/repo`)
+/// — and the `/api/v1` it answers under, which keeps that prefix.
+fn parse_gitea_url(raw: &str) -> Result<GitHubImportSource> {
+    let source = parse_api_source_url(raw, "Gitea")?;
+    let mut segments: Vec<String> = source
+        .path_segments()
+        .ok_or_else(|| anyhow::anyhow!("invalid Gitea URL: repository path is missing"))?
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect();
+    let repo = segments
+        .pop()
+        .map(|segment| segment.strip_suffix(".git").unwrap_or(&segment).to_string())
+        .filter(|segment| !segment.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("invalid Gitea URL: repository name is missing"))?;
+    let owner = segments
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("invalid Gitea URL: repository owner is missing"))?;
+    let prefix: String = segments
+        .iter()
+        .map(|segment| format!("/{segment}"))
+        .collect();
+    let api_base_url = api_base_url(source, &format!("{prefix}/api/v1"), "Gitea")?;
+    Ok(GitHubImportSource {
+        owner,
+        repo,
+        api_base_url,
+    })
+}
+
 fn parse_gitlab_url(raw: &str) -> Result<GitLabImportSource> {
     let source = parse_api_source_url(raw, "GitLab")?;
     let project_path = {
@@ -3294,6 +3363,41 @@ fn api_base_url(mut source: reqwest::Url, path: &str, platform: &str) -> Result<
 #[cfg(test)]
 mod import_source_url_tests {
     use super::*;
+
+    /// card_64ae115d5bd6: a Gitea or Forgejo repository URL names its
+    /// `/api/v1`, keeping the path prefix of a server installed under one.
+    #[test]
+    fn a_gitea_url_names_the_api_it_answers_under() {
+        let plain = parse_gitea_url("https://gitea.example.com/team/widgets.git").unwrap();
+        assert_eq!(
+            (plain.owner.as_str(), plain.repo.as_str()),
+            ("team", "widgets")
+        );
+        assert_eq!(plain.api_base_url, "https://gitea.example.com/api/v1");
+
+        let prefixed = parse_gitea_url("https://example.com/git/team/widgets/").unwrap();
+        assert_eq!(
+            (prefixed.owner.as_str(), prefixed.repo.as_str()),
+            ("team", "widgets")
+        );
+        assert_eq!(prefixed.api_base_url, "https://example.com/git/api/v1");
+
+        let port = parse_gitea_url("https://codeberg.org:8443/team/widgets").unwrap();
+        assert_eq!(port.api_base_url, "https://codeberg.org:8443/api/v1");
+        assert!(parse_gitea_url("https://gitea.example.com/widgets").is_err());
+
+        // No Gitea instance's sign-in can vouch for its ids: always the host.
+        assert_eq!(
+            SourceOrigin::gitea(&plain.api_base_url).unwrap().service,
+            "gitea:gitea.example.com"
+        );
+        assert_eq!(
+            SourceOrigin::gitea("https://codeberg.org/api/v1")
+                .unwrap()
+                .service,
+            "gitea:codeberg.org"
+        );
+    }
 
     /// An account id names a person only on the instance that issued it, so
     /// the byline's service says which instance: the bare platform for
@@ -3565,12 +3669,14 @@ async fn import_github_milestones(
             "created_at",
             &gm.created_at,
         )?;
+        // A Gitea milestone nobody edited has no `updated_at`; it was last
+        // updated when it was created.
         let updated_at = parse_import_datetime(
             "GitHub",
             "milestone",
             gm.number,
             "updated_at",
-            &gm.updated_at,
+            gm.updated_at.as_deref().unwrap_or(&gm.created_at),
         )?;
 
         let model = milestone::ActiveModel {
@@ -3824,7 +3930,8 @@ async fn import_github_pr(
         .map(|review| {
             // An unsubmitted draft belongs to whoever is writing it and is not
             // a review yet; GitHub only shows it to the token's own account.
-            if review.state == "PENDING" {
+            // Gitea's `REQUEST_REVIEW` is a request for a review, not one.
+            if review.state == "PENDING" || review.state == "REQUEST_REVIEW" {
                 return None;
             }
             match parse_required_import_datetime(
@@ -3882,7 +3989,12 @@ async fn import_github_pr(
         } else {
             None
         }),
-        base_sha: Set((state != "open").then(|| pr.base.sha.clone())),
+        base_sha: Set((state != "open").then(|| {
+            pr.merge_base
+                .clone()
+                .filter(|sha| !sha.is_empty())
+                .unwrap_or_else(|| pr.base.sha.clone())
+        })),
         head_repo_id: Set(None),
         ci_approved_sha: Set(None),
         ci_approved_by: Set(None),
@@ -3937,8 +4049,9 @@ async fn import_github_pr(
         };
         let action = match review.state.as_str() {
             "APPROVED" => "approve",
-            "CHANGES_REQUESTED" => "request_changes",
-            "COMMENTED" => "comment",
+            // GitHub's spelling, then Gitea's.
+            "CHANGES_REQUESTED" | "REQUEST_CHANGES" => "request_changes",
+            "COMMENTED" | "COMMENT" => "comment",
             "DISMISSED" => "dismiss",
             _ => "comment",
         };
@@ -5019,6 +5132,7 @@ mod imported_issue_label_tests {
             updated_at: "2024-01-03T01:00:00Z".to_string(),
             closed_at: None,
             merge_commit_sha: None,
+            merge_base: None,
         }
     }
 
@@ -5382,6 +5496,61 @@ mod imported_issue_label_tests {
         );
     }
 
+    /// Gitea spells review verdicts its own way: `REQUEST_CHANGES` and
+    /// `COMMENT` are verdicts, `REQUEST_REVIEW` is a request for one and no
+    /// review at all (card_64ae115d5bd6).
+    #[tokio::test]
+    async fn gitea_review_states_import_as_their_verdicts() {
+        let db = test_db().await;
+        let mut stats = ImportStats::default();
+        let review = |id: i64, state: &str| GitHubReview {
+            id,
+            user: Some(github_user(40 + id, "gitea-reviewer")),
+            state: state.to_string(),
+            body: Some(state.to_lowercase()),
+            submitted_at: Some("2024-01-05T00:00:00Z".to_string()),
+        };
+        let origin = SourceOrigin::gitea("https://gitea.example.com/api/v1").unwrap();
+        import_github_pr(
+            &db,
+            1,
+            &github_pr(),
+            &[],
+            &[
+                review(1, "REQUEST_CHANGES"),
+                review(2, "COMMENT"),
+                review(3, "APPROVED"),
+                review(4, "REQUEST_REVIEW"),
+            ],
+            IMPORTER_ID,
+            &origin,
+            &HashMap::new(),
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        let mut actions: Vec<(String, Option<String>)> = rg_db::entities::pr_review::Entity::find()
+            .all(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|review| (review.action, review.original_service))
+            .collect();
+        actions.sort();
+        let service = Some("gitea:gitea.example.com".to_string());
+        assert_eq!(
+            actions,
+            [
+                ("approve".to_string(), service.clone()),
+                ("comment".to_string(), service.clone()),
+                ("request_changes".to_string(), service.clone()),
+            ],
+            "the review request is not a review"
+        );
+        assert!(stats.pr_reviews_failed.is_empty());
+    }
+
     #[tokio::test]
     async fn github_pr_rejects_bad_timestamps_before_writing_the_pr() {
         let db = test_db().await;
@@ -5582,7 +5751,7 @@ mod imported_issue_label_tests {
             state: "open".to_string(),
             due_on: Some("2024-06-30T12:34:56Z".to_string()),
             created_at: "2024-02-01T02:03:04Z".to_string(),
-            updated_at: "2024-02-02T03:04:05Z".to_string(),
+            updated_at: Some("2024-02-02T03:04:05Z".to_string()),
             closed_at: None,
         };
         let gitlab = GitLabMilestone {
@@ -6114,7 +6283,7 @@ mod tests {
             state: "open".to_string(),
             due_on: None,
             created_at: "2024-02-01T02:03:04Z".to_string(),
-            updated_at: "2024-02-02T03:04:05Z".to_string(),
+            updated_at: Some("2024-02-02T03:04:05Z".to_string()),
             closed_at: None,
         };
         let gitlab_milestone = |title: &str| GitLabMilestone {

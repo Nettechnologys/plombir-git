@@ -3225,7 +3225,8 @@
       "access": "RepoWrite",
       "handler": "api::repo_content::delete_branch",
       "testedIn": [
-        "web"
+        "web",
+        "smoke"
       ],
       "reachedFromUi": true
     },
@@ -7680,7 +7681,8 @@
               "handler": "api::repo_content::delete_branch",
               "matched": true,
               "testedIn": [
-                "web"
+                "web",
+                "smoke"
               ]
             },
             {
@@ -26018,7 +26020,7 @@
         {
           "tag": "button",
           "label": "i18n:imports.refresh",
-          "line": 216,
+          "line": 219,
           "via": null,
           "href": null,
           "handler": "refreshImports",
@@ -26042,8 +26044,8 @@
         },
         {
           "tag": "form",
-          "label": "GitHub GitLab Gitea Git",
-          "line": 228,
+          "label": "GitHub GitLab Gitea / Forgejo Git",
+          "line": 231,
           "via": null,
           "href": null,
           "handler": "startImport",
@@ -26081,38 +26083,8 @@
         },
         {
           "tag": "select",
-          "label": "GitHub GitLab Gitea Git",
-          "line": 231,
-          "via": null,
-          "href": null,
-          "handler": null,
-          "calls": [],
-          "unresolved": false
-        },
-        {
-          "tag": "input",
-          "label": "",
-          "line": 261,
-          "via": null,
-          "href": null,
-          "handler": null,
-          "calls": [],
-          "unresolved": false
-        },
-        {
-          "tag": "input",
-          "label": "",
-          "line": 262,
-          "via": null,
-          "href": null,
-          "handler": null,
-          "calls": [],
-          "unresolved": false
-        },
-        {
-          "tag": "input",
-          "label": "",
-          "line": 263,
+          "label": "GitHub GitLab Gitea / Forgejo Git",
+          "line": 234,
           "via": null,
           "href": null,
           "handler": null,
@@ -26160,9 +26132,39 @@
           "unresolved": false
         },
         {
+          "tag": "input",
+          "label": "",
+          "line": 268,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "input",
+          "label": "",
+          "line": 269,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "input",
+          "label": "",
+          "line": 270,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
           "tag": "button",
           "label": "i18n:imports.starting",
-          "line": 271,
+          "line": 274,
           "via": null,
           "href": null,
           "handler": null,
@@ -26172,7 +26174,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 306,
+          "line": 309,
           "via": null,
           "href": "task.source_url",
           "handler": null,
@@ -26182,7 +26184,7 @@
         {
           "tag": "a",
           "label": "/",
-          "line": 315,
+          "line": 318,
           "via": null,
           "href": "taskHref(task)",
           "handler": null,
@@ -26192,7 +26194,7 @@
         {
           "tag": "button",
           "label": "i18n:imports.deleting",
-          "line": 325,
+          "line": 328,
           "via": null,
           "href": null,
           "handler": "() => deleteImport(task.id)",

@@ -1043,21 +1043,20 @@ pub async fn compute_diff(
 ///   be in this repository: a merge brought it here, and so does an import
 ///   (`refs/imported-pulls/`). A fork head that neither did is read from the
 ///   fork, as before.
-/// * The base is `pr.base_sha` when it was recorded — the tip the merge
-///   moved, or the base an import was told by its source — and this
-///   repository holds it.
-/// * Otherwise the base of a merged pull request is the first parent of its
-///   merge commit — the base's tip just before the merge, for each strategy:
+/// * The base of a merged pull request is the first parent of its merge
+///   commit — the base's tip just before the merge, for each strategy:
 ///   [`gix_merge_no_ff`]'s commit lists the base first, a squash
 ///   has the base as its only parent, and a rebase's last commit sits on the
 ///   one before it, whose merge base with the original head is the branch
 ///   point. Measured from the base's tip *now*, the head of a merge is an
 ///   ancestor and the diff is empty.
-/// * A pull request closed unmerged is measured from the base branch's
-///   current tip, which does not hold its head. So is a merged row from
-///   before `base_sha` whose merge commit is the head itself — a rebase that
-///   rewrote nothing — which shows an empty diff, as it always did. Without
-///   the base branch there is no base to read, and the caller says so.
+/// * Without a merge commit to ask — a rebase that rewrote nothing, whose
+///   merge commit is the head itself, or a row that names none — the base is
+///   `pr.base_sha` when it was recorded and this repository holds it: the tip
+///   the merge moved, or the merge base an import's source named.
+/// * Otherwise, and for a pull request closed unmerged, the base branch's
+///   current tip, which does not hold the head. Without the base branch there
+///   is no base to read, and the caller says so.
 fn settled_diff_revs(
     repo_path: &std::path::Path,
     pr: &PullRequest,
@@ -1089,7 +1088,11 @@ fn settled_diff_revs(
         Some(base) => held_commit(&repo, base)?,
         None => None,
     };
-    let base = match recorded_base.or(merge_parent) {
+    // The merge commit's parent first: it comes out of the history itself,
+    // while a recorded base is only as good as whoever recorded it — Gitea's
+    // `base.sha` is its base branch's tip now. The record still decides when
+    // there is no merge commit to ask, above all a rebase that rewrote nothing.
+    let base = match merge_parent.or(recorded_base) {
         Some(base) => base.to_string(),
         None => match crate::repo::service::try_get_branch_sha(repo_path, &pr.base_branch)? {
             Some(tip) => tip,

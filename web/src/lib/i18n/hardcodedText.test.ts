@@ -69,6 +69,8 @@ const NON_TRANSLATABLE = new Set([
 	'GitHub',
 	'GitLab',
 	'Gitea',
+	// The import platform choice: Forgejo speaks Gitea's API (card_64ae115d5bd6).
+	'Gitea / Forgejo',
 	'Google Workspace',
 	'application/json',
 	'application/x-www-form-urlencoded',

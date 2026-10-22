@@ -8,6 +8,16 @@ This project records user-facing changes here. The format follows
 
 ### Added
 
+- Importing from Gitea or Forgejo brings what importing from GitHub does —
+  labels, milestones, issues with their comments, pull requests with their
+  reviews and head commits, releases and the wiki — instead of the repository
+  alone. Their `/api/v1` answers GitHub's calls, read with Gitea's spelling
+  (`limit`, `Authorization: token`, its review states, the `null` it sends for
+  an empty list) and from a server installed under a path prefix. Bylines name
+  the server (`gitea:<host>`), so no sign-in re-attributes them. Proven against
+  a live Gitea 1.22.6 by `import_gitea_live_tests`, which
+  `scripts/gitea-import-live.sh up` starts and fills.
+
 - A person who signs in with GitHub or GitLab can take back what that account
   wrote before an import brought it here: **Settings → Security → Imported
   history** lists, per repository they can read, the issues, comments, pull

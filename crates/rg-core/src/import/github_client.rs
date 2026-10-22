@@ -2,7 +2,9 @@
 //!
 //! Provides typed API calls to fetch repository data (issues, PRs,
 //! labels, milestones, releases) from GitHub.com or GitHub Enterprise Server
-//! instances.
+//! instances — and from Gitea and Forgejo, whose `/api/v1` answers the same
+//! calls in the same shapes, with the differences [`ApiDialect`] names
+//! (card_64ae115d5bd6).
 //!
 //! A repository's wiki is deliberately absent: GitHub serves no page content
 //! over this API, only the `has_wiki` feature flag — which is on by default and
@@ -14,9 +16,52 @@ use reqwest::{header, Client};
 use serde::{Deserialize, Serialize};
 
 /// GitHub API client.
+/// Which server answers: the calls and response shapes are shared, the
+/// spelling of a few of them is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiDialect {
+    /// GitHub.com and GitHub Enterprise Server.
+    GitHub,
+    /// Gitea and Forgejo: `?limit=` instead of `?per_page=`, a page of at most
+    /// 50 items by default (`[api] MAX_RESPONSE_ITEMS`), no `sort` on the
+    /// issue and pull request lists, and `Authorization: token …`.
+    Gitea,
+}
+
+impl ApiDialect {
+    /// The query parameter asking for a full page.
+    fn page_size(self) -> &'static str {
+        match self {
+            Self::GitHub => "per_page=100",
+            Self::Gitea => "limit=50",
+        }
+    }
+
+    /// Oldest first where the server lets the order be asked for; Gitea lists
+    /// in its own order, which is harmless now that every object keeps its
+    /// source number.
+    fn oldest_first(self) -> &'static str {
+        match self {
+            Self::GitHub => "&sort=created&direction=asc",
+            Self::Gitea => "",
+        }
+    }
+}
+
+/// A list field Gitea sends as `null` when it is empty — `assignees` above all,
+/// which its converter fills only when there is one (`convert::ToAPIIssue`).
+fn null_as_empty<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 pub struct GitHubClient {
     client: Client,
     base_url: String,
+    dialect: ApiDialect,
     #[allow(dead_code)]
     token: String,
 }
@@ -53,9 +98,11 @@ pub struct GitHubIssue {
     pub title: String,
     pub body: Option<String>,
     pub state: String,
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub labels: Vec<GitHubLabel>,
     pub milestone: Option<GitHubMilestone>,
     pub user: Option<GitHubUser>,
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub assignees: Vec<GitHubUser>,
     pub comments: i64,
     pub created_at: String,
@@ -78,6 +125,7 @@ pub struct GitHubPR {
     pub user: Option<GitHubUser>,
     pub head: GitHubRef,
     pub base: GitHubRef,
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub labels: Vec<GitHubLabel>,
     pub milestone: Option<GitHubMilestone>,
     pub created_at: String,
@@ -89,6 +137,12 @@ pub struct GitHubPR {
     /// only when `merged` is true.
     #[serde(default)]
     pub merge_commit_sha: Option<String>,
+    /// Gitea's record of where the pull request branched off its base. Its
+    /// `base.sha` is the base branch's tip *now*, which after a merge holds
+    /// the head — so for a diff this is the base to read from. GitHub sends no
+    /// such field.
+    #[serde(default)]
+    pub merge_base: Option<String>,
 }
 
 /// Git reference in a PR.
@@ -113,13 +167,17 @@ pub struct GitHubLabel {
 /// Milestone from GitHub API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubMilestone {
+    /// GitHub's milestone number; Gitea has only the `id`.
+    #[serde(alias = "id")]
     pub number: i64,
     pub title: String,
     pub description: Option<String>,
     pub state: String,
     pub due_on: Option<String>,
     pub created_at: String,
-    pub updated_at: String,
+    /// `null` on a Gitea milestone that was never edited.
+    #[serde(default)]
+    pub updated_at: Option<String>,
     pub closed_at: Option<String>,
 }
 
@@ -137,7 +195,7 @@ pub struct GitHubRelease {
     /// Who published the release on GitHub.
     #[serde(default)]
     pub author: Option<GitHubUser>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub assets: Vec<GitHubAsset>,
 }
 
@@ -146,6 +204,8 @@ pub struct GitHubRelease {
 pub struct GitHubAsset {
     pub id: i64,
     pub name: String,
+    /// Absent from a Gitea attachment.
+    #[serde(default)]
     pub content_type: String,
     pub size: i64,
     pub download_count: i64,
@@ -181,21 +241,52 @@ impl GitHubClient {
     /// This makes it impossible to validate one hostname and connect the PAT
     /// client through a fresh resolver for another.
     pub fn new(token: String, destination: super::trust::ImportApiDestination) -> Result<Self> {
+        Self::with_dialect(token, destination, ApiDialect::GitHub)
+    }
+
+    /// A client for a Gitea or Forgejo server's `/api/v1`.
+    pub fn new_gitea(
+        token: String,
+        destination: super::trust::ImportApiDestination,
+    ) -> Result<Self> {
+        Self::with_dialect(token, destination, ApiDialect::Gitea)
+    }
+
+    fn with_dialect(
+        token: String,
+        destination: super::trust::ImportApiDestination,
+        dialect: ApiDialect,
+    ) -> Result<Self> {
         let (base_url, builder) = destination.into_parts();
         let mut headers = header::HeaderMap::new();
+        // Gitea documents `token …` for an access token; GitHub `Bearer …`.
+        let scheme = match dialect {
+            ApiDialect::GitHub => "Bearer",
+            ApiDialect::Gitea => "token",
+        };
         headers.insert(
             header::AUTHORIZATION,
-            header::HeaderValue::from_str(&format!("Bearer {token}"))
+            header::HeaderValue::from_str(&format!("{scheme} {token}"))
                 .context("invalid import auth token: not a valid HTTP header value")?,
         );
-        headers.insert(
-            header::ACCEPT,
-            header::HeaderValue::from_static("application/vnd.github.v3+json"),
-        );
-        headers.insert(
-            "X-GitHub-Api-Version",
-            header::HeaderValue::from_static("2022-11-28"),
-        );
+        match dialect {
+            ApiDialect::GitHub => {
+                headers.insert(
+                    header::ACCEPT,
+                    header::HeaderValue::from_static("application/vnd.github.v3+json"),
+                );
+                headers.insert(
+                    "X-GitHub-Api-Version",
+                    header::HeaderValue::from_static("2022-11-28"),
+                );
+            }
+            ApiDialect::Gitea => {
+                headers.insert(
+                    header::ACCEPT,
+                    header::HeaderValue::from_static("application/json"),
+                );
+            }
+        }
 
         // Reuse the shared outbound builder so the import client inherits the
         // request + connect timeout — a slow/hanging import source (e.g. a
@@ -213,6 +304,7 @@ impl GitHubClient {
         Ok(Self {
             client,
             base_url,
+            dialect,
             token,
         })
     }
@@ -222,6 +314,13 @@ impl GitHubClient {
         let destination =
             super::trust::TrustedImportOrigins::trusted_api_destination_for_test(&base_url)?;
         Self::new(token, destination)
+    }
+
+    #[cfg(test)]
+    fn new_gitea_for_trusted_test(token: String, base_url: String) -> Result<Self> {
+        let destination =
+            super::trust::TrustedImportOrigins::trusted_api_destination_for_test(&base_url)?;
+        Self::new_gitea(token, destination)
     }
 
     /// Get repository metadata.
@@ -234,8 +333,11 @@ impl GitHubClient {
     /// List all labels for a repository.
     pub async fn list_labels(&self, owner: &str, repo: &str) -> Result<Vec<GitHubLabel>> {
         self.paginate_all(&format!(
-            "{}/repos/{}/{}/labels?per_page=100",
-            self.base_url, owner, repo
+            "{}/repos/{}/{}/labels?{}",
+            self.base_url,
+            owner,
+            repo,
+            self.dialect.page_size()
         ))
         .await
     }
@@ -243,8 +345,11 @@ impl GitHubClient {
     /// List milestones for a repository.
     pub async fn list_milestones(&self, owner: &str, repo: &str) -> Result<Vec<GitHubMilestone>> {
         self.paginate_all(&format!(
-            "{}/repos/{}/{}/milestones?state=all&per_page=100",
-            self.base_url, owner, repo
+            "{}/repos/{}/{}/milestones?state=all&{}",
+            self.base_url,
+            owner,
+            repo,
+            self.dialect.page_size()
         ))
         .await
     }
@@ -260,8 +365,12 @@ impl GitHubClient {
         // the local ids follow.
         let raw: Vec<GitHubIssue> = self
             .paginate_all(&format!(
-                "{}/repos/{}/{}/issues?state=all&sort=created&direction=asc&per_page=100",
-                self.base_url, owner, repo
+                "{}/repos/{}/{}/issues?state=all&type=issues{}&{}",
+                self.base_url,
+                owner,
+                repo,
+                self.dialect.oldest_first(),
+                self.dialect.page_size()
             ))
             .await?;
         // Filter out pull requests (they have a pull_request field)
@@ -274,8 +383,12 @@ impl GitHubClient {
     /// List pull requests for a repository.
     pub async fn list_pull_requests(&self, owner: &str, repo: &str) -> Result<Vec<GitHubPR>> {
         self.paginate_all(&format!(
-            "{}/repos/{}/{}/pulls?state=all&sort=created&direction=asc&per_page=100",
-            self.base_url, owner, repo
+            "{}/repos/{}/{}/pulls?state=all{}&{}",
+            self.base_url,
+            owner,
+            repo,
+            self.dialect.oldest_first(),
+            self.dialect.page_size()
         ))
         .await
     }
@@ -288,8 +401,12 @@ impl GitHubClient {
         issue_number: i64,
     ) -> Result<Vec<GitHubComment>> {
         self.paginate_all(&format!(
-            "{}/repos/{}/{}/issues/{}/comments?per_page=100",
-            self.base_url, owner, repo, issue_number
+            "{}/repos/{}/{}/issues/{}/comments?{}",
+            self.base_url,
+            owner,
+            repo,
+            issue_number,
+            self.dialect.page_size()
         ))
         .await
     }
@@ -302,8 +419,12 @@ impl GitHubClient {
         pr_number: i64,
     ) -> Result<Vec<GitHubReview>> {
         self.paginate_all(&format!(
-            "{}/repos/{}/{}/pulls/{}/reviews?per_page=100",
-            self.base_url, owner, repo, pr_number
+            "{}/repos/{}/{}/pulls/{}/reviews?{}",
+            self.base_url,
+            owner,
+            repo,
+            pr_number,
+            self.dialect.page_size()
         ))
         .await
     }
@@ -311,8 +432,11 @@ impl GitHubClient {
     /// List releases for a repository.
     pub async fn list_releases(&self, owner: &str, repo: &str) -> Result<Vec<GitHubRelease>> {
         self.paginate_all(&format!(
-            "{}/repos/{}/{}/releases?per_page=100",
-            self.base_url, owner, repo
+            "{}/repos/{}/{}/releases?{}",
+            self.base_url,
+            owner,
+            repo,
+            self.dialect.page_size()
         ))
         .await
     }
@@ -734,5 +858,154 @@ mod redirect_tests {
             .is_err(),
             "the rebound sink received a request and could observe the bearer token"
         );
+    }
+}
+
+/// card_64ae115d5bd6: Gitea and Forgejo through the GitHub client. The response
+/// samples follow Gitea's own `modules/structs` — the fields it sends, and the
+/// `null` it sends for an empty list.
+#[cfg(test)]
+mod gitea_tests {
+    use super::*;
+    use crate::import::pagination_test_server::{respond, serve};
+    use tokio::net::TcpListener;
+
+    const USER: &str = r#"{"id":3,"login":"alice","login_name":"","source_id":0,
+        "full_name":"Alice","email":"alice@example.com","avatar_url":"https://gitea.example.com/avatars/3",
+        "html_url":"https://gitea.example.com/alice","is_admin":false}"#;
+
+    fn issue_page(number: i64) -> String {
+        format!(
+            r#"[{{"id":{id},"number":{number},"user":{USER},"original_author":"","original_author_id":0,
+            "title":"filed on Gitea","body":"body","ref":"","assets":[],"labels":null,
+            "milestone":{{"id":4,"title":"v1","description":"","state":"open","open_issues":1,
+              "closed_issues":0,"created_at":"2026-01-01T00:00:00Z","updated_at":null,
+              "closed_at":null,"due_on":null}},
+            "assignee":null,"assignees":null,"state":"open","is_locked":false,"comments":2,
+            "created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-03T00:00:00Z",
+            "closed_at":null,"due_date":null,"pull_request":null,
+            "repository":{{"id":1,"name":"widgets","owner":"team","full_name":"team/widgets"}}}}]"#,
+            id = number + 100,
+        )
+    }
+
+    /// The dialect's own spelling — `token`, `limit`, `type=issues` — and a
+    /// `Link` chain followed page by page, with every `null` list read as an
+    /// empty one rather than failing the import.
+    #[tokio::test]
+    async fn a_gitea_issue_list_is_read_in_gitea_s_spelling() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let next = format!("Link: <http://{addr}/api/v1/page-two>; rel=\"next\"\r\n");
+        let first = issue_page(1);
+        let second = issue_page(2);
+        let server = tokio::spawn(serve(
+            listener,
+            vec![respond(next.as_bytes(), &first), respond(b"", &second)],
+        ));
+
+        let client = GitHubClient::new_gitea_for_trusted_test(
+            "gitea-token".to_owned(),
+            format!("http://{addr}/api/v1"),
+        )
+        .expect("build client");
+        let issues = client
+            .list_issues("team", "widgets")
+            .await
+            .expect("Gitea's issue list imports");
+
+        assert_eq!(
+            issues.iter().map(|issue| issue.number).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(issues[0].assignees.is_empty() && issues[0].labels.is_empty());
+        let milestone = issues[0].milestone.as_ref().expect("the milestone");
+        assert_eq!(
+            milestone.number, 4,
+            "a Gitea milestone is numbered by its id"
+        );
+        assert_eq!(milestone.updated_at, None);
+        assert_eq!(issues[0].user.as_ref().unwrap().login, "alice");
+
+        let requests = server.await.expect("server");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].starts_with(
+                "GET /api/v1/repos/team/widgets/issues?state=all&type=issues&limit=50 "
+            ),
+            "{}",
+            requests[0]
+        );
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("authorization: token gitea-token"),
+            "{}",
+            requests[0]
+        );
+        assert!(
+            !requests[0]
+                .to_ascii_lowercase()
+                .contains("x-github-api-version"),
+            "{}",
+            requests[0]
+        );
+        assert!(requests[1].contains("/api/v1/page-two"), "{}", requests[1]);
+    }
+
+    /// A merged pull request, its reviews in Gitea's state names, and a
+    /// release whose attachment carries no `content_type` — each as Gitea
+    /// sends it.
+    #[test]
+    fn gitea_pull_requests_reviews_and_releases_deserialize() {
+        let repo = format!(
+            r#"{{"id":1,"owner":{USER},"name":"widgets","full_name":"team/widgets","description":"",
+            "empty":false,"private":false,"fork":false,"html_url":"https://gitea.example.com/team/widgets",
+            "ssh_url":"git@gitea.example.com:team/widgets.git",
+            "clone_url":"https://gitea.example.com/team/widgets.git","default_branch":"main"}}"#
+        );
+        let pr: GitHubPR = serde_json::from_str(&format!(
+            r#"{{"id":20,"number":8,"user":{USER},"title":"merged on Gitea","body":"",
+            "labels":null,"milestone":null,"assignee":null,"assignees":null,
+            "requested_reviewers":null,"state":"closed","draft":false,"is_locked":false,
+            "comments":0,"mergeable":false,"merged":true,"merged_at":"2026-01-05T00:00:00Z",
+            "merge_commit_sha":"3333333333333333333333333333333333333333","merged_by":{USER},
+            "base":{{"label":"main","ref":"main","sha":"2222222222222222222222222222222222222222","repo_id":1,"repo":{repo}}},
+            "head":{{"label":"feature","ref":"feature","sha":"1111111111111111111111111111111111111111","repo_id":1,"repo":null}},
+            "merge_base":"0000000000000000000000000000000000000000","due_date":null,
+            "created_at":"2026-01-04T00:00:00Z","updated_at":"2026-01-05T00:00:00Z",
+            "closed_at":"2026-01-05T00:00:00Z","pin_order":0}}"#
+        ))
+        .expect("a Gitea pull request deserializes");
+        assert_eq!(pr.merged, Some(true));
+        assert!(pr.labels.is_empty());
+        assert_eq!(pr.head.sha, "1111111111111111111111111111111111111111");
+        assert_eq!(
+            pr.merge_commit_sha.as_deref(),
+            Some("3333333333333333333333333333333333333333")
+        );
+
+        let reviews: Vec<GitHubReview> = serde_json::from_str(&format!(
+            r#"[{{"id":5,"user":{USER},"team":null,"state":"REQUEST_CHANGES","body":"no",
+              "commit_id":"1111111111111111111111111111111111111111","stale":false,"official":true,
+              "dismissed":false,"comments_count":0,"submitted_at":"2026-01-04T12:00:00Z"}},
+             {{"id":6,"user":{USER},"team":null,"state":"REQUEST_REVIEW","body":"",
+              "commit_id":"","stale":false,"official":false,"dismissed":false,
+              "comments_count":0,"submitted_at":"0001-01-01T00:00:00Z"}}]"#
+        ))
+        .expect("Gitea reviews deserialize");
+        assert_eq!(reviews[0].state, "REQUEST_CHANGES");
+
+        let releases: Vec<GitHubRelease> = serde_json::from_str(&format!(
+            r#"[{{"id":9,"tag_name":"v1","target_commitish":"main","name":"v1","body":"",
+              "draft":false,"prerelease":false,"created_at":"2026-01-06T00:00:00Z",
+              "published_at":"2026-01-06T00:00:00Z","author":{USER},
+              "assets":[{{"id":1,"name":"widgets.tgz","size":12,"download_count":0,
+                "created_at":"2026-01-06T00:00:00Z","uuid":"0b3e",
+                "browser_download_url":"https://gitea.example.com/attachments/0b3e"}}]}}]"#
+        ))
+        .expect("a Gitea release deserializes");
+        assert_eq!(releases[0].assets[0].content_type, "");
+        assert_eq!(releases[0].author.as_ref().unwrap().id, 3);
     }
 }

@@ -65,6 +65,12 @@ const failures = [];
 // exemption list stops describing the tree it exempts.
 const UNEXECUTED = new Map([
   [
+    'gitea-import-live.sh',
+    'starts and fills a throwaway Gitea in Docker for the ignored live import test ' +
+      '(import_gitea_live_tests, listed in NOT_RUN_BY_CI) — by hand, until a Regression job ' +
+      'runs a Gitea server (card_7f2bdd581d17).',
+  ],
+  [
     'full-interface-regression.mjs',
     'a manual replay against a throwaway instance, and regression.yml says so where it runs the narrow ' +
       'routing-only smoke instead. It registers users, writes repositories and exercises delete verbs — ' +

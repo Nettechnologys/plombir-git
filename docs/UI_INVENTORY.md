@@ -233,7 +233,7 @@ succeed and which must be denied.
 | (showCreate = false)} disabled= > | :186 | `POST /api/v1/repos/{owner}/{name}/branches` | `RepoWrite` | web |
 | (showCreate = false)} disabled= > | :186 | `GET /api/v1/repos/{owner}/{name}/branches` | `RepoRead` | web |
 | (showCreate = false)} disabled= > | :186 | `GET /api/v1/repos/{owner}/{name}/branches/protection` | `RepoRead` | rust+web |
-| i18n:repo.branches.deleting | :262 | `DELETE /api/v1/repos/{owner}/{name}/branches/{branch}` | `RepoWrite` | web |
+| i18n:repo.branches.deleting | :262 | `DELETE /api/v1/repos/{owner}/{name}/branches/{branch}` | `RepoWrite` | web+smoke |
 | i18n:repo.branches.deleting | :262 | `GET /api/v1/repos/{owner}/{name}/branches` | `RepoRead` | web |
 | i18n:repo.branches.deleting | :262 | `GET /api/v1/repos/{owner}/{name}/branches/protection` | `RepoRead` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
@@ -1124,10 +1124,10 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:imports.refresh | :216 | `GET /api/v1/imports` | `User` | rust+web |
-| GitHub GitLab Gitea Git | :228 | `POST /api/v1/imports` | `User` | rust+web |
-| GitHub GitLab Gitea Git | :228 | `GET /api/v1/imports` | `User` | rust+web |
-| i18n:imports.deleting | :325 | `DELETE /api/v1/imports/{id}` | `User` | rust+web |
+| i18n:imports.refresh | :219 | `GET /api/v1/imports` | `User` | rust+web |
+| GitHub GitLab Gitea / Forgejo Git | :231 | `POST /api/v1/imports` | `User` | rust+web |
+| GitHub GitLab Gitea / Forgejo Git | :231 | `GET /api/v1/imports` | `User` | rust+web |
+| i18n:imports.deleting | :328 | `DELETE /api/v1/imports/{id}` | `User` | rust+web |
 
 ### `/login`
 

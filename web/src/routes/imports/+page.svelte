@@ -36,8 +36,11 @@
   let importLabels = $state(true);
   let importMilestones = $state(true);
 
+  // Gitea and Forgejo answer GitHub's API under `/api/v1`, so they bring
+  // issues, pull requests, releases and the wiki too (card_64ae115d5bd6); a
+  // plain Git remote has only its history.
   function supportsMetadataImport(value = platform): boolean {
-    return value === 'github' || value === 'gitlab';
+    return value === 'github' || value === 'gitlab' || value === 'gitea';
   }
 
   function sourcePlaceholder(): string {
@@ -45,7 +48,7 @@
       case 'gitlab':
         return 'https://gitlab.com/example/project';
       case 'gitea':
-        return 'https://gitea.example.com/example/project.git';
+        return 'https://gitea.example.com/example/project';
       case 'git':
         return 'https://git.example.com/example/project.git';
       default:
@@ -231,7 +234,7 @@
         <select bind:value={platform}>
           <option value="github">GitHub</option>
           <option value="gitlab">GitLab</option>
-          <option value="gitea">Gitea</option>
+          <option value="gitea">Gitea / Forgejo</option>
           <option value="git">Git</option>
         </select>
       </label>
