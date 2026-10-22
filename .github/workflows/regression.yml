@@ -257,6 +257,23 @@ jobs:
           cargo nextest run -p rg-ssh --test integration --run-ignored only
           -E 'test(/^ssh_lfs_transfer_stock_client_tests::/)'
 
+      # An import from a real Gitea and a real Forgejo, each started and filled
+      # through its own API by the script. Recorded samples could not have
+      # caught what the first live run did — Gitea's `base.sha` is the branch
+      # tip at request time, so a merged pull request's diff came out empty —
+      # and a new release can change a shape the same way (card_7f2bdd581d17).
+      # Both images are pinned in .github/ci-images/Dockerfile, so the next
+      # release reaches this step as a Dependabot pull request.
+      - name: Run live Gitea and Forgejo import tests
+        run: |
+          for server in gitea forgejo; do
+            echo "::group::${server}"
+            eval "$(bash scripts/gitea-import-live.sh up "${server}")"
+            cargo nextest run -p rg-core --test integration --run-ignored only -E 'test(=import_gitea_live_tests::a_gitea_repository_imports_with_its_history)'
+            bash scripts/gitea-import-live.sh down
+            echo "::endgroup::"
+          done
+
       # nextest does not run doc-tests (upstream limitation), so they need
       # their own step or they silently stop being checked.
       - name: Run doc-tests

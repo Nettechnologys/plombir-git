@@ -30,8 +30,8 @@
 //      unwatched;
 //   4. the root Dockerfile's `# syntax=` directive is the `dockerfile-frontend`
 //      pin;
-//   5. the reverse-proxy script pins no digest of its own and reads both images
-//      out of the pin file.
+//   5. the reverse-proxy script and the live import script pin no digest of
+//      their own and read their images out of the pin file.
 
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -46,6 +46,7 @@ const root = resolve(process.argv[2] ?? join(scriptsDir, '..'));
 const PIN_FILE = '.github/ci-images/Dockerfile';
 const PIN_DIRECTORY = '/.github/ci-images';
 const PROXY_SCRIPT = 'scripts/check-reverse-proxy-examples.sh';
+const LIVE_IMPORT_SCRIPT = 'scripts/gitea-import-live.sh';
 const ROOT_DOCKERFILE = 'Dockerfile';
 
 // The stages the pin file must declare, and why each is there. A new pin is a
@@ -56,6 +57,8 @@ const STAGES = new Map([
   ['nginx', `the nginx image ${PROXY_SCRIPT} loads deploy/nginx.conf.example with`],
   ['caddy', `the Caddy image ${PROXY_SCRIPT} loads deploy/Caddyfile.example with`],
   ['dockerfile-frontend', `the \`# syntax=\` directive on the first line of ${ROOT_DOCKERFILE}`],
+  ['gitea', `the Gitea ${LIVE_IMPORT_SCRIPT} starts for the live import test`],
+  ['forgejo', `the Forgejo ${LIVE_IMPORT_SCRIPT} starts for the live import test`],
 ]);
 
 const PINNED = /^[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$/;
@@ -191,19 +194,23 @@ if (rootDockerfile !== null) {
   }
 }
 
-// ── 5. The reverse-proxy script reads, it does not pin ──
-const proxySource = read(PROXY_SCRIPT);
-if (proxySource !== null) {
-  const code = shellCodeOnly(proxySource);
+// ── 5. The scripts that start a pinned image read it, they do not pin it ──
+for (const [script, stages] of [
+  [PROXY_SCRIPT, ['nginx', 'caddy']],
+  [LIVE_IMPORT_SCRIPT, ['gitea', 'forgejo']],
+]) {
+  const source = read(script);
+  if (source === null) continue;
+  const code = shellCodeOnly(source);
   if (/@sha256:/.test(code)) {
-    failures.push(`${PROXY_SCRIPT} pins a digest of its own again — read it from ${PIN_FILE}, the copy is the one no updater bumps`);
+    failures.push(`${script} pins a digest of its own again — read it from ${PIN_FILE}, the copy is the one no updater bumps`);
   }
   if (!code.includes(PIN_FILE)) {
-    failures.push(`${PROXY_SCRIPT} no longer reads ${PIN_FILE}`);
+    failures.push(`${script} no longer reads ${PIN_FILE}`);
   }
-  for (const stage of ['nginx', 'caddy']) {
+  for (const stage of stages) {
     if (!new RegExp(`\\bci_image ${stage}\\b`).test(code)) {
-      failures.push(`${PROXY_SCRIPT} no longer reads the \`${stage}\` pin (\`ci_image ${stage}\`)`);
+      failures.push(`${script} no longer reads the \`${stage}\` pin (\`ci_image ${stage}\`)`);
     }
   }
 }

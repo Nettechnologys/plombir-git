@@ -66,11 +66,23 @@ export interface Issue {
   assignee_id: number | null;
   /** The assignee's username, when the issue is on someone whose account resolves. */
   assignee?: string | null;
+  /**
+   * Who the issue was assigned to on the platform it was imported from —
+   * logins there, not accounts here. Only on the issue itself, never in a list.
+   */
+  original_assignees?: ImportedPerson[];
   milestone_id: number | null;
   labels: string[];
   created_at: string;
   updated_at: string;
   closed_at: string | null;
+}
+
+/** A person an imported issue or pull request named on its source. */
+export interface ImportedPerson {
+  login: string;
+  /** `github`, `gitlab`, or `<platform>:<host>` for any other server. */
+  service: string;
 }
 
 /** A comment as `GET /issues/{number}/comments` lists it. */

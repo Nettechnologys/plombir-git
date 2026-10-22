@@ -3,8 +3,15 @@
 # has to carry, and print the environment the live import test reads
 # (card_64ae115d5bd6).
 #
-#   scripts/gitea-import-live.sh up     # start + seed, prints `export …` lines
-#   scripts/gitea-import-live.sh down   # remove the container
+#   scripts/gitea-import-live.sh up [gitea|forgejo]  # start + seed, prints `export …` lines
+#   scripts/gitea-import-live.sh down                # remove the container
+#
+# The Regression workflow runs it for both servers and runs the test after each
+# (card_7f2bdd581d17). Their images are pinned in .github/ci-images/Dockerfile,
+# where Dependabot proposes the next release — and that pull request's own run
+# is where a changed answer shows up. Forgejo's image answers to the same
+# `gitea` command and `GITEA__` settings. `GITEA_LIVE_IMAGE` overrides the pin,
+# to try a release by hand before it is pinned.
 #
 # The repository `importer/moved` holds: two labels and a milestone; issue #1
 # with a comment by a second account; a pull request (#2, sharing the issue
@@ -17,8 +24,20 @@ set -euo pipefail
 
 NAME="${GITEA_LIVE_NAME:-plombir-gitea-live}"
 PORT="${GITEA_LIVE_PORT:-33000}"
-IMAGE="${GITEA_LIVE_IMAGE:-gitea/gitea:1.22.6}"
 BASE="http://127.0.0.1:${PORT}"
+CI_IMAGES="$(dirname "$0")/../.github/ci-images/Dockerfile"
+
+# The same reader as scripts/check-reverse-proxy-examples.sh: one
+# `FROM <image> AS <stage>` line per pin.
+ci_image() {
+  local image
+  image="$(awk -v stage="$1" '$1 == "FROM" && $3 == "AS" && $4 == stage { print $2 }' "${CI_IMAGES}")"
+  if [ -z "${image}" ] || [ "$(printf '%s\n' "${image}" | wc -l)" -ne 1 ]; then
+    echo "${CI_IMAGES} must pin exactly one \`FROM <image> AS $1\`." >&2
+    exit 1
+  fi
+  printf '%s\n' "${image}"
+}
 
 down() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
 
@@ -26,6 +45,16 @@ if [ "${1:-up}" = "down" ]; then
   down
   exit 0
 fi
+
+case "${2:-gitea}" in
+  gitea) PINNED="$(ci_image gitea)" ;;
+  forgejo) PINNED="$(ci_image forgejo)" ;;
+  *)
+    echo "unknown server \`$2\`: gitea or forgejo" >&2
+    exit 2
+    ;;
+esac
+IMAGE="${GITEA_LIVE_IMAGE:-${PINNED}}"
 
 down
 docker run -d --rm --name "$NAME" -p "127.0.0.1:${PORT}:3000" \

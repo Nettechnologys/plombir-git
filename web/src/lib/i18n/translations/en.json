@@ -80,7 +80,9 @@
     "bot_title": "An AI agent account",
     "on_behalf_of": "on behalf of",
     "imported_title": "Imported: the account beside it ran the import",
-    "originally_by": "originally by"
+    "originally_by": "originally by",
+    "assigned_on_source": "assigned there:",
+    "review_requested_on_source": "review requested there:"
   },
   "ssh_keys": {
     "title": "SSH Keys",

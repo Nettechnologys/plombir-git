@@ -16,10 +16,14 @@ pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<Comme
 }
 
 /// List comments for an issue, ordered by creation time.
+///
+/// The id breaks a tie: an import writes the source's timestamps, and a bot or
+/// a migration can leave several comments in one second (card_ba4dab292b1c).
 pub async fn list_by_issue(db: &DatabaseConnection, issue_id: i64) -> Result<Vec<Comment>> {
     CommentEntity::find()
         .filter(issue_comment::Column::IssueId.eq(issue_id))
         .order_by_asc(issue_comment::Column::CreatedAt)
+        .order_by_asc(issue_comment::Column::Id)
         .all(db)
         .await
         .context("db: list issue comments")

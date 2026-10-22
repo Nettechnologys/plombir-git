@@ -80,7 +80,9 @@
     "bot_title": "AI 智能体账户",
     "on_behalf_of": "代表",
     "imported_title": "导入的内容：旁边的账户执行了导入",
-    "originally_by": "原作者"
+    "originally_by": "原作者",
+    "assigned_on_source": "在来源平台的指派：",
+    "review_requested_on_source": "在来源平台请求的审查："
   },
   "ssh_keys": {
     "title": "SSH 密钥",

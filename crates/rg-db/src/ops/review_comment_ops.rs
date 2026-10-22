@@ -15,11 +15,13 @@ pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<Revie
         .context("db: find review comment by id")
 }
 
-/// List all comments for a PR (across all reviews).
+/// List all comments for a PR (across all reviews), oldest first, the id
+/// breaking a tie of one second (see `issue_comment_ops::list_by_issue`).
 pub async fn list_by_pr(db: &DatabaseConnection, pr_id: i64) -> Result<Vec<ReviewComment>> {
     CommentEntity::find()
         .filter(review_comment::Column::PrId.eq(pr_id))
         .order_by_asc(review_comment::Column::CreatedAt)
+        .order_by_asc(review_comment::Column::Id)
         .all(db)
         .await
         .context("db: list review comments by PR")

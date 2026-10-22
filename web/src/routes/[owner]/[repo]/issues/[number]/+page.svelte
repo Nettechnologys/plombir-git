@@ -5,6 +5,7 @@
   import AttachmentPanel from '$lib/components/AttachmentPanel.svelte';
   import BotBadge from '$lib/components/BotBadge.svelte';
   import ImportedBadge from '$lib/components/ImportedBadge.svelte';
+  import ImportedPeople from '$lib/components/ImportedPeople.svelte';
   import LabelChip from '$lib/components/LabelChip.svelte';
   import Modal from '$lib/components/Modal.svelte';
   import ThreadSubscription from '$lib/components/ThreadSubscription.svelte';
@@ -423,6 +424,7 @@
             </button>
           {/if}
         </div>
+        <ImportedPeople people={issue.original_assignees} role="assignees" />
       </section>
 
       {#if issue.body}

@@ -5,6 +5,7 @@
   import AttachmentPanel from '$lib/components/AttachmentPanel.svelte';
   import BotBadge from '$lib/components/BotBadge.svelte';
   import ImportedBadge from '$lib/components/ImportedBadge.svelte';
+  import ImportedPeople from '$lib/components/ImportedPeople.svelte';
   import Modal from '$lib/components/Modal.svelte';
   import ThreadSubscription from '$lib/components/ThreadSubscription.svelte';
   import { pulls, reviews } from '$lib/api/client.svelte';
@@ -749,6 +750,8 @@
                 {/each}
               </div>
             {/if}
+            <ImportedPeople people={pr.original_reviewers} role="reviewers" />
+            <ImportedPeople people={pr.original_assignees} role="assignees" />
             {#if permission.canWrite}
               <div class="reviewer-form">
                 <input bind:value={reviewerUsername} placeholder={t('pulls.reviewers.placeholder')} disabled={mutationBusy} />

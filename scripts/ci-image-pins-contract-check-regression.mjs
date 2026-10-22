@@ -26,6 +26,7 @@ const check = 'scripts/ci-image-pins-contract-check.mjs';
 const COPIED = [
   check,
   'scripts/check-reverse-proxy-examples.sh',
+  'scripts/gitea-import-live.sh',
   'Dockerfile',
   '.github/dependabot.yml',
   '.github/ci-images/Dockerfile',
@@ -177,6 +178,25 @@ fixture(
     `NGINX_IMAGE=nginx:1.27-alpine@sha256:${'b'.repeat(64)}`,
   ),
   'pins a digest of its own',
+);
+
+// card_7f2bdd581d17: the live import script is held to the same rule, and
+// to reading both servers it starts.
+fixture(
+  'the live import script pinning a digest of its own is red',
+  'scripts/gitea-import-live.sh',
+  (source) => source.replace(
+    'gitea) PINNED="$(ci_image gitea)" ;;',
+    `gitea) PINNED=gitea/gitea:1.27.3@sha256:${'c'.repeat(64)} ;;`,
+  ),
+  'gitea-import-live.sh pins a digest of its own',
+);
+
+fixture(
+  'the live import script no longer starting the pinned Forgejo is red',
+  'scripts/gitea-import-live.sh',
+  (source) => source.replace('forgejo) PINNED="$(ci_image forgejo)" ;;', 'forgejo) PINNED="$(ci_image gitea)" ;;'),
+  'no longer reads the `forgejo` pin',
 );
 
 if (failures > 0) {

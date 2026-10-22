@@ -6,8 +6,8 @@ forms. The format is the Gitea/GitHub Markdown one: a `.md` file whose optional
 YAML front matter names the template and the labels it applies.
 
 **Where the files go** is the awkward part, and it is why this page exists:
-Plombir Git reads eight different template directories, eight different chooser
-configuration paths and six different pull-request template paths, and nothing
+Plombir Git reads nine different template directories, eight different chooser
+configuration paths and ten different pull-request template paths, and nothing
 in the UI tells you which. The complete inventories are below — copy a path
 from them rather than guessing.
 
@@ -104,7 +104,7 @@ consequences worth knowing:
 ### Where issue templates are read from
 
 Every `.md` file directly inside any of these directories is a template. All
-eight directories are read, not just the first one that exists, so a repository
+nine directories are read, not just the first one that exists, so a repository
 carrying both a `.github` and a `.gitea` directory offers both sets.
 
 <!-- inventory: issue-template-directories -->
@@ -117,7 +117,11 @@ issue_template
 .github/issue_template
 .gitlab/ISSUE_TEMPLATE
 .gitlab/issue_template
+.gitlab/issue_templates
 ```
+
+`.gitlab/issue_templates` is the directory GitLab uses, so a repository that
+moved here from GitLab keeps its templates where they are.
 
 Three rules apply to the files inside:
 
@@ -200,7 +204,17 @@ pull_request_template.md
 .gitea/pull_request_template.md
 .github/PULL_REQUEST_TEMPLATE.md
 .github/pull_request_template.md
+docs/PULL_REQUEST_TEMPLATE.md
+docs/pull_request_template.md
+.gitlab/merge_request_templates/Default.md
+.gitlab/merge_request_templates/default.md
 ```
+
+The last two are GitLab's default merge request template. GitLab keeps any
+number of templates in `.gitlab/merge_request_templates/` and pre-fills a new
+merge request only from `Default.md`; the others are a menu there, and they are
+not read here. GitLab quick actions in a template (`/label ~bug`, `/assign me`)
+are not run: they arrive as text in the description.
 
 The same 1048576-byte (1 MiB) ceiling and UTF-8 requirement apply.
 

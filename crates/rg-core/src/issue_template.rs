@@ -12,7 +12,7 @@ const MAX_TEMPLATE_SIZE: usize = 1024 * 1024;
 ///
 /// [`MAX_TEMPLATE_SIZE`] bounds one template and nothing else, while every body
 /// discovery finds stays in [`IssueTemplateDiscovery::templates`] until the
-/// endpoint has answered. How many files live under the eight candidate
+/// endpoint has answered. How many files live under the nine candidate
 /// directories is chosen by whoever can push, so a thousand templates a byte
 /// under the per-file ceiling cost a thousand times what that number promises.
 /// The same reasoning, and the same figure, as `MAX_WORKFLOW_TOTAL_BYTES` in
@@ -38,6 +38,10 @@ const MAX_TEMPLATE_FILE_COUNT: usize = 256;
 /// is refused before its listing enters heap.
 const ISSUE_TEMPLATE_LISTING_LIMIT_BYTES: u64 = 8 * 1024 * 1024;
 
+/// `.gitlab/issue_templates` is where GitLab keeps them — plural, unlike the
+/// two `.gitlab/` spellings above, which came over from Gitea's list and which
+/// GitLab itself never reads. Without it a repository that moved here from
+/// GitLab offered no templates at all (card_7c39212f8fff).
 const ISSUE_TEMPLATE_DIRS: &[&str] = &[
     "ISSUE_TEMPLATE",
     "issue_template",
@@ -47,6 +51,7 @@ const ISSUE_TEMPLATE_DIRS: &[&str] = &[
     ".github/issue_template",
     ".gitlab/ISSUE_TEMPLATE",
     ".gitlab/issue_template",
+    ".gitlab/issue_templates",
 ];
 
 const ISSUE_CONFIGS: &[&str] = &[
@@ -60,6 +65,10 @@ const ISSUE_CONFIGS: &[&str] = &[
     ".github/issue_template/config.yml",
 ];
 
+/// The first that exists wins. The tail is where the other forges keep the
+/// file (card_7c39212f8fff): GitHub also looks in `docs/`, and GitLab fills a
+/// new merge request from `.gitlab/merge_request_templates/Default.md` — only
+/// that one; the directory's other files are offered in a menu we do not have.
 const PULL_REQUEST_TEMPLATES: &[&str] = &[
     "PULL_REQUEST_TEMPLATE.md",
     "pull_request_template.md",
@@ -67,6 +76,10 @@ const PULL_REQUEST_TEMPLATES: &[&str] = &[
     ".gitea/pull_request_template.md",
     ".github/PULL_REQUEST_TEMPLATE.md",
     ".github/pull_request_template.md",
+    "docs/PULL_REQUEST_TEMPLATE.md",
+    "docs/pull_request_template.md",
+    ".gitlab/merge_request_templates/Default.md",
+    ".gitlab/merge_request_templates/default.md",
 ];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -140,7 +153,7 @@ pub fn discover_issue_templates(
     };
     let mut discovery = IssueTemplateDiscovery::default();
     // One budget for the whole discovery rather than one per directory: the
-    // eight candidate directories are all searched and everything found in them
+    // nine candidate directories are all searched and everything found in them
     // is held together, so bounding each of them separately would bound
     // nothing.
     let mut budget = TemplateSetBudget::new();
@@ -1253,7 +1266,7 @@ struct IssueContactLink {
     }
 
     /// The paths are the other half of the contract, and the larger half: three
-    /// lists, twenty-two entries, none of them guessable and none of them
+    /// lists, twenty-seven entries, none of them guessable and none of them
     /// visible anywhere in the product. Compared as sets in both directions —
     /// a path this server stopped opening must not stay in the document any
     /// more than a path it opens may be missing from it.
@@ -1824,5 +1837,66 @@ struct IssueContactLink {
 
         assert_eq!(template.file_name, ".gitea/PULL_REQUEST_TEMPLATE.md");
         assert_eq!(template.content, "## Checklist\n");
+    }
+
+    /// card_7c39212f8fff: a repository that moved here from GitLab keeps its
+    /// issue templates in `.gitlab/issue_templates/` — plural — and that
+    /// directory used to be read by nobody.
+    #[test]
+    fn gitlab_issue_templates_are_offered() {
+        let (_directory, repository) =
+            committed_repository(&[(".gitlab/issue_templates/bug.md", "## What happened\n")]);
+
+        let discovery = discover_issue_templates(&repository, "main").unwrap();
+
+        assert!(discovery.errors.is_empty(), "{:?}", discovery.errors);
+        assert_eq!(
+            discovery
+                .templates
+                .iter()
+                .map(|template| (template.file_name.as_str(), template.name.as_str()))
+                .collect::<Vec<_>>(),
+            [(".gitlab/issue_templates/bug.md", "bug.md")]
+        );
+    }
+
+    /// card_7c39212f8fff: GitLab fills a new merge request from `Default.md`
+    /// in its template directory, GitHub also looks for the pull-request
+    /// template under `docs/`. Each alone is found; the directory's other
+    /// GitLab templates are a menu GitLab offers, not a default, and are left
+    /// alone.
+    #[test]
+    fn gitlab_default_and_docs_pull_request_templates_are_found() {
+        for (files, expected) in [
+            (
+                &[
+                    (".gitlab/merge_request_templates/Default.md", "## MR\n"),
+                    (".gitlab/merge_request_templates/Bug.md", "## Bug\n"),
+                ][..],
+                Some((".gitlab/merge_request_templates/Default.md", "## MR\n")),
+            ),
+            (
+                &[(".gitlab/merge_request_templates/default.md", "## mr\n")][..],
+                Some((".gitlab/merge_request_templates/default.md", "## mr\n")),
+            ),
+            (
+                &[(".gitlab/merge_request_templates/Bug.md", "## Bug\n")][..],
+                None,
+            ),
+            (
+                &[("docs/pull_request_template.md", "## Docs\n")][..],
+                Some(("docs/pull_request_template.md", "## Docs\n")),
+            ),
+        ] {
+            let (_directory, repository) = committed_repository(files);
+            let template = read_pull_request_template(&repository, "main").unwrap();
+            assert_eq!(
+                template
+                    .as_ref()
+                    .map(|template| (template.file_name.as_str(), template.content.as_str())),
+                expected,
+                "{files:?}"
+            );
+        }
     }
 }

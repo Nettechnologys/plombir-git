@@ -299,11 +299,16 @@ impl GitLabClient {
         project_id: &str,
         issue_iid: i64,
     ) -> Result<Vec<GitLabNote>> {
-        // Filter out system notes for cleaner import
+        // Filter out system notes for cleaner import.
+        //
+        // Oldest first, said out loud: GitLab lists notes newest first by
+        // default. The import writes them in the order they arrive, and notes
+        // created in the same second are shown in that order, so the default
+        // reversed them (card_ba4dab292b1c).
         let all_notes: Vec<GitLabNote> = Self::paginate_all(
             &self.client,
             &format!(
-                "{}/projects/{}/issues/{}/notes?per_page=100",
+                "{}/projects/{}/issues/{}/notes?order_by=created_at&sort=asc&per_page=100",
                 self.base_url,
                 urlencoding(project_id),
                 issue_iid
@@ -315,10 +320,11 @@ impl GitLabClient {
 
     /// List notes (comments) for a merge request.
     pub async fn list_mr_notes(&self, project_id: &str, mr_iid: i64) -> Result<Vec<GitLabNote>> {
+        // Oldest first, for the reason given in `list_issue_notes`.
         let all_notes: Vec<GitLabNote> = Self::paginate_all(
             &self.client,
             &format!(
-                "{}/projects/{}/merge_requests/{}/notes?per_page=100",
+                "{}/projects/{}/merge_requests/{}/notes?order_by=created_at&sort=asc&per_page=100",
                 self.base_url,
                 urlencoding(project_id),
                 mr_iid
@@ -546,6 +552,56 @@ mod pagination_tests {
             requests[0].contains("page=1") && requests[1].contains("page=2"),
             "each page must be asked for once: {requests:?}"
         );
+    }
+
+    /// card_ba4dab292b1c: GitLab lists notes newest first unless told
+    /// otherwise, and the import writes them in the order they arrive. Two
+    /// notes of the same second then showed up in our conversation the wrong
+    /// way round, since the list breaks a tie on the order of insertion.
+    #[tokio::test]
+    async fn issue_and_merge_request_notes_are_asked_for_oldest_first() {
+        const NOTES: &str = r#"[{"id":7,"body":"first","author":null,"system":false,
+            "created_at":"2024-01-02T00:00:00.000Z","updated_at":"2024-01-02T00:00:00.000Z"}]"#;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let server = tokio::spawn(serve(
+            listener,
+            vec![respond(b"", NOTES), respond(b"", NOTES)],
+        ));
+
+        let client =
+            GitLabClient::new_for_trusted_test("token".to_owned(), format!("http://{addr}"))
+                .expect("build client");
+        assert_eq!(
+            client
+                .list_issue_notes("group/widgets", 3)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            client
+                .list_mr_notes("group/widgets", 4)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let requests = server.await.expect("server");
+        assert_eq!(requests.len(), 2);
+        for (request, path) in requests
+            .iter()
+            .zip(["/issues/3/notes?", "/merge_requests/4/notes?"])
+        {
+            let line = request.lines().next().unwrap_or_default();
+            assert!(line.contains(path), "{line}");
+            assert!(
+                line.contains("order_by=created_at") && line.contains("sort=asc"),
+                "notes must be asked for oldest first: {line}"
+            );
+        }
     }
 }
 

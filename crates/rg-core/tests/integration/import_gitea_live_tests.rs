@@ -6,6 +6,9 @@
 //! assertions below expect: issue #1 with a comment by a second account, pull
 //! request #2 merged with a merge commit and its branch deleted, an approving
 //! review, labels, a milestone, a release and a wiki page.
+//!
+//! The Regression workflow runs it against an old and a current Gitea and
+//! against Forgejo, one container after another (card_7f2bdd581d17).
 
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 

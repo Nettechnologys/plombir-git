@@ -16,11 +16,14 @@ pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<PrRev
         .context("db: find review by id")
 }
 
-/// List all reviews for a PR, ordered by creation time.
+/// List all reviews for a PR, ordered by creation time, the id breaking a tie
+/// of one second (see `issue_comment_ops::list_by_issue`). An imported merge
+/// request's notes are stored here.
 pub async fn list_by_pr(db: &DatabaseConnection, pr_id: i64) -> Result<Vec<PrReview>> {
     ReviewEntity::find()
         .filter(pr_review::Column::PrId.eq(pr_id))
         .order_by_asc(pr_review::Column::CreatedAt)
+        .order_by_asc(pr_review::Column::Id)
         .all(db)
         .await
         .context("db: list reviews by PR")

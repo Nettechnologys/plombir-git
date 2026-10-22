@@ -4,19 +4,12 @@
   // import, which is who it belongs to here (card_04088376105b). Renders
   // nothing for what was written on this instance.
   import { t } from '$lib/i18n';
+  import { importedPlatform } from '$lib/importedPlatform';
 
   let { login = null, service = null }: { login?: string | null; service?: string | null } =
     $props();
 
-  const PLATFORMS: Record<string, string> = { github: 'GitHub', gitlab: 'GitLab' };
-  // `github` / `gitlab` is github.com / gitlab.com; any other server is
-  // `github:ghe.example.com`, and its host is worth showing.
-  const platform = $derived.by(() => {
-    if (!service) return '';
-    const [kind, ...host] = service.split(':');
-    const name = PLATFORMS[kind] ?? kind;
-    return host.length ? `${name} · ${host.join(':')}` : name;
-  });
+  const platform = $derived(service ? importedPlatform(service) : '');
 </script>
 
 {#if login && service}
