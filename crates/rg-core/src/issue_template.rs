@@ -89,20 +89,39 @@ const ISSUE_CONFIGS: &[&str] = &[
 /// new merge request from `.gitlab/merge_request_templates/Default.md` — only
 /// that one; the directory's other files are offered in a menu we do not have.
 /// Forgejo looks in `.forgejo/` before `.gitea/` (card_04b603522857).
-const PULL_REQUEST_TEMPLATES: &[&str] = &[
-    "PULL_REQUEST_TEMPLATE.md",
-    "pull_request_template.md",
-    ".forgejo/PULL_REQUEST_TEMPLATE.md",
-    ".forgejo/pull_request_template.md",
-    ".gitea/PULL_REQUEST_TEMPLATE.md",
-    ".gitea/pull_request_template.md",
-    ".github/PULL_REQUEST_TEMPLATE.md",
-    ".github/pull_request_template.md",
-    "docs/PULL_REQUEST_TEMPLATE.md",
-    "docs/pull_request_template.md",
-    ".gitlab/merge_request_templates/Default.md",
-    ".gitlab/merge_request_templates/default.md",
+///
+/// The root, `.github/` and `docs/` are where GitHub looks, and GitHub matches
+/// the name there by a rule rather than by a path, so those three are
+/// [`PullRequestTemplatePath::GitHub`] (card_0a9377f1e686).
+const PULL_REQUEST_TEMPLATES: &[PullRequestTemplatePath] = &[
+    PullRequestTemplatePath::GitHub(""),
+    PullRequestTemplatePath::Exact(".forgejo/PULL_REQUEST_TEMPLATE.md"),
+    PullRequestTemplatePath::Exact(".forgejo/pull_request_template.md"),
+    PullRequestTemplatePath::Exact(".gitea/PULL_REQUEST_TEMPLATE.md"),
+    PullRequestTemplatePath::Exact(".gitea/pull_request_template.md"),
+    PullRequestTemplatePath::GitHub(".github"),
+    PullRequestTemplatePath::GitHub("docs"),
+    PullRequestTemplatePath::Exact(".gitlab/merge_request_templates/Default.md"),
+    PullRequestTemplatePath::Exact(".gitlab/merge_request_templates/default.md"),
 ];
+
+/// One place [`read_pull_request_template`] looks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PullRequestTemplatePath {
+    /// Exactly this path, the way Gitea, Forgejo and GitLab look it up.
+    Exact(&'static str),
+    /// GitHub's rule, directly inside this directory (`""` is the root): a
+    /// file named `pull_request_template` in any capitalization, ending in
+    /// `.md` or `.txt`. A repository that kept `.github/Pull_Request_Template.md`
+    /// or `docs/pull_request_template.txt` on GitHub used to start every new
+    /// pull request here from an empty description.
+    GitHub(&'static str),
+}
+
+/// The file names [`PullRequestTemplatePath::GitHub`] accepts, lowercased, in
+/// the order two of them in one directory are preferred.
+const GITHUB_PULL_REQUEST_TEMPLATE_NAMES: &[&str] =
+    &["pull_request_template.md", "pull_request_template.txt"];
 
 /// Where Gitea and Forgejo find a pull-request template written as a YAML
 /// form, beside the Markdown ones above. The form format is not read here, so
@@ -335,14 +354,108 @@ pub fn read_pull_request_template(
         return Ok(None);
     };
     for candidate in PULL_REQUEST_TEMPLATES {
-        if let Some(content) = try_read_text_blob(&git, repository_path, &commit_ref, candidate)? {
-            return Ok(Some(PullRequestTemplate {
-                content,
-                file_name: (*candidate).to_string(),
-            }));
+        let found = match *candidate {
+            PullRequestTemplatePath::Exact(path) => {
+                try_read_text_blob(&git, repository_path, &commit_ref, path)?
+                    .map(|content| (path.to_string(), content))
+            }
+            PullRequestTemplatePath::GitHub(directory) => {
+                read_github_pull_request_template(&git, repository_path, &commit_ref, directory)?
+            }
+        };
+        if let Some((file_name, content)) = found {
+            return Ok(Some(PullRequestTemplate { content, file_name }));
         }
     }
     Ok(None)
+}
+
+/// GitHub's pull-request template directly inside `directory` (`""` is the
+/// root), as `(path, content)`.
+///
+/// The name is matched without regard to case, so it cannot be asked for by
+/// path: one non-recursive `ls-tree -lz` names every entry of the directory
+/// and carries each size, which spends [`MAX_TEMPLATE_SIZE`] before the blob
+/// is read — the same order [`list_directory`] keeps. Two spellings in one
+/// directory are ranked by [`GITHUB_PULL_REQUEST_TEMPLATE_NAMES`] and then by
+/// byte order, so `PULL_REQUEST_TEMPLATE.md` still wins over
+/// `pull_request_template.md`, as it did when both were exact candidates.
+fn read_github_pull_request_template(
+    git: &GitCommandGateway,
+    repository_path: &Path,
+    git_ref: &str,
+    directory: &str,
+) -> Result<Option<(String, String)>> {
+    let prefix = if directory.is_empty() {
+        String::new()
+    } else {
+        format!("{directory}/")
+    };
+    let mut arguments = vec!["ls-tree", "-lz", git_ref];
+    if !prefix.is_empty() {
+        arguments.extend(["--", prefix.as_str()]);
+    }
+    // The root is a directory of the repository's choosing as much as any
+    // template directory is, so its listing is bounded the same way.
+    let output = git.run_bounded(
+        &arguments,
+        Some(repository_path),
+        ISSUE_TEMPLATE_LISTING_LIMIT_BYTES,
+    )?;
+    output.ensure_success()?;
+
+    let mut best: Option<(usize, String, Option<u64>)> = None;
+    for record in output.stdout.split(|byte| *byte == 0) {
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+            continue;
+        };
+        let Some(name) = record[tab + 1..].strip_prefix(prefix.as_bytes()) else {
+            continue;
+        };
+        let lowercase = name.to_ascii_lowercase();
+        let Some(rank) = GITHUB_PULL_REQUEST_TEMPLATE_NAMES
+            .iter()
+            .position(|candidate| candidate.as_bytes() == lowercase.as_slice())
+        else {
+            continue;
+        };
+        let mut fields = record[..tab]
+            .split(|byte| *byte == b' ')
+            .filter(|field| !field.is_empty());
+        let (Some(_mode), Some(kind), Some(_object), Some(size)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        // A directory named like the template is not one, exactly as for an
+        // exact candidate in `blob_size`.
+        if kind != b"blob" {
+            continue;
+        }
+        // Every accepted name is ASCII, and ASCII case folding keeps every
+        // other byte, so a name that matched is valid UTF-8.
+        let name = String::from_utf8_lossy(name).into_owned();
+        // A size we cannot read counts as over the ceiling, as in `blob_size`.
+        let size = std::str::from_utf8(size)
+            .ok()
+            .and_then(|size| size.parse::<u64>().ok());
+        if best
+            .as_ref()
+            .is_none_or(|(best_rank, best_name, _)| (rank, &name) < (*best_rank, best_name))
+        {
+            best = Some((rank, name, size));
+        }
+    }
+
+    let Some((_, name, size)) = best else {
+        return Ok(None);
+    };
+    let path = format!("{prefix}{name}");
+    if size.is_none_or(|size| size > MAX_TEMPLATE_SIZE as u64) {
+        anyhow::bail!("template is larger than {MAX_TEMPLATE_SIZE} bytes");
+    }
+    let content = read_measured_template(git, repository_path, git_ref, &path)?;
+    Ok(Some((path, content)))
 }
 
 /// The Markdown templates directly inside one directory, plus the entries that
@@ -669,9 +782,9 @@ mod tests {
     use super::{
         discover_issue_templates, is_issue_form_name, parse_markdown_template, read_issue_config,
         read_pull_request_template, split_front_matter, validate_config, IssueConfig,
-        ISSUE_CONFIGS, ISSUE_TEMPLATE_DIRS, LEGACY_ISSUE_TEMPLATES, MAX_TEMPLATE_FILE_COUNT,
-        MAX_TEMPLATE_SIZE, MAX_TEMPLATE_TOTAL_BYTES, PULL_REQUEST_FORM_TEMPLATES,
-        PULL_REQUEST_TEMPLATES,
+        PullRequestTemplatePath, GITHUB_PULL_REQUEST_TEMPLATE_NAMES, ISSUE_CONFIGS,
+        ISSUE_TEMPLATE_DIRS, LEGACY_ISSUE_TEMPLATES, MAX_TEMPLATE_FILE_COUNT, MAX_TEMPLATE_SIZE,
+        MAX_TEMPLATE_TOTAL_BYTES, PULL_REQUEST_FORM_TEMPLATES, PULL_REQUEST_TEMPLATES,
     };
     use std::collections::BTreeSet;
 
@@ -1348,36 +1461,51 @@ struct IssueContactLink {
     fn every_path_a_template_may_live_at_is_listed_in_the_documentation() {
         let (name, content) = TEMPLATE_DOCUMENTATION;
 
+        let owned = |paths: &[&str]| -> Vec<String> {
+            paths.iter().map(|path| (*path).to_owned()).collect()
+        };
+        let pull_request_templates = documented_pull_request_templates();
+
+        // The pull-request inventory promises an order as well — "the first of
+        // these paths that exists wins" — so it is compared as a list too.
+        let marker = "<!-- inventory: pull-request-templates -->";
+        assert_eq!(
+            inventory_after(name, content, marker),
+            pull_request_templates,
+            "{name}: the inventory under `{marker}` lists the pull-request template paths in an \
+             order other than the one they are tried in"
+        );
+
         for (marker, paths, what) in [
             (
                 "<!-- inventory: issue-template-directories -->",
-                ISSUE_TEMPLATE_DIRS,
+                owned(ISSUE_TEMPLATE_DIRS),
                 "directory issue templates are read from",
             ),
             (
                 "<!-- inventory: issue-config-paths -->",
-                ISSUE_CONFIGS,
+                owned(ISSUE_CONFIGS),
                 "path the issue chooser configuration is read from",
             ),
             (
-                "<!-- inventory: pull-request-templates -->",
-                PULL_REQUEST_TEMPLATES,
+                marker,
+                pull_request_templates,
                 "path the pull-request template is read from",
             ),
             (
                 "<!-- inventory: legacy-issue-templates-not-read -->",
-                LEGACY_ISSUE_TEMPLATES,
+                owned(LEGACY_ISSUE_TEMPLATES),
                 "path a single-file issue template is named at",
             ),
             (
                 "<!-- inventory: pull-request-forms-not-read -->",
-                PULL_REQUEST_FORM_TEMPLATES,
+                owned(PULL_REQUEST_FORM_TEMPLATES),
                 "path a YAML pull-request form is named at",
             ),
         ] {
             let documented: BTreeSet<String> =
                 inventory_after(name, content, marker).into_iter().collect();
-            let opened: BTreeSet<String> = paths.iter().map(|path| (*path).to_owned()).collect();
+            let opened: BTreeSet<String> = paths.into_iter().collect();
 
             let undocumented: Vec<&String> = opened.difference(&documented).collect();
             assert!(
@@ -1402,6 +1530,29 @@ struct IssueContactLink {
             "{name} does not state the {MAX_TEMPLATE_SIZE}-byte ceiling that decides whether a \
              template is served or reported as broken"
         );
+    }
+
+    /// The pull-request template paths as the document spells them, in the
+    /// order they are tried: an exact candidate is its path, and GitHub's rule
+    /// is each name it accepts in that directory, lowercased — the document
+    /// states in prose that the case does not matter.
+    fn documented_pull_request_templates() -> Vec<String> {
+        PULL_REQUEST_TEMPLATES
+            .iter()
+            .flat_map(|candidate| match *candidate {
+                PullRequestTemplatePath::Exact(path) => vec![path.to_owned()],
+                PullRequestTemplatePath::GitHub(directory) => GITHUB_PULL_REQUEST_TEMPLATE_NAMES
+                    .iter()
+                    .map(|name| {
+                        if directory.is_empty() {
+                            (*name).to_owned()
+                        } else {
+                            format!("{directory}/{name}")
+                        }
+                    })
+                    .collect(),
+            })
+            .collect()
     }
 
     fn committed_repository(files: &[(&str, &str)]) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -1984,6 +2135,105 @@ struct IssueContactLink {
         }
     }
 
+    /// card_0a9377f1e686: GitHub matches the pull-request template's name
+    /// without regard to case and takes `.md` or `.txt`, in the root, `docs/`
+    /// and `.github/`. Every spelling it accepts is found here, in its place in
+    /// the candidate order, and nothing GitHub would not accept is.
+    #[test]
+    fn github_pull_request_template_is_found_by_its_rule_not_its_path() {
+        for (files, expected) in [
+            (
+                &[(".github/Pull_Request_Template.txt", "## txt\n")][..],
+                Some((".github/Pull_Request_Template.txt", "## txt\n")),
+            ),
+            (
+                &[("docs/PULL_REQUEST_TEMPLATE.TXT", "## docs\n")][..],
+                Some(("docs/PULL_REQUEST_TEMPLATE.TXT", "## docs\n")),
+            ),
+            (
+                &[("Pull_Request_Template.md", "## root\n")][..],
+                Some(("Pull_Request_Template.md", "## root\n")),
+            ),
+            // Two spellings in one directory: Markdown before text, and the
+            // old exact order between the two Markdown spellings.
+            (
+                &[
+                    (".github/pull_request_template.txt", "## txt\n"),
+                    (".github/Pull_Request_Template.md", "## md\n"),
+                ][..],
+                Some((".github/Pull_Request_Template.md", "## md\n")),
+            ),
+            (
+                &[
+                    ("pull_request_template.md", "## lower\n"),
+                    ("PULL_REQUEST_TEMPLATE.md", "## upper\n"),
+                ][..],
+                Some(("PULL_REQUEST_TEMPLATE.md", "## upper\n")),
+            ),
+            // The rule keeps its place in the order: the root before
+            // `.forgejo/`, `.gitea/` before `.github/`.
+            (
+                &[
+                    ("pull_request_template.TXT", "## root\n"),
+                    (".forgejo/PULL_REQUEST_TEMPLATE.md", "## forgejo\n"),
+                ][..],
+                Some(("pull_request_template.TXT", "## root\n")),
+            ),
+            (
+                &[
+                    (".github/PULL_REQUEST_TEMPLATE.txt", "## github\n"),
+                    (".gitea/PULL_REQUEST_TEMPLATE.md", "## gitea\n"),
+                ][..],
+                Some((".gitea/PULL_REQUEST_TEMPLATE.md", "## gitea\n")),
+            ),
+            // A directory named like the template is not one.
+            (
+                &[
+                    (".github/pull_request_template.md/notes.md", "## no\n"),
+                    ("docs/pull_request_template.md", "## docs\n"),
+                ][..],
+                Some(("docs/pull_request_template.md", "## docs\n")),
+            ),
+            // Not names GitHub reads: another extension, a nested file, and
+            // GitHub's directory of templates picked by a query parameter.
+            (
+                &[
+                    (".github/pull_request_template.rst", "## no\n"),
+                    (".github/nested/pull_request_template.md", "## no\n"),
+                    (".github/PULL_REQUEST_TEMPLATE/feature.md", "## no\n"),
+                    ("Xpull_request_template.md", "## no\n"),
+                ][..],
+                None,
+            ),
+        ] {
+            let (_directory, repository) = committed_repository(files);
+            let template = read_pull_request_template(&repository, "main").unwrap();
+            assert_eq!(
+                template
+                    .as_ref()
+                    .map(|template| (template.file_name.as_str(), template.content.as_str())),
+                expected,
+                "{files:?}"
+            );
+        }
+    }
+
+    /// The size ceiling is spent on a template found by GitHub's rule as it is
+    /// on an exact candidate: a refusal, not a template read whole and cut.
+    #[test]
+    fn github_pull_request_template_over_the_ceiling_is_refused() {
+        let oversized = "a".repeat(MAX_TEMPLATE_SIZE + 1);
+        let (_directory, repository) =
+            committed_repository(&[(".github/Pull_Request_Template.md", oversized.as_str())]);
+
+        let error = read_pull_request_template(&repository, "main").unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains(&format!("larger than {MAX_TEMPLATE_SIZE} bytes")),
+            "{error:#}"
+        );
+    }
+
     /// card_04b603522857: a repository that moved here from Forgejo keeps its
     /// templates under `.forgejo/` — and its pull-request template and chooser
     /// configuration there too — which Forgejo reads before `.gitea/`.
@@ -2050,9 +2300,10 @@ struct IssueContactLink {
     /// none of them is a Markdown candidate, and a configuration is not a form.
     #[test]
     fn a_yaml_form_is_never_a_template_this_server_reads() {
+        let read = documented_pull_request_templates();
         for path in PULL_REQUEST_FORM_TEMPLATES {
             assert!(
-                !PULL_REQUEST_TEMPLATES.contains(path),
+                !read.iter().any(|read| read.eq_ignore_ascii_case(path)),
                 "{path} is read now; drop it from PULL_REQUEST_FORM_TEMPLATES"
             );
             assert!(path.ends_with(".yaml") || path.ends_with(".yml"), "{path}");

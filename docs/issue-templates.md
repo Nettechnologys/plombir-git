@@ -223,23 +223,35 @@ line is wrong before you rely on the file.
 A pull-request template is plain Markdown with **no** front matter: the whole
 file, including any leading dashes, becomes the initial description of a new
 pull request. There is one template per repository — the first of these paths
-that exists wins.
+that exists wins, in this order.
 
 <!-- inventory: pull-request-templates -->
 ```text
-PULL_REQUEST_TEMPLATE.md
 pull_request_template.md
+pull_request_template.txt
 .forgejo/PULL_REQUEST_TEMPLATE.md
 .forgejo/pull_request_template.md
 .gitea/PULL_REQUEST_TEMPLATE.md
 .gitea/pull_request_template.md
-.github/PULL_REQUEST_TEMPLATE.md
 .github/pull_request_template.md
-docs/PULL_REQUEST_TEMPLATE.md
+.github/pull_request_template.txt
 docs/pull_request_template.md
+docs/pull_request_template.txt
 .gitlab/merge_request_templates/Default.md
 .gitlab/merge_request_templates/default.md
 ```
+
+In the repository root, `.github/` and `docs/` the name is matched the way
+GitHub matches it: **in any capitalization**, so `PULL_REQUEST_TEMPLATE.md`,
+`.github/Pull_Request_Template.md` and `docs/PULL_REQUEST_TEMPLATE.TXT` are all
+found. When one of these directories holds more than one spelling, a `.md`
+file wins over a `.txt` one. Under `.forgejo/`, `.gitea/` and `.gitlab/` only
+the exact names listed are read, as Forgejo, Gitea and GitLab read them.
+
+A `.txt` template is used as it is written: its text becomes the description.
+
+GitHub's `PULL_REQUEST_TEMPLATE/` directory of several templates, chosen there
+with the `template` query parameter, is not read.
 
 The last two are GitLab's default merge request template. GitLab keeps any
 number of templates in `.gitlab/merge_request_templates/` and pre-fills a new
