@@ -5,6 +5,7 @@
 
 pub mod github_client;
 pub mod gitlab_client;
+pub mod reattribution;
 pub mod service;
 pub mod trust;
 

@@ -59,6 +59,34 @@ export interface PublicSsoProvider {
 }
 
 /** One external identity linked to the signed-in account. */
+/**
+ * What an import brought into one repository that a GitHub / GitLab account
+ * this account signs in with wrote (card_2a006cf365f6). Moved only by
+ * `claimImportedAuthorship`, after the person confirms.
+ */
+export interface ClaimableImportedRepository {
+  repo_id: number;
+  /** `owner/name`. */
+  repository: string;
+  /** `github` (github.com) or `gitlab` (gitlab.com). */
+  service: string;
+  /** The login on that service the sign-in vouched for. */
+  login: string;
+  issues: number;
+  comments: number;
+  pull_requests: number;
+  reviews: number;
+  releases: number;
+}
+
+export interface ImportedAuthorshipClaim {
+  issues: number;
+  comments: number;
+  pull_requests: number;
+  reviews: number;
+  releases: number;
+}
+
 export interface SsoLink {
   slug: string;
   name: string;
@@ -192,6 +220,13 @@ export const auth = {
   ssoAuthorizeUrl: (slug: string) =>
     withApiBase(`/auth/sso/${encodeURIComponent(slug)}`),
   listSsoLinks: () => request<SsoLink[]>('/users/me/sso'),
+  listImportedAuthorship: () =>
+    request<ClaimableImportedRepository[]>('/users/me/imported-authorship'),
+  claimImportedAuthorship: (repositories: number[]) =>
+    request<ImportedAuthorshipClaim>('/users/me/imported-authorship/claim', {
+      method: 'POST',
+      body: JSON.stringify({ repositories }),
+    }),
   // Starts linking a provider to the signed-in account. The browser then goes
   // to `authorize_url`; the provider's callback attaches the identity to this
   // account and comes back to `/settings/security?sso_linked=<slug>`. A first

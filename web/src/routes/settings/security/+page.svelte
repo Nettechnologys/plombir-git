@@ -18,6 +18,7 @@
   import { createT, formatDate } from '$lib/i18n';
   import { readSsoError, ssoErrorMessage, type SsoError } from '$lib/ssoError';
   import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import ImportedAuthorshipSection from '$lib/components/ImportedAuthorshipSection.svelte';
   import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
@@ -611,6 +612,8 @@
       <p class="muted state-unknown">{t('account_security.sso.providers_unknown')}</p>
     {/if}
   </section>
+
+  <ImportedAuthorshipSection {confirmer} />
 
   {#if setup}
     <section class="section setup-section">

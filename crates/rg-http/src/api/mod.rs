@@ -21,6 +21,7 @@ pub mod clearable;
 pub mod collaborators;
 pub mod commit_signing_keys;
 pub mod deploy_keys;
+pub mod imported_authorship;
 pub mod imports;
 pub mod instance;
 pub mod issues;

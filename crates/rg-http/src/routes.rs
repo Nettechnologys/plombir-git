@@ -1340,6 +1340,18 @@ pub(crate) fn build_all_routes(
         // about a provider: it is the listing the settings page needs before it
         // can offer the unlink above.
         .get(User, "/users/me/sso", api::sso::list_my_links)
+        // What a GitHub / GitLab sign-in vouches the account wrote before it
+        // was imported, and the confirmed move of it (card_2a006cf365f6).
+        .get(
+            User,
+            "/users/me/imported-authorship",
+            api::imported_authorship::list_claimable,
+        )
+        .post(
+            User,
+            "/users/me/imported-authorship/claim",
+            api::imported_authorship::claim,
+        )
         .get(
             User,
             "/users/me/collaborations",

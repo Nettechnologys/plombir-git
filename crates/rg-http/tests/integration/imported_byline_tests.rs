@@ -261,3 +261,295 @@ async fn an_imported_approval_authorizes_nothing() {
         "the approval given here counts, the imported one does not"
     );
 }
+
+mod reattribution {
+    use rg_db::sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, NotSet, QueryFilter, Set};
+
+    use crate::common::{create_repo, register_full, spawn_test_app_with_db};
+
+    const GITHUB_ID: i64 = 583231;
+
+    async fn link_github(db: &rg_db::DatabaseConnection, user_id: i64) {
+        let now = chrono::Utc::now();
+        // Every instance carries the built-in GitHub sign-in row; the link
+        // below names it by slug, as a real sign-in would.
+        let provider = rg_db::ops::sso_provider_ops::find_by_slug(db, "github")
+            .await
+            .expect("read the sign-in providers")
+            .expect("the built-in GitHub sign-in provider");
+        assert_ne!(
+            provider.provider_type, "oidc",
+            "the built-in `github` sign-in asks api.github.com"
+        );
+        rg_db::entities::oauth_account::ActiveModel {
+            id: NotSet,
+            provider: Set("github".to_string()),
+            provider_user_id: Set(GITHUB_ID.to_string()),
+            provider_username: Set("alice-on-github".to_string()),
+            email: Set("alice@example.com".to_string()),
+            user_id: Set(user_id),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(db)
+        .await
+        .expect("link alice's GitHub account");
+    }
+
+    /// An imported issue in `repo_id` written by `service` account `GITHUB_ID`.
+    async fn imported_issue(
+        db: &rg_db::DatabaseConnection,
+        repo_id: i64,
+        number: i64,
+        importer_id: i64,
+        service: &str,
+    ) -> rg_db::entities::issue::Model {
+        let now = chrono::Utc::now();
+        rg_db::entities::issue::ActiveModel {
+            id: NotSet,
+            repo_id: Set(repo_id),
+            number: Set(number),
+            title: Set(format!("imported #{number}")),
+            body: Set(None),
+            state: Set("open".to_string()),
+            author_id: Set(importer_id),
+            original_author: Set(Some("alice-on-github".to_string())),
+            original_author_id: Set(Some(GITHUB_ID)),
+            original_service: Set(Some(service.to_string())),
+            assignee_id: Set(None),
+            milestone_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            closed_at: Set(None),
+            deleted_at: Set(None),
+        }
+        .insert(db)
+        .await
+        .expect("seed an imported issue")
+    }
+
+    async fn authors(db: &rg_db::DatabaseConnection, repo_id: i64) -> Vec<(i64, i64)> {
+        let mut rows: Vec<(i64, i64)> = rg_db::entities::issue::Entity::find()
+            .filter(rg_db::entities::issue::Column::RepoId.eq(repo_id))
+            .all(db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|issue| (issue.number, issue.author_id))
+            .collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    /// card_2a006cf365f6: what a GitHub sign-in vouches the account wrote
+    /// comes back to it — after it is shown and asked for, in repositories it
+    /// can read, and only for github.com ids.
+    #[tokio::test]
+    async fn a_confirmed_claim_moves_exactly_what_the_sign_in_vouches_for() {
+        let (base, db) = spawn_test_app_with_db().await;
+        let (importer_token, importer_id) =
+            register_full(&base, "claim-importer", "claim-importer@example.com").await;
+        let (alice_token, alice_id) =
+            register_full(&base, "claim-alice", "claim-alice@example.com").await;
+        link_github(&db, alice_id).await;
+
+        let public_id = create_repo(&base, &importer_token, "moved-public").await;
+        let private: serde_json::Value = reqwest::Client::new()
+            .post(format!("{base}/api/v1/repos"))
+            .bearer_auth(&importer_token)
+            .json(&serde_json::json!({ "name": "moved-private", "is_private": true }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let private_id = private["id"].as_i64().expect("private repository id");
+
+        let issue = imported_issue(&db, public_id, 1, importer_id, "github").await;
+        // The same account id on a GitHub Enterprise server is somebody else.
+        imported_issue(&db, public_id, 2, importer_id, "github:ghe.example.com").await;
+        imported_issue(&db, private_id, 1, importer_id, "github").await;
+        let now = chrono::Utc::now();
+        rg_db::entities::issue_comment::ActiveModel {
+            id: NotSet,
+            issue_id: Set(issue.id),
+            author_id: Set(importer_id),
+            original_author: Set(Some("alice-on-github".to_string())),
+            original_author_id: Set(Some(GITHUB_ID)),
+            original_service: Set(Some("github".to_string())),
+            body: Set("alice's reply on GitHub".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let client = reqwest::Client::new();
+        let listed: Vec<serde_json::Value> = client
+            .get(format!("{base}/api/v1/users/me/imported-authorship"))
+            .bearer_auth(&alice_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            listed.len(),
+            1,
+            "only the repository alice can read: {listed:?}"
+        );
+        assert_eq!(listed[0]["repository"], "claim-importer/moved-public");
+        assert_eq!(listed[0]["service"], "github");
+        assert_eq!(listed[0]["login"], "alice-on-github");
+        assert_eq!(
+            listed[0]["issues"], 1,
+            "the GitHub Enterprise issue is not hers"
+        );
+        assert_eq!(listed[0]["comments"], 1);
+        assert_eq!(
+            authors(&db, public_id).await,
+            [(1, importer_id), (2, importer_id)],
+            "listing moves nothing"
+        );
+
+        let refused = client
+            .post(format!("{base}/api/v1/users/me/imported-authorship/claim"))
+            .bearer_auth(&alice_token)
+            .json(&serde_json::json!({ "repositories": [private_id] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.status(),
+            404,
+            "a repository she cannot read is not there"
+        );
+        assert_eq!(authors(&db, private_id).await, [(1, importer_id)]);
+
+        let claimed: serde_json::Value = client
+            .post(format!("{base}/api/v1/users/me/imported-authorship/claim"))
+            .bearer_auth(&alice_token)
+            .json(&serde_json::json!({ "repositories": [public_id] }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(claimed["issues"], 1, "{claimed}");
+        assert_eq!(claimed["comments"], 1, "{claimed}");
+        assert_eq!(
+            authors(&db, public_id).await,
+            [(1, alice_id), (2, importer_id)],
+            "her github.com issue is hers; the GitHub Enterprise one stays"
+        );
+        let comment = rg_db::entities::issue_comment::Entity::find()
+            .filter(rg_db::entities::issue_comment::Column::IssueId.eq(issue.id))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(comment.author_id, alice_id);
+        assert_eq!(
+            comment.original_author.as_deref(),
+            Some("alice-on-github"),
+            "the byline stays"
+        );
+
+        let audit = rg_db::entities::audit_log::Entity::find()
+            .filter(rg_db::entities::audit_log::Column::Action.eq("import.authorship_claimed"))
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].user_id, Some(alice_id));
+
+        let after: Vec<serde_json::Value> = client
+            .get(format!("{base}/api/v1/users/me/imported-authorship"))
+            .bearer_auth(&alice_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(after.is_empty(), "nothing left to claim: {after:?}");
+    }
+
+    /// An OIDC provider is whatever issuer its discovery URL names, whatever
+    /// its slug says: its ids are not github.com's, so a link through it
+    /// vouches for nothing even under the slug `github`.
+    #[tokio::test]
+    async fn an_oidc_provider_named_github_vouches_for_nothing() {
+        let (base, db) = spawn_test_app_with_db().await;
+        let (importer_token, importer_id) =
+            register_full(&base, "oidc-importer", "oidc-importer@example.com").await;
+        let (token, alice_id) = register_full(&base, "oidc-alice", "oidc-alice@example.com").await;
+        link_github(&db, alice_id).await;
+        let provider = rg_db::ops::sso_provider_ops::find_by_slug(&db, "github")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active: rg_db::entities::sso_provider::ActiveModel = provider.into();
+        active.provider_type = Set("oidc".to_string());
+        active.discovery_url = Set(Some("https://idp.example.com".to_string()));
+        active
+            .update(&db)
+            .await
+            .expect("turn the provider into OIDC");
+        let repo_id = create_repo(&base, &importer_token, "moved").await;
+        imported_issue(&db, repo_id, 1, importer_id, "github").await;
+
+        let listed: Vec<serde_json::Value> = reqwest::Client::new()
+            .get(format!("{base}/api/v1/users/me/imported-authorship"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(listed.is_empty(), "{listed:?}");
+    }
+
+    /// Without a sign-in to vouch for an account id there is nothing to claim,
+    /// however the logins read.
+    #[tokio::test]
+    async fn without_a_linked_sign_in_nothing_is_claimable() {
+        let (base, db) = spawn_test_app_with_db().await;
+        let (importer_token, importer_id) =
+            register_full(&base, "noclaim-importer", "noclaim-importer@example.com").await;
+        let (token, _) = register_full(&base, "alice-on-github", "aog@example.com").await;
+        let repo_id = create_repo(&base, &importer_token, "moved").await;
+        imported_issue(&db, repo_id, 1, importer_id, "github").await;
+
+        let listed: Vec<serde_json::Value> = reqwest::Client::new()
+            .get(format!("{base}/api/v1/users/me/imported-authorship"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            listed.is_empty(),
+            "a local login that spells the source login proves nothing: {listed:?}"
+        );
+        let claimed: serde_json::Value = reqwest::Client::new()
+            .post(format!("{base}/api/v1/users/me/imported-authorship/claim"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "repositories": [repo_id] }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(claimed["issues"], 0);
+        assert_eq!(authors(&db, repo_id).await, [(1, importer_id)]);
+    }
+}

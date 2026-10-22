@@ -969,6 +969,28 @@
     },
     {
       "method": "GET",
+      "url": "/api/v1/users/me/imported-authorship",
+      "access": "User",
+      "handler": "api::imported_authorship::list_claimable",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/users/me/imported-authorship/claim",
+      "access": "User",
+      "handler": "api::imported_authorship::claim",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
       "url": "/api/v1/users/me/collaborations",
       "access": "User",
       "handler": "api::collaborators::list_my_collaborations",
@@ -28583,7 +28605,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.retry",
-          "line": 422,
+          "line": 423,
           "via": null,
           "href": null,
           "handler": "loadBackupStatus",
@@ -28608,7 +28630,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.mfa.current_password",
-          "line": 437,
+          "line": 438,
           "via": null,
           "href": null,
           "handler": "regenerateBackupCodes",
@@ -28688,7 +28710,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.working",
-          "line": 449,
+          "line": 450,
           "via": null,
           "href": null,
           "handler": null,
@@ -28698,7 +28720,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.mfa.current_password",
-          "line": 457,
+          "line": 458,
           "via": null,
           "href": null,
           "handler": "disableMfa",
@@ -28778,7 +28800,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.disabling",
-          "line": 464,
+          "line": 465,
           "via": null,
           "href": null,
           "handler": null,
@@ -28788,7 +28810,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.starting",
-          "line": 470,
+          "line": 471,
           "via": null,
           "href": null,
           "handler": "startSetup",
@@ -28814,7 +28836,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.passkeys.retry",
-          "line": 500,
+          "line": 501,
           "via": null,
           "href": null,
           "handler": "loadPasskeyList",
@@ -28839,7 +28861,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.passkeys.remove",
-          "line": 514,
+          "line": 515,
           "via": null,
           "href": null,
           "handler": "() => removePasskey(key.id)",
@@ -28863,7 +28885,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.passkeys.name",
-          "line": 529,
+          "line": 530,
           "via": null,
           "href": null,
           "handler": "addPasskey",
@@ -28873,7 +28895,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.passkeys.waiting",
-          "line": 539,
+          "line": 540,
           "via": null,
           "href": null,
           "handler": null,
@@ -28883,7 +28905,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.sso.retry",
-          "line": 567,
+          "line": 568,
           "via": null,
           "href": null,
           "handler": "loadSsoLinks",
@@ -28908,7 +28930,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.sso.unlink",
-          "line": 582,
+          "line": 583,
           "via": null,
           "href": null,
           "handler": "() => unlinkSsoProvider(link)",
@@ -28933,7 +28955,7 @@
         {
           "tag": "button",
           "label": ")}",
-          "line": 600,
+          "line": 601,
           "via": null,
           "href": null,
           "handler": "() => linkSsoProvider(provider)",
@@ -28958,7 +28980,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.setup.code",
-          "line": 623,
+          "line": 626,
           "via": null,
           "href": null,
           "handler": "enableMfa",
@@ -29039,7 +29061,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.setup.verifying",
-          "line": 634,
+          "line": 637,
           "via": null,
           "href": null,
           "handler": null,
@@ -29049,12 +29071,37 @@
         {
           "tag": "button",
           "label": "i18n:account_security.backup.copy",
-          "line": 650,
+          "line": 653,
           "via": null,
           "href": null,
           "handler": "copyBackupCodes",
           "calls": [],
           "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:account_security.imported.claim",
+          "line": 97,
+          "via": "ImportedAuthorshipSection",
+          "href": null,
+          "handler": "() => claim(row)",
+          "calls": [
+            {
+              "symbol": "auth.claimImportedAuthorship",
+              "method": "POST",
+              "url": "/api/v1/users/me/imported-authorship/claim",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/me/imported-authorship/claim",
+              "access": "User",
+              "handler": "api::imported_authorship::claim",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
         },
         {
           "tag": "button",
@@ -29091,6 +29138,20 @@
             "rust",
             "web",
             "smoke"
+          ]
+        },
+        {
+          "symbol": "auth.listImportedAuthorship",
+          "method": "GET",
+          "url": "/api/v1/users/me/imported-authorship",
+          "opaque": false,
+          "routeUrl": "/api/v1/users/me/imported-authorship",
+          "access": "User",
+          "handler": "api::imported_authorship::list_claimable",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
           ]
         }
       ]
@@ -29540,7 +29601,7 @@
       "outsider"
     ],
     "scenarios": 52,
-    "inventoryEntries": 824,
+    "inventoryEntries": 826,
     "coveredEntries": 197,
     "coveredRoutes": 187,
     "maxUiRoutesWithoutFrontendTest": 24

@@ -50,6 +50,8 @@ export {
   type Me,
   type PublicSsoProvider,
   type SsoLink,
+  type ClaimableImportedRepository,
+  type ImportedAuthorshipClaim,
   type SudoConfirmation,
 } from './auth';
 export { attachments, type Attachment, type AttachmentTarget } from './attachments';

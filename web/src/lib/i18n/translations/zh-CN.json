@@ -2196,6 +2196,18 @@
       "unlink_confirm_title": "解除登录提供方关联",
       "unlinked": "已取消关联 {provider}。",
       "unlink_failed": "取消关联提供方失败"
+    },
+    "imported": {
+      "title": "导入的历史",
+      "description": "由导入带到这里、并由你用于登录的 GitHub 或 GitLab 账户撰写的议题、评论、合并请求、评审和发布。在你认领之前，它们属于执行导入的人。",
+      "counts": "{issues} 个议题 · {comments} 条评论 · {pull_requests} 个合并请求 · {reviews} 次评审 · {releases} 个发布",
+      "as": "作为 {login}",
+      "claim": "认领",
+      "claim_confirm_title": "认领导入的历史？",
+      "claim_confirm": "{repository} 中由 {login} 撰写的所列内容都将归你所有。此操作无法撤销。",
+      "claimed": "{repository} 中的 {count} 项现在归你所有。",
+      "claim_failed": "无法认领导入的历史。",
+      "load_failed": "无法检查导入的历史。"
     }
   },
   "access_tokens": {

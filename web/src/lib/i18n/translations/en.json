@@ -2196,6 +2196,18 @@
       "unlink_confirm_title": "Unlink sign-in provider",
       "unlinked": "{provider} unlinked.",
       "unlink_failed": "Failed to unlink the provider"
+    },
+    "imported": {
+      "title": "Imported history",
+      "description": "Issues, comments, pull requests, reviews and releases an import brought here that a GitHub or GitLab account you sign in with wrote. They belong to whoever ran the import until you take them back.",
+      "counts": "{issues} issues · {comments} comments · {pull_requests} pull requests · {reviews} reviews · {releases} releases",
+      "as": "as {login}",
+      "claim": "Take back",
+      "claim_confirm_title": "Take back imported history?",
+      "claim_confirm": "Everything listed for {repository} that {login} wrote will be yours. This cannot be undone.",
+      "claimed": "{count} items in {repository} are now yours.",
+      "claim_failed": "Could not take back the imported history.",
+      "load_failed": "Could not check for imported history."
     }
   },
   "access_tokens": {

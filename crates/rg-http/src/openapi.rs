@@ -339,6 +339,8 @@ pub(crate) fn stamp_security(
         crate::api::sso::reauthenticate,
         crate::api::sso::unlink_oauth_account,
         crate::api::sso::list_my_links,
+        crate::api::imported_authorship::list_claimable,
+        crate::api::imported_authorship::claim,
         // Repositories
         crate::api::repos::create_repo,
         crate::api::repos::list_repos,
@@ -763,6 +765,9 @@ pub(crate) fn stamp_security(
             crate::api::passkeys::PasskeyLoginResponse,
             crate::api::sso::SsoProviderInfo,
             crate::api::sso::SsoLinkInfo,
+            crate::api::imported_authorship::ClaimableRepositoryResponse,
+            crate::api::imported_authorship::ClaimRequest,
+            crate::api::imported_authorship::ClaimResponse,
             crate::api::sso::SsoLinkStart,
             crate::api::sso::SsoReauthenticateStart,
             crate::api::sso::SsoReauthenticateRequest,

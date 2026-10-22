@@ -8,6 +8,17 @@ This project records user-facing changes here. The format follows
 
 ### Added
 
+- A person who signs in with GitHub or GitLab can take back what that account
+  wrote before an import brought it here: **Settings → Security → Imported
+  history** lists, per repository they can read, the issues, comments, pull
+  requests, reviews and releases written by the github.com / gitlab.com account
+  their sign-in vouches for, and moves a repository's worth to their account
+  only after they confirm it (`GET /users/me/imported-authorship`,
+  `POST /users/me/imported-authorship/claim`, audit action
+  `import.authorship_claimed`). Accounts are matched by the source's numeric
+  id, never by login, and only for imports from github.com and gitlab.com; the
+  byline stays, and an imported review still authorizes nothing.
+
 - What an import from GitHub or GitLab brings — issues, their comments, pull
   and merge requests, their reviews and conversation, releases — names who
   wrote it on the source: `original_author` (the login), `original_author_id`
