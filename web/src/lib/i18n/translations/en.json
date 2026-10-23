@@ -339,7 +339,11 @@
     },
     "empty": {
       "no_repos": "No repositories yet",
-      "get_started": "Create your first repository to get started!"
+      "import_title": "Bring a repository over",
+      "import_body": "From GitHub, GitLab, Gitea or Forgejo. Issues and pull requests keep their numbers, with their reviews, labels, milestones and releases, and the import receipt lists what came over and what could not.",
+      "import_action": "Import a repository",
+      "create_title": "Start a new one",
+      "create_body": "An empty repository, or one with a README, a .gitignore and a licence."
     },
     "repo": {
       "private": "Private"
@@ -2388,5 +2392,10 @@
       "review_requested": "You're receiving notifications because your review was requested.",
       "manual": "You're receiving notifications because you subscribed."
     }
+  },
+  "trial": {
+    "title": "Trial mode — not for production.",
+    "body": "This instance was started with plombir-git trial: its data lives in one throwaway directory and goes with it.",
+    "deploy": "For a real deployment run plombir-git serve (deploy/README.md)."
   }
 }

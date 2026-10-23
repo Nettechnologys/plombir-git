@@ -1282,8 +1282,8 @@ mod tests {
     fn every_documented_config_install_creates_an_owner_only_file() {
         const SURFACES: [(&str, &str, &str); 4] = [
             (
-                "README.md",
-                include_str!("../../../README.md"),
+                "docs/install.md",
+                include_str!("../../../docs/install.md"),
                 "install -m 600 plombir-git.example.toml plombir-git.toml",
             ),
             (
@@ -1499,8 +1499,9 @@ mod tests {
     /// are checked because they are copied *from* — the `[section]` blocks in
     /// a README are pasted into `plombir-git.toml` exactly as often, and
     /// `deny_unknown_fields` does not care which of the two the operator used.
-    const DOCUMENTED_CONFIGS: [(&str, &str); 2] = [
-        ("README.md", include_str!("../../../README.md")),
+    const DOCUMENTED_CONFIGS: [(&str, &str); 3] = [
+        ("docs/install.md", include_str!("../../../docs/install.md")),
+        ("docs/runner.md", include_str!("../../../docs/runner.md")),
         (
             "deploy/README.md",
             include_str!("../../../deploy/README.md"),
@@ -1555,7 +1556,7 @@ mod tests {
         blocks
     }
 
-    /// README sections whose ```toml blocks describe a **different** Plombir Git
+    /// Doc sections whose ```toml blocks describe a **different** Plombir Git
     /// document, each with the test that checks them instead.
     ///
     /// `FOREIGN_TOML_SECTIONS` above tells a foreigner apart by its first line;
@@ -1565,7 +1566,7 @@ mod tests {
     /// foreigners: a block of ours that stopped looking like ours must still
     /// fail, and a block excused here has to be checked somewhere.
     const FOREIGN_TOML_DOCUMENTS: [(&str, &str, &str); 1] = [(
-        "README.md",
+        "docs/runner.md",
         "## CI runner (`plombir-git-runner`)",
         "`runner.toml`, checked against the `RunnerConfig` declaration by \
          `rg-runner/src/config.rs::every_toml_block_in_the_readme_runner_section_loads_as_a_runner_config`",
@@ -3064,10 +3065,15 @@ mod tests {
     /// a different document — the inventory that answers "does this knob exist
     /// and what does it do by default" — and its numbers were the last copies
     /// of two defaults that nothing held to the code.
-    const NARRATIVE_DOCS: [(&str, &str); 1] = [(
-        "docs/FEATURE_INVENTORY.md",
-        include_str!("../../../docs/FEATURE_INVENTORY.md"),
-    )];
+    const NARRATIVE_DOCS: [(&str, &str); 2] = [
+        (
+            "docs/FEATURE_INVENTORY.md",
+            include_str!("../../../docs/FEATURE_INVENTORY.md"),
+        ),
+        // The subcommand reference, where the README's `--config` fallback
+        // sentence went (card_fbe97fcbad2a).
+        ("docs/cli.md", include_str!("../../../docs/cli.md")),
+    ];
 
     /// A built-in default stated in prose rather than as an assignment: the
     /// sentence that tells an operator what happens when they set nothing.
@@ -3193,7 +3199,7 @@ mod tests {
                 ),
             ),
             row(
-                "README.md",
+                "docs/cli.md",
                 "they fall back to",
                 "DEFAULT_DB_URL",
                 format!("`{}`", super::DEFAULT_DB_URL),

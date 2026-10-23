@@ -668,7 +668,10 @@ mod documented_environment_tests {
     const PRODUCTION_LIB_PATH: &str = "crates/rg-mcp/src/lib.rs";
 
     /// The page an operator reaches for before running anything.
-    const README: (&str, &str) = ("README.md", include_str!("../../../README.md"));
+    ///
+    /// It was the root `README.md` until the README became a one-screen front
+    /// page; the binary's section moved here whole (card_fbe97fcbad2a).
+    const README: (&str, &str) = ("docs/mcp.md", include_str!("../../../docs/mcp.md"));
 
     /// The heading that opens the crate doc's environment table.
     const CRATE_DOC_HEADING: &str = "//! # Environment";

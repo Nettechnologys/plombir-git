@@ -2,6 +2,7 @@
   import '$lib/app.css';
   import Navbar from '$lib/components/Navbar.svelte';
   import InstanceBanner from '$lib/components/InstanceBanner.svelte';
+  import TrialBanner from '$lib/components/TrialBanner.svelte';
   import SessionStatusBanner from '$lib/components/SessionStatusBanner.svelte';
   import SudoPrompt from '$lib/components/SudoPrompt.svelte';
   import Layout from '$lib/components/Layout.svelte';
@@ -11,7 +12,13 @@ import { registerKeyboardShortcuts } from '$lib/stores/instance.svelte';
 import { locale, t } from '$lib/i18n';
 import { onMount } from 'svelte';
 import type { Snippet } from 'svelte';
-import { setBanner, setRegistrationOpen, setSetupRequired, setSourceLink } from '$lib/stores/instance.svelte';
+import {
+  setBanner,
+  setRegistrationOpen,
+  setSetupRequired,
+  setSourceLink,
+  setTrialMode,
+} from '$lib/stores/instance.svelte';
 import { instance } from '$lib/api/client.svelte';
 import { withBackendBase } from '$lib/api/_base';
 
@@ -66,6 +73,7 @@ import { withBackendBase } from '$lib/api/_base';
       setSourceLink({ url: info.source_url, commit: info.source_commit });
       setRegistrationOpen(info.registration_open ?? null);
       setSetupRequired(info.setup_required === true);
+      setTrialMode(info.trial_mode === true);
       if (info.banner_message) {
         setBanner(info.banner_message, info.banner_type ?? 'info');
       }
@@ -78,6 +86,7 @@ import { withBackendBase } from '$lib/api/_base';
 </script>
 
 <div class="app">
+  <TrialBanner />
   <InstanceBanner />
   <SessionStatusBanner />
   <Navbar />

@@ -12,7 +12,20 @@
   let password = $state('');
   // Asked for only while the instance has no account yet: the first
   // registration needs the one-time setup token from the server's startup log.
-  let setupToken = $state('');
+  // The setup link `plombir-git trial` prints carries it as `?setup_token=`;
+  // it is taken from there once and dropped from the address bar.
+  let setupToken = $state(takeSetupTokenFromLink());
+
+  function takeSetupTokenFromLink(): string {
+    if (typeof window === 'undefined') return '';
+    const url = new URL(window.location.href);
+    const token = url.searchParams.get('setup_token')?.trim() ?? '';
+    if (token) {
+      url.searchParams.delete('setup_token');
+      window.history.replaceState(window.history.state, '', url.pathname + url.search + url.hash);
+    }
+    return token;
+  }
   let localError = $state('');
   // The instance creates the account only once the mailed link is followed.
   let confirmationSent = $state(false);

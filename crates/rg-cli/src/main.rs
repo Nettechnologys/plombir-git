@@ -3,6 +3,7 @@
 //! The command surface is defined in [`cli`]; each subcommand's implementation
 //! lives in a focused module:
 //!  - [`serve`] — the `serve` command (startup validation + HTTP/SSH bootstrap)
+//!  - [`trial`] — the `trial` command: a throwaway data directory, then `serve`
 //!  - [`runner`] — the deprecated `runner` alias for `plombir-git-runner run`
 //!  - [`commands`] — the remaining one-shot subcommands
 //!  - [`admin`] — SQLite backup/restore + JWT secret helpers
@@ -23,6 +24,7 @@ mod repo_root;
 mod runner;
 mod serve;
 mod telemetry;
+mod trial;
 
 use clap::Parser;
 
@@ -112,6 +114,29 @@ async fn run() -> anyhow::Result<()> {
                 log_max_size_mb,
                 log_max_files,
                 listen_address_file,
+                trial: None,
+            })
+            .await?;
+        }
+
+        Commands::Trial {
+            data_dir,
+            http_addr,
+            ssh_addr,
+            public_url,
+            listen_address_file,
+        } => {
+            let trial = trial::TrialMode {
+                public_url: trial::normalize_public_url(&public_url)?,
+            };
+            let config = trial::prepare_data_dir(std::path::Path::new(&data_dir))?;
+            serve::run_serve(serve::ServeArgs {
+                http_addr: Some(http_addr),
+                ssh_addr: Some(ssh_addr),
+                config: Some(config),
+                listen_address_file,
+                trial: Some(trial),
+                ..serve::ServeArgs::default()
             })
             .await?;
         }

@@ -890,6 +890,7 @@ fn resolve_spa_build_dir(cfg: Option<&crate::config::ConfigFile>) -> std::path::
 async fn establish_setup_token(
     db: &rg_db::DatabaseConnection,
     encryption_key_file: &Path,
+    trial: Option<&crate::trial::TrialMode>,
 ) -> anyhow::Result<rg_core::user::registration::SetupToken> {
     use rg_core::user::registration::SetupToken;
 
@@ -922,6 +923,9 @@ async fn establish_setup_token(
          register through the web form with this one-time setup token (also kept in the file \
          above, readable by this user only). The token is deleted once the first account exists."
     );
+    if let Some(trial) = trial {
+        trial.announce_setup(&secret);
+    }
     Ok(SetupToken::required(secret, Some(path)))
 }
 
@@ -1014,6 +1018,7 @@ fn read_setup_token_file(path: &Path) -> anyhow::Result<Option<String>> {
 
 /// What `serve` was given on its command line, before the config file and the
 /// built-in defaults fill in the rest.
+#[derive(Default)]
 pub(crate) struct ServeArgs {
     pub(crate) repo_root: Option<String>,
     pub(crate) http_addr: Option<String>,
@@ -1041,6 +1046,8 @@ pub(crate) struct ServeArgs {
     pub(crate) log_max_size_mb: Option<u64>,
     pub(crate) log_max_files: Option<usize>,
     pub(crate) listen_address_file: Option<String>,
+    /// Set by `plombir-git trial` only; `serve` itself never turns it on.
+    pub(crate) trial: Option<crate::trial::TrialMode>,
 }
 
 /// The CLI values that are resolved only once logging is up, because their
@@ -1126,6 +1133,7 @@ struct ServeSettings {
     metrics_enabled: bool,
     metrics_token: Option<String>,
     timeouts: ServeTimeouts,
+    trial: Option<crate::trial::TrialMode>,
 }
 
 impl ServeSettings {
@@ -1157,6 +1165,7 @@ impl ServeSettings {
             log_max_size_mb,
             log_max_files,
             listen_address_file,
+            trial,
         } = args;
         let cfg = config.as_deref().map(load_config_file).transpose()?;
 
@@ -1305,6 +1314,7 @@ impl ServeSettings {
                 })
                 .filter(|token| !token.trim().is_empty()),
             timeouts,
+            trial,
             base,
             cfg,
         };
@@ -1324,6 +1334,12 @@ impl ServeSettings {
     /// subscriber exists to say it.
     fn announce(&self) {
         announce_source_link(&self.source_url);
+        if self.trial.is_some() {
+            tracing::warn!(
+                "TRIAL MODE (`plombir-git trial`): not for production. Every page says so; for a \
+                 real deployment run `plombir-git serve` (deploy/README.md)"
+            );
+        }
         if self.transports.import.allows_insecure_http() {
             tracing::warn!(
                 "Import credentials may traverse explicitly allowlisted plaintext HTTP origins \
@@ -1617,7 +1633,8 @@ async fn init_storage(settings: &mut ServeSettings) -> anyhow::Result<ServeStora
     // first boot this also creates the durable key file and its database marker
     // before any other startup path writes encrypted state.
     establish_encryption_key(&db, &mut settings.auth_secrets).await?;
-    let setup_token = establish_setup_token(&db, &settings.encryption_key_file).await?;
+    let setup_token =
+        establish_setup_token(&db, &settings.encryption_key_file, settings.trial.as_ref()).await?;
 
     upgrade_stored_secrets(&db, &settings.auth_secrets.encryption_key).await?;
     report_unaddressable_owners_and_repositories(&db).await;
@@ -2235,6 +2252,7 @@ fn build_transports(
         shutdown_rx: shutdown_rx.clone(),
         shutdown_grace_secs: settings.timeouts.shutdown_grace,
         attestation_enabled: settings.attestation_enabled,
+        trial_mode: settings.trial.is_some(),
         source_url: settings.source_url,
         notification_hub: Some(notification_hub),
         instance_settings,
@@ -2943,7 +2961,9 @@ mod serve_tests {
         let key_file = dir.path().join("keys").join("encryption_key");
         let token_file = key_file.with_file_name("setup_token");
 
-        let first = super::establish_setup_token(&db, &key_file).await.unwrap();
+        let first = super::establish_setup_token(&db, &key_file, None)
+            .await
+            .unwrap();
         assert!(first.is_required());
         let secret = token_on_disk(&token_file);
         assert_eq!(secret.len(), 43);
@@ -2952,7 +2972,9 @@ mod serve_tests {
             0o600
         );
 
-        let again = super::establish_setup_token(&db, &key_file).await.unwrap();
+        let again = super::establish_setup_token(&db, &key_file, None)
+            .await
+            .unwrap();
         assert!(again.is_required());
         assert_eq!(
             token_on_disk(&token_file),
@@ -2962,21 +2984,27 @@ mod serve_tests {
 
         // An empty file is no token: a fresh one replaces it.
         std::fs::write(&token_file, "\n").unwrap();
-        super::establish_setup_token(&db, &key_file).await.unwrap();
+        super::establish_setup_token(&db, &key_file, None)
+            .await
+            .unwrap();
         let replaced = token_on_disk(&token_file);
         assert_eq!(replaced.len(), 43);
         assert_ne!(replaced, secret);
 
         // A token another account on the host could read is refused, not used.
         std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(super::establish_setup_token(&db, &key_file).await.is_err());
+        assert!(super::establish_setup_token(&db, &key_file, None)
+            .await
+            .is_err());
         std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         // Once an account exists the file is a stale secret and goes.
         rg_db::ops::user_ops::create_user(&db, "founder", "founder@example.com", "x", "Founder")
             .await
             .unwrap();
-        let after = super::establish_setup_token(&db, &key_file).await.unwrap();
+        let after = super::establish_setup_token(&db, &key_file, None)
+            .await
+            .unwrap();
         assert!(!after.is_required());
         assert!(!token_file.exists(), "the stale token survived the start");
     }

@@ -230,6 +230,45 @@ pub(crate) enum Commands {
         listen_address_file: Option<String>,
     },
 
+    /// Try Plombir Git out: a throwaway instance with nothing to prepare.
+    ///
+    /// NOT for production. Everything the server needs is created in the data
+    /// directory on the first start — a `plombir-git.toml` holding a generated
+    /// JWT secret, the SSH host key, the at-rest encryption key and a SQLite
+    /// database — and reused on the next. Registration stays closed: the first
+    /// account is the administrator and is created through the one-time setup
+    /// link printed in the log. Every page carries a trial banner.
+    ///
+    /// Inside the container image the data directory defaults to the container
+    /// layer, so `docker run --rm` takes the data with it. Keep it with a
+    /// volume and `--data-dir /data`. For a real deployment use `serve` and
+    /// deploy/README.md.
+    Trial {
+        /// Directory that holds the whole trial instance (created 0700)
+        #[arg(long, default_value = "./plombir-git-trial")]
+        data_dir: String,
+
+        /// HTTP listen address
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        http_addr: String,
+
+        /// SSH listen address
+        #[arg(long, default_value = "0.0.0.0:2222")]
+        ssh_addr: String,
+
+        /// The address a browser reaches this instance at, used only to print
+        /// the setup link. Change it when the HTTP port is published under a
+        /// different number or name.
+        #[arg(long, default_value = "http://localhost:8080")]
+        public_url: String,
+
+        /// Atomically publish the actual bound HTTP and SSH addresses, as
+        /// `serve --listen-address-file` does — for scripts that start a trial
+        /// on port 0.
+        #[arg(long)]
+        listen_address_file: Option<String>,
+    },
+
     /// Run database migrations and exit.
     ///
     /// File-backed SQLite migrations are offline-only: stop every Plombir Git
@@ -704,9 +743,13 @@ impl Commands {
             | Self::Package {
                 cmd: PackageCmd::Publish { .. },
             } => StateCreationContract::NoLocalState,
-            // Both long-running entrypoints resolve and install their own
-            // policy after loading their richer configuration.
-            Self::Serve { .. } | Self::Runner { .. } => StateCreationContract::EntrypointOwned,
+            // The long-running entrypoints resolve and install their own
+            // policy after loading their richer configuration. `trial` creates
+            // its data directory and config owner-only by hand before handing
+            // over to `serve`, which installs the policy as usual.
+            Self::Serve { .. } | Self::Trial { .. } | Self::Runner { .. } => {
+                StateCreationContract::EntrypointOwned
+            }
         }
     }
 }
@@ -1357,6 +1400,14 @@ const AFTER: &str = "after";
     /// re-runs — the tests below.
     const README_MD: &str = include_str!("../../../README.md");
     const DEPLOY_README_MD: &str = include_str!("../../../deploy/README.md");
+    /// Where the README's from-source quick start and its `serve` flag table
+    /// went when the README became a one-screen front page (card_fbe97fcbad2a).
+    const INSTALL_MD: &str = include_str!("../../../docs/install.md");
+    /// Where the README's subcommand inventory went, for the same reason.
+    const CLI_MD: &str = include_str!("../../../docs/cli.md");
+    /// The runner and MCP pages, which carry the variables those binaries read.
+    const RUNNER_MD: &str = include_str!("../../../docs/runner.md");
+    const MCP_MD: &str = include_str!("../../../docs/mcp.md");
 
     /// Every `--long-flag` token in `text` — the spelling both the runnable
     /// quick-start block and the flag table use.
@@ -1424,21 +1475,21 @@ const AFTER: &str = "after";
     /// shows them: the command it invites you to paste into a shell, and the
     /// table below it.
     fn readme_serve_flags() -> BTreeSet<&'static str> {
-        let quickstart = README_MD
+        let quickstart = INSTALL_MD
             .split_once(SERVE_QUICKSTART_LEAD)
             .and_then(|(_, rest)| rest.split_once("```"))
             .map(|(block, _)| block)
             .unwrap_or_else(|| {
                 panic!(
-                    "README.md must keep the fenced `{SERVE_QUICKSTART_LEAD}` example — \
-                     it is the first command a new operator runs"
+                    "docs/install.md must keep the fenced `{SERVE_QUICKSTART_LEAD}` example — \
+                     it is the first command an operator installing from source runs"
                 )
             });
 
         let mut flags = long_flags(quickstart);
         let mut rows_with_a_flag = 0;
 
-        for cell in first_table_cells(README_MD, SERVE_FLAG_TABLE_LEAD) {
+        for cell in first_table_cells(INSTALL_MD, SERVE_FLAG_TABLE_LEAD) {
             let named = long_flags(cell);
             if !named.is_empty() {
                 rows_with_a_flag += 1;
@@ -1487,7 +1538,7 @@ const AFTER: &str = "after";
         for flag in &advertised {
             assert!(
                 accepted.contains(*flag),
-                "README.md offers `plombir-git serve {flag}`, which clap does not accept — \
+                "docs/install.md offers `plombir-git serve {flag}`, which clap does not accept — \
                  an operator following the page gets `error: unexpected argument`. \
                  Rename it on the page too, or restore the flag."
             );
@@ -1540,7 +1591,13 @@ const AFTER: &str = "after";
         // reported first should not depend on the filesystem.
         files.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-        for extra in ["Dockerfile", "deploy/README.md", "README.md"] {
+        for extra in [
+            "Dockerfile",
+            "deploy/README.md",
+            "README.md",
+            "docs/install.md",
+            "docs/cli.md",
+        ] {
             files.push((extra.to_string(), read(&root.join(extra))));
         }
 
@@ -2051,8 +2108,8 @@ const AFTER: &str = "after";
     /// declaration they describe.
     const CONFIG_BACKED_CLAIMS: [(&str, &str, &str, &str); 2] = [
         (
-            "README.md",
-            README_MD,
+            "docs/cli.md",
+            CLI_MD,
             "Every subcommand that touches the database or the repository directory",
             ")",
         ),
@@ -2113,7 +2170,7 @@ const AFTER: &str = "after";
         // Rows name more than one command (`backup-db` / `restore-db`) and carry
         // their arguments (`index-repo <owner/name>`), so a row contributes the
         // first word of each of its first cell's code spans.
-        let documented: BTreeSet<String> = first_table_cells(README_MD, CLI_TABLE_LEAD)
+        let documented: BTreeSet<String> = first_table_cells(CLI_MD, CLI_TABLE_LEAD)
             .into_iter()
             .flat_map(|cell| {
                 cell.split('`')
@@ -2139,7 +2196,7 @@ const AFTER: &str = "after";
 
         assert_eq!(
             documented, offered,
-            "the README's CLI table says it is what the binary offers, and it no longer is. \
+            "docs/cli.md's CLI table says it is what the binary offers, and it no longer is. \
              A subcommand missing from it is one an operator cannot discover; a row clap \
              does not have is `error: unrecognized subcommand` on the first try."
         );
@@ -2723,7 +2780,7 @@ const AFTER: &str = "after";
         let documented = documented_defaults();
         let mut checked = 0;
 
-        for row in first_table_rows(README_MD, SERVE_FLAG_TABLE_LEAD) {
+        for row in first_table_rows(INSTALL_MD, SERVE_FLAG_TABLE_LEAD) {
             let (Some(flags), Some(stated)) = (row.first(), row.get(2)) else {
                 continue;
             };
@@ -2736,7 +2793,7 @@ const AFTER: &str = "after";
                 }
                 assert!(
                     stated.contains(entry.value.as_str()),
-                    "README.md's `serve` table gives `{}` the default {stated:?}, and \
+                    "docs/install.md's `serve` table gives `{}` the default {stated:?}, and \
                      `config::{}` is `{}` — an operator plans a deployment around the \
                      number on the page, and for a limit like `[rate_limit].max` that \
                      number is a threat model",
@@ -2995,8 +3052,12 @@ std::env::set_var::<&str, &str>("TYPED", "1");
     /// The pages an operator reads *before* setting anything. `include_str!`
     /// rather than a runtime read: a renamed or moved document breaks the build
     /// instead of quietly leaving the census with nothing to match against.
-    const OPERATOR_DOCUMENTS: [(&str, &str); 4] = [
+    const OPERATOR_DOCUMENTS: [(&str, &str); 8] = [
         ("README.md", README_MD),
+        ("docs/install.md", INSTALL_MD),
+        ("docs/cli.md", CLI_MD),
+        ("docs/runner.md", RUNNER_MD),
+        ("docs/mcp.md", MCP_MD),
         ("deploy/README.md", DEPLOY_README_MD),
         (
             "plombir-git.example.toml",

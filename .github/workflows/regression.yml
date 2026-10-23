@@ -1221,3 +1221,17 @@ jobs:
               docker logs plombir-git-smoke >&2 || true
               exit 1
             }
+
+      # The README's first command, against this image: `plombir-git trial`
+      # with nothing prepared — no secret, no config, no volume — then the setup
+      # link it prints, the first account, a repository and a clone over HTTP.
+      # A step of its own because the boot step above is about the production
+      # CMD and its trap removes that container; this one must not inherit a
+      # JWT secret from anywhere. release.yml runs the same script against the
+      # image it has just published (card_794de0f08b9a).
+      - name: Try the image the way the README's first command does
+        if: steps.scope.outputs.build == 'true'
+        env:
+          TRIAL_HTTP_PORT: "18081"
+          TRIAL_SSH_PORT: "12223"
+        run: scripts/trial-smoke.sh plombir-git:ci

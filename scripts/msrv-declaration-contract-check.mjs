@@ -103,10 +103,11 @@ for (const crate of crates) {
 const STATEMENTS = [
   {
     file: 'README.md',
-    patterns: [
-      { what: 'the Rust badge', regex: /img\.shields\.io\/badge\/rust-(\d+\.\d+)%2B/g },
-      { what: 'the requirement', regex: /^- Rust (\d+\.\d+)\+/gm },
-    ],
+    patterns: [{ what: 'the Rust badge', regex: /img\.shields\.io\/badge\/rust-(\d+\.\d+)%2B/g }],
+  },
+  {
+    file: 'docs/install.md',
+    patterns: [{ what: 'the requirement', regex: /^- Rust (\d+\.\d+)\+/gm }],
   },
   {
     file: 'CONTRIBUTING.md',
@@ -142,5 +143,5 @@ if (problems.length > 0) {
 
 if (print) process.stdout.write(`version=${declared}\n`);
 console.error(
-  `msrv: Rust ${declared}, inherited by ${crates.length} crate(s), stated alike in README.md and CONTRIBUTING.md`,
+  `msrv: Rust ${declared}, inherited by ${crates.length} crate(s), stated alike in README.md, docs/install.md and CONTRIBUTING.md`,
 );

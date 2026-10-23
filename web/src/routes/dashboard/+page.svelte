@@ -417,9 +417,25 @@
   {#if loading}
     <p class="text-secondary">{t('common.loading')}</p>
   {:else if repoList.length === 0}
+    <!-- Bringing a repository over comes first: on a new instance most people
+         arrive with their work somewhere else, and the import keeps issue and
+         pull request numbers, reviews and releases (card_f9686a3f8141). -->
     <div class="empty">
       <p>{t('dashboard.empty.no_repos')}</p>
-      <p class="text-secondary">{t('dashboard.empty.get_started')}</p>
+      <div class="empty-actions">
+        <div class="empty-action primary-action" data-testid="empty-import">
+          <h2>{t('dashboard.empty.import_title')}</h2>
+          <p class="text-secondary">{t('dashboard.empty.import_body')}</p>
+          <a class="btn-primary" href="/imports">{t('dashboard.empty.import_action')}</a>
+        </div>
+        <div class="empty-action" data-testid="empty-create">
+          <h2>{t('dashboard.empty.create_title')}</h2>
+          <p class="text-secondary">{t('dashboard.empty.create_body')}</p>
+          <button class="btn-secondary" type="button" disabled={creating} onclick={() => (showCreate = true)}>
+            {t('dashboard.new_repo')}
+          </button>
+        </div>
+      </div>
     </div>
   {:else}
     <div class="repo-list">
@@ -632,6 +648,39 @@
     padding: 60px 24px;
     color: var(--text-secondary);
   }
+
+  .empty-actions {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+    max-width: 720px;
+    margin: 24px auto 0;
+    text-align: left;
+  }
+
+  .empty-action {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 20px;
+    border: 1px solid var(--border-light);
+    border-radius: 8px;
+    background: var(--bg-secondary);
+  }
+
+  .empty-action.primary-action { border-color: var(--accent); }
+
+  .empty-action h2 {
+    margin: 0;
+    font-size: 16px;
+    color: var(--text-primary);
+  }
+
+  .empty-action p { margin: 0; flex: 1; }
+
+  a.btn-primary { display: inline-block; text-decoration: none; }
+  a.btn-primary:hover { text-decoration: none; }
 
   .repo-list {
     display: flex;

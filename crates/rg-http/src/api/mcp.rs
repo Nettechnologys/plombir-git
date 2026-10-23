@@ -364,15 +364,37 @@ pub async fn mcp_endpoint(
             .and_then(|flag| flag.as_bool())
             .unwrap_or(response.get("error").is_some());
         let actor = rg_core::audit::AuditActor::resolve_after_the_fact(&state.db, user_id).await;
+        let target = ToolCallTarget::of(request.params.as_ref());
+        let resource_id = match &target.repository {
+            Some((owner, name)) => {
+                rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, name)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|repository| repository.id)
+            }
+            None => None,
+        };
+        let resource_name = target
+            .repository
+            .as_ref()
+            .map(|(owner, name)| format!("{owner}/{name}"));
+        let mut details = serde_json::json!({ "tool": tool, "is_error": is_error });
+        if let Some(number) = target.number {
+            details["number"] = serde_json::json!(number);
+        }
+        if let Some(path) = target.path {
+            details["path"] = serde_json::json!(path);
+        }
         rg_core::audit::record(
             &state.db,
             &actor,
             MCP_TOOL_CALL_ACTION,
-            None,
-            None,
-            None,
+            resource_name.as_ref().map(|_| "repo"),
+            resource_id,
+            resource_name.as_deref(),
             Some(&headers),
-            Some(serde_json::json!({ "tool": tool, "is_error": is_error })),
+            Some(details),
         )
         .await;
     }
@@ -382,3 +404,74 @@ pub async fn mcp_endpoint(
 
 /// The audit action every tool call through this endpoint writes.
 pub const MCP_TOOL_CALL_ACTION: &str = "agent.mcp_tool_call";
+
+/// What a tool call names as its subject, for the audit row: the repository,
+/// and the issue or pull request number and file path where the tool takes
+/// one.
+///
+/// Picked out by name, never copied whole: `write_file`'s arguments carry the
+/// file's content, and `create_issue`'s its body (card_e07434639f8e). Without
+/// it every `agent.mcp_tool_call` row named only the tool, and the journal
+/// could not say what an agent had touched.
+#[derive(Debug, Default, PartialEq)]
+struct ToolCallTarget {
+    repository: Option<(String, String)>,
+    number: Option<i64>,
+    path: Option<String>,
+}
+
+impl ToolCallTarget {
+    fn of(params: Option<&serde_json::Value>) -> Self {
+        let Some(arguments) = params.and_then(|params| params.get("arguments")) else {
+            return Self::default();
+        };
+        let text = |key: &str| {
+            arguments
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+        };
+        Self {
+            repository: text("owner")
+                .zip(text("repo"))
+                .map(|(owner, repo)| (owner.to_string(), repo.to_string())),
+            number: arguments.get("number").and_then(serde_json::Value::as_i64),
+            path: text("path").map(str::to_string),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tool_call_target_tests {
+    use super::ToolCallTarget;
+
+    #[test]
+    fn names_the_repository_number_and_path_and_nothing_else() {
+        let params = serde_json::json!({
+            "name": "write_file",
+            "arguments": {
+                "owner": "alice", "repo": "site", "path": "src/lib.rs",
+                "content": "fn secret() {}", "message": "edit", "number": 7,
+            },
+        });
+        let target = ToolCallTarget::of(Some(&params));
+        assert_eq!(
+            target,
+            ToolCallTarget {
+                repository: Some(("alice".into(), "site".into())),
+                number: Some(7),
+                path: Some("src/lib.rs".into()),
+            }
+        );
+        assert!(!format!("{target:?}").contains("secret"));
+    }
+
+    #[test]
+    fn a_tool_without_a_repository_names_none() {
+        let params = serde_json::json!({ "name": "list_repos", "arguments": {} });
+        assert_eq!(ToolCallTarget::of(Some(&params)), ToolCallTarget::default());
+        assert_eq!(ToolCallTarget::of(None), ToolCallTarget::default());
+        let half = serde_json::json!({ "arguments": { "owner": "alice" } });
+        assert_eq!(ToolCallTarget::of(Some(&half)).repository, None);
+    }
+}

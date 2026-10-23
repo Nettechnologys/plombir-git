@@ -14,3 +14,4 @@ mod sqlite_db_presence;
 mod sqlite_migration_offline;
 mod sqlite_restore_offline;
 mod state_permissions;
+mod trial_start;

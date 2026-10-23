@@ -1293,6 +1293,44 @@ async fn an_agents_pull_request_merges_only_after_a_code_owner_approves() {
         ],
         "every step the agent took is in the audit log under its tool"
     );
+
+    // And each row says where: the repository as the Resource column shows it,
+    // the pull request's number and the file, never a file's content
+    // (card_e07434639f8e).
+    let app = rg_core::repo::service::find_repo_by_owner_name(&f.db, "alice", "app")
+        .await
+        .unwrap()
+        .expect("alice/app");
+    let rows = f.audit("agent.mcp_tool_call").await;
+    for row in &rows {
+        assert_eq!(row.resource_type.as_deref(), Some("repo"), "{row:?}");
+        assert_eq!(row.resource_name.as_deref(), Some("alice/app"), "{row:?}");
+        assert_eq!(row.resource_id, Some(app.id), "{row:?}");
+        assert!(
+            !row.details.as_deref().unwrap().contains("fn answer"),
+            "a written file's content reached the audit log: {row:?}"
+        );
+    }
+    let details = |tool: &str| -> Vec<serde_json::Value> {
+        rows.iter()
+            .map(|row| {
+                serde_json::from_str::<serde_json::Value>(row.details.as_deref().unwrap()).unwrap()
+            })
+            .filter(|details| details["tool"] == tool)
+            .collect()
+    };
+    let read = &details("read_file")[0];
+    assert_eq!(read["path"], "README.md", "a read names its file: {read}");
+    let written = &details("write_file")[0];
+    assert_eq!(
+        written["path"], "src/agent.rs",
+        "a write names its file: {written}"
+    );
+    let merged = &details("merge_pr")[0];
+    assert_eq!(
+        merged["number"], number,
+        "a merge names its pull request: {merged}"
+    );
 }
 
 impl Fixture {

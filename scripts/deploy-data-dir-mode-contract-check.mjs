@@ -101,7 +101,7 @@ if (!dockerfile.includes('chmod 700 /data')) {
 // data` and `chmod 755 data` differ only in digits a regex is easy to get
 // backwards, and getting it backwards here means flagging the safe form.
 const CHMOD_ON_DATA = /chmod\s+(?:-R\s+)?([0-7]{3,4})\s+(?:\.\/)?(?:[\w./-]*\/)?data\b/g;
-for (const surface of ['deploy/README.md', 'README.md']) {
+for (const surface of ['deploy/README.md', 'README.md', 'docs/install.md']) {
   const body = readFileSync(join(root, surface), 'utf8');
   for (const widened of body.matchAll(CHMOD_ON_DATA)) {
     if ((Number.parseInt(widened[1], 8) & 0o077) === 0) continue;

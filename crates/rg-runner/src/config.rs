@@ -1336,7 +1336,10 @@ labels = ["linux", "docker"]
     /// `include_str!` rather than a runtime read: the path resolves at compile
     /// time (a moved README breaks the build instead of silently skipping the
     /// checks), and editing the page rebuilds — and so re-runs — these tests.
-    const README: (&str, &str) = ("README.md", include_str!("../../../README.md"));
+    ///
+    /// It was the root `README.md` until the README became a one-screen front
+    /// page; the runner's section moved here whole (card_fbe97fcbad2a).
+    const README: (&str, &str) = ("docs/runner.md", include_str!("../../../docs/runner.md"));
 
     /// The heading that opens the runner's half of the README. Everything up to
     /// the next `## ` heading is the section these checks read.

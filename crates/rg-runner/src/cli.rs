@@ -221,8 +221,9 @@ mod tests {
 
     /// The files an operator copies a command out of: the shipped compose
     /// files, the image's own default command, and the two guides that quote
-    /// them. The root `README.md` is here because it is the only page that
-    /// spells out `register` at all.
+    /// them. `docs/runner.md` is here because it is the only page that spells
+    /// out `register` at all; the root `README.md` because it is the page read
+    /// first.
     ///
     /// Walked at run time rather than pinned with `include_str!` so that a
     /// compose file added to `deploy/` joins the contract by existing. The
@@ -260,7 +261,12 @@ mod tests {
         // either the first or the last one depending on the filesystem.
         files.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-        for extra in ["Dockerfile", "deploy/README.md", "README.md"] {
+        for extra in [
+            "Dockerfile",
+            "deploy/README.md",
+            "README.md",
+            "docs/runner.md",
+        ] {
             files.push((extra.to_string(), read(&root.join(extra))));
         }
 
@@ -444,7 +450,7 @@ mod tests {
         }
 
         // Floors, not counts: both shipped compose files carry the `run` block
-        // with three flags each, and the README's `register` example names five.
+        // with three flags each, and docs/runner.md's `register` example names five.
         assert!(
             offered >= 3,
             "only {offered} subcommand invocations found across the operator pages — \

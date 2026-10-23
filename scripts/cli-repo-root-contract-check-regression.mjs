@@ -153,6 +153,14 @@ pub(crate) async fn run_serve() -> anyhow::Result<()> {
 }
 ${serveExtra}`,
   );
+  writeFileSync(
+    join(src, 'trial.rs'),
+    `pub(crate) fn prepare_data_dir(data_dir: &Path) -> anyhow::Result<String> {
+    rg_core::platform::fs::create_dir_all_owner_only(data_dir)?;
+    Ok(String::new())
+}
+`,
+  );
 }
 
 const cases = [

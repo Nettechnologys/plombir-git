@@ -13,6 +13,9 @@
 # Build:
 #   docker build -t plombir-git:latest .
 #
+# Try it (a throwaway instance, nothing to prepare — not for production):
+#   docker run --rm -p 8080:8080 -p 2222:2222 plombir-git:latest plombir-git trial
+#
 # Run:
 #   docker run -d -p 8080:8080 -p 2222:2222 \
 #     -e PLOMBIR_GIT_JWT_SECRET=your-secret \

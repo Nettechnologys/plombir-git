@@ -227,6 +227,14 @@ jobs:
             echo '::error::GHCR image is not public. A package admin must change its visibility to public, then rerun this job; see docs/releases/README.md.'
             exit 1
           fi
+      # The README's first command, against the image just published and
+      # pulled anonymously, as a newcomer would: `docker run … plombir-git trial`,
+      # the setup link, the first account, a repository, a clone. The image is
+      # already public at this point; a red step here means the tag's own
+      # front page does not work (card_794de0f08b9a).
+      - name: Try the published image with the README's first command
+        shell: bash
+        run: scripts/trial-smoke.sh "${REGISTRY_IMAGE}:${GITHUB_REF_NAME}"
       # The deploy files of this tag, with the compose file's image set to the
       # digest just published: an operator installing this release takes the
       # compose file, the config template and the env example from one commit.

@@ -7,10 +7,13 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
 const root = process.cwd();
-const readme = readFileSync(process.env.FEATURE_README_OVERRIDE || path.join(root, 'README.md'), 'utf8');
+// The table left the README when the README became a one-screen front page
+// (card_fbe97fcbad2a); its links are now relative to docs/.
+const PAGE = 'docs/features.md';
+const readme = readFileSync(process.env.FEATURE_README_OVERRIDE || path.join(root, PAGE), 'utf8');
 const section = readme.split(/^## Features\s*$/m)[1]?.split(/^## /m)[0];
 const failures = [];
-if (!section) failures.push('README Features section is missing');
+if (!section) failures.push(`${PAGE}: the Features section is missing`);
 
 const expected = [
   'Git transport', 'Repositories', 'Auth', 'Issues', 'Pull requests', 'Wiki',
@@ -29,7 +32,8 @@ for (const line of section?.split('\n') || []) {
   const [area, capability, evidence] = cells;
   if (rows.has(area)) failures.push(`Duplicate feature row: ${area}`);
   rows.set(area, capability);
-  const linkedPath = /^\[[^\]]+\]\(([^)]+)\)$/.exec(evidence)?.[1];
+  const linked = /^\[[^\]]+\]\(([^)]+)\)$/.exec(evidence)?.[1];
+  const linkedPath = linked?.startsWith('../') ? linked.slice(3) : undefined;
   if (!linkedPath || !/^(crates\/|web\/).+\.(rs|svelte)$/.test(linkedPath)) {
     failures.push(`${area}: Implementation must link to a Rust route/service or Svelte page`);
   } else if (!existsSync(path.join(root, linkedPath))) {

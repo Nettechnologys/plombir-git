@@ -71,6 +71,22 @@ export function setSetupRequired(required: boolean) {
   setupRequired = required;
 }
 
+// ── Trial mode ──────────────────────────────────────────
+
+/// Whether the server was started by `plombir-git trial`
+/// (`GET /api/v1/instance` → `trial_mode`). Kept apart from the operator's
+/// banner above: that one can be dismissed and replaced, while a trial
+/// instance has to say what it is on every page.
+let trialMode = $state(false);
+
+export function getTrialMode(): boolean {
+  return trialMode;
+}
+
+export function setTrialMode(trial: boolean) {
+  trialMode = trial;
+}
+
 // ── Keyboard Shortcuts ──────────────────────────────────
 
 /// Call this once in root layout to register global keyboard shortcuts.

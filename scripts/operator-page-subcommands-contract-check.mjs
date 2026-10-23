@@ -43,7 +43,17 @@ import { productionRustCode } from './lib/rust-source.mjs';
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(process.argv[2] ?? join(scriptsDir, '..'));
 
-const PAGES = ['README.md', 'deploy/README.md'];
+// The README's command reference moved into docs/ when the README became a
+// one-screen front page (card_fbe97fcbad2a); the pages went with it.
+const PAGES = [
+  'README.md',
+  'deploy/README.md',
+  'docs/install.md',
+  'docs/cli.md',
+  'docs/runner.md',
+  'docs/mcp.md',
+  'docs/agents.md',
+];
 const BINARIES = [
   { binary: 'plombir-git', source: 'crates/rg-cli/src/cli.rs' },
   { binary: 'plombir-git-runner', source: 'crates/rg-runner/src/cli.rs' },

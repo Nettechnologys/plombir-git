@@ -23,7 +23,7 @@
 | Reachable from the browser | 313 (69%) |
 | Layout modules | 2 |
 | Pages | 75 |
-| Interactive controls | 1069 |
+| Interactive controls | 1071 |
 | Controls calling an API | 376 |
 | Controls from shared components | 436 |
 | Browser sweep: scenarios / inventory entries / routes | 52 / 197 / 187 |
@@ -80,11 +80,11 @@
 | `/settings/security` | 19 | 11 | 3 |
 | `/[owner]/[repo]/releases/edit/[id]` | 18 | 5 | 11 |
 | `/[owner]/[repo]/tags` | 18 | 5 | 12 |
+| `/dashboard` | 18 | 4 | 0 |
 | `/[owner]/[repo]/packages/[format]/[...name]` | 17 | 6 | 11 |
 | `/[owner]/[repo]/packages/upload` | 17 | 5 | 11 |
 | `/[owner]/[repo]/wiki` | 17 | 5 | 11 |
 | `/[owner]/[repo]/commits` | 16 | 6 | 12 |
-| `/dashboard` | 16 | 4 | 0 |
 | `/imports` | 16 | 3 | 2 |
 | `/[owner]/[repo]/commits/[sha]` | 15 | 7 | 11 |
 | `/[owner]/[repo]/settings/branches` | 15 | 2 | 2 |
@@ -142,7 +142,7 @@ succeed and which must be denied.
 
 | Scope | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| `/` | `instance.get` | `GET /api/v1/instance` | `Public` | rust+web |
+| `/` | `instance.get` | `GET /api/v1/instance` | `Public` | rust+web+smoke |
 | `/` | `web/src/routes/+layout.svelte#checkBackendReadiness` | `GET /health` | `Public` | rust+smoke |
 
 ### `/`
@@ -703,17 +703,17 @@ succeed and which must be denied.
 | i18n:releases.attestation.signing | :623 | `POST /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation` | `RepoWrite` | rust+web |
 | i18n:common.delete | :649 | `DELETE /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}` | `RepoWrite` | rust+web+browser |
 | i18n:common.delete | :686 | `DELETE /api/v1/repos/{owner}/{name}/releases/{id}` | `RepoWrite` | rust+web |
-| i18n:common.delete | :686 | `GET /api/v1/instance` | `Public` | rust+web+browser |
+| i18n:common.delete | :686 | `GET /api/v1/instance` | `Public` | rust+web+smoke+browser |
 | i18n:common.delete | :686 | `GET /api/v1/repos/{owner}/{name}/releases` | `RepoRead` | rust+web |
 | i18n:common.delete | :686 | `GET /api/v1/repos/{owner}/{name}/releases/{id}` | `RepoRead` | rust+web |
 | i18n:common.delete | :686 | `GET /api/v1/repos/{owner}/{name}/releases/{release_id}/assets` | `RepoRead` | rust+web |
 | i18n:common.delete | :686 | `GET /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation` | `RepoRead` | rust+web |
-| i18n:common.previous | :701 | `GET /api/v1/instance` | `Public` | rust+web |
+| i18n:common.previous | :701 | `GET /api/v1/instance` | `Public` | rust+web+smoke |
 | i18n:common.previous | :701 | `GET /api/v1/repos/{owner}/{name}/releases` | `RepoRead` | rust+web |
 | i18n:common.previous | :701 | `GET /api/v1/repos/{owner}/{name}/releases/{id}` | `RepoRead` | rust+web |
 | i18n:common.previous | :701 | `GET /api/v1/repos/{owner}/{name}/releases/{release_id}/assets` | `RepoRead` | rust+web |
 | i18n:common.previous | :701 | `GET /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation` | `RepoRead` | rust+web |
-| i18n:common.next | :709 | `GET /api/v1/instance` | `Public` | rust+web |
+| i18n:common.next | :709 | `GET /api/v1/instance` | `Public` | rust+web+smoke |
 | i18n:common.next | :709 | `GET /api/v1/repos/{owner}/{name}/releases` | `RepoRead` | rust+web |
 | i18n:common.next | :709 | `GET /api/v1/repos/{owner}/{name}/releases/{id}` | `RepoRead` | rust+web |
 | i18n:common.next | :709 | `GET /api/v1/repos/{owner}/{name}/releases/{release_id}/assets` | `RepoRead` | rust+web |
@@ -1107,7 +1107,7 @@ succeed and which must be denied.
 | i18n:common.loading | :347 | `GET /api/v1/repos/templates/licenses` | `Public` | web |
 | i18n:common.loading | :347 | `GET /api/v1/repos/templates/readmes` | `Public` | web |
 | i18n:common.loading | :347 | `GET /api/v1/repos/templates/labels` | `Public` | web |
-| i18n:common.retry | :452 | `GET /api/v1/users/me/collaborations` | `User` | rust+web |
+| i18n:common.retry | :468 | `GET /api/v1/users/me/collaborations` | `User` | rust+web |
 | _(page load)_ | — | `GET /api/v1/repos/{owner}` | `PublicFiltered` | rust+web+browser |
 
 ### `/explore`
@@ -1250,7 +1250,7 @@ succeed and which must be denied.
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
 | i18n:settings.profile.retry | :232 | `GET /api/v1/users/me` | `User` | rust+web+smoke |
-| i18n:settings.profile.retry | :232 | `GET /api/v1/instance` | `Public` | rust+web |
+| i18n:settings.profile.retry | :232 | `GET /api/v1/instance` | `Public` | rust+web+smoke |
 | i18n:settings.profile.display_name | :239 | `PATCH /api/v1/users/me` | `User` | rust+web |
 | uploadAvatar | :264 | `PUT /api/v1/users/me/avatar` | `User` | rust+web |
 | i18n:settings.profile.remove_avatar | :273 | `DELETE /api/v1/users/me/avatar` | `User` | rust+web |
@@ -1361,7 +1361,7 @@ CI runners, and webhooks. A browser test cannot cover these routes.
 | POST | `/{owner}/{repo}/git-upload-pack` | `Foreign:git_http.rs` | rust |
 | POST | `/{owner}/{repo}/git-receive-pack` | `Foreign:git_http.rs` | rust |
 | GET | `/livez` | `Public` | rust |
-| GET | `/readyz` | `Public` | rust |
+| GET | `/readyz` | `Public` | rust+smoke |
 | GET | `/metrics` | `Public` | rust+smoke |
 | POST | `/api/v1/users/register` | `Public` | rust+web+smoke |
 | POST | `/api/v1/users/login` | `Public` | rust+web+smoke |

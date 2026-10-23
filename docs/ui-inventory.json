@@ -346,7 +346,8 @@
       "access": "Public",
       "handler": "handlers::readyz",
       "testedIn": [
-        "rust"
+        "rust",
+        "smoke"
       ],
       "reachedFromUi": false
     },
@@ -369,6 +370,7 @@
       "testedIn": [
         "rust",
         "web",
+        "smoke",
         "browser"
       ],
       "reachedFromUi": true,
@@ -5530,7 +5532,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         },
         {
@@ -17531,6 +17534,7 @@
               "testedIn": [
                 "rust",
                 "web",
+                "smoke",
                 "browser"
               ],
               "browserScenarios": [
@@ -17635,7 +17639,8 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "web"
+                "web",
+                "smoke"
               ]
             },
             {
@@ -17716,7 +17721,8 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "web"
+                "web",
+                "smoke"
               ]
             },
             {
@@ -25808,8 +25814,28 @@
         },
         {
           "tag": "a",
+          "label": "i18n:dashboard.empty.import_action",
+          "line": 429,
+          "via": null,
+          "href": "/imports",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:dashboard.new_repo",
+          "line": 434,
+          "via": null,
+          "href": null,
+          "handler": "() => (showCreate = true)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "a",
           "label": "/ )}",
-          "line": 427,
+          "line": 443,
           "via": null,
           "href": "`/${owner}/${repo.name}`",
           "handler": null,
@@ -25819,7 +25845,7 @@
         {
           "tag": "button",
           "label": "i18n:common.retry",
-          "line": 452,
+          "line": 468,
           "via": null,
           "href": null,
           "handler": "retryCollaborations",
@@ -25844,7 +25870,7 @@
         {
           "tag": "a",
           "label": "/",
-          "line": 461,
+          "line": 477,
           "via": null,
           "href": "`/${repo.owner}/${repo.name}`",
           "handler": null,
@@ -27839,7 +27865,7 @@
         {
           "tag": "form",
           "label": ")}",
-          "line": 69,
+          "line": 82,
           "via": null,
           "href": null,
           "handler": "handleSubmit",
@@ -27849,7 +27875,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.register.submitting",
-          "line": 102,
+          "line": 115,
           "via": null,
           "href": null,
           "handler": null,
@@ -27859,7 +27885,7 @@
         {
           "tag": "a",
           "label": "i18n:auth.register.footer_link",
-          "line": 110,
+          "line": 123,
           "via": null,
           "href": "/login",
           "handler": null,
@@ -28428,7 +28454,8 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "web"
+                "web",
+                "smoke"
               ]
             }
           ],

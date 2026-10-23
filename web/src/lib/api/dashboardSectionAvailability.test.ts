@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import DashboardPage from '../../routes/dashboard/+page.svelte';
 import { fetchUser, logout } from '../stores/auth.svelte';
 import { setTestPage } from '../test/app';
-import { auth, orgs, repos, resetTestClient } from '../test/client';
+import { auth, imports, orgs, repos, resetTestClient } from '../test/client';
 import {
 	click,
 	element,
@@ -216,5 +216,39 @@ describe('dashboard optional section availability', () => {
 		expect(repos.templates.gitignores).toHaveBeenCalledTimes(2);
 		expect(rendered!.container.textContent).toContain('Recovered ignore');
 		expect(rendered!.container.querySelector('.template-availability')).toBeNull();
+	});
+});
+
+// card_f9686a3f8141: on an empty dashboard the first thing offered is to bring
+// a repository over, and it leads to the import form; creating one comes second.
+describe('an account with no repositories yet', () => {
+	it('offers the import first, and it leads to the import form', async () => {
+		orgs.list.mockResolvedValue([]);
+		rendered = await renderComponent(DashboardPage);
+
+		const actions = [...rendered.container.querySelectorAll('.empty-actions > .empty-action')];
+		expect(actions.map((action) => action.getAttribute('data-testid'))).toEqual(['empty-import', 'empty-create']);
+		const importLink = element<HTMLAnchorElement>(actions[0] as HTMLElement, 'a.btn-primary');
+		expect(importLink.getAttribute('href')).toBe('/imports');
+		expect(importLink.textContent).toContain('Import a repository');
+		expect(actions[0].textContent).toContain('GitHub');
+		expect(actions[0].textContent).toContain('keep their numbers');
+
+		// Following the link lands on the page whose first panel is the form.
+		await rendered.destroy();
+		imports.list.mockResolvedValue([]);
+		const { default: ImportsPage } = await import('../../routes/imports/+page.svelte');
+		setTestPage(importLink.getAttribute('href')!, {});
+		rendered = await renderComponent(ImportsPage);
+		const form = element(rendered.container, 'form.import-form');
+		expect(form.querySelector('input[type="url"]')).not.toBeNull();
+	});
+
+	it('still opens the create form from the second card', async () => {
+		orgs.list.mockResolvedValue([]);
+		rendered = await renderComponent(DashboardPage);
+
+		await click(element(rendered.container, '[data-testid="empty-create"] button'));
+		expect(rendered.container.textContent).toContain('Create a new repository');
 	});
 });

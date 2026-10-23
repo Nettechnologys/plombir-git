@@ -339,7 +339,11 @@
     },
     "empty": {
       "no_repos": "暂无仓库",
-      "get_started": "创建您的第一个仓库开始使用！"
+      "import_title": "迁移已有仓库",
+      "import_body": "支持 GitHub、GitLab、Gitea 与 Forgejo。Issue 与拉取请求保留原编号，连同评审、标签、里程碑和发布一起迁移；导入回执会列出哪些内容已迁移、哪些未能迁移。",
+      "import_action": "导入仓库",
+      "create_title": "新建仓库",
+      "create_body": "空仓库，或带有 README、.gitignore 和许可证的仓库。"
     },
     "repo": {
       "private": "私有"
@@ -2388,5 +2392,10 @@
       "review_requested": "你正在接收通知，因为有人请求你评审。",
       "manual": "你正在接收通知，因为你订阅了它。"
     }
+  },
+  "trial": {
+    "title": "试用模式——请勿用于生产环境。",
+    "body": "此实例由 plombir-git trial 启动：其数据存放在一个临时目录中，并会随之消失。",
+    "deploy": "正式部署请运行 plombir-git serve（见 deploy/README.md）。"
   }
 }

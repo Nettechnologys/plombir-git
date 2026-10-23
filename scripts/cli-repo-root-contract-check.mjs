@@ -80,6 +80,12 @@ const DIRECTORY_CREATORS = [
     ],
     why: '`serve` is the process that defines the instance rather than one addressing an existing one, so a first boot creating its own root is the correct answer and not a mistake about which root',
   },
+  {
+    file: 'crates/rg-cli/src/trial.rs',
+    sites: 1,
+    directories: ['the trial data directory (`plombir-git trial --data-dir`, default `./plombir-git-trial`)'],
+    why: '`trial` defines a throwaway instance the way `serve` defines a real one: the directory it makes is the whole instance, not an existing one it could be pointed away from. Everything inside it — config, keys, database, repositories — is created by this start or reused from the previous one, and `serve` then logs each of those files by its absolute path',
+  },
 ];
 
 /**

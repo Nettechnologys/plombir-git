@@ -205,3 +205,33 @@ async fn concurrent_bootstrap_attempts_with_the_token_yield_exactly_one_admin() 
         "exactly one bootstrap, got {statuses:?}"
     );
 }
+
+/// `plombir-git trial` is announced to every visitor, and only by it: an
+/// instance started by `serve` must not claim to be a throwaway one.
+#[tokio::test]
+async fn the_instance_says_whether_it_is_a_trial() {
+    async fn trial_mode(base: &str) -> bool {
+        let info: serde_json::Value = reqwest::Client::new()
+            .get(format!("{base}/api/v1/instance"))
+            .send()
+            .await
+            .expect("GET /instance")
+            .json()
+            .await
+            .expect("instance json");
+        info["trial_mode"].as_bool().expect("trial_mode is a bool")
+    }
+
+    let (serve, _db) = spawn_test_app_with_overrides(StateOverrides::default()).await;
+    assert!(!trial_mode(&serve).await, "`serve` is not a trial");
+
+    let (trial, _db) = spawn_test_app_with_overrides(StateOverrides {
+        trial_mode: true,
+        ..Default::default()
+    })
+    .await;
+    assert!(
+        trial_mode(&trial).await,
+        "the banner flag must reach the UI"
+    );
+}

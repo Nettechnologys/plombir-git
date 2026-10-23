@@ -202,6 +202,10 @@ pub struct AppState {
     /// enabled. Default `false`: the sign/verify endpoints return 404 until an
     /// operator turns the feature on.
     pub attestation_enabled: bool,
+    /// Whether this process was started by `plombir-git trial`. Only shown —
+    /// `GET /api/v1/instance` → `trial_mode` puts a banner on every page — and
+    /// never consulted for an access decision.
+    pub trial_mode: bool,
     /// The repository holding this instance's source, validated and without a
     /// trailing slash — `[server].source_url`. `GET /api/v1/instance` joins it
     /// with [`build_info::source_commit`] into the link the UI offers under
@@ -628,6 +632,8 @@ pub struct HttpServerConfig {
     /// Enable opt-in Ed25519 provenance attestation of release assets. Default
     /// `false` (feature off; endpoints 404).
     pub attestation_enabled: bool,
+    /// Started by `plombir-git trial` — see [`AppState::trial_mode`].
+    pub trial_mode: bool,
     /// Repository the UI links as this instance's source, validated by the
     /// caller and without a trailing slash. See [`AppState::source_url`].
     pub source_url: String,
@@ -849,6 +855,7 @@ async fn run_with_listener(
         git_idle_timeout_secs: config.git_idle_timeout_secs,
         ci_engine: config.ci_engine,
         attestation_enabled: config.attestation_enabled,
+        trial_mode: config.trial_mode,
         source_url: Arc::from(config.source_url),
         ws_session_recheck_secs: ws::DEFAULT_WS_SESSION_RECHECK_SECS,
         instance_settings: config.instance_settings,

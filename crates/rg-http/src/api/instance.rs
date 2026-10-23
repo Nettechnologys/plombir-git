@@ -87,6 +87,13 @@ pub struct InstanceInfo {
     /// (card_2296f052332b). The same fact the operator reads from `/health`'s
     /// SMTP check, as a yes or no.
     pub email_confirmation: bool,
+    /// Whether this instance was started by `plombir-git trial` — a throwaway
+    /// instance, not for production. The UI shows a banner on every page while
+    /// it is `true`.
+    ///
+    /// Anonymous on purpose: the warning is for whoever is about to put work
+    /// into the instance, and that includes a visitor who has not signed in.
+    pub trial_mode: bool,
 }
 
 /// GET /api/v1/instance — the public announcement of this instance.
@@ -142,6 +149,7 @@ pub async fn get_instance(State(state): State<AppState>) -> impl IntoResponse {
             setup_required,
             registration_open,
             email_confirmation: super::account::mailer(&state).is_some(),
+            trial_mode: state.trial_mode,
         }),
     )
         .into_response()

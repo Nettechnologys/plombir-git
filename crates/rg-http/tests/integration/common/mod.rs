@@ -363,6 +363,8 @@ pub struct StateOverrides {
     /// Outbound mail for this state. The default is none, so no test sends
     /// mail it did not ask for.
     pub smtp_config: Option<rg_core::email::SmtpConfig>,
+    /// Reports this state as started by `plombir-git trial`.
+    pub trial_mode: bool,
 }
 
 /// The at-rest encryption key every test AppState carries.
@@ -492,6 +494,7 @@ pub fn build_test_app_state_with(
         // Enabled in the test harness so attestation endpoints are reachable;
         // production defaults to off (opt-in).
         attestation_enabled: true,
+        trial_mode: overrides.trial_mode,
         source_url: std::sync::Arc::from(TEST_SOURCE_URL),
         ws_session_recheck_secs: overrides
             .ws_session_recheck_secs

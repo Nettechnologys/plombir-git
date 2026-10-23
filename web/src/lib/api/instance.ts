@@ -44,6 +44,11 @@ export interface InstanceInfo {
    * server does not send it, and then no confirmation is offered.
    */
   email_confirmation?: boolean;
+  /**
+   * Whether the server was started by `plombir-git trial`: a throwaway
+   * instance, not for production. Optional: an older server does not send it.
+   */
+  trial_mode?: boolean;
 }
 
 export const instance = {

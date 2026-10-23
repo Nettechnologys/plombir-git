@@ -14,7 +14,9 @@ import { fileURLToPath } from 'node:url';
 import { adoptChild, removeScratchDir, scratchDir } from './lib/scratch-dir.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const readme = readFileSync(join(root, 'README.md'), 'utf8');
+// The from-source quick start moved here when the README became a one-screen
+// front page whose first command is the Docker trial (card_fbe97fcbad2a).
+const readme = readFileSync(join(root, 'docs/install.md'), 'utf8');
 const work = scratchDir(join(tmpdir(), 'plombir-git-readme-'));
 const clone = join(work, 'plombir-git');
 const listenFile = join(work, 'listen-addresses');
