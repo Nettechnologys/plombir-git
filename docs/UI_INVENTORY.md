@@ -19,7 +19,7 @@
 
 | | |
 |---|---|
-| Router routes (with declared `Access`) | 451 |
+| Router routes (with declared `Access`) | 452 |
 | Reachable from the browser | 313 (69%) |
 | Layout modules | 2 |
 | Pages | 75 |
@@ -37,7 +37,7 @@
 | `RepoRead` | 111 | 72 | 4 | 0 |
 | `RepoWrite` | 81 | 62 | 12 | 2 |
 | `User` | 57 | 47 | 5 | 0 |
-| `RepoAdmin` | 53 | 49 | 0 | 4 |
+| `RepoAdmin` | 54 | 49 | 0 | 4 |
 | `InstanceAdmin` | 33 | 28 | 0 | 1 |
 | `Public` | 25 | 10 | 2 | 0 |
 | `OrgAdmin` | 19 | 14 | 0 | 3 |
@@ -1396,6 +1396,7 @@ CI runners, and webhooks. A browser test cannot cover these routes.
 | GET | `/api/v1/ci/oidc/.well-known/openid-configuration` | `Public` | rust |
 | GET | `/api/v1/ci/oidc/jwks` | `Public` | rust |
 | GET | `/api/v1/ci/oidc/token` | `Foreign:api/ci_oidc.rs` | rust |
+| GET | `/api/v1/repos/{owner}/{name}/actions/runners` | `RepoAdmin` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/actions/variables` | `RepoAdmin` | **—** |
 | GET | `/api/v1/repos/{owner}/{name}/actions/variables/{variable_name}` | `RepoAdmin` | **—** |
 | PUT | `/api/v1/repos/{owner}/{name}/actions/variables/{variable_name}` | `RepoAdmin` | **—** |

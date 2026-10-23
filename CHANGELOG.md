@@ -8,6 +8,18 @@ This project records user-facing changes here. The format follows
 
 ### Added
 
+- `GET /repos/{owner}/{name}/actions/runners` lists a repository's runners to
+  its administrators, GitHub's shape: `status` (`online` / `offline`), `busy`,
+  `labels` and `last_seen_at`. A monitor can now tell a runner that is up but
+  no longer polling from one that works, without the instance
+  administrator's keys that `/admin/runners` needs.
+
+- The commit that applies review suggestions ends with a `Co-authored-by:`
+  trailer for every other person whose suggestion it carries, as GitHub
+  writes it. It used to name only whoever pressed Apply, so the reviewer's
+  lines landed — and later squashed into the base branch — under someone
+  else's name.
+
 - A squash merge credits everyone else who wrote one of the commits it
   replaces: its message ends with one `Co-authored-by:` trailer per person,
   told apart by email, as GitHub and GitLab write them. The squash names the

@@ -2841,6 +2841,16 @@
     },
     {
       "method": "GET",
+      "url": "/api/v1/repos/{owner}/{name}/actions/runners",
+      "access": "RepoAdmin",
+      "handler": "api::runners::list_repo_runners",
+      "testedIn": [
+        "rust"
+      ],
+      "reachedFromUi": false
+    },
+    {
+      "method": "GET",
       "url": "/api/v1/repos/{owner}/{name}/actions/secrets",
       "access": "RepoAdmin",
       "handler": "api::ci_secrets::list",

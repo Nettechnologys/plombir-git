@@ -543,6 +543,46 @@ pub async fn apply_suggestion(
     })
 }
 
+/// The message of the commit that applies `count` suggestions: what it does,
+/// then one `Co-authored-by:` trailer for every other person whose suggestion
+/// it carries — the line is the reviewer's, the click is the actor's, and
+/// GitHub writes the same trailers (card_b3d513f83366). Without them the
+/// reviewer is gone from the branch, and from the squash that later reads
+/// its commits' trailers.
+///
+/// `authors` is in the order the suggestions were chosen; each account is
+/// named once, by username and account email as the actor is. An author whose
+/// account no longer exists has nobody left to name.
+async fn suggestion_commit_message(
+    db: &DatabaseConnection,
+    count: usize,
+    authors: impl IntoIterator<Item = i64>,
+    actor: &rg_db::entities::user::Model,
+) -> Result<String> {
+    let mut author_ids = Vec::new();
+    for author_id in authors {
+        if author_id != actor.id && !author_ids.contains(&author_id) {
+            author_ids.push(author_id);
+        }
+    }
+    let accounts = rg_db::ops::user_ops::find_by_ids(db, &author_ids)
+        .await
+        .context("load the authors of the applied suggestions")?;
+
+    let trailers: Vec<String> = author_ids
+        .iter()
+        .filter_map(|author_id| accounts.iter().find(|account| account.id == *author_id))
+        .map(|account| format!("Co-authored-by: {} <{}>", account.username, account.email))
+        .collect();
+
+    let subject = format!("Apply {count} review suggestion(s)");
+    Ok(if trailers.is_empty() {
+        subject
+    } else {
+        format!("{subject}\n\n{}", trailers.join("\n"))
+    })
+}
+
 #[derive(Debug)]
 struct ValidatedSuggestion {
     comment: ReviewComment,
@@ -571,6 +611,7 @@ pub async fn apply_suggestions(
     })?;
     let mut unique_ids = HashSet::new();
     let mut suggestions_by_path: BTreeMap<String, Vec<ValidatedSuggestion>> = BTreeMap::new();
+    let mut suggestion_authors = Vec::with_capacity(comment_ids.len());
     for &comment_id in comment_ids {
         if !unique_ids.insert(comment_id) {
             return Err(crate::error::invalid_request(format!(
@@ -621,6 +662,7 @@ pub async fn apply_suggestions(
                 "suggestion must target a valid RIGHT-side range",
             ));
         }
+        suggestion_authors.push(comment.author_id);
         suggestions_by_path
             .entry(comment.path.clone())
             .or_default()
@@ -631,6 +673,9 @@ pub async fn apply_suggestions(
                 replacement,
             });
     }
+
+    let commit_message =
+        suggestion_commit_message(db, comment_ids.len(), suggestion_authors, actor).await?;
 
     let push_policy = crate::branch_protection::server_side::ServerSideCommitPolicy::load(
         db,
@@ -647,7 +692,6 @@ pub async fn apply_suggestions(
     let actor_username_for_git = actor.username.clone();
     let actor_email_for_git = actor.email.clone();
     let repo_root_for_git = repo_root.to_path_buf();
-    let suggestion_count = comment_ids.len();
     let (suggestions_by_path, commit_sha) = crate::blocking::run_blocking_git(
         "preparing and committing review suggestions",
         move || {
@@ -736,7 +780,7 @@ pub async fn apply_suggestions(
                 &head_branch_for_git,
                 &head_sha_for_git,
                 &file_updates,
-                &format!("Apply {suggestion_count} review suggestion(s)"),
+                &commit_message,
                 &actor_username_for_git,
                 &actor_email_for_git,
                 &repo_root_for_git,

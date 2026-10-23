@@ -2056,6 +2056,11 @@ pub(crate) fn build_all_routes(
         )
         .get(
             RepoAdmin,
+            "/repos/{owner}/{name}/actions/runners",
+            api::runners::list_repo_runners,
+        )
+        .get(
+            RepoAdmin,
             "/repos/{owner}/{name}/actions/secrets",
             api::ci_secrets::list,
         )

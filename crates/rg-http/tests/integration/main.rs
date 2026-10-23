@@ -276,6 +276,7 @@ mod sso_transport_policy_tests;
 mod status_check_without_names_tests;
 mod storage_quota_tests;
 mod sudo_step_up_tests;
+mod suggestion_co_author_tests;
 mod suggestion_push_hook_tests;
 mod supply_chain_journal_census;
 mod tag_protection_lifecycle_tests;

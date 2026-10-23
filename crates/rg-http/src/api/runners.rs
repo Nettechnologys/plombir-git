@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::access_audit::{grant_actor, record_instance_credential, InstanceResource};
 use crate::api::admin::InstanceAdmin;
 use crate::api::auth::SudoUser;
+use crate::api::repo_access::RepoAdmin;
 use crate::error::AppError;
 use crate::AppState;
 use utoipa::{IntoParams, ToSchema};
@@ -2547,6 +2548,102 @@ pub async fn list_runners_admin(
             AppError::from(e).into_response()
         }
     }
+}
+
+/// One runner of a repository, as its administrators see it — GitHub's
+/// `GET /repos/{owner}/{repo}/actions/runners` shape plus when it last spoke.
+#[derive(Serialize, ToSchema)]
+pub struct RepoRunnerResponse {
+    id: i64,
+    name: String,
+    /// `online` while the runner polls or runs a job, `offline` once it
+    /// stopped or the watchdog stopped hearing from it.
+    status: &'static str,
+    /// Whether the runner is executing a job right now.
+    busy: bool,
+    labels: Vec<String>,
+    /// The last time the runner authenticated to the server.
+    last_seen_at: String,
+    version: Option<String>,
+    os: Option<String>,
+    arch: Option<String>,
+}
+
+/// GET /api/v1/repos/{owner}/{name}/actions/runners
+///
+/// The runners registered for this repository, for its administrators.
+///
+/// Until this existed the only reader was `/admin/runners`, an instance-admin
+/// session: a monitor watching one repository's CI had to hold the instance's
+/// keys, or settle for "the runner's process is up" — which a runner whose
+/// token was revoked, or whose network is gone, also is (card_28cc6b110902).
+/// The token hash never leaves the row.
+#[utoipa::path(
+    get,
+    path = "/repos/{owner}/{name}/actions/runners",
+    tag = "Runners",
+    params(
+        ("owner" = String, Path, description = "Repository owner"),
+        ("name" = String, Path, description = "Repository name"),
+    ),
+    responses(
+        (status = 200, description = "Success", body = Vec<RepoRunnerResponse>),
+        (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Not an administrator of the repository", body = serde_json::Value),
+        (status = 404, description = "Repository not found", body = serde_json::Value),
+    ),
+)]
+pub async fn list_repo_runners(
+    State(state): State<AppState>,
+    Path((_, _)): Path<(String, String)>,
+    RepoAdmin { repo, .. }: RepoAdmin,
+) -> impl IntoResponse {
+    let runners = match rg_db::ops::runner_ops::list_for_repo(&state.db, repo.id).await {
+        Ok(runners) => runners,
+        Err(error) => {
+            tracing::error!(
+                repo_id = repo.id,
+                error = %format!("{error:#}"),
+                "list_repo_runners failed"
+            );
+            return AppError::from(error).into_response();
+        }
+    };
+    let mut response = Vec::with_capacity(runners.len());
+    for runner in runners {
+        // One row whose labels cannot be read must not blind the listing a
+        // monitor polls to the liveness of every other runner: the row is
+        // listed without them and the operator is told, as the registration
+        // audit entry does with the same column.
+        let labels = if runner.labels.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&runner.labels).unwrap_or_else(|error| {
+                tracing::warn!(
+                    runner_id = runner.id,
+                    error = %error,
+                    "list_repo_runners: stored runner labels are not a JSON list; listed without them"
+                );
+                Vec::new()
+            })
+        };
+        response.push(RepoRunnerResponse {
+            id: runner.id,
+            name: runner.name,
+            status: if runner.status == "offline" {
+                "offline"
+            } else {
+                "online"
+            },
+            busy: runner.status == "busy",
+            labels,
+            last_seen_at: runner.last_seen_at.to_string(),
+            version: runner.version,
+            os: runner.os,
+            arch: runner.arch,
+        });
+    }
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 // ── Runner Token Authentication ──────────────────────────

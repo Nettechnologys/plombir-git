@@ -226,6 +226,21 @@ pub async fn list_all(db: &DatabaseConnection) -> Result<Vec<Runner>> {
         .context("db: list all runners")
 }
 
+/// The runners registered for one repository, most recently seen first.
+///
+/// A runner serves exactly the repository it was registered for (`repo_id`);
+/// a row without one polls nothing until it is re-registered, so it serves no
+/// repository and is not listed under any.
+pub async fn list_for_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<Runner>> {
+    RunnerEntity::find()
+        .filter(Column::RepoId.eq(repo_id))
+        .order_by_desc(Column::LastSeenAt)
+        .order_by_asc(Column::Id)
+        .all(db)
+        .await
+        .context("db: list repository runners")
+}
+
 /// Deregister a runner: hand its in-flight jobs back to the pool and delete the
 /// runner row, as one transaction.
 ///
