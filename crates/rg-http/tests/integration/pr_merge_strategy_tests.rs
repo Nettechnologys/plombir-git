@@ -244,9 +244,12 @@ async fn merge_squash_and_rebase_update_refs_and_pr_state() {
                 show("%B").trim_end(),
                 "Merge pull request #1 from feature\n\nMerge the feature"
             ),
+            // The feature commits are `Merge Test`'s, not the pull request
+            // author's, so the squash credits them (card_fbdf6fe490e9).
             "squash" => assert_eq!(
                 show("%B").trim_end(),
-                "Merge the feature (#1)\n\n* feature a\n* feature b"
+                "Merge the feature (#1)\n\n* feature a\n* feature b\n\n\
+                 Co-authored-by: Merge Test <merge-test@example.com>"
             ),
             _ => assert_eq!(show("%s"), "feature b"),
         }
@@ -263,6 +266,155 @@ async fn merge_squash_and_rebase_update_refs_and_pr_state() {
         assert_eq!(pr["state"], "merged");
         assert_eq!(pr["merge_strategy"], strategy);
         assert_eq!(pr["merge_commit_sha"], main_sha);
+    }
+
+    server.abort();
+}
+
+/// A base commit on `main`, then one commit on `feature` per `(author,
+/// message)`, each written as that author.
+fn seed_feature_by(bare_path: &Path, commits: &[(&str, &str)]) -> tempfile::TempDir {
+    let worktree = tempfile::tempdir().unwrap();
+    let path = worktree.path();
+    let path_arg = path.to_string_lossy();
+    git(&["init", "--initial-branch=main", &path_arg], None);
+    configure_worktree(path);
+
+    std::fs::write(path.join("README.md"), "base\n").unwrap();
+    git(&["add", "."], Some(path));
+    git(&["commit", "-m", "base"], Some(path));
+    let bare_arg = bare_path.to_string_lossy();
+    git(&["remote", "add", "origin", &bare_arg], Some(path));
+    git(&["push", "origin", "main"], Some(path));
+
+    git(&["checkout", "-b", "feature"], Some(path));
+    for (index, (author, message)) in commits.iter().enumerate() {
+        std::fs::write(path.join(format!("part-{index}.txt")), "part\n").unwrap();
+        git(&["add", "."], Some(path));
+        git(&["commit", "--author", author, "-m", message], Some(path));
+    }
+    git(&["push", "origin", "feature"], Some(path));
+    worktree
+}
+
+/// card_fbdf6fe490e9: a squash names one author, the pull request's. Everyone
+/// else who wrote one of the commits it replaces — by the commit's author, or
+/// by that commit's own `Co-authored-by:` — gets one trailer, as GitHub and
+/// GitLab write them; nobody gets two, and a pull request of one person's
+/// commits gets none.
+#[tokio::test]
+async fn a_squash_credits_the_other_authors_of_the_commits_it_replaces() {
+    let (db, app_dir) = setup_test_db().await;
+    let repo_root = app_dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    let app = rg_http::create_router_for_test(build_test_app_state(db, repo_root.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let base = format!("http://{addr}");
+    let server = tokio::spawn(async move {
+        let _app_dir = app_dir;
+        axum::serve(listener, app).await.unwrap();
+    });
+    crate::common::wait_for_listener(&addr).await;
+
+    let (token, _) = register_full(&base, "merge-owner", "merge-owner@example.com").await;
+    let (author_token, _) = register_full(&base, "pr-author", "pr-author@example.com").await;
+    let client = reqwest::Client::new();
+
+    let pairing = "pair on the parser\n\nCo-authored-by: Third Dev <third@example.com>";
+    for (repo, commits, expected_trailers) in [
+        (
+            "many-authors",
+            vec![
+                // The pull request's author, from another machine: the same
+                // person by email, whatever its case.
+                (
+                    "PR Author (laptop) <PR-Author@Example.com>",
+                    "start the parser",
+                ),
+                ("Second Dev <second@example.com>", "handle escapes"),
+                ("Second Dev <second@example.com>", "handle quotes"),
+                ("Second Dev <second@example.com>", pairing),
+            ],
+            "Co-authored-by: Second Dev <second@example.com>\n\
+             Co-authored-by: Third Dev <third@example.com>",
+        ),
+        (
+            "one-author",
+            vec![
+                ("pr-author <pr-author@example.com>", "start the parser"),
+                ("pr-author <pr-author@example.com>", "finish the parser"),
+            ],
+            "",
+        ),
+    ] {
+        create_repo_and_pr(&base, &token, repo).await;
+        let collaborator = client
+            .post(format!(
+                "{base}/api/v1/repos/merge-owner/{repo}/collaborators"
+            ))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"username": "pr-author", "permission": "write"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(collaborator.status(), 201);
+        let bare_path = repo_root.join(format!("merge-owner/{repo}.git"));
+        let _worktree = seed_feature_by(&bare_path, &commits);
+        open_pr(&base, &author_token, repo, "main").await;
+
+        let merged = client
+            .post(format!(
+                "{base}/api/v1/repos/merge-owner/{repo}/pulls/1/merge"
+            ))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"strategy": "squash"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(merged.status(), 200, "{}", merged.text().await.unwrap());
+
+        let show = |format: &str| {
+            git(
+                &[
+                    "show",
+                    "-s",
+                    &format!("--format={format}"),
+                    "refs/heads/main",
+                ],
+                Some(&bare_path),
+            )
+        };
+        assert_eq!(show("%an <%ae>"), "pr-author <pr-author@example.com>");
+        let message = show("%B");
+        let trailers: Vec<&str> = message
+            .lines()
+            .filter(|line| line.starts_with("Co-authored-by:"))
+            .collect();
+        assert_eq!(trailers.join("\n"), expected_trailers, "{repo}: {message}");
+        // Trailers are the message's last paragraph, where git reads them.
+        if !expected_trailers.is_empty() {
+            assert!(
+                message
+                    .trim_end()
+                    .ends_with(&format!("\n\n{expected_trailers}")),
+                "{repo}: {message}"
+            );
+            let parsed = git(
+                &[
+                    "log",
+                    "-1",
+                    "--format=%(trailers:key=Co-authored-by,valueonly)",
+                    "refs/heads/main",
+                ],
+                Some(&bare_path),
+            );
+            assert_eq!(
+                parsed.lines().count(),
+                trailers.len(),
+                "git does not read the trailers: {parsed}"
+            );
+        }
     }
 
     server.abort();

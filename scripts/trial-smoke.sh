@@ -52,7 +52,8 @@ for _ in $(seq 1 120); do
   # Read whole, then search: `docker logs … | grep -q` under pipefail fails
   # whenever grep stops reading first and docker logs takes the SIGPIPE.
   logs="$(docker logs "${name}" 2>&1 || true)"
-  link="$(grep -oE "http://localhost:${http_port}/register\?setup_token=[A-Za-z0-9_-]+" <<<"${logs}" | head -n 1 || true)"
+  link="$(grep -m1 -oE "http://localhost:${http_port}/register\?setup_token=[A-Za-z0-9_-]+" <<<"${logs}" || true)"
+  link="${link%%$'\n'*}"
   if [ -n "${link}" ]; then
     break
   fi

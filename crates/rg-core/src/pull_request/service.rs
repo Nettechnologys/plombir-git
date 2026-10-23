@@ -5,7 +5,7 @@ use chrono::Utc;
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait, Set, TransactionTrait,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -5156,7 +5156,18 @@ const SQUASH_MESSAGE_SUBJECTS: usize = 100;
 /// The commits are what the author wrote down about the change; a squash that
 /// drops both them and the description leaves `git log` a generated line that
 /// says nothing (card_422fc7bcac73).
-fn squash_commit_message(pr: &PullRequest, squashed_subjects: &[String]) -> String {
+///
+/// Then one `Co-authored-by:` trailer for every other person who wrote one of
+/// those commits, which is what GitHub and GitLab write: the squash names one
+/// author, and without the trailers everyone else's work lands in the base
+/// branch under that one name (card_fbdf6fe490e9). People are told apart by
+/// email, case-insensitively, as git and GitHub tell them apart; `author`
+/// gets none, and neither does anyone the description already credits.
+fn squash_commit_message(
+    pr: &PullRequest,
+    squashed: &SquashedCommits,
+    author: &GitPerson,
+) -> String {
     let title = pr.title.trim();
     let subject = if title.is_empty() {
         format!(
@@ -5170,51 +5181,132 @@ fn squash_commit_message(pr: &PullRequest, squashed_subjects: &[String]) -> Stri
     let body = if !description.is_empty() {
         description.to_string()
     } else {
-        let mut listed: Vec<String> = squashed_subjects
+        let mut listed: Vec<String> = squashed
+            .subjects
             .iter()
             .take(SQUASH_MESSAGE_SUBJECTS)
             .map(|subject| format!("* {subject}"))
             .collect();
-        if squashed_subjects.len() > SQUASH_MESSAGE_SUBJECTS {
+        if squashed.subjects.len() > SQUASH_MESSAGE_SUBJECTS {
             listed.push(format!(
                 "* … and {} more",
-                squashed_subjects.len() - SQUASH_MESSAGE_SUBJECTS
+                squashed.subjects.len() - SQUASH_MESSAGE_SUBJECTS
             ));
         }
         listed.join("\n")
     };
-    if body.is_empty() {
-        subject
-    } else {
-        format!("{subject}\n\n{body}")
+
+    let mut credited: HashSet<String> = description
+        .lines()
+        .filter_map(co_author_trailer)
+        .map(|person| person.email.to_lowercase())
+        .collect();
+    credited.insert(author.email.to_lowercase());
+    let trailers: Vec<String> = squashed
+        .authors
+        .iter()
+        .filter(|person| credited.insert(person.email.to_lowercase()))
+        .map(|person| format!("Co-authored-by: {} <{}>", person.name, person.email))
+        .collect();
+
+    let mut message = subject;
+    for section in [body, trailers.join("\n")] {
+        if !section.is_empty() {
+            message.push_str("\n\n");
+            message.push_str(&section);
+        }
     }
+    message
 }
 
-/// Subjects of the commits `head` brings that `base` does not have, oldest
-/// first — what a squash of `head` onto `base` replaces.
-fn squashed_commit_subjects(
+/// The person a `Co-authored-by: Name <email>` line credits, if `line` is one.
+fn co_author_trailer(line: &str) -> Option<GitPerson> {
+    let (token, value) = line.split_once(':')?;
+    if !token.trim().eq_ignore_ascii_case("Co-authored-by") {
+        return None;
+    }
+    trailer_person(value)
+}
+
+/// `Name <email>` as a trailer writes a person; `None` without an email.
+fn trailer_person(value: &str) -> Option<GitPerson> {
+    let value = value.trim().strip_suffix('>')?;
+    let (name, email) = value.rsplit_once('<')?;
+    let email = email.trim();
+    if email.is_empty() {
+        return None;
+    }
+    Some(GitPerson {
+        name: name.trim().to_string(),
+        email: email.to_string(),
+    })
+}
+
+/// What a squash of `head` onto `base` replaces, read from the commits
+/// themselves.
+#[derive(Debug, Default)]
+struct SquashedCommits {
+    /// Subjects, oldest first.
+    subjects: Vec<String>,
+    /// Everyone who wrote one of the commits — its author, then whoever its
+    /// own `Co-authored-by:` trailers credit — once per email, in order of
+    /// first appearance. Taken from the commit objects, not from accounts: a
+    /// commit from a fork or a rebase is often by someone with no account here.
+    authors: Vec<GitPerson>,
+}
+
+/// The commits `head` brings that `base` does not have, oldest first — what a
+/// squash of `head` onto `base` replaces.
+fn squashed_commits(
     repo: &gix::Repository,
     base: gix::ObjectId,
     head: gix::ObjectId,
-) -> Result<Vec<String>> {
+) -> Result<SquashedCommits> {
     let walk = repo
         .rev_walk([head])
         .with_hidden([base])
         .all()
         .context("failed to walk the commits a squash replaces")?;
-    let mut subjects = Vec::new();
+    // The walk is newest first; each commit's people are kept together so
+    // that reversing the commits keeps an author ahead of their co-authors.
+    let mut commits = Vec::new();
     for info in walk {
         let info = info.context("failed to walk the commits a squash replaces")?;
         let commit = info
             .object()
             .context("failed to read a commit a squash replaces")?;
+        let signature = commit
+            .author()
+            .context("failed to read the author of a commit a squash replaces")?;
+        let mut people = vec![GitPerson {
+            name: signature.name.to_string(),
+            email: signature.email.to_string(),
+        }];
         let message = commit
             .message()
             .context("failed to read the message of a commit a squash replaces")?;
-        subjects.push(message.summary().to_string());
+        if let Some(body) = message.body() {
+            people.extend(
+                body.trailers()
+                    .filter(|trailer| trailer.is_co_authored_by())
+                    .filter_map(|trailer| trailer_person(&trailer.value.to_string())),
+            );
+        }
+        commits.push((message.summary().to_string(), people));
     }
-    subjects.reverse();
-    Ok(subjects)
+    commits.reverse();
+
+    let mut squashed = SquashedCommits::default();
+    let mut seen = HashSet::new();
+    for (subject, people) in commits {
+        squashed.subjects.push(subject);
+        for person in people {
+            if !person.email.is_empty() && seen.insert(person.email.to_lowercase()) {
+                squashed.authors.push(person);
+            }
+        }
+    }
+    Ok(squashed)
 }
 
 /// Update PR state after successful merge.
@@ -6103,8 +6195,8 @@ fn gix_squash_merge(
 
     let merged_tree_id = gix_merge_commits_to_tree(&repo, our_commit, their_commit, head_ref)?;
 
-    let subjects = squashed_commit_subjects(&repo, our_commit.detach(), their_commit.detach())?;
-    let message = squash_commit_message(pr, &subjects);
+    let squashed = squashed_commits(&repo, our_commit.detach(), their_commit.detach())?;
+    let message = squash_commit_message(pr, &squashed, &identity.author);
 
     // Squash merge: single-parent commit, authored by the pull request's author
     // and committed by the merger — see [`MergeIdentity`], and
@@ -7885,7 +7977,10 @@ mod fork_fetch_tests {
 
 #[cfg(test)]
 mod merge_message_tests {
-    use super::{merge_commit_message, squash_commit_message, PullRequest};
+    use super::{
+        co_author_trailer, merge_commit_message, squash_commit_message, GitPerson, PullRequest,
+        SquashedCommits,
+    };
 
     fn pull_request(title: &str, body: Option<&str>) -> PullRequest {
         let now = chrono::Utc::now();
@@ -7925,8 +8020,22 @@ mod merge_message_tests {
         }
     }
 
-    fn subjects(names: &[&str]) -> Vec<String> {
-        names.iter().map(|name| name.to_string()).collect()
+    fn subjects(names: &[&str]) -> SquashedCommits {
+        SquashedCommits {
+            subjects: names.iter().map(|name| name.to_string()).collect(),
+            authors: Vec::new(),
+        }
+    }
+
+    fn person(name: &str, email: &str) -> GitPerson {
+        GitPerson {
+            name: name.to_string(),
+            email: email.to_string(),
+        }
+    }
+
+    fn pr_author() -> GitPerson {
+        person("pr-author", "pr-author@example.com")
     }
 
     /// card_422fc7bcac73: the squash commit is the only trace the pull request
@@ -7936,7 +8045,7 @@ mod merge_message_tests {
     fn a_squash_is_titled_after_the_pull_request_and_carries_its_description() {
         let pr = pull_request("Add the parser", Some("  Why: the old one leaked.\n"));
         assert_eq!(
-            squash_commit_message(&pr, &subjects(&["wip", "fix"])),
+            squash_commit_message(&pr, &subjects(&["wip", "fix"]), &pr_author()),
             "Add the parser (#7)\n\nWhy: the old one leaked."
         );
     }
@@ -7945,7 +8054,7 @@ mod merge_message_tests {
     fn a_squash_without_a_description_lists_the_commits_it_replaces() {
         let pr = pull_request("Add the parser", Some("   "));
         assert_eq!(
-            squash_commit_message(&pr, &subjects(&["first", "second"])),
+            squash_commit_message(&pr, &subjects(&["first", "second"]), &pr_author()),
             "Add the parser (#7)\n\n* first\n* second"
         );
     }
@@ -7953,10 +8062,13 @@ mod merge_message_tests {
     #[test]
     fn a_long_squash_list_stops_and_says_how_many_it_left_out() {
         let pr = pull_request("Big", None);
-        let many: Vec<String> = (0..super::SQUASH_MESSAGE_SUBJECTS + 3)
-            .map(|index| format!("c{index}"))
-            .collect();
-        let message = squash_commit_message(&pr, &many);
+        let many = SquashedCommits {
+            subjects: (0..super::SQUASH_MESSAGE_SUBJECTS + 3)
+                .map(|index| format!("c{index}"))
+                .collect(),
+            authors: Vec::new(),
+        };
+        let message = squash_commit_message(&pr, &many, &pr_author());
         assert_eq!(
             message
                 .lines()
@@ -7971,9 +8083,101 @@ mod merge_message_tests {
     fn a_squash_with_nothing_to_say_falls_back_to_the_generated_subject() {
         let pr = pull_request("  ", None);
         assert_eq!(
-            squash_commit_message(&pr, &[]),
+            squash_commit_message(&pr, &SquashedCommits::default(), &pr_author()),
             "Squash merge pull request #7 from feature"
         );
+    }
+
+    /// card_fbdf6fe490e9: everyone else who wrote one of the squashed commits
+    /// is credited once, in the order they first appear; the squash's own
+    /// author is not, whatever case their email was written in.
+    #[test]
+    fn a_squash_credits_every_other_commit_author_once() {
+        let pr = pull_request("Add the parser", Some("Why: the old one leaked."));
+        let squashed = SquashedCommits {
+            subjects: subjects(&["a", "b", "c", "d"]).subjects,
+            authors: vec![
+                person("PR Author (laptop)", "PR-Author@Example.com"),
+                person("Second Dev", "second@example.com"),
+                person("Third Dev", "third@example.com"),
+            ],
+        };
+        assert_eq!(
+            squash_commit_message(&pr, &squashed, &pr_author()),
+            "Add the parser (#7)\n\nWhy: the old one leaked.\n\n\
+             Co-authored-by: Second Dev <second@example.com>\n\
+             Co-authored-by: Third Dev <third@example.com>"
+        );
+        // And the other way round: an account email in capitals is still the
+        // same person as a commit that wrote it in lower case.
+        let shouting = person("pr-author", "PR-AUTHOR@EXAMPLE.COM");
+        let squashed = SquashedCommits {
+            subjects: subjects(&["a"]).subjects,
+            authors: vec![pr_author()],
+        };
+        assert_eq!(
+            squash_commit_message(&pr, &squashed, &shouting),
+            "Add the parser (#7)\n\nWhy: the old one leaked."
+        );
+    }
+
+    #[test]
+    fn a_squash_of_one_authors_commits_has_no_trailers() {
+        let pr = pull_request("Add the parser", None);
+        let squashed = SquashedCommits {
+            subjects: subjects(&["first", "second"]).subjects,
+            authors: vec![pr_author()],
+        };
+        assert_eq!(
+            squash_commit_message(&pr, &squashed, &pr_author()),
+            "Add the parser (#7)\n\n* first\n* second"
+        );
+    }
+
+    /// A description that already ends in the trailer — written by hand, or
+    /// copied from a commit — keeps its own line and gains no second one.
+    #[test]
+    fn a_squash_does_not_repeat_a_co_author_the_description_credits() {
+        let pr = pull_request(
+            "Add the parser",
+            Some("Pairing.\n\nco-authored-by: Second <SECOND@example.com>"),
+        );
+        let squashed = SquashedCommits {
+            subjects: subjects(&["first"]).subjects,
+            authors: vec![person("Second Dev", "second@example.com")],
+        };
+        assert_eq!(
+            squash_commit_message(&pr, &squashed, &pr_author()),
+            "Add the parser (#7)\n\nPairing.\n\nco-authored-by: Second <SECOND@example.com>"
+        );
+    }
+
+    #[test]
+    fn a_squash_with_only_co_authors_to_say_puts_them_under_the_subject() {
+        let pr = pull_request("  ", None);
+        let squashed = SquashedCommits {
+            subjects: Vec::new(),
+            authors: vec![person("Second Dev", "second@example.com")],
+        };
+        assert_eq!(
+            squash_commit_message(&pr, &squashed, &pr_author()),
+            "Squash merge pull request #7 from feature\n\n\
+             Co-authored-by: Second Dev <second@example.com>"
+        );
+    }
+
+    #[test]
+    fn a_co_author_line_needs_the_token_and_an_email() {
+        assert_eq!(
+            co_author_trailer("Co-Authored-By:  Ann Lee <ann@example.com> "),
+            Some(person("Ann Lee", "ann@example.com"))
+        );
+        assert_eq!(
+            co_author_trailer("Signed-off-by: Ann <ann@example.com>"),
+            None
+        );
+        assert_eq!(co_author_trailer("Co-authored-by: Ann"), None);
+        assert_eq!(co_author_trailer("Co-authored-by: Ann <>"), None);
     }
 
     #[test]

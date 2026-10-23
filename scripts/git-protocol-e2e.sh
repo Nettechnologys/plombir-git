@@ -267,8 +267,12 @@ fi
 assert_equal "true" \
   "$(git -C "${WORK_DIR}/http-partial" config --get remote.origin.promisor)" \
   "HTTP promisor configuration"
-if ! GIT_NO_LAZY_FETCH=1 git -C "${WORK_DIR}/http-partial" \
-  rev-list --objects --missing=print HEAD | grep -q '^?'; then
+# Read the listing whole, then search it: piped straight into `grep -q`, the
+# match ends grep before rev-list has written everything, rev-list dies of
+# SIGPIPE, and pipefail turns "found" into "did not omit any objects".
+HTTP_PARTIAL_OBJECTS="$(GIT_NO_LAZY_FETCH=1 git -C "${WORK_DIR}/http-partial" \
+  rev-list --objects --missing=print HEAD)"
+if ! grep -q '^?' <<<"${HTTP_PARTIAL_OBJECTS}"; then
   echo "HTTP blob:none clone did not omit any objects" >&2
   exit 1
 fi
@@ -293,8 +297,9 @@ if ! grep -q "filter tree:0" "${SSH_PARTIAL_TRACE}"; then
   echo "SSH partial clone did not request tree:0" >&2
   exit 1
 fi
-if ! GIT_NO_LAZY_FETCH=1 git -C "${WORK_DIR}/ssh-partial" \
-  rev-list --objects --missing=print HEAD | grep -q '^?'; then
+SSH_PARTIAL_OBJECTS="$(GIT_NO_LAZY_FETCH=1 git -C "${WORK_DIR}/ssh-partial" \
+  rev-list --objects --missing=print HEAD)"
+if ! grep -q '^?' <<<"${SSH_PARTIAL_OBJECTS}"; then
   echo "SSH tree:0 clone did not omit any objects" >&2
   exit 1
 fi

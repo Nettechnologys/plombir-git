@@ -250,14 +250,26 @@ the exact names listed are read, as Forgejo, Gitea and GitLab read them.
 
 A `.txt` template is used as it is written: its text becomes the description.
 
-GitHub's `PULL_REQUEST_TEMPLATE/` directory of several templates, chosen there
-with the `template` query parameter, is not read.
+The last two are GitLab's default merge request template. GitLab quick actions
+in a template (`/label ~bug`, `/assign me`) are not run: they arrive as text in
+the description.
 
-The last two are GitLab's default merge request template. GitLab keeps any
-number of templates in `.gitlab/merge_request_templates/` and pre-fills a new
-merge request only from `Default.md`; the others are a menu there, and they are
-not read here. GitLab quick actions in a template (`/label ~bug`, `/assign me`)
-are not run: they arrive as text in the description.
+There is no menu of templates here. GitHub's `PULL_REQUEST_TEMPLATE/`
+directory of several templates, chosen there with the `template` query
+parameter, is not read, and of GitLab's `.gitlab/merge_request_templates/`
+only `Default.md` is: GitLab pre-fills a new merge request from it and offers
+the others in a menu. An import names every other Markdown file in these
+directories in its receipt, so a repository whose only templates were a menu
+does not start its pull requests empty without saying why. To keep one, copy it
+to a path listed above.
+
+<!-- inventory: pull-request-template-menus-not-read -->
+```text
+PULL_REQUEST_TEMPLATE
+.github/PULL_REQUEST_TEMPLATE
+docs/PULL_REQUEST_TEMPLATE
+.gitlab/merge_request_templates
+```
 
 The same 1048576-byte (1 MiB) ceiling and UTF-8 requirement apply.
 

@@ -150,6 +150,39 @@ pub(crate) const PULL_REQUEST_FORM_TEMPLATES: &[&str] = &[
     "docs/pull_request_template.yml",
 ];
 
+/// Directories of several pull-request templates, offered as a menu by the
+/// forge they came from: GitHub's `PULL_REQUEST_TEMPLATE/` in the root, `docs/`
+/// or `.github/` (picked with the `template` query parameter; the name is
+/// spelled exactly so, as GitHub's documentation spells it), and GitLab's
+/// `.gitlab/merge_request_templates/`. There is no menu here: a new pull
+/// request starts from the one template [`read_pull_request_template`] finds,
+/// which for GitLab is that directory's `Default.md`. An import names every
+/// other Markdown file in them (see [`is_pull_request_template_candidate`]), so a repository whose only templates are a
+/// menu does not lose them without a word (card_d0cce77841fe).
+pub(crate) const PULL_REQUEST_TEMPLATE_MENUS: &[&str] = &[
+    "PULL_REQUEST_TEMPLATE",
+    ".github/PULL_REQUEST_TEMPLATE",
+    "docs/PULL_REQUEST_TEMPLATE",
+    ".gitlab/merge_request_templates",
+];
+
+/// Whether `path` is one [`read_pull_request_template`] tries — by its exact
+/// path, or by GitHub's rule in its directory. A candidate that loses to an
+/// earlier one is still a candidate, not part of a menu: which file wins is
+/// the documented order, not a choice the author lost.
+pub(crate) fn is_pull_request_template_candidate(path: &str) -> bool {
+    let (directory, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let name = name.to_ascii_lowercase();
+    PULL_REQUEST_TEMPLATES
+        .iter()
+        .any(|candidate| match *candidate {
+            PullRequestTemplatePath::Exact(exact) => exact == path,
+            PullRequestTemplatePath::GitHub(github) => {
+                github == directory && GITHUB_PULL_REQUEST_TEMPLATE_NAMES.contains(&name.as_str())
+            }
+        })
+}
+
 /// GitHub's single-file issue template from before the template directory:
 /// one `ISSUE_TEMPLATE.md` in the root, `docs/` or `.github/`. Not read here —
 /// a template is a file inside one of [`ISSUE_TEMPLATE_DIRS`] — so an import
@@ -785,6 +818,7 @@ mod tests {
         PullRequestTemplatePath, GITHUB_PULL_REQUEST_TEMPLATE_NAMES, ISSUE_CONFIGS,
         ISSUE_TEMPLATE_DIRS, LEGACY_ISSUE_TEMPLATES, MAX_TEMPLATE_FILE_COUNT, MAX_TEMPLATE_SIZE,
         MAX_TEMPLATE_TOTAL_BYTES, PULL_REQUEST_FORM_TEMPLATES, PULL_REQUEST_TEMPLATES,
+        PULL_REQUEST_TEMPLATE_MENUS,
     };
     use std::collections::BTreeSet;
 
@@ -1501,6 +1535,11 @@ struct IssueContactLink {
                 "<!-- inventory: pull-request-forms-not-read -->",
                 owned(PULL_REQUEST_FORM_TEMPLATES),
                 "path a YAML pull-request form is named at",
+            ),
+            (
+                "<!-- inventory: pull-request-template-menus-not-read -->",
+                owned(PULL_REQUEST_TEMPLATE_MENUS),
+                "directory whose menu of pull-request templates is named",
             ),
         ] {
             let documented: BTreeSet<String> =

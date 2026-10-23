@@ -29,9 +29,12 @@ fail() {
 [ -f "${guide}" ] || fail "no ${guide}"
 
 # ── What the guide tells each client ─────────────────────────────────
-claude_line="$(grep -E '^claude mcp add --transport http ' "${guide}" | head -n 1)"
+# `grep -m1`, not `grep | head -n 1`: under pipefail a guide without the line
+# made the substitution fail and `set -e` exit before `fail` could say why.
+claude_line="$(grep -m1 -E '^claude mcp add --transport http ' "${guide}" || true)"
 [ -n "${claude_line}" ] || fail "no 'claude mcp add --transport http' line"
-claude_url="$(grep -oE 'https?://[^ "]+/api/v1/mcp' <<<"${claude_line}" | head -n 1)"
+claude_url="$(grep -oE 'https?://[^ "]+/api/v1/mcp' <<<"${claude_line}" || true)"
+claude_url="${claude_url%%$'\n'*}"
 grep -qF -- "--header \"Authorization: Bearer \$${token_var}\"" <<<"${claude_line}" \
   || fail "the Claude Code command does not send Authorization: Bearer \$${token_var}"
 

@@ -8,6 +8,19 @@ This project records user-facing changes here. The format follows
 
 ### Added
 
+- A squash merge credits everyone else who wrote one of the commits it
+  replaces: its message ends with one `Co-authored-by:` trailer per person,
+  told apart by email, as GitHub and GitLab write them. The squash names the
+  pull request's author; before, the other authors' work landed in the base
+  branch under that one name. A co-author a squashed commit already credited
+  is carried over, and one the description already names is not repeated.
+
+- An import names, in its receipt, each template of a menu it cannot offer:
+  GitHub's `PULL_REQUEST_TEMPLATE/` directories and the files of GitLab's
+  `.gitlab/merge_request_templates/` other than `Default.md`. A repository
+  whose only pull-request templates were a menu used to start every pull
+  request empty, and neither the receipt nor the Imports page said why.
+
 - CI of a repository brought over from Forgejo runs as it is: workflows in
   `.forgejo/workflows` are read, first of the three directories in Forgejo's
   order (`.forgejo/workflows`, `.gitea/workflows`, `.github/workflows`), never

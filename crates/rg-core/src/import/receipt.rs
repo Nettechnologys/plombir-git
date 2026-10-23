@@ -106,6 +106,11 @@ const PULL_REQUEST_FORM_NOT_READ: &str =
     "A pull-request template in YAML is not read here: a new pull request starts from \
      `PULL_REQUEST_TEMPLATE.md` instead, so write it as Markdown beside this file";
 
+const PULL_REQUEST_TEMPLATE_MENU_NOT_READ: &str =
+    "A menu of pull-request templates is not offered here: a new pull request starts from \
+     the one `pull_request_template.md` (or GitLab's `merge_request_templates/Default.md`), so \
+     copy the template you want there";
+
 /// The CI of the imported default branch, as far as it will not run here.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct CiReceipt {
@@ -416,33 +421,43 @@ fn templates_not_read(repository: &Path) -> anyhow::Result<Vec<TemplateNotRead>>
             .map_err(|error| anyhow::anyhow!("failed to look up {path}: {error}"))
     };
 
-    let mut not_read = Vec::new();
-    for directory in crate::issue_template::ISSUE_TEMPLATE_DIRS {
+    // The blobs directly in `directory` whose name `keep` accepts, by path and
+    // sorted; none when the directory is absent or is not one.
+    let files_in = |directory: &str, keep: &dyn Fn(&str) -> bool| -> anyhow::Result<Vec<String>> {
         let Some(entry) = lookup(directory)? else {
-            continue;
+            return Ok(Vec::new());
         };
         if !entry.mode().is_tree() {
-            continue;
+            return Ok(Vec::new());
         }
         let listing = entry
             .object()
             .map_err(|error| anyhow::anyhow!("failed to read {directory}: {error}"))?
             .try_into_tree()
             .map_err(|_| anyhow::anyhow!("{directory} is committed as a directory, not a tree"))?;
-        let mut forms = Vec::new();
+        let mut files = Vec::new();
         for item in listing.iter() {
             let item =
                 item.map_err(|error| anyhow::anyhow!("failed to list {directory}: {error}"))?;
             let name = item.filename().to_string();
-            if item.mode().is_blob() && crate::issue_template::is_issue_form_name(&name) {
-                forms.push(format!("{directory}/{name}"));
+            if item.mode().is_blob() && keep(&name) {
+                files.push(format!("{directory}/{name}"));
             }
         }
-        forms.sort();
-        not_read.extend(forms.into_iter().map(|path| TemplateNotRead {
-            path,
-            reason: ISSUE_FORM_NOT_READ,
-        }));
+        files.sort();
+        Ok(files)
+    };
+
+    let mut not_read = Vec::new();
+    for directory in crate::issue_template::ISSUE_TEMPLATE_DIRS {
+        not_read.extend(
+            files_in(directory, &crate::issue_template::is_issue_form_name)?
+                .into_iter()
+                .map(|path| TemplateNotRead {
+                    path,
+                    reason: ISSUE_FORM_NOT_READ,
+                }),
+        );
     }
     for (paths, reason) in [
         (
@@ -462,6 +477,21 @@ fn templates_not_read(repository: &Path) -> anyhow::Result<Vec<TemplateNotRead>>
                 });
             }
         }
+    }
+    // GitHub's and GitLab's template menus (card_d0cce77841fe). A repository
+    // whose only pull-request templates were a menu otherwise starts every
+    // pull request here empty, and nothing says why.
+    for directory in crate::issue_template::PULL_REQUEST_TEMPLATE_MENUS {
+        let is_markdown = |name: &str| name.to_ascii_lowercase().ends_with(".md");
+        not_read.extend(
+            files_in(directory, &is_markdown)?
+                .into_iter()
+                .filter(|path| !crate::issue_template::is_pull_request_template_candidate(path))
+                .map(|path| TemplateNotRead {
+                    path,
+                    reason: PULL_REQUEST_TEMPLATE_MENU_NOT_READ,
+                }),
+        );
     }
     Ok(not_read)
 }
@@ -834,6 +864,112 @@ mod tests {
             .is_empty());
         let markdown = repository_with(Some(&[(".gitea/ISSUE_TEMPLATE/bug.md", "## Bug\n")]));
         assert!(templates_not_read(markdown.path()).unwrap().is_empty());
+    }
+
+    /// card_d0cce77841fe: GitHub's `PULL_REQUEST_TEMPLATE/` menu and GitLab's
+    /// `merge_request_templates/` are named file by file; GitLab's `Default.md`
+    /// is the template a new pull request starts from, so it is not, and
+    /// neither is a file that is not Markdown or a menu of the wrong spelling.
+    #[test]
+    fn a_menu_of_pull_request_templates_is_named_but_not_its_default() {
+        let repo = repository_with(Some(&[
+            (".github/PULL_REQUEST_TEMPLATE/feature.md", "## Feature\n"),
+            (".github/PULL_REQUEST_TEMPLATE/Bugfix.MD", "## Bugfix\n"),
+            (
+                ".github/PULL_REQUEST_TEMPLATE/notes.txt",
+                "not a template\n",
+            ),
+            ("docs/PULL_REQUEST_TEMPLATE/release.md", "## Release\n"),
+            ("PULL_REQUEST_TEMPLATE/docs.md", "## Docs\n"),
+            (".gitlab/merge_request_templates/Default.md", "## MR\n"),
+            (".gitlab/merge_request_templates/default.md", "## mr\n"),
+            (".gitlab/merge_request_templates/Bug.md", "## Bug\n"),
+            (
+                ".gitea/PULL_REQUEST_TEMPLATE/other.md",
+                "## Gitea has no menu\n",
+            ),
+        ]));
+        let named = templates_not_read(repo.path()).unwrap();
+        assert_eq!(
+            named
+                .iter()
+                .map(|item| (item.path.as_str(), item.reason))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "PULL_REQUEST_TEMPLATE/docs.md",
+                    PULL_REQUEST_TEMPLATE_MENU_NOT_READ
+                ),
+                (
+                    ".github/PULL_REQUEST_TEMPLATE/Bugfix.MD",
+                    PULL_REQUEST_TEMPLATE_MENU_NOT_READ
+                ),
+                (
+                    ".github/PULL_REQUEST_TEMPLATE/feature.md",
+                    PULL_REQUEST_TEMPLATE_MENU_NOT_READ
+                ),
+                (
+                    "docs/PULL_REQUEST_TEMPLATE/release.md",
+                    PULL_REQUEST_TEMPLATE_MENU_NOT_READ
+                ),
+                (
+                    ".gitlab/merge_request_templates/Bug.md",
+                    PULL_REQUEST_TEMPLATE_MENU_NOT_READ
+                ),
+            ]
+        );
+
+        // The acceptance shape of the card: a repository whose only templates
+        // are the two menus gets both named.
+        let menus_only = repository_with(Some(&[
+            (".github/PULL_REQUEST_TEMPLATE/feature.md", "## Feature\n"),
+            (".gitlab/merge_request_templates/Bug.md", "## Bug\n"),
+        ]));
+        let paths: Vec<String> = templates_not_read(menus_only.path())
+            .unwrap()
+            .into_iter()
+            .map(|item| item.path)
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                ".github/PULL_REQUEST_TEMPLATE/feature.md",
+                ".gitlab/merge_request_templates/Bug.md"
+            ]
+        );
+    }
+
+    /// The menu entries are what is NOT a candidate, so the candidate test has
+    /// to know every path the reader tries — or a template that is read would
+    /// be reported as lost.
+    #[test]
+    fn every_pull_request_template_the_reader_tries_is_a_candidate() {
+        for path in [
+            "pull_request_template.md",
+            "PULL_REQUEST_TEMPLATE.TXT",
+            ".github/Pull_Request_Template.md",
+            "docs/pull_request_template.txt",
+            ".gitea/PULL_REQUEST_TEMPLATE.md",
+            ".forgejo/pull_request_template.md",
+            ".gitlab/merge_request_templates/Default.md",
+            ".gitlab/merge_request_templates/default.md",
+        ] {
+            assert!(
+                crate::issue_template::is_pull_request_template_candidate(path),
+                "{path}"
+            );
+        }
+        for path in [
+            ".gitlab/merge_request_templates/DEFAULT.md",
+            ".gitlab/merge_request_templates/Bug.md",
+            ".github/PULL_REQUEST_TEMPLATE/pull_request_template.md",
+            ".gitea/Pull_Request_Template.md",
+        ] {
+            assert!(
+                !crate::issue_template::is_pull_request_template_candidate(path),
+                "{path}"
+            );
+        }
     }
 
     #[test]

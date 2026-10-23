@@ -1026,7 +1026,10 @@ jobs:
           changed="$(git diff --name-only "${BASE_SHA}" HEAD)"
           echo "Files changed against ${BASE_SHA}:"
           printf '%s\n' "${changed}"
-          if printf '%s\n' "${changed}" | grep -qE '^(Dockerfile|\.dockerignore|Cargo\.(toml|lock)|rust-toolchain\.toml|crates/|web/|scripts/openapi-interface-smoke\.mjs|\.github/workflows/regression\.yml)'; then
+          # A here-string, not `printf | grep -q`: on a long file list grep
+          # stops at the first match, printf dies of SIGPIPE, and pipefail
+          # turns "an input changed" into a skipped image build.
+          if grep -qE '^(Dockerfile|\.dockerignore|Cargo\.(toml|lock)|rust-toolchain\.toml|crates/|web/|scripts/openapi-interface-smoke\.mjs|\.github/workflows/regression\.yml)' <<<"${changed}"; then
             echo "build=true" >>"${GITHUB_OUTPUT}"
             echo "An input of the image build changed — building."
           else
@@ -1183,7 +1186,11 @@ jobs:
             fi
           done
 
-          if ! curl -fsS http://127.0.0.1:18080/ | grep -qi '<!doctype html'; then
+          # The page is read whole before the search: piped into `grep -q`,
+          # an index.html past one pipe buffer makes curl exit 23 on the early
+          # match, and pipefail reports a frontend that is there as missing.
+          if ! front_page="$(curl -fsS http://127.0.0.1:18080/)" \
+            || ! grep -qi '<!doctype html' <<<"${front_page}"; then
             echo "The server is healthy but / is not the frontend — check the" >&2
             echo "web/build copy in the Dockerfile's runtime stage." >&2
             docker logs plombir-git-smoke >&2 || true

@@ -305,9 +305,12 @@ stand_register_founder() {
 # alone decides whether the stand comes up.
 stand_frontend_published() {
   [[ -s "${STAND_FRONTEND_LOG}" ]] || return 1
-  local url
-  url="$(sed 's/\x1b\[[0-9;]*m//g' "${STAND_FRONTEND_LOG}" \
-    | grep -oE 'http://(127\.0\.0\.1|localhost):[0-9]+' | head -1)"
+  local log url
+  # Strip, then search the whole text: no early-exit reader in a pipe, which
+  # the scripts sourcing this file run under pipefail.
+  log="$(sed 's/\x1b\[[0-9;]*m//g' "${STAND_FRONTEND_LOG}")"
+  url="$(grep -m1 -oE 'http://(127\.0\.0\.1|localhost):[0-9]+' <<<"${log}" || true)"
+  url="${url%%$'\n'*}"
   [[ -n "${url}" ]] || return 1
   STAND_FRONTEND_URL="${url/localhost/127.0.0.1}"
   return 0
