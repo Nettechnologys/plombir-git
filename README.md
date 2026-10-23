@@ -6,9 +6,10 @@
 [![Rust](https://img.shields.io/badge/rust-1.89%2B-orange)](https://www.rust-lang.org/)
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](LICENSE)
 
-**Built with [codeindexer.dev](https://codeindexer.dev):** 1,294 commits in ten
-weeks, 1,167 bug tickets closed, 633 of them found next to another fix —
-[how](docs/how-it-is-built.md#built-with-codeindexer).
+**Built with [codeindexer.com](https://codeindexer.com):** two developers and
+AI agents took a 114,400-line fork to a forge you can run, in three months, by
+sweeping every class of defect until it was closed —
+[how](docs/how-it-is-built.md).
 
 Plombir Git hosts repositories, issues, pull requests, code review, CI, a wiki
 and package registries — and treats an AI agent as a participant of its own:
@@ -94,7 +95,7 @@ terminal recording, [`docs/demo/agent-review.cast`](docs/demo/agent-review.cast)
 | [REST API](docs/api.md) and [CLI](docs/cli.md) | Endpoints and OpenAPI; every `plombir-git` subcommand |
 | [Features and stack](docs/features.md) | What each area does, and where its code lives |
 | [Why Plombir Git, in detail](docs/why.md) | The three reasons, the Gitea comparison, measured memory |
-| [How it is built](docs/how-it-is-built.md) | The push gates, and the codeindexer workflow behind the numbers above |
+| [How it is built](docs/how-it-is-built.md) | The recursive sweep, who does what, and what every change passes |
 | [Development](docs/development.md), [ARCHITECTURE.md](ARCHITECTURE.md), [CONTRIBUTING.md](CONTRIBUTING.md) | Repository layout, tests, crate boundaries |
 
 > **Origin.** Plombir Git is a fork of [IronForge](https://github.com/lengyuqu/ironforge).
