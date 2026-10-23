@@ -36,11 +36,6 @@ create the administrator account, and you have a forge at
 production: with `--rm` the data goes with the container. To keep it, add
 `-v plombir-git-trial:/data` and end the command with `--data-dir /data`.
 
-`plombir-git trial` is new in the next release after v0.2.0; until it is
-tagged, build the image from this repository first
-(`docker build -t plombir-git .`) and run `plombir-git` in place of the
-`ghcr.io/…:latest` name.
-
 Then:
 
 - **Connect your agent** — Claude Code, Codex or Cursor over MCP, with a bot

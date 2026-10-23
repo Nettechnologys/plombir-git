@@ -7,15 +7,16 @@ To only try Plombir Git, the [one-command trial](../README.md#try-it-in-one-comm
 Tagged builds are available under [GitHub Releases](https://github.com/Nettechnologys/plombir-git/releases).
 Each release includes Linux x86_64 and aarch64 archives, SHA-256 checksums,
 SPDX SBOMs, a multi-architecture image at
-`ghcr.io/nettechnologys/plombir-git:v0.2.0` (substitute the desired tag), and
+`ghcr.io/nettechnologys/plombir-git:v0.3.0` (substitute the desired tag), and
 from v0.2.0 on a `plombir-git-deploy-<tag>.tar.gz` with a
 compose file pinned to that image's digest
 ([how to run it](../deploy/README.md#-published-release--no-source-tree)).
 This page and `deploy/README.md` describe `main`: for a release, read them at
 its tag (`https://github.com/Nettechnologys/plombir-git/blob/<tag>/README.md`).
 What [CHANGELOG.md](../CHANGELOG.md) lists under *Unreleased* is in no release
-yet. Read the [v0.2.0 release notes](releases/v0.2.0.md) before upgrading
-a v0.1.1 instance.
+yet. Read the [v0.3.0 release notes](releases/v0.3.0.md) before upgrading
+a v0.2.0 instance, and the [v0.2.0 notes](releases/v0.2.0.md) first for a
+v0.1.1 one.
 Run an unpacked binary from its archive directory so its bundled `web/build`
 is found by the default configuration.
 `plombir-git --version`, `plombir-git-runner --version` and

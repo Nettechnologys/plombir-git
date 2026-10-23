@@ -191,7 +191,7 @@ one you meant.
 
 ```bash
 # As the system account that should own the data, e.g. a dedicated `forge` user.
-tag=v0.2.0   # the release you install
+tag=v0.3.0   # the release you install
 curl -fLO "https://github.com/Nettechnologys/plombir-git/releases/download/${tag}/plombir-git-deploy-${tag}.tar.gz"
 curl -fLO "https://github.com/Nettechnologys/plombir-git/releases/download/${tag}/SHA256SUMS"
 sha256sum --check --ignore-missing SHA256SUMS

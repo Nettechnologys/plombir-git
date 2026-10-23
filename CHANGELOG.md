@@ -6,6 +6,14 @@ This project records user-facing changes here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-23
+
+This release changes how Actions workflows run, and a v0.2.0
+`plombir-git-runner` no longer takes Actions jobs. Read the
+[v0.3.0 release notes](docs/releases/v0.3.0.md) before upgrading: they list
+what to check first, the database migrations, and which workflows start
+running.
+
 ### Added
 
 - `GET /repos/{owner}/{name}/actions/runners` lists a repository's runners to
@@ -106,6 +114,122 @@ This project records user-facing changes here. The format follows
   `release.delete`, `release.asset.delete` and `release.asset.attest`, each
   with the file name and SHA-256 where there is a file.
 
+- `plombir-git trial` starts a throwaway instance with nothing prepared: it
+  writes an owner-only `plombir-git.toml` with a generated JWT secret into its
+  data directory and runs the ordinary `serve` on it. Registration stays
+  closed; the log prints a setup link that opens the register page with the
+  token filled in. `GET /api/v1/instance` reports `trial_mode`, and every page
+  then carries a trial banner. Nothing else turns trial mode on. It is the
+  README's first command, and `scripts/trial-smoke.sh` runs it against the
+  image every Regression run builds and every release publishes.
+
+- An Actions job runs its steps one by one, each in its own process — on the
+  host, or `docker exec`ed into the one container the job runs in — with
+  GitHub's command line for `bash`, `sh`, `python`, `pwsh` or a `{0}`
+  template; a step without `shell:` runs under `bash -e`, or `sh -e` where
+  there is no bash. `$GITHUB_ENV`, `$GITHUB_PATH`, `$GITHUB_STEP_SUMMARY` and
+  `$GITHUB_OUTPUT` carry what one step leaves for the next. A step's `if:` is
+  read between steps with `success()`, `failure()`, `always()` and
+  `cancelled()`, and `id`, `continue-on-error` and `timeout-minutes` work. The
+  job page lists the steps, each with its own log at
+  `…/jobs/{job_id}/steps/{number}/log`. Native `.plombir-git-ci.yml` jobs run
+  their script unchanged.
+
+- Steps and jobs have outputs: `steps.<id>.outputs.*`, `.outcome` and
+  `.conclusion` in the steps after it, and a job's `outputs:` as
+  `needs.<id>.outputs.*` and `needs.<id>.result` in the jobs that need it. A
+  job's outputs are capped at 1 MiB, as on GitHub. A step id or a needed job
+  that does not exist where it is read is refused by name when the workflow
+  is read, never read as the empty string.
+
+- `strategy.matrix` takes `include` and `exclude` with GitHub's rules, and the
+  whole matrix, a dimension, `include` or `exclude` may be
+  `${{ fromJSON(needs.<job>.outputs.<name>) }}`, expanded when its stage is
+  reached (at most 256 variants). `fail-fast` and `max-parallel` are honoured,
+  and `jobs.<id>.continue-on-error` may be an expression per variant: an
+  experimental leg that fails no longer fails the pipeline.
+
+- `services:` start before a job's first step, each on a Docker network of
+  the job's own, in both runners. A job in `container:` reaches
+  `postgres:5432`, a job on the host reaches a service through `ports:`
+  published on loopback. The runner waits up to five minutes for health
+  checks and fails the job before any step when a service is not healthy.
+  `credentials:` pull a private image. Services and their network go with the
+  job, and those a dead runner left are swept before the next job on that
+  machine.
+
+- `uses:` runs composite actions (`owner/repo[/path]@ref` or `./path`) and
+  JavaScript actions (`runs.using: node12` to `node24`, such as
+  `actions/setup-node` and `actions/setup-go`), with `pre` / `post`,
+  `INPUT_*`, `GITHUB_STATE`, `GITHUB_ACTION_PATH` and a tool cache that
+  outlives the job. Where an action may come from is the operator's decision,
+  in `[ci]`: `actions_sources` (`["instance"]` by default — this instance's
+  public repositories and the workflow's own; add `"upstream"` for
+  `actions_upstream_url`, `https://github.com` by default),
+  `actions_require_full_sha` and `actions_cache_max_mb` (1024). A source the
+  policy does not allow is refused by name; Docker actions are refused.
+
+- `on: schedule` workflows run. Once a minute the server reads every live
+  repository's default branch and runs each `- cron:` entry whose latest tick
+  nobody has claimed, once, even across restarts and replicas. GitHub's cron
+  dialect, in UTC; missed ticks are not caught up, and
+  `[ci] schedule_min_interval_minutes` (5) is the floor. Pull mirrors are not
+  scheduled.
+
+- `${{ vars.NAME }}` reads a configuration variable of the repository or of
+  the organization that owns it, the repository's winning, as on GitHub.
+  Administrators set them under the repository's and the organization's
+  settings or through `/actions/variables`.
+
+- More of a workflow is read instead of refused: `run-name:` (shown in the
+  pipeline list), `jobs.<id>.name` (rendered per matrix variant and shown
+  beside the job's id), `github.head_ref` and `github.base_ref`
+  (`CI_HEAD_REF` / `CI_BASE_REF`), `github.ref_name` in `run:`, `env:` and
+  `with:` (`CI_REF_NAME`), `inputs.*` and `github.event.inputs.*` in `if:`,
+  `concurrency.group`, `run:`, `env:` and `with:`, and `always()`,
+  `failure()` and `!cancelled()` in the `if:` of a job with `needs:`, so a
+  `notify` job runs after a failed build. `::add-mask::<value>` masks the
+  value in the step's log from that line on.
+
+- `GET /repos/{owner}/{name}/commits/{sha}/diff` and the commit page show
+  which files a commit changed, against its first parent.
+
+- The person given access to a repository finds it under **Shared with you**
+  on the dashboard (`GET /users/me/collaborations`), sees their access level
+  in the repository header, and is notified when access is granted, changed
+  or removed.
+
+- Notifications arrive live: a requested review, a mention, an assignment, a
+  failed pipeline, and a watched repository's new issues, pull requests and
+  pushes reach an open tab over the WebSocket instead of on the next periodic
+  re-read.
+
+- An import from GitHub, Gitea or Forgejo brings each release's files, held
+  to the repository's `[limits]` and to the import's budget, and checked
+  against the SHA-256 GitHub lists. A GitLab release's links into the
+  source's own file stores are fetched too; other links stay in the release
+  notes. Imported releases keep the dates and the order their source gave
+  them.
+
+- An import keeps comments on lines of a pull request's diff on their line,
+  side and commit, replies in their thread — from GitHub, Gitea (one thread
+  per line, as Gitea shows them) and GitLab's diff notes. GitLab approvals
+  come over as approvals that authorize nothing. Who an issue or pull request
+  was assigned to on the source, and whose review it asked for, is kept as
+  the source's logins and shown on the issue and pull request.
+
+- GitLab `CODEOWNERS` sections are read as sections, and `.gitlab/CODEOWNERS`
+  as GitLab's third path. The pull-request template is found in any case and
+  as `.txt`, as GitHub finds it; issue and pull-request templates are also
+  read from `.forgejo/` and Forgejo's `docs/ISSUE_TEMPLATE`. The repository
+  page finds the README in `.gitea/`, `.github/`, the root and `docs/`, and
+  its relative links and images lead from the file's own directory.
+
+- An `agent.mcp_tool_call` audit entry names the repository the tool touched
+  and the issue or pull request number and path, never the content it wrote.
+- An empty dashboard offers importing from GitHub, GitLab, Gitea or Forgejo
+  first and creating a repository second.
+
 ### Changed
 
 - Webhook payloads that name no repository now carry
@@ -113,6 +237,60 @@ This project records user-facing changes here. The format follows
   event is about. `ci.status` used to send `repository: "repo#<id>"`; JSON
   subscribers reading that field get the address instead (`repository_id` is
   unchanged). Push payloads add `repository.full_name`.
+
+- Merges name people instead of `Plombir Git <noreply@plombir-git.local>`.
+  The committer is the account that merged — the one pressing the button, or
+  the one that asked for auto-merge or queued it. A squash is authored by the
+  pull request's author and its message is `<title> (#N)` followed by the
+  description, or by the subjects of the commits it replaces when there is
+  none; a merge commit names the merger twice and carries the title under its
+  generated subject; a rebase keeps each commit's author and takes only the
+  committer. The server identity stays on the merge queue's rehearsal
+  commits, which never reach a branch.
+
+- An Actions job is given only the secrets its workflow names, and each
+  step's process only those the step names, plus those the workflow's and the
+  job's `env:` name. A composite action's steps get what the workflow hands
+  the action in `with:` / `env:`. A script that read a secret from the
+  environment without the workflow naming it gets nothing. Native
+  `.plombir-git-ci.yml` jobs keep every secret.
+
+- `permissions:` is what an Actions job's `CI_JOB_TOKEN` is minted with:
+  `contents` and `packages` `read` or `none`, and `id-token: write` for a
+  workload identity. A workflow that declares nothing gets GitHub's
+  restricted default, `contents: read` and `packages: read` without
+  `id-token`, and any `write` but `id-token`'s is refused when the workflow is
+  read. `/api/v1/ci/oidc/token` answers only a token that carries
+  `id-token: write`; native jobs keep their workload identity.
+
+- The runner protocol is at 6. A runner that sends less is never handed an
+  Actions job (`426`, naming the job) and keeps taking native jobs; a
+  `plombir-git-runner` from v0.2.0 sends none.
+
+- A runner that stops (`POST /runners/{id}/deregister`, which every runner
+  calls on `SIGTERM`) hands its jobs back and is marked offline instead of
+  deleted, so a unit restart or a reboot no longer leaves it answering `401`
+  until someone registers it again. `DELETE /admin/runners/{id}` revokes a
+  runner. A poll marks an offline runner online.
+
+- Actions semantics that now match GitHub: a job whose needed job was skipped
+  is skipped too, and a job with `needs:` is held until its stage is reached,
+  so its environment asks for an approval only when it is going to run; a job
+  that failed under `continue-on-error` reads as `success` to the jobs after
+  it; `&&` and `||` give back an operand instead of `false`; a quote inside a
+  condition literal is doubled (`'it''s'`); `::set-output` is refused, and a
+  variable a step `export`s ends with the step — use `$GITHUB_ENV`.
+
+- On a rootless Docker daemon a job container runs as the container's root,
+  which is the daemon's user on the host and owns the workspace. It used to
+  run as the runner's uid, which the daemon maps to a subordinate id that
+  could not write to `/workspace`.
+
+- The README is a front page; its reference sections moved whole to `docs/`
+  (install, using Git, API, CLI, runner, MCP, features, development).
+  `docs/agents.md` connects Claude Code, Codex or Cursor over MCP, and
+  `scripts/agents-guide-check.sh` runs it step by step against the trial.
+- Grafana in the observability stack is 13.2.4.
 
 ### Fixed
 
@@ -156,6 +334,53 @@ This project records user-facing changes here. The format follows
   orphaned objects, with both counters.
 - Applying a suggestion or resolving a thread no longer marks the review
   comment as edited, and a new comment is never marked edited.
+
+- A push with nothing to run no longer fails an open pull request's merge.
+  A repository whose only workflow is `on: pull_request` published a red
+  "no workflow is triggered by push" pipeline on every push to a pull
+  request's branch, and the merge gate judged that one. Workflows that sit
+  the event out are now no work, the gate judges a pull request by its own
+  latest run, and retrying a pull request's pipeline no longer answers `409`.
+- A job the embedded runner finished records when it finished; the pipeline
+  page measured it from its start to the viewer's clock.
+- Pipeline, stage and job times are read as UTC. Away from UTC every one was
+  off by the viewer's offset: in UTC+2 a one-second job lasted two hours.
+- Pull request descriptions, reviews and comments, and the repository README,
+  render as Markdown through the same sanitizer issues use. Pull requests
+  printed theirs raw, and the README came out with fenced code drawn as
+  rules.
+- The pipeline list names a run by its commit's subject (`commit_message` in
+  `GET /pipelines`); every run without a `run-name:` read `#<id>`.
+- `working-directory: ${{ matrix.dir }}` (or `inputs.*`, `github.ref_name`,
+  `defaults.run.working-directory`) is resolved instead of failing the step
+  with "No such file or directory", and may not leave the workspace.
+- `actions/upload-artifact` and `actions/cache` render `name:` and `path:`
+  per matrix variant (`dist-linux`, `out-mac`), where they were copied as
+  `${MATRIX_OS}`. An upload without `name:` is GitHub's `artifact`; every
+  unnamed upload used to be refused.
+- A GitLab `CODEOWNERS` file split into sections ran by half: a heading
+  became a rule for a file of that name, and lines without owners of their
+  own were dropped.
+- The sweep of a dead runner's containers listed no Docker network at all
+  (`docker network ls` has no `.Names`), and a steps container a killed
+  runner left kept its memory and workspace mount forever. Both are removed
+  before every Docker job and when the external runner starts.
+
+### Security
+
+- A `workflow_dispatch` value holding `${{` is refused. Typed into the form
+  of a workflow that echoes `${{ inputs.target }}`, `${{ secrets.DEPLOY_KEY }}`
+  handed the step a secret the workflow never named.
+- Every step of every Actions job could mint a workload identity for any
+  audience, a downloaded action's included. Only a job whose `permissions:`
+  carry `id-token: write` can now.
+- An imported byline's account id is recorded with the server that issued it
+  (`github:<host>` / `gitlab:<host>` for anything but github.com and
+  gitlab.com), so a sign-in can never claim a namesake's history from another
+  server.
+- Dependencies: `tokio` 1.54.1 (RUSTSEC-2026-0386), `ctutils` 0.4.4
+  (RUSTSEC-2026-0385), `rustls-webpki` 0.103.16, `webpki-roots` and
+  `webpki-root-certs` 1.0.10 (RUSTSEC-2026-0381, 0382 and 0383).
 
 ## [0.2.0] - 2026-10-17
 
@@ -775,6 +1000,7 @@ See the [v0.1.1 release notes](docs/releases/v0.1.1.md) for upgrade and
 rollback guidance. Publication of a release does not establish that a registry
 package is publicly accessible.
 
-[Unreleased]: https://github.com/Nettechnologys/plombir-git/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Nettechnologys/plombir-git/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.2.0
 [0.1.1]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.1.1

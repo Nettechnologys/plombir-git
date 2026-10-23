@@ -21,9 +21,7 @@ try it out, start a throwaway one:
 docker run --rm -p 8080:8080 -p 2222:2222 ghcr.io/nettechnologys/plombir-git:latest plombir-git trial
 ```
 
-(`plombir-git trial` is new in the release after v0.2.0; until it is tagged,
-build the image with `docker build -t plombir-git .` and use `plombir-git` as
-the image name.) Open the setup link it prints, create your account, and create a repository
+Open the setup link it prints, create your account, and create a repository
 (**Dashboard → New Repository**, tick *Initialize repository*). The examples below
 use `http://localhost:8080`, your account `you` and the repository `you/app`.
 Put your own instance's address wherever `http://localhost:8080` appears.
