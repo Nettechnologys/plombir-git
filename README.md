@@ -98,6 +98,21 @@ terminal recording, [`docs/demo/agent-review.cast`](docs/demo/agent-review.cast)
 | [How it is built](docs/how-it-is-built.md) | The recursive sweep, who does what, and what every change passes |
 | [Development](docs/development.md), [ARCHITECTURE.md](ARCHITECTURE.md), [CONTRIBUTING.md](CONTRIBUTING.md) | Repository layout, tests, crate boundaries |
 
+## Who makes it
+
+Plombir Git is made by [NetTechnologys s.r.o.](https://github.com/Nettechnologys):
+[Yahook](https://github.com/Yahook) and [vadiksext](https://github.com/vadiksext),
+working with AI agents. Our own team already does its work in it.
+
+A lot of work from every side went into making it hold up. Three months of the
+recursive sweep closed one class of defect after another, each with a test and
+a check that runs before every push. Outside the team, Rinat
+([hicaru](https://github.com/hicaru)) wrote a full code review and security
+audit, and Alexey Stupenkov ([alexio777](https://github.com/alexio777)) sent 18
+pull requests, most of them security hardening. Every outside finding was
+checked against the code before anything changed —
+[how it is built](docs/how-it-is-built.md#reviews-from-outside).
+
 > **Origin.** Plombir Git is a fork of [IronForge](https://github.com/lengyuqu/ironforge).
 > See [NOTICE](NOTICE) for provenance and licensing details.
 

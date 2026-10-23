@@ -13,7 +13,9 @@ previous round could not yet see.
 
 Plombir Git is made by [NetTechnologys s.r.o.](https://github.com/Nettechnologys),
 a team that has been building software for 25 years. Two of us work on this
-forge. We also make [codeindexer.com](https://codeindexer.com), the
+forge, [Yahook](https://github.com/Yahook) and
+[vadiksext](https://github.com/vadiksext), and our own team already does its
+work in it. We also make [codeindexer.com](https://codeindexer.com), the
 development platform Plombir Git is built with. It covers code search with a
 call graph, a task manager and roadmap for AI agents, a shared base of solved
 problems, security audits, and an autonomous runner that works through the
@@ -118,18 +120,20 @@ error: each one answered as if it had worked.
 Two people outside the loop reviewed the code and helped fix it. Thank you,
 both.
 
-- **Rinat** wrote a full-repository review and security audit on 1 September
-  2026 (`CODE_REVIEW.md` on the `audite` branch): 14 findings. Each was checked
-  against the code before anything was changed. 12 held up and are fixed. Two
-  did not: one looked for a fork-PR secrets gate under names the code does not
-  use (it is `ci_approved_sha`), and one stopped reading the merge queue
-  before the branch that re-queues a failed pull request. By `git blame`, the
-  dangerous defaults in that report came with the IronForge import.
-- **Alexey Stupenkov** sent 13 pull requests in October: sandboxed downloads
-  of user content, release asset names, the minimum git version, credentials
-  kept out of request logs, deployment hardening and more. Each went through
-  the same loop as our own findings. Five landed under his name, and the rest
-  were folded into our own commits, with the decisions that shaped them.
+- **Rinat** ([hicaru](https://github.com/hicaru)) wrote a full-repository
+  review and security audit on 1 September 2026 (`CODE_REVIEW.md` on the
+  `audite` branch): 14 findings. Each was checked against the code before
+  anything was changed. 12 held up and are fixed. Two did not: one looked for
+  a fork-PR secrets gate under names the code does not use (it is
+  `ci_approved_sha`), and one stopped reading the merge queue before the
+  branch that re-queues a failed pull request. By `git blame`, the dangerous
+  defaults in that report came with the IronForge import.
+- **Alexey Stupenkov** ([alexio777](https://github.com/alexio777)) sent 18
+  pull requests on 9 October: sandboxed downloads of user content, release
+  asset names, the minimum git version, credentials kept out of request logs,
+  deployment hardening and more. Each went through the same loop as our own
+  findings. Five landed under his name, and the rest were folded into our own
+  commits, with the decisions that shaped them.
 
 After each review the sweep went on, and kept finding defects neither review
 had reached.
