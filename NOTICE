@@ -26,28 +26,23 @@ began as a fork of IronForge:
 
     https://github.com/lengyuqu/ironforge
 
-At the time of forking, the upstream IronForge README identified the project
-as MIT licensed in two places: an "MIT" license badge and a plain-text
-"License: MIT" statement in the body of the README. However, the upstream
-repository did not ship a LICENSE, NOTICE, or COPYING file containing the full
-MIT License text and an explicit copyright notice, and GitHub reported no
-detected license for it.
-
-This NOTICE is provided in good faith to credit the upstream project and to
-record the fork's provenance accurately. The upstream author's stated intent
-was to release the project under the MIT License; the omission was the license
-file itself, not the license grant. Anyone reusing code that originates from
-upstream IronForge (rather than Plombir Git's own changes) should preserve this
-attribution and, before wider distribution, confirm the applicable terms with
-the upstream author directly.
+IronForge is licensed under the MIT License. At the time of forking, the
+upstream README stated this in two places (an "MIT" license badge and a
+"License: MIT" statement), but the repository shipped no license file. At our
+request (upstream issue #2) the upstream author added the full MIT License
+text with an explicit copyright notice on 23 October 2026, in upstream commit
+9133b270ca ("docs: add the MIT LICENSE text referenced by the README"), and
+GitHub now detects the upstream license as MIT.
 
 The MIT License is compatible with the GNU AGPL: code originating from
-upstream IronForge is included here under the MIT terms its author stated, and
-the combined work is distributed under the AGPL. For those upstream portions
-the MIT permission notice applies, reproduced below with the upstream authors
-credited as the copyright holders, since upstream named none:
+upstream IronForge is included here under the MIT License, and the combined
+work is distributed under the AGPL. For those upstream portions the upstream
+copyright notice and MIT permission notice apply, reproduced below as
+published in the upstream LICENSE file. Anyone reusing code that originates
+from upstream IronForge (rather than Plombir Git's own changes) must preserve
+them.
 
-    Copyright (c) the IronForge authors (https://github.com/lengyuqu/ironforge)
+    Copyright (c) 2026 Yu Qu (lengyuqu)
 
     Permission is hereby granted, free of charge, to any person obtaining a
     copy of this software and associated documentation files (the
