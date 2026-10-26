@@ -46,6 +46,23 @@ function run(fixture) {
   };
 }
 
+// The tags the fixtures edit are read from the live compose file, not spelled
+// here. Spelled, they were a second pin of each image that no updater moves: the
+// first Dependabot bump of Prometheus (PR #41) turned this stand red because
+// every anchor below had stopped matching. A pin this read cannot find is the
+// stand breaking, and it says so instead of going green.
+function livePin(repository) {
+  const text = readFileSync(join(root, compose), 'utf8');
+  const escaped = repository.replace(/[./]/g, '\\$&');
+  const match = text.match(new RegExp(`^ {4}image: (${escaped}:[^@\\s]+)@sha256:[0-9a-f]{64}$`, 'm'));
+  if (!match) throw new Error(`${compose} has no digest-pinned \`${repository}\` image line`);
+  return match[1];
+}
+
+const PROMETHEUS = livePin('prom/prometheus');
+const ALERTMANAGER = livePin('prom/alertmanager');
+const GRAFANA = livePin('grafana/grafana');
+
 let failures = 0;
 
 // `mutate` receives the compose text and returns the text the fixture gets.
@@ -109,10 +126,10 @@ const green = (expected, forbidden) => (result) => {
 fixture(
   'a commented-out pin above the live one does not become the tag',
   (source) => source.replace(
-    '    image: prom/prometheus:v3.15.0',
-    '    # image: prom/prometheus:v1.0.0-stale\n    image: prom/prometheus:v3.15.0',
+    `    image: ${PROMETHEUS}`,
+    `    # image: prom/prometheus:v1.0.0-stale\n    image: ${PROMETHEUS}`,
   ),
-  green('prometheus=prom/prometheus:v3.15.0', 'v1.0.0-stale'),
+  green(`prometheus=${PROMETHEUS}`, 'v1.0.0-stale'),
 );
 
 // …and the same line commented out with nothing live behind it is not a tag
@@ -120,29 +137,29 @@ fixture(
 fixture(
   'a service whose only pin is commented out is red',
   (source) => source.replace(
-    '    image: prom/prometheus:v3.15.0',
-    '    # image: prom/prometheus:v3.15.0',
+    `    image: ${PROMETHEUS}`,
+    `    # image: ${PROMETHEUS}`,
   ),
   red('services.prometheus.image is absent'),
 );
 
 fixture(
   'a floating tag is red',
-  (source) => source.replace('image: prom/prometheus:v3.15.0', 'image: prom/prometheus:latest'),
+  (source) => source.replace(`image: ${PROMETHEUS}`, 'image: prom/prometheus:latest'),
   red('pin an explicit tag'),
 );
 
 fixture(
   'an untagged image is red',
-  (source) => source.replace('image: prom/prometheus:v3.15.0', 'image: prom/prometheus'),
+  (source) => source.replace(`image: ${PROMETHEUS}`, 'image: prom/prometheus'),
   red('pin an explicit tag'),
 );
 
 fixture(
   'another registry for the image this gate runs is red',
   (source) => source.replace(
-    'image: prom/alertmanager:v0.34.1',
-    'image: quay.io/prometheus/alertmanager:v0.34.1',
+    `image: ${ALERTMANAGER}`,
+    `image: quay.io/prometheus/${ALERTMANAGER.slice('prom/'.length)}`,
   ),
   red('not a `prom/alertmanager` image'),
 );
@@ -152,7 +169,7 @@ fixture(
 // stack does not have.
 fixture(
   'another repository for the Grafana image is red',
-  (source) => source.replace('image: grafana/grafana:13', 'image: grafana/grafana-oss:13'),
+  (source) => source.replace(`image: ${GRAFANA}`, GRAFANA.replace('grafana/grafana:', 'image: grafana/grafana-oss:')),
   red('not a `grafana/grafana` image'),
 );
 
@@ -185,7 +202,7 @@ fixture(
     '      - ./prometheus/alerts.yml:',
     '      # - ./prometheus/alerts-deleted.yml:/etc/prometheus/alerts.yml:ro\n      - ./prometheus/alerts.yml:',
   ),
-  green('prometheus=prom/prometheus:v3.15.0', null),
+  green(`prometheus=${PROMETHEUS}`, null),
 );
 
 // A long-syntax bind mount is a mount `sed -nE '…- (\./…)'` could not see at
@@ -215,12 +232,12 @@ fixture(
 );
 
 // The digest carries its own colon; it must not be read as the tag separator,
-// or the repository check reads `prom/prometheus:v3.15.0@sha256` as the name.
+// or the repository check reads `prom/prometheus:<tag>@sha256` as the name.
 fixture(
   'the image this gate runs keeps its digest on stdout',
   (source) => source.replace('  # ── Prometheus (Metrics Storage) ──\n', '  # ── Prometheus ──\n'),
   (result) => {
-    const reason = green('prometheus=prom/prometheus:v3.15.0@sha256:', null)(result);
+    const reason = green(`prometheus=${PROMETHEUS}@sha256:`, null)(result);
     if (reason) return reason;
     if (!/^alertmanager=prom\/alertmanager:v[^@\s]+@sha256:[0-9a-f]{64}$/m.test(result.stdout)) {
       return 'stdout does not carry the alertmanager digest';
