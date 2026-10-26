@@ -24,6 +24,15 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
+    # The MySQL smoke job tests an LTS line (8.4). MySQL's newer majors are
+    # calendar-versioned innovation releases (26.10 on 2026-10-21, the same
+    # image as `latest`), short-lived by design; Dependabot proposed one as an
+    # ordinary bump (#46). Only 8.4.x digest updates come through here; moving
+    # the job to the next LTS is a deliberate change.
+    ignore:
+      - dependency-name: mysql
+        update-types:
+          - version-update:semver-major
   # The observability stack pins its images by digest; this is what proposes
   # the next digest as a reviewable pull request.
   - package-ecosystem: docker-compose

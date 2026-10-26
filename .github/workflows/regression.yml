@@ -436,12 +436,12 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        # PostgreSQL 17.11. Pinned by the multi-platform index digest so a rerun
+        # PostgreSQL 18.6. Pinned by the multi-platform index digest so a rerun
         # of the same commit migrates against the same server build. The pin
         # lives in ci/images/Dockerfile, where Dependabot sees it; a
         # service image cannot be read from a file, so it is repeated here and
         # scripts/ci-image-pins-contract-check.mjs fails while the two differ.
-        image: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
+        image: postgres:18@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6
         env:
           POSTGRES_USER: plombir_git
           POSTGRES_PASSWORD: plombir_git
