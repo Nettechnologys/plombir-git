@@ -562,8 +562,8 @@ jobs:
     timeout-minutes: 20
     services:
       mysql:
-        # MySQL 8.4.11, pinned by digest for the reason given on postgres-smoke.
-        image: mysql:8.4@sha256:6ea90827b1100f8f2ae306a539f86d2c264a26ed435a2a9f75551dd5c3aeb242
+        # MySQL 8.4.13, pinned by digest for the reason given on postgres-smoke.
+        image: mysql:8.4@sha256:76f0358884cb92d9a086d24e5671c38048d3fef40f2588703d73eb55392d6b69
         env:
           MYSQL_ROOT_PASSWORD: root
           MYSQL_DATABASE: plombir_git
