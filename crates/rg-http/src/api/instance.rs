@@ -46,6 +46,11 @@ pub struct InstanceInfo {
     ///
     /// Anonymous on purpose: it says what the software does, not what is in it.
     pub attestation_enabled: bool,
+    /// Whether assigning an issue to a bot with an agent profile may start an
+    /// agent run here (`[agents].enabled`, ADR-0001). The bot settings page
+    /// says so next to the profile, so an owner does not set one up and wait
+    /// for runs this instance will never start.
+    pub agents_enabled: bool,
     /// Where to read the source code of the build answering this request:
     /// `<[server].source_url>/tree/<commit>`, or the repository itself when
     /// the build did not record its commit.
@@ -144,6 +149,7 @@ pub async fn get_instance(State(state): State<AppState>) -> impl IntoResponse {
             banner_message: settings.banner_message,
             banner_type: settings.banner_type,
             attestation_enabled: state.attestation_enabled,
+            agents_enabled: state.agents_enabled,
             source_url: build_info::source_link(&state.source_url, source_commit),
             source_commit: source_commit.map(str::to_string),
             setup_required,

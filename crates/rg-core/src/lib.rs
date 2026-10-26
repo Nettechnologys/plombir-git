@@ -13,6 +13,7 @@
 //! - **Infrastructure**: search, lfs, email, audit, platform
 
 // ── Identity & Auth ─────────────────────────────────
+pub mod agent;
 pub mod attachment;
 pub mod attestation;
 pub mod auth;

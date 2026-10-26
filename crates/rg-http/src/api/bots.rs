@@ -85,35 +85,7 @@ pub(crate) async fn resolve_narrowing(
                 "a token may be confined to at most {MAX_TOKEN_REPOSITORIES} repositories"
             )));
         }
-        Some(names) => {
-            let mut ids = Vec::with_capacity(names.len());
-            for full_name in names {
-                let unknown = || {
-                    AppError::bad_request(format!(
-                        "repository '{full_name}' does not exist or is not visible to you"
-                    ))
-                };
-                let Some((owner, name)) = full_name.trim().split_once('/') else {
-                    return Err(AppError::bad_request(format!(
-                        "repository '{full_name}' must be written as owner/name"
-                    )));
-                };
-                let Some(repository) =
-                    rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, name)
-                        .await
-                        .map_err(AppError::from)?
-                else {
-                    return Err(unknown());
-                };
-                if !super::repo_access::may_read(state, &repository, Some(caller_id)).await? {
-                    return Err(unknown());
-                }
-                ids.push(repository.id);
-            }
-            ids.sort_unstable();
-            ids.dedup();
-            Some(ids)
-        }
+        Some(names) => Some(resolve_repository_names(state, caller_id, names).await?),
     };
 
     let mcp_tools = match &narrowing.mcp_tools {
@@ -153,11 +125,52 @@ pub(crate) async fn resolve_narrowing(
     })
 }
 
+/// The ids of the repositories `names` (`owner/name`), each one `caller_id`
+/// can read, ascending and without repeats.
+///
+/// An unknown repository and an invisible one get the same answer, so naming
+/// a repository here is not a way to probe for private names. Shared by token
+/// narrowing and a bot's agent profile (ADR-0001 D6), which name repositories
+/// the same way and must refuse them the same way.
+pub(crate) async fn resolve_repository_names(
+    state: &AppState,
+    caller_id: i64,
+    names: &[String],
+) -> Result<Vec<i64>, AppError> {
+    let mut ids = Vec::with_capacity(names.len());
+    for full_name in names {
+        let unknown = || {
+            AppError::bad_request(format!(
+                "repository '{full_name}' does not exist or is not visible to you"
+            ))
+        };
+        let Some((owner, name)) = full_name.trim().split_once('/') else {
+            return Err(AppError::bad_request(format!(
+                "repository '{full_name}' must be written as owner/name"
+            )));
+        };
+        let Some(repository) =
+            rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, name)
+                .await
+                .map_err(AppError::from)?
+        else {
+            return Err(unknown());
+        };
+        if !super::repo_access::may_read(state, &repository, Some(caller_id)).await? {
+            return Err(unknown());
+        }
+        ids.push(repository.id);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
 /// `owner/name` of every live repository among `ids`, as it is called now —
 /// three queries however many repositories and owners there are. It was a
 /// repository lookup and an owner lookup per repository of every token in a
 /// listing (card_ae49267ffd93).
-async fn repository_full_names(
+pub(crate) async fn repository_full_names(
     state: &AppState,
     ids: &[i64],
 ) -> anyhow::Result<std::collections::HashMap<i64, String>> {
@@ -272,7 +285,7 @@ pub struct CreateBotRequest {
 
 /// The bot `{bot}` when the caller owns it; anybody else's bot, or no bot at
 /// all, is the same `404`.
-async fn owned_bot(
+pub(crate) async fn owned_bot(
     state: &AppState,
     owner_id: i64,
     bot: &str,

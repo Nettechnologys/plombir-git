@@ -293,6 +293,9 @@ pub(crate) fn stamp_security(
         crate::api::bots::list_bot_tokens,
         crate::api::bots::create_bot_token,
         crate::api::bots::delete_bot_token,
+        crate::api::agent_profiles::get_agent_profile,
+        crate::api::agent_profiles::put_agent_profile,
+        crate::api::agent_profiles::delete_agent_profile,
         // MCP over HTTP
         crate::api::mcp::mcp_endpoint,
         crate::api::ssh_keys::list_ssh_keys,
@@ -722,6 +725,8 @@ pub(crate) fn stamp_security(
             crate::api::bots::TokenNarrowing,
             crate::api::bots::TokenNarrowingResponse,
             crate::api::bots::BotResponse,
+            crate::api::agent_profiles::AgentProfileRequest,
+            crate::api::agent_profiles::AgentProfileResponse,
             crate::api::bots::CreateBotRequest,
             crate::api::bots::CreateBotTokenRequest,
             crate::api::bots::BotTokenResponse,

@@ -104,6 +104,12 @@ const CIPHERTEXT_PRODUCERS = [
     why: 'a mirror password has to be replayed to the remote, so it is sealed rather than hashed',
   },
   {
+    file: 'crates/rg-core/src/agent/profile.rs',
+    sites: 1,
+    writes: ['agent_profiles.model_key_encrypted'],
+    why: 'a bot\'s model API key has to be handed to its agent runs (ADR-0001 D5), so it is sealed rather than hashed',
+  },
+  {
     file: 'crates/rg-core/src/webhook/service.rs',
     sites: 2,
     writes: ['webhooks.secret_encrypted'],

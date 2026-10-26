@@ -68,6 +68,8 @@ macro_rules! probed_entities {
 probed_entities!(
     access_token,
     access_token_repository,
+    agent_profile,
+    agent_profile_repository,
     artifact,
     attachment,
     audit_log,

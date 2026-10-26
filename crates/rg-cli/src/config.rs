@@ -30,6 +30,8 @@ pub(crate) struct ConfigFile {
     #[serde(default)]
     pub(crate) releases: ReleasesConfig,
     #[serde(default)]
+    pub(crate) agents: AgentsConfig,
+    #[serde(default)]
     pub(crate) rate_limit: RateLimitConfig,
     #[serde(default)]
     pub(crate) smtp: SmtpConfig,
@@ -311,6 +313,16 @@ pub(crate) struct ReleasesConfig {
     /// false). Also settable via `PLOMBIR_GIT_ATTESTATION_ENABLED=1`, which wins.
     #[serde(default)]
     pub(crate) attestation_enabled: Option<bool>,
+}
+
+/// `[agents]` — agents a person can hand an issue to (ADR-0001).
+#[derive(Debug, serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AgentsConfig {
+    /// Let an assignment to a bot with an agent profile start an agent run
+    /// (default false). Runs have open network access in this version.
+    #[serde(default)]
+    pub(crate) enabled: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -796,6 +808,10 @@ pub(crate) const DEFAULT_CI_DOCKER: bool = false;
 pub(crate) const DEFAULT_CI_EXTERNAL_RUNNERS: bool = false;
 pub(crate) const DEFAULT_CI_ALLOW_HOST_RUNNER: bool = false;
 pub(crate) const DEFAULT_ATTESTATION_ENABLED: bool = false;
+/// `[agents].enabled`: an agent run executes code steered by text other people
+/// wrote, with open network access (ADR-0001 D8), so an upgrade never turns it
+/// on.
+pub(crate) const DEFAULT_AGENTS_ENABLED: bool = false;
 /// `[server].hsts_preload`: a promise about every subdomain is never made by
 /// default.
 pub(crate) const DEFAULT_HSTS_PRELOAD: bool = false;
@@ -2203,6 +2219,12 @@ mod tests {
                 "attestation_enabled",
                 "DEFAULT_ATTESTATION_ENABLED",
                 super::DEFAULT_ATTESTATION_ENABLED.to_string(),
+            ),
+            row(
+                "agents",
+                "enabled",
+                "DEFAULT_AGENTS_ENABLED",
+                super::DEFAULT_AGENTS_ENABLED.to_string(),
             ),
             row(
                 "rate_limit",

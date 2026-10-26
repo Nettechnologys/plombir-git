@@ -25,6 +25,7 @@ const NEW_SECRET: &str = "a-freshly-generated-secret-after-a-leak";
 const TOTP_PLAINTEXT: &str = "JBSWY3DPEHPK3PXP";
 const CI_SECRET_PLAINTEXT: &str = "ghp_a-deploy-token-nobody-wants-to-retype";
 const WEBHOOK_SECRET_PLAINTEXT: &str = "the-key-every-delivery-is-signed-with";
+const MODEL_KEY_PLAINTEXT: &str = "sk-ant-rekey-0123456789";
 
 async fn fresh_db(dir: &Path) -> DatabaseConnection {
     let db = crate::common::migrated_sqlite(&dir.join("test.db"), 2).await;
@@ -108,6 +109,31 @@ async fn live_instance(db: &DatabaseConnection, secret: &str) -> i64 {
     .await
     .expect("register webhook");
 
+    // A bot whose agent profile carries a model key, sealed through the
+    // service the API uses (ADR-0001 D5).
+    let bot = rg_core::user::bots::create_bot(db, user.id, "alice-agent", None)
+        .await
+        .expect("create bot");
+    rg_core::agent::profile::save(
+        db,
+        &encryption::derive_key(secret),
+        &bot,
+        rg_core::agent::profile::ProfileUpdate {
+            enabled: true,
+            preset: "claude_code".to_string(),
+            image: None,
+            command: None,
+            runner_tags: None,
+            model_key: rg_core::agent::profile::ModelKey::Set(MODEL_KEY_PLAINTEXT.to_string()),
+            timeout_secs: None,
+            max_runs_per_day: None,
+            max_iterations: None,
+            repository_ids: vec![repo.id],
+        },
+    )
+    .await
+    .expect("store agent profile");
+
     // Establishes `instance_signing_key.seed_encrypted` the way the first
     // server start does.
     rg_core::auth::instance_key::load_or_adopt(db, "a-signing-secret", secret)
@@ -167,7 +193,25 @@ async fn a_live_database_moves_onto_the_new_key() {
         1
     );
     assert_eq!(column(&report, "webhooks.secret_encrypted").rewritten, 1);
+    assert_eq!(
+        column(&report, "agent_profiles.model_key_encrypted").rewritten,
+        1
+    );
     assert_eq!(report.unreadable(), 0, "{report:?}");
+    let bot = rg_db::ops::user_ops::find_by_username(&db, "alice-agent")
+        .await
+        .unwrap()
+        .expect("the bot survives the rotation");
+    let sealed_key = rg_db::ops::agent_profile_ops::find_by_bot(&db, bot.id)
+        .await
+        .unwrap()
+        .and_then(|profile| profile.model_key_encrypted)
+        .expect("the profile keeps its model key");
+    assert!(!opens(&sealed_key, OLD_SECRET));
+    assert_eq!(
+        encryption::decrypt(&sealed_key, &encryption::derive_key(NEW_SECRET)).unwrap(),
+        MODEL_KEY_PLAINTEXT
+    );
 
     // The values are the same secrets, just sealed differently.
     let totp = stored_totp(&db).await;
@@ -312,7 +356,7 @@ async fn a_dry_run_reports_everything_and_changes_nothing() {
         .await
         .expect("dry run");
     assert!(report.dry_run);
-    assert_eq!(report.rewritten(), 4, "{report:?}");
+    assert_eq!(report.rewritten(), 5, "{report:?}");
 
     assert_eq!(before, stored_totp(&db).await, "a dry run must not write");
     verify_encryption_key(&db, OLD_SECRET)
@@ -412,7 +456,7 @@ async fn a_second_run_recognises_the_already_rotated_values() {
         .expect("a re-run must not fail");
 
     assert_eq!(second.rewritten(), 0, "{second:?}");
-    assert_eq!(second.already_new(), 4, "{second:?}");
+    assert_eq!(second.already_new(), 5, "{second:?}");
     assert_eq!(second.unreadable(), 0, "{second:?}");
 }
 

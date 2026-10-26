@@ -2460,6 +2460,136 @@ async fn ci_secret_conditional_update_is_portable() {
     exercise_ci_secret_update_contract(&db, repo.id, owner.id).await;
 }
 
+/// A bot's agent profile (ADR-0001) writes, rewrites and cascades the same
+/// way on every backend: the sealed key and the command are `TEXT`, the
+/// repository list is replaced in one transaction, and deleting the bot takes
+/// the profile and its list.
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn agent_profile_round_trip_is_portable() {
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("agentowner{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Agent Profile Smoke",
+    )
+    .await
+    .expect("create agent profile owner");
+    let first = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("agentrepo{suffix}")),
+    )
+    .await
+    .expect("create first repository");
+    let second = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("agentrepotwo{suffix}")),
+    )
+    .await
+    .expect("create second repository");
+    let bot = rg_core::user::bots::create_bot(&db, owner.id, &format!("agentbot{suffix}"), None)
+        .await
+        .expect("create bot");
+
+    let key = rg_core::auth::encryption::derive_key("agent-profile-smoke");
+    let long_command = format!(
+        "run-agent {}",
+        "x".repeat(rg_core::agent::profile::MAX_COMMAND_CHARS - 10)
+    );
+    let update = |repository_ids: Vec<i64>, model_key, command: &str| {
+        rg_core::agent::profile::ProfileUpdate {
+            enabled: true,
+            preset: "custom".to_string(),
+            image: Some("ghcr.io/acme/agent:1".to_string()),
+            command: Some(command.to_string()),
+            runner_tags: Some(vec!["docker".to_string(), "gpu".to_string()]),
+            model_key,
+            timeout_secs: Some(rg_core::agent::profile::MAX_TIMEOUT_SECS),
+            max_runs_per_day: None,
+            max_iterations: None,
+            repository_ids,
+        }
+    };
+    let saved = rg_core::agent::profile::save(
+        &db,
+        &key,
+        &bot,
+        update(
+            vec![second.id, first.id, first.id],
+            rg_core::agent::profile::ModelKey::Set("sk-smoke-0123456789".to_string()),
+            &long_command,
+        ),
+    )
+    .await
+    .expect("save the profile");
+    assert_eq!(saved.repository_ids, {
+        let mut ids = vec![first.id, second.id];
+        ids.sort_unstable();
+        ids
+    });
+    assert_eq!(
+        saved.profile.command.as_deref(),
+        Some(long_command.as_str())
+    );
+    assert_eq!(saved.runner_tags(), vec!["docker", "gpu"]);
+    let sealed = saved
+        .profile
+        .model_key_encrypted
+        .clone()
+        .expect("key stored");
+    assert_eq!(
+        rg_core::auth::encryption::decrypt(&sealed, &key).unwrap(),
+        "sk-smoke-0123456789"
+    );
+
+    let rewritten = rg_core::agent::profile::save(
+        &db,
+        &key,
+        &bot,
+        update(
+            vec![second.id],
+            rg_core::agent::profile::ModelKey::Keep,
+            "run-agent",
+        ),
+    )
+    .await
+    .expect("rewrite the profile");
+    assert_eq!(
+        rewritten.profile.id, saved.profile.id,
+        "a rewrite is an update"
+    );
+    assert_eq!(rewritten.repository_ids, vec![second.id]);
+    assert_eq!(rewritten.profile.model_key_encrypted, Some(sealed));
+    assert_eq!(rewritten.profile.created_at, saved.profile.created_at);
+
+    // The row itself, so what is checked is the backend's own cascade.
+    rg_db::entities::user::Entity::delete_by_id(bot.id)
+        .exec(&db)
+        .await
+        .expect("delete the bot row");
+    assert!(rg_db::ops::agent_profile_ops::find_by_bot(&db, bot.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        rg_db::ops::agent_profile_ops::repository_ids(&db, saved.profile.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn commit_status_parent_delete_is_portable() {

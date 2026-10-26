@@ -64,6 +64,9 @@ macro_rules! with_encrypted_columns {
             // rather than hashed — see `crate::webhook::service`.
             webhook, SecretEncrypted, secret_encrypted,
                 "webhooks.secret_encrypted", optional;
+            // A bot's model API key, sent into its agent runs (ADR-0001 D5).
+            agent_profile, ModelKeyEncrypted, model_key_encrypted,
+                "agent_profiles.model_key_encrypted", optional;
         }
     };
 }

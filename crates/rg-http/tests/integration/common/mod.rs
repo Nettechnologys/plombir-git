@@ -494,6 +494,8 @@ pub fn build_test_app_state_with(
         // Enabled in the test harness so attestation endpoints are reachable;
         // production defaults to off (opt-in).
         attestation_enabled: true,
+        // Off as in production; a test that needs runs turns it on.
+        agents_enabled: false,
         trial_mode: overrides.trial_mode,
         source_url: std::sync::Arc::from(TEST_SOURCE_URL),
         ws_session_recheck_secs: overrides

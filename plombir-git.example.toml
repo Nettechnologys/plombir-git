@@ -200,6 +200,15 @@ allow_host_runner = false
 # which wins.
 attestation_enabled = false
 
+[agents]
+# Let a person hand an issue to a bot: assigning the issue to a bot whose owner
+# set up an agent profile starts the agent on a runner, under the bot's name,
+# and a person still approves what it opens. Opt-in, because the agent reads
+# text other people wrote and, in this version, has open network access from
+# its container. Profiles can be edited either way; this decides whether they
+# ever run.
+enabled = false
+
 [rate_limit]
 max = 0          # 0 = disabled (global per-IP limit for every request)
 window_secs = 60

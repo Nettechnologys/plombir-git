@@ -19,11 +19,11 @@ use crate::config::{
     resolve_import_transport_policy, resolve_ldap_transport_policy,
     resolve_mirror_transport_policy, resolve_oidc_transport_policy,
     resolve_package_upload_max_bytes, resolve_settings, resolve_trusted_import_origins,
-    resolve_webhook_transport_policy, CliSettings, ResolvedSettings, DEFAULT_AGENT_RATE_LIMIT_MAX,
-    DEFAULT_AGENT_RATE_LIMIT_WINDOW, DEFAULT_ATTESTATION_ENABLED, DEFAULT_AUDIT_ARCHIVE_DIR,
-    DEFAULT_AUDIT_ENABLED, DEFAULT_AUTH_RATE_LIMIT_MAX, DEFAULT_AUTH_RATE_LIMIT_WINDOW,
-    DEFAULT_BACKUP_ENABLED, DEFAULT_CI_ALLOW_HOST_RUNNER, DEFAULT_CI_DOCKER,
-    DEFAULT_CI_EXTERNAL_RUNNERS, DEFAULT_DB_BACKUP_DIR, DEFAULT_HSTS_PRELOAD,
+    resolve_webhook_transport_policy, CliSettings, ResolvedSettings, DEFAULT_AGENTS_ENABLED,
+    DEFAULT_AGENT_RATE_LIMIT_MAX, DEFAULT_AGENT_RATE_LIMIT_WINDOW, DEFAULT_ATTESTATION_ENABLED,
+    DEFAULT_AUDIT_ARCHIVE_DIR, DEFAULT_AUDIT_ENABLED, DEFAULT_AUTH_RATE_LIMIT_MAX,
+    DEFAULT_AUTH_RATE_LIMIT_WINDOW, DEFAULT_BACKUP_ENABLED, DEFAULT_CI_ALLOW_HOST_RUNNER,
+    DEFAULT_CI_DOCKER, DEFAULT_CI_EXTERNAL_RUNNERS, DEFAULT_DB_BACKUP_DIR, DEFAULT_HSTS_PRELOAD,
     DEFAULT_METRICS_ENABLED, DEFAULT_MIRROR_ENABLED, DEFAULT_RATE_LIMIT_MAX_KEYS,
     DEFAULT_RETENTION_ENABLED, DEFAULT_SEARCH_RATE_LIMIT_MAX, DEFAULT_SEARCH_RATE_LIMIT_WINDOW,
 };
@@ -1121,6 +1121,7 @@ struct ServeSettings {
     registration: rg_core::user::registration::RegistrationMode,
     registration_source: RegistrationSource,
     attestation_enabled: bool,
+    agents_enabled: bool,
     source_url: String,
     rate_limits: RateLimits,
     package_upload_max_bytes: usize,
@@ -1269,6 +1270,10 @@ impl ServeSettings {
             registration,
             registration_source,
             attestation_enabled: resolve_attestation_enabled(cfg.as_ref()),
+            agents_enabled: cfg
+                .as_ref()
+                .and_then(|c| c.agents.enabled)
+                .unwrap_or(DEFAULT_AGENTS_ENABLED),
             source_url,
             rate_limits,
             package_upload_max_bytes: resolve_package_upload_max_bytes(cfg.as_ref())?,
@@ -2252,6 +2257,7 @@ fn build_transports(
         shutdown_rx: shutdown_rx.clone(),
         shutdown_grace_secs: settings.timeouts.shutdown_grace,
         attestation_enabled: settings.attestation_enabled,
+        agents_enabled: settings.agents_enabled,
         trial_mode: settings.trial.is_some(),
         source_url: settings.source_url,
         notification_hub: Some(notification_hub),

@@ -175,6 +175,7 @@ pub mod m20261021_000005_pull_request_base_sha;
 pub mod m20261022_000001_imported_original_author;
 pub mod m20261022_000002_pipeline_run_name;
 pub mod m20261022_000003_imported_assignments;
+pub mod m20261026_000001_agent_profiles;
 
 use sea_orm_migration::prelude::*;
 
@@ -440,6 +441,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261022_000001_imported_original_author::Migration),
             Box::new(m20261022_000002_pipeline_run_name::Migration),
             Box::new(m20261022_000003_imported_assignments::Migration),
+            Box::new(m20261026_000001_agent_profiles::Migration),
         ]
     }
 }

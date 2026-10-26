@@ -1244,6 +1244,21 @@ pub(crate) fn build_all_routes(
             "/users/bots/{bot}/tokens/{id}",
             api::bots::delete_bot_token,
         )
+        .get(
+            User,
+            "/users/bots/{bot}/agent",
+            api::agent_profiles::get_agent_profile,
+        )
+        .put(
+            User,
+            "/users/bots/{bot}/agent",
+            api::agent_profiles::put_agent_profile,
+        )
+        .delete(
+            User,
+            "/users/bots/{bot}/agent",
+            api::agent_profiles::delete_agent_profile,
+        )
         // SSH keys
         .get(User, "/users/ssh-keys", api::ssh_keys::list_ssh_keys)
         .post(User, "/users/ssh-keys", api::ssh_keys::create_ssh_key)

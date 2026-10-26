@@ -1,3 +1,4 @@
+pub mod agent_profile_ops;
 pub(crate) mod aggregate;
 pub mod artifact_ops;
 pub mod attachment_ops;

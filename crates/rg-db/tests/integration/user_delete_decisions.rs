@@ -38,6 +38,12 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
         "the account's own credential",
     ),
     (
+        "agent_profiles",
+        "bot_id",
+        "CASCADE",
+        "ADR-0001: the bot's own agent configuration and the model key its owner sealed into it",
+    ),
+    (
         "commit_signing_keys",
         "user_id",
         "CASCADE",

@@ -424,6 +424,16 @@ const VACUOUS_ALLOW: &[(&str, &str)] = &[
          the gate. The owner's cell is real",
     ),
     (
+        "outsider global GET /api/v1/users/bots/{bot}/agent",
+        "the bot and its agent profile are the owner's: the outsider is 404 by the ownership check \
+         behind the gate. The owner's cell is real",
+    ),
+    (
+        "outsider global DELETE /api/v1/users/bots/{bot}/agent",
+        "the bot and its agent profile are the owner's: the outsider is 404 by the ownership check \
+         behind the gate. The owner's cell is real",
+    ),
+    (
         "GET /api/v1/auth/sso/{slug}",
         "no SSO provider is configured on this instance",
     ),
@@ -1089,6 +1099,31 @@ async fn seed_owner_rows(fx: &Fixture, db: &rg_db::DatabaseConnection, owner_id:
         serde_json::json!({"name": "sweep-agent"}),
     )
     .await;
+    // An agent profile for the bot, so `GET` / `DELETE .../agent` find a row
+    // in the owner's cell instead of answering `404` for want of one.
+    let sweep_bot = rg_db::ops::user_ops::find_by_username(db, SWEEP_BOT)
+        .await
+        .unwrap()
+        .expect("fixture: the sweep bot was just created");
+    rg_core::agent::profile::save(
+        db,
+        &rg_core::auth::encryption::derive_key("sweep-encryption-key"),
+        &sweep_bot,
+        rg_core::agent::profile::ProfileUpdate {
+            enabled: false,
+            preset: "claude_code".to_string(),
+            image: None,
+            command: None,
+            runner_tags: None,
+            model_key: rg_core::agent::profile::ModelKey::Keep,
+            timeout_secs: None,
+            max_runs_per_day: None,
+            max_iterations: None,
+            repository_ids: Vec::new(),
+        },
+    )
+    .await
+    .unwrap_or_else(|error| panic!("fixture: seeding the bot's agent profile failed: {error}"));
 
     OwnerRows {
         ssh_key_id,
