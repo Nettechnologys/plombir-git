@@ -29,7 +29,7 @@ running server.
 
 - Rust 1.89+ — the oldest compiler the crates build with, checked in CI.
   The repository's `rust-toolchain.toml` pins the toolchain the gates run
-  (1.99.0), and rustup installs it on the first `cargo` call in this tree.
+  (1.99.1), and rustup installs it on the first `cargo` call in this tree.
 - `git` 2.38 or newer on `PATH`. A few pack / diff operations are still
   delegated to the CLI, and outbound clones (imports, pull mirrors) pin the
   remote's checked address through `http.curloptResolve`, which git before
