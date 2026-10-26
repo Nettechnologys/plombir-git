@@ -460,8 +460,14 @@ impl Drop for TempDb {
     }
 }
 
-/// Every scalar column whose name says it stores a `users.id`, with its actual
-/// `ON DELETE` action or the explicit `NO FOREIGN KEY` state.
+/// Every scalar column that stores a `users.id` — by its name, or by a foreign
+/// key to `users(id)` under any name — with its actual `ON DELETE` action or
+/// the explicit `NO FOREIGN KEY` state.
+///
+/// The foreign-key half used to be missing: the query read the vocabulary
+/// below and nothing else, so a `REFERENCES users(id) ON DELETE CASCADE` under
+/// a name outside it (the first one was a bot's `bot_id`) was invisible to the
+/// census its module docs describe.
 async fn live_user_references(db: &DatabaseConnection) -> Vec<(String, String, String)> {
     let names = USER_REFERENCE_COLUMN_NAMES
         .iter()
@@ -483,7 +489,7 @@ async fn live_user_references(db: &DatabaseConnection) -> Vec<(String, String, S
             WHERE m.type = 'table'
               AND m.name <> 'users'
               AND m.name NOT LIKE 'sqlite_%'
-              AND p.name IN ({names})
+              AND (p.name IN ({names}) OR f."table" IS NOT NULL)
             ORDER BY m.name, p.name
             "#
             ),
