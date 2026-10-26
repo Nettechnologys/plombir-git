@@ -4,7 +4,7 @@
 # Dockerfile frontend, which stage 2a needs for `COPY --parents` — the flag is
 # stable there, but the daemon's builtin parser rejects it outright
 # (`unknown flag: --parents`). Dependabot does not update a parser directive,
-# so the same reference is pinned in .github/ci-images/Dockerfile, which it
+# so the same reference is pinned in ci/images/Dockerfile, which it
 # does read; scripts/ci-image-pins-contract-check.mjs keeps the two equal.
 #
 # === Plombir Git Dockerfile ===

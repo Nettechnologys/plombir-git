@@ -29,7 +29,7 @@ const COPIED = [
   'scripts/gitea-import-live.sh',
   'Dockerfile',
   '.github/dependabot.yml',
-  '.github/ci-images/Dockerfile',
+  'ci/images/Dockerfile',
   '.github/workflows',
   'scripts/lib',
 ];
@@ -106,14 +106,14 @@ const bumpDigest = (source, stage) => source.replace(
 // copy does not. This is the drift the check exists to name.
 fixture(
   'a Dependabot bump of the postgres pin that the workflow did not follow is red',
-  '.github/ci-images/Dockerfile',
+  'ci/images/Dockerfile',
   (source) => bumpDigest(source, 'postgres'),
   'jobs.postgres-smoke.services.postgres.image',
 );
 
 fixture(
   'a Dependabot bump of the frontend pin that the directive did not follow is red',
-  '.github/ci-images/Dockerfile',
+  'ci/images/Dockerfile',
   (source) => bumpDigest(source, 'dockerfile-frontend'),
   'Dockerfile:1 selects',
 );
@@ -121,7 +121,7 @@ fixture(
 // A byte read takes the first `FROM … AS postgres`, commented or not.
 fixture(
   'a commented-out stale pin above the live one changes nothing',
-  '.github/ci-images/Dockerfile',
+  'ci/images/Dockerfile',
   (source) => source.replace(
     /^FROM postgres:/m,
     '# FROM postgres:16@sha256:0000000000000000000000000000000000000000000000000000000000000000 AS postgres\nFROM postgres:',
@@ -131,14 +131,14 @@ fixture(
 
 fixture(
   'a stage pinned twice is red',
-  '.github/ci-images/Dockerfile',
+  'ci/images/Dockerfile',
   (source) => `${source}FROM mysql:8.0@sha256:${'a'.repeat(64)} AS mysql\n`,
   'pinned twice',
 );
 
 fixture(
   'a tag-only pin is red',
-  '.github/ci-images/Dockerfile',
+  'ci/images/Dockerfile',
   (source) => source.replace(/^(FROM mysql:8\.4)@sha256:[0-9a-f]{64}/m, '$1'),
   'must be `<name>:<tag>@sha256:<64 hex>`',
 );
@@ -146,8 +146,20 @@ fixture(
 fixture(
   'dropping the Dependabot entry is red',
   '.github/dependabot.yml',
-  (source) => source.replace('directory: /.github/ci-images', 'directory: /.github/ci-images-gone'),
+  (source) => source.replace('directory: /ci/images', 'directory: /ci/images-gone'),
   'no `docker` entry',
+);
+
+// The pin file lived in `.github/ci-images/` for three weekly runs, each of
+// which found the bumps and then could not open a single pull request.
+fixture(
+  'a docker entry under .github/ is red',
+  '.github/dependabot.yml',
+  (source) => source.replace(
+    '  - package-ecosystem: docker-compose\n',
+    '  - package-ecosystem: docker\n    directory: /.github/ci-images\n    schedule:\n      interval: weekly\n  - package-ecosystem: docker-compose\n',
+  ),
+  'under .github/',
 );
 
 fixture(

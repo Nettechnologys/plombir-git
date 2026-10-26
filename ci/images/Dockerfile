@@ -12,6 +12,13 @@
 # one at this directory and every bump arrives as a reviewable pull request
 # (card_2d33ee054ad2).
 #
+# Not under `.github/`. It lived in `.github/ci-images/` from 2026-10-16, and
+# every weekly run found the bumps (nginx 1.31, caddy 2.11, forgejo 17) and then
+# failed to open the pull request with `400 The request contains invalid or
+# unauthorized changes`: only the github-actions ecosystem gets the `workflows`
+# permission a change under `.github/` needs (dependabot-core#15237), so no
+# docker update for this file ever arrived.
+#
 # Who reads which line:
 #   postgres, mysql  `services:` of the postgres-smoke and mysql-smoke jobs in
 #                    `.github/workflows/regression.yml`. A service image cannot

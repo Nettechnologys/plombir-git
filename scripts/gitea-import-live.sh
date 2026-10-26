@@ -7,7 +7,7 @@
 #   scripts/gitea-import-live.sh down                # remove the container
 #
 # The Regression workflow runs it for both servers and runs the test after each
-# (card_7f2bdd581d17). Their images are pinned in .github/ci-images/Dockerfile,
+# (card_7f2bdd581d17). Their images are pinned in ci/images/Dockerfile,
 # where Dependabot proposes the next release — and that pull request's own run
 # is where a changed answer shows up. Forgejo's image answers to the same
 # `gitea` command and `GITEA__` settings. `GITEA_LIVE_IMAGE` overrides the pin,
@@ -25,7 +25,7 @@ set -euo pipefail
 NAME="${GITEA_LIVE_NAME:-plombir-gitea-live}"
 PORT="${GITEA_LIVE_PORT:-33000}"
 BASE="http://127.0.0.1:${PORT}"
-CI_IMAGES="$(dirname "$0")/../.github/ci-images/Dockerfile"
+CI_IMAGES="$(dirname "$0")/../ci/images/Dockerfile"
 
 # The same reader as scripts/check-reverse-proxy-examples.sh: one
 # `FROM <image> AS <stage>` line per pin.

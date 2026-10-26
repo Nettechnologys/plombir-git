@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // Every third-party image pinned where no Dependabot ecosystem looks is pinned
-// a second time in `.github/ci-images/Dockerfile`, which one does — and this
+// a second time in `ci/images/Dockerfile`, which one does — and this
 // check keeps the two pins the same reference.
 //
 // Why this exists: a digest fixes the bytes, and without an updater it also
@@ -13,7 +13,7 @@
 // Dependabot logs of 2026-10-15 carry no `Checking if` line for any of them
 // (card_2d33ee054ad2).
 //
-// `.github/ci-images/Dockerfile` is never built; it is a list Dependabot can
+// `ci/images/Dockerfile` is never built; it is a list Dependabot can
 // read. A consumer that can read a file reads it (the reverse-proxy script); a
 // consumer that cannot — a workflow service image, a parser directive — repeats
 // the reference, and this is what fails while the copy and the source differ.
@@ -24,7 +24,11 @@
 //   1. the pin file is one `FROM <name>:<tag>@sha256:<digest> AS <stage>` per
 //      line and nothing else, every stage named once — the shell reader in
 //      check-reverse-proxy-examples.sh understands exactly that shape;
-//   2. `.github/dependabot.yml` has a `docker` entry for that directory;
+//   2. `.github/dependabot.yml` has a `docker` entry for that directory, and
+//      no entry of an ecosystem other than github-actions points under
+//      `/.github` — Dependabot finds those updates and then cannot open their
+//      pull requests (the pin file sat there for three weekly runs that each
+//      ended in `400 invalid or unauthorized changes`);
 //   3. every `services.*.image` and `container.image` of every workflow job is
 //      one of the pinned references, so a service added later cannot slip in
 //      unwatched;
@@ -43,8 +47,8 @@ import { parseYamlFile, selectYamlParser } from './lib/yaml-parser.mjs';
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(process.argv[2] ?? join(scriptsDir, '..'));
 
-const PIN_FILE = '.github/ci-images/Dockerfile';
-const PIN_DIRECTORY = '/.github/ci-images';
+const PIN_FILE = 'ci/images/Dockerfile';
+const PIN_DIRECTORY = '/ci/images';
 const PROXY_SCRIPT = 'scripts/check-reverse-proxy-examples.sh';
 const LIVE_IMPORT_SCRIPT = 'scripts/gitea-import-live.sh';
 const ROOT_DOCKERFILE = 'Dockerfile';
@@ -132,6 +136,20 @@ if (!parser) {
     );
     if (!watched) {
       failures.push(`.github/dependabot.yml has no \`docker\` entry for \`${PIN_DIRECTORY}\` — the pins there are watched by nothing`);
+    }
+    // Only the github-actions ecosystem gets the `workflows` permission a change
+    // under `.github/` needs (dependabot-core#15237); any other ecosystem finds
+    // its bumps there and is refused when it opens the pull request.
+    for (const entry of Array.isArray(dependabot.updates) ? dependabot.updates : []) {
+      if (!isObject(entry) || entry['package-ecosystem'] === 'github-actions') continue;
+      for (const directory of [entry.directory, ...(Array.isArray(entry.directories) ? entry.directories : [])]) {
+        if (typeof directory === 'string' && /^\/?\.github(\/|$)/.test(directory)) {
+          failures.push(
+            `.github/dependabot.yml: the \`${entry['package-ecosystem']}\` entry watches \`${directory}\`, under .github/ — `
+              + 'Dependabot cannot open a pull request there for any ecosystem but github-actions; move the files out',
+          );
+        }
+      }
     }
   }
 

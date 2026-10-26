@@ -262,7 +262,7 @@ jobs:
       # caught what the first live run did — Gitea's `base.sha` is the branch
       # tip at request time, so a merged pull request's diff came out empty —
       # and a new release can change a shape the same way (card_7f2bdd581d17).
-      # Both images are pinned in .github/ci-images/Dockerfile, so the next
+      # Both images are pinned in ci/images/Dockerfile, so the next
       # release reaches this step as a Dependabot pull request.
       - name: Run live Gitea and Forgejo import tests
         run: |
@@ -438,7 +438,7 @@ jobs:
       postgres:
         # PostgreSQL 17.11. Pinned by the multi-platform index digest so a rerun
         # of the same commit migrates against the same server build. The pin
-        # lives in .github/ci-images/Dockerfile, where Dependabot sees it; a
+        # lives in ci/images/Dockerfile, where Dependabot sees it; a
         # service image cannot be read from a file, so it is repeated here and
         # scripts/ci-image-pins-contract-check.mjs fails while the two differ.
         image: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3

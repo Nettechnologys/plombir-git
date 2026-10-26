@@ -16,9 +16,11 @@ updates:
   # smoke jobs and the two reverse proxies the deploy examples are loaded by.
   # They are pinned in a Dockerfile that is never built because no Dependabot
   # ecosystem reads a workflow's service image or a shell variable — see the
-  # header of .github/ci-images/Dockerfile.
+  # header of ci/images/Dockerfile. The directory must stay outside `.github/`:
+  # a docker update under it is refused when Dependabot opens the pull request,
+  # since only the github-actions ecosystem may write there.
   - package-ecosystem: docker
-    directory: /.github/ci-images
+    directory: /ci/images
     schedule:
       interval: weekly
     open-pull-requests-limit: 10

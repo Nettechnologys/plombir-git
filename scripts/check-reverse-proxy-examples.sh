@@ -19,7 +19,7 @@
 # unrelated push the day a proxy release changes its grammar. A version tag is
 # not enough either — `1.27-alpine` is rebuilt under the same name — so each
 # carries the digest of its multi-platform index. Both pins live in
-# .github/ci-images/Dockerfile, the file Dependabot watches for them, and are
+# ci/images/Dockerfile, the file Dependabot watches for them, and are
 # read from there: a copy here would be the one no updater ever proposes to bump
 # (card_2d33ee054ad2). scripts/ci-image-pins-contract-check.mjs holds that file
 # to one `FROM <image>@sha256:<digest> AS <name>` per line, which is the only
@@ -28,7 +28,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-CI_IMAGES=.github/ci-images/Dockerfile
+CI_IMAGES=ci/images/Dockerfile
 
 ci_image() {
   local image
