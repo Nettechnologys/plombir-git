@@ -238,9 +238,17 @@ pub(crate) fn restore_sqlite_db(db_url: &str, input: &PathBuf, force: bool) -> a
 fn remove_sqlite_sidecar_files(db_path: &Path) -> anyhow::Result<()> {
     for suffix in ["", "-wal", "-shm"] {
         let path = PathBuf::from(format!("{}{}", db_path.display(), suffix));
-        if path.exists() {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("failed to remove {}", path.display()))?;
+        // Removed outright, and a file that is already gone is the goal, not a
+        // failure: SQLite deletes `-wal` and `-shm` itself when the last
+        // connection closes, so an `exists()` check followed by the removal
+        // raced that cleanup and failed the restore with "No such file or
+        // directory" on a file nobody needed any more.
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to remove {}", path.display()));
+            }
         }
     }
     Ok(())
