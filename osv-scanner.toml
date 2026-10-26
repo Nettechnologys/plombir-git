@@ -15,3 +15,12 @@ rsa "Marvin Attack" timing side-channel, no patched release. Reaches us through 
 sqlx-mysql RSA auth (server-to-DB) and russh SSH host/user RSA keys. Both use RSA \
 for signatures/auth; neither exposes an attacker-controlled RSA decryption oracle, \
 the vector Marvin exploits."""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0387"
+reason = """\
+crypto-bigint timing variability, patched only on the 0.7 line (we take 0.7.9); \
+no patched 0.5.x. 0.5.5 comes from jsonwebtoken's rust_crypto p256 / p384 \
+(elliptic-curve 0.13) and the test-only P-256 authenticator. Production JWTs are \
+HS256 and EdDSA only and no EC key is ever built, so the affected arithmetic never \
+touches a secret of ours. Revisit when jsonwebtoken moves to elliptic-curve 0.14."""

@@ -14,4 +14,13 @@ ignore = [
     # curve25519/ECDH, not RSA key transport) — the exact vector Marvin exploits.
     # Revisit when the `rsa` crate ships a constant-time fix or both drop it.
     "RUSTSEC-2023-0071",
+    # crypto-bigint timing variability — fixed only on the 0.7 line (>= 0.7.6,
+    # we take 0.7.9); NO patched 0.5.x exists. 0.5.5 reaches us only through
+    # jsonwebtoken's `rust_crypto` backend (p256 / p384 for ES256 / ES384,
+    # elliptic-curve 0.13 — jsonwebtoken 11.1 still pins it) and the test-only
+    # P-256 software authenticator in rg-http. Production code signs and verifies
+    # with HS256 secrets and EdDSA keys only; no EC key is ever built, so the
+    # affected arithmetic never runs on a secret of ours. Revisit when
+    # jsonwebtoken moves to elliptic-curve 0.14 or we drop its EC algorithms.
+    "RUSTSEC-2026-0387",
 ]
