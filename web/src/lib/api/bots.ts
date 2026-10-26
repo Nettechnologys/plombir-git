@@ -20,6 +20,49 @@ export interface BotToken extends TokenNarrowingFields {
   created_at: string;
 }
 
+/** What a bot runs when a person assigns it an issue (ADR-0001). */
+export type AgentPreset = 'claude_code' | 'codex' | 'custom';
+
+/**
+ * A bot's agent profile as its owner sees it. The model key never comes back;
+ * `has_model_key` is all the page learns.
+ */
+export interface AgentProfile {
+  enabled: boolean;
+  preset: AgentPreset;
+  image: string | null;
+  command: string | null;
+  runner_tags: string[];
+  has_model_key: boolean;
+  timeout_secs: number;
+  max_runs_per_day: number;
+  max_iterations: number;
+  /** `owner/name`, as each repository is called now. */
+  repositories: string[];
+  /** Whether this instance starts agent runs at all (`[agents].enabled`). */
+  agents_enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * A complete profile to save. Every field is the new value except the key:
+ * leave `model_key` out to keep the stored one, or set `clear_model_key`.
+ */
+export interface AgentProfileInput {
+  enabled: boolean;
+  preset: AgentPreset;
+  image?: string;
+  command?: string;
+  runner_tags?: string[];
+  model_key?: string;
+  clear_model_key?: boolean;
+  timeout_secs?: number;
+  max_runs_per_day?: number;
+  max_iterations?: number;
+  repositories: string[];
+}
+
 export const bots = {
   list: () => request<Bot[]>('/users/bots'),
   create: (username: string, display_name?: string) =>
@@ -36,4 +79,13 @@ export const bots = {
     }),
   deleteToken: (bot: string, id: number) =>
     request<void>(`/users/bots/${encodeURIComponent(bot)}/tokens/${id}`, { method: 'DELETE' }),
+  getAgentProfile: (bot: string) =>
+    request<AgentProfile>(`/users/bots/${encodeURIComponent(bot)}/agent`),
+  saveAgentProfile: (bot: string, profile: AgentProfileInput) =>
+    request<AgentProfile>(`/users/bots/${encodeURIComponent(bot)}/agent`, {
+      method: 'PUT',
+      body: JSON.stringify(profile),
+    }),
+  deleteAgentProfile: (bot: string) =>
+    request<void>(`/users/bots/${encodeURIComponent(bot)}/agent`, { method: 'DELETE' }),
 };

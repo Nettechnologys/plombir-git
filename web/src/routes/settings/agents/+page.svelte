@@ -6,6 +6,7 @@
   import { isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
   import { createT, formatDate as formatLocaleDate } from '$lib/i18n';
   import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import AgentProfilePanel from '$lib/components/AgentProfilePanel.svelte';
   import { createConfirmer } from '$lib/confirm.svelte';
 
   const t = createT();
@@ -307,6 +308,7 @@
 
             {#if selected === bot.username}
               <div class="token-panel">
+                <AgentProfilePanel username={bot.username} />
                 {#if newToken}
                   <section class="token-created" aria-label={t('agents.new_token_label')}>
                     <div>

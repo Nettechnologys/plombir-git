@@ -664,6 +664,37 @@
     },
     {
       "method": "GET",
+      "url": "/api/v1/users/bots/{bot}/agent",
+      "access": "User",
+      "handler": "api::agent_profiles::get_agent_profile",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "PUT",
+      "url": "/api/v1/users/bots/{bot}/agent",
+      "access": "User",
+      "handler": "api::agent_profiles::put_agent_profile",
+      "testedIn": [
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "DELETE",
+      "url": "/api/v1/users/bots/{bot}/agent",
+      "access": "User",
+      "handler": "api::agent_profiles::delete_agent_profile",
+      "testedIn": [
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
       "url": "/api/v1/users/ssh-keys",
       "access": "User",
       "handler": "api::ssh_keys::list_ssh_keys",
@@ -28118,7 +28149,7 @@
         {
           "tag": "form",
           "label": "i18n:agents.username",
-          "line": 260,
+          "line": 261,
           "via": null,
           "href": null,
           "handler": "createBot",
@@ -28157,7 +28188,7 @@
         {
           "tag": "button",
           "label": "i18n:agents.creating",
-          "line": 269,
+          "line": 270,
           "via": null,
           "href": null,
           "handler": null,
@@ -28167,7 +28198,7 @@
         {
           "tag": "a",
           "label": "@",
-          "line": 288,
+          "line": 289,
           "via": null,
           "href": "`/${bot.username}`",
           "handler": null,
@@ -28177,7 +28208,7 @@
         {
           "tag": "button",
           "label": "i18n:common.close",
-          "line": 294,
+          "line": 295,
           "via": null,
           "href": null,
           "handler": "() => openTokens(bot)",
@@ -28202,7 +28233,7 @@
         {
           "tag": "button",
           "label": "i18n:agents.deleting",
-          "line": 297,
+          "line": 298,
           "via": null,
           "href": null,
           "handler": "() => deleteBot(bot)",
@@ -28241,7 +28272,7 @@
         {
           "tag": "button",
           "label": "i18n:common.copy",
-          "line": 317,
+          "line": 319,
           "via": null,
           "href": null,
           "handler": "copyNewToken",
@@ -28251,7 +28282,7 @@
         {
           "tag": "form",
           "label": "i18n:agents.token_name",
-          "line": 321,
+          "line": 323,
           "via": null,
           "href": null,
           "handler": "mintToken",
@@ -28290,7 +28321,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 332,
+          "line": 334,
           "via": null,
           "href": null,
           "handler": null,
@@ -28300,7 +28331,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 339,
+          "line": 341,
           "via": null,
           "href": null,
           "handler": null,
@@ -28310,7 +28341,7 @@
         {
           "tag": "button",
           "label": "i18n:agents.creating",
-          "line": 342,
+          "line": 344,
           "via": null,
           "href": null,
           "handler": null,
@@ -28320,7 +28351,7 @@
         {
           "tag": "button",
           "label": "i18n:agents.revoking",
-          "line": 375,
+          "line": 377,
           "via": null,
           "href": null,
           "handler": "() => revokeToken(token)",
@@ -28356,6 +28387,114 @@
           "unresolved": false
         },
         {
+          "tag": "form",
+          "label": "i18n:agents.profile.enabled",
+          "line": 178,
+          "via": "AgentProfilePanel",
+          "href": null,
+          "handler": "save",
+          "calls": [
+            {
+              "symbol": "bots.saveAgentProfile",
+              "method": "PUT",
+              "url": "/api/v1/users/bots/{bot}/agent",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/bots/{bot}/agent",
+              "access": "User",
+              "handler": "api::agent_profiles::put_agent_profile",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "input",
+          "label": "",
+          "line": 180,
+          "via": "AgentProfilePanel",
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "select",
+          "label": "",
+          "line": 185,
+          "via": "AgentProfilePanel",
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "textarea",
+          "label": "",
+          "line": 198,
+          "via": "AgentProfilePanel",
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "input",
+          "label": "",
+          "line": 213,
+          "via": "AgentProfilePanel",
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "textarea",
+          "label": "",
+          "line": 219,
+          "via": "AgentProfilePanel",
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:agents.profile.saving",
+          "line": 239,
+          "via": "AgentProfilePanel",
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:agents.deleting",
+          "line": 243,
+          "via": "AgentProfilePanel",
+          "href": null,
+          "handler": "remove",
+          "calls": [
+            {
+              "symbol": "bots.deleteAgentProfile",
+              "method": "DELETE",
+              "url": "/api/v1/users/bots/{bot}/agent",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/bots/{bot}/agent",
+              "access": "User",
+              "handler": "api::agent_profiles::delete_agent_profile",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
           "tag": "button",
           "label": "",
           "line": 32,
@@ -28376,7 +28515,37 @@
           "unresolved": true
         }
       ],
-      "passive": []
+      "passive": [
+        {
+          "symbol": "bots.getAgentProfile",
+          "method": "GET",
+          "url": "/api/v1/users/bots/{bot}/agent",
+          "opaque": false,
+          "routeUrl": "/api/v1/users/bots/{bot}/agent",
+          "access": "User",
+          "handler": "api::agent_profiles::get_agent_profile",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "instance.get",
+          "method": "GET",
+          "url": "/api/v1/instance",
+          "opaque": false,
+          "routeUrl": "/api/v1/instance",
+          "access": "Public",
+          "handler": "api::instance::get_instance",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web",
+            "smoke"
+          ]
+        }
+      ]
     },
     {
       "route": "/settings/notifications",
@@ -29723,7 +29892,7 @@
       "outsider"
     ],
     "scenarios": 52,
-    "inventoryEntries": 832,
+    "inventoryEntries": 836,
     "coveredEntries": 197,
     "coveredRoutes": 187,
     "maxUiRoutesWithoutFrontendTest": 24

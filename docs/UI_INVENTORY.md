@@ -19,13 +19,13 @@
 
 | | |
 |---|---|
-| Router routes (with declared `Access`) | 452 |
-| Reachable from the browser | 313 (69%) |
+| Router routes (with declared `Access`) | 455 |
+| Reachable from the browser | 316 (69%) |
 | Layout modules | 2 |
 | Pages | 75 |
-| Interactive controls | 1071 |
-| Controls calling an API | 376 |
-| Controls from shared components | 436 |
+| Interactive controls | 1079 |
+| Controls calling an API | 378 |
+| Controls from shared components | 444 |
 | Browser sweep: scenarios / inventory entries / routes | 52 / 197 / 187 |
 | **UI routes without a web/smoke/browser test** | **24** |
 | UI routes without corpus or browser coverage | 0 |
@@ -36,7 +36,7 @@
 |---|---:|---:|---:|---:|
 | `RepoRead` | 111 | 72 | 4 | 0 |
 | `RepoWrite` | 81 | 62 | 12 | 2 |
-| `User` | 57 | 47 | 5 | 0 |
+| `User` | 60 | 50 | 5 | 0 |
 | `RepoAdmin` | 54 | 49 | 0 | 4 |
 | `InstanceAdmin` | 33 | 28 | 0 | 1 |
 | `Public` | 25 | 10 | 2 | 0 |
@@ -73,6 +73,7 @@
 | `/[owner]/[repo]/branches` | 22 | 6 | 12 |
 | `/[owner]/[repo]/milestones` | 22 | 8 | 13 |
 | `/[owner]/[repo]/releases/new` | 21 | 5 | 11 |
+| `/settings/agents` | 21 | 7 | 10 |
 | `/[owner]/[repo]/settings` | 20 | 5 | 4 |
 | `/[owner]/[repo]/time_tracking` | 20 | 10 | 13 |
 | `/[owner]/[repo]/network` | 19 | 6 | 11 |
@@ -93,7 +94,6 @@
 | `/[owner]/[repo]/compare/[...spec]` | 13 | 4 | 11 |
 | `/[owner]/[repo]/packages/[format]` | 13 | 4 | 11 |
 | `/[owner]/[repo]/settings/webhooks` | 13 | 6 | 2 |
-| `/settings/agents` | 13 | 5 | 2 |
 | `/admin/hooks` 🔒 | 12 | 6 | 12 |
 | `/login` | 12 | 1 | 0 |
 | `/orgs/[name]/hooks` | 12 | 6 | 12 |
@@ -1228,15 +1228,19 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:agents.username | :260 | `POST /api/v1/users/bots` | `User` | rust+web |
-| i18n:agents.username | :260 | `GET /api/v1/users/bots` | `User` | rust+web |
-| i18n:common.close | :294 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
-| i18n:agents.deleting | :297 | `DELETE /api/v1/users/bots/{bot}` | `User` | rust+web |
-| i18n:agents.deleting | :297 | `GET /api/v1/users/bots` | `User` | rust+web |
-| i18n:agents.token_name | :321 | `POST /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
-| i18n:agents.token_name | :321 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
-| i18n:agents.revoking | :375 | `DELETE /api/v1/users/bots/{bot}/tokens/{id}` | `User` | web |
-| i18n:agents.revoking | :375 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
+| i18n:agents.username | :261 | `POST /api/v1/users/bots` | `User` | rust+web |
+| i18n:agents.username | :261 | `GET /api/v1/users/bots` | `User` | rust+web |
+| i18n:common.close | :295 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
+| i18n:agents.deleting | :298 | `DELETE /api/v1/users/bots/{bot}` | `User` | rust+web |
+| i18n:agents.deleting | :298 | `GET /api/v1/users/bots` | `User` | rust+web |
+| i18n:agents.token_name | :323 | `POST /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
+| i18n:agents.token_name | :323 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
+| i18n:agents.revoking | :377 | `DELETE /api/v1/users/bots/{bot}/tokens/{id}` | `User` | web |
+| i18n:agents.revoking | :377 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
+| i18n:agents.profile.enabled | `AgentProfilePanel` | `PUT /api/v1/users/bots/{bot}/agent` | `User` | web |
+| i18n:agents.deleting | `AgentProfilePanel` | `DELETE /api/v1/users/bots/{bot}/agent` | `User` | web |
+| _(page load)_ | — | `GET /api/v1/users/bots/{bot}/agent` | `User` | rust+web |
+| _(page load)_ | — | `GET /api/v1/instance` | `Public` | rust+web+smoke |
 
 ### `/settings/notifications`
 

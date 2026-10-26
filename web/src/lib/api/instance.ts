@@ -19,6 +19,12 @@ export interface InstanceInfo {
    */
   attestation_enabled: boolean;
   /**
+   * Whether assigning an issue to a bot with an agent profile may start an
+   * agent run here (`[agents].enabled`, ADR-0001). The agents page says so
+   * next to the profile form.
+   */
+  agents_enabled: boolean;
+  /**
    * Where to read the source of the build answering this request:
    * `<[server].source_url>/tree/<commit>`, or the repository itself when the
    * build did not record its commit. The AGPL §13 offer — it follows the

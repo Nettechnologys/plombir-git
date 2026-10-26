@@ -10,7 +10,7 @@ vi.mock('$lib/stores/auth.svelte', () => ({
 import AgentsPage from '../../routes/settings/agents/+page.svelte';
 import BotBadge from '../components/BotBadge.svelte';
 import { setTestPage } from '../test/app';
-import { bots, resetTestClient, splitList } from '../test/client';
+import { ApiError, bots, instance, resetTestClient, splitList } from '../test/client';
 import {
 	expectEscapeClosesAndRestoresFocus,
 	expectModalSurvivesInteraction,
@@ -57,6 +57,25 @@ beforeEach(() => {
 	setTestPage('/settings/agents', {});
 	bots.list.mockResolvedValue([bot(2, 'alice-agent')]);
 	bots.listTokens.mockResolvedValue([botToken(5, 'claude-code')]);
+	bots.getAgentProfile.mockRejectedValue(new ApiError('this bot has no agent profile', 404));
+	instance.get.mockResolvedValue({ agents_enabled: true });
+});
+
+const storedProfile = (overrides: Record<string, unknown> = {}) => ({
+	enabled: true,
+	preset: 'claude_code',
+	image: null,
+	command: null,
+	runner_tags: ['docker'],
+	has_model_key: true,
+	timeout_secs: 1800,
+	max_runs_per_day: 20,
+	max_iterations: 5,
+	repositories: ['alice/app'],
+	agents_enabled: true,
+	created_at: timestamp,
+	updated_at: timestamp,
+	...overrides,
 });
 
 afterEach(async () => {
@@ -163,6 +182,88 @@ describe('agents settings', () => {
 		await expectModalSurvivesInteraction(rendered.container, element(dialog, 'h2'));
 		await expectEscapeClosesAndRestoresFocus(rendered.container, opener);
 		expect(bots.delete).not.toHaveBeenCalled();
+	});
+});
+
+describe('agent profile', () => {
+	const profileForm = () => element<HTMLFormElement>(rendered!.container, 'form.profile-form');
+	const field = (label: string) => {
+		const found = Array.from(profileForm().querySelectorAll('label')).find((node) =>
+			node.textContent?.includes(label),
+		);
+		if (!found) throw new Error(`no field labelled ${label}`);
+		return found.querySelector<HTMLInputElement | HTMLTextAreaElement>('input, textarea')!;
+	};
+
+	it('sets up a profile for an agent that has none, key and repositories included', async () => {
+		bots.saveAgentProfile.mockResolvedValue(storedProfile());
+		await openTokens();
+		expect(bots.getAgentProfile).toHaveBeenCalledWith('alice-agent');
+		expect(field('Model API key').getAttribute('placeholder')).toBe('No key stored');
+		expect(rendered!.container.querySelector('.delete-profile')).toBeNull();
+
+		await check(field('Start a run') as HTMLInputElement, true);
+		await input(field('Model API key'), '  sk-ant-test  ');
+		await input(field('Repositories it may work in'), 'alice/app\nalice/docs');
+		await input(field('Runner labels'), 'docker, gpu');
+		await submit(profileForm());
+
+		expect(bots.saveAgentProfile).toHaveBeenCalledWith('alice-agent', {
+			enabled: true,
+			preset: 'claude_code',
+			image: undefined,
+			command: undefined,
+			runner_tags: ['docker', 'gpu'],
+			model_key: 'sk-ant-test',
+			clear_model_key: undefined,
+			timeout_secs: 1800,
+			max_runs_per_day: 20,
+			max_iterations: 5,
+			repositories: ['alice/app', 'alice/docs'],
+		});
+		expect(rendered!.container.textContent).toContain('Agent profile saved');
+		expect(field('Model API key').getAttribute('placeholder')).toContain('A key is stored');
+	});
+
+	it('keeps the stored key when the field is left empty and removes it only when asked', async () => {
+		bots.getAgentProfile.mockResolvedValue(storedProfile());
+		bots.saveAgentProfile.mockResolvedValue(storedProfile({ has_model_key: false }));
+		await openTokens();
+
+		await submit(profileForm());
+		expect(bots.saveAgentProfile.mock.calls[0][1]).toMatchObject({
+			model_key: undefined,
+			clear_model_key: undefined,
+			repositories: ['alice/app'],
+		});
+
+		bots.saveAgentProfile.mockResolvedValue(storedProfile({ has_model_key: false }));
+		bots.getAgentProfile.mockResolvedValue(storedProfile());
+		await rendered!.destroy();
+		await openTokens();
+		await check(field('Remove the stored key') as HTMLInputElement, true);
+		await submit(profileForm());
+		expect(bots.saveAgentProfile.mock.calls[1][1]).toMatchObject({
+			model_key: undefined,
+			clear_model_key: true,
+		});
+	});
+
+	it('says when this instance does not run agents', async () => {
+		instance.get.mockResolvedValue({ agents_enabled: false });
+		await openTokens();
+		expect(element(rendered!.container, '.agents-off').textContent).toContain('[agents] enabled = false');
+	});
+
+	it('deletes the profile after confirmation', async () => {
+		bots.getAgentProfile.mockResolvedValue(storedProfile());
+		bots.deleteAgentProfile.mockResolvedValue(undefined);
+		await openTokens();
+		await click(element(rendered!.container, '.delete-profile'));
+		expect(bots.deleteAgentProfile).not.toHaveBeenCalled();
+		expect(await answerConfirm()).toContain('@alice-agent');
+		expect(bots.deleteAgentProfile).toHaveBeenCalledWith('alice-agent');
+		expect(rendered!.container.textContent).toContain('Agent profile deleted');
 	});
 });
 
