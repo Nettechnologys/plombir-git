@@ -225,7 +225,7 @@ zip = { version = "9", default-features = false, features = [
     "xz",
     "zstd",
 ] }
-zstd = "0.13"
+zstd = "0.14.3"
 
 # HTTP plumbing below axum, and stream helpers
 http = "1"
