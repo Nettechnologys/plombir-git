@@ -9,10 +9,12 @@
   // right only on the developer's machine (card_e34af7255aa6). The SSH one
   // is absent when the instance names no SSH host and the page has none.
   const httpExample = buildHttpCloneUrl('OWNER', 'REPO');
-  const sshExample = buildSshCloneUrl(
-    'OWNER',
-    'REPO',
-    typeof window === 'undefined' ? undefined : window.location.hostname,
+  let sshExample = $derived(
+    buildSshCloneUrl(
+      'OWNER',
+      'REPO',
+      typeof window === 'undefined' ? undefined : window.location.hostname,
+    ),
   );
 </script>
 

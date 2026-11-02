@@ -178,6 +178,8 @@ pub struct AppState {
     /// is `None`; a handler that formats its own fallback is how three features
     /// came to name three different addresses (card_f78054e9e98f).
     pub external_url: Option<String>,
+    /// External SSH clone port; distinct from the SSH listener behind a proxy.
+    pub ssh_clone_port: Option<std::num::NonZeroU16>,
     /// Whether this process terminates TLS on its own listener (`[tls]`).
     /// Without `external_url` it decides the scheme of every URL the server
     /// hands back, so it has to be the listener's truth, not a guess from the
@@ -609,6 +611,8 @@ pub struct HttpServerConfig {
     /// scheme also decides whether the session cookie is `Secure` and whether
     /// HSTS is sent.
     pub external_url: Option<String>,
+    /// External SSH clone port advertised to browsers.
+    pub ssh_clone_port: Option<std::num::NonZeroU16>,
     /// Whether HSTS advertises `preload` (`[server].hsts_preload`, default
     /// false): a promise that the domain and every subdomain are https-only,
     /// which only the domain's owner can make.
@@ -854,6 +858,7 @@ async fn run_with_listener(
         log_write_queue,
         delivery_tracker: rg_core::task_tracker::delivery_tracker().clone(),
         external_url: config.external_url,
+        ssh_clone_port: config.ssh_clone_port,
         tls_enabled: config.tls_config.is_some(),
         hsts_preload: config.hsts_preload,
         job_timeout_secs: config.job_timeout_secs,

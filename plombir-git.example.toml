@@ -22,6 +22,8 @@ repo_root = "./repos"
 state_permissions = "owner-only"
 http_addr = "0.0.0.0:8080"
 ssh_addr = "0.0.0.0:2222"
+# Public SSH port in clone URLs when a proxy publishes a different port.
+# ssh_clone_port = 2222
 # host_key = "/path/to/ssh_host_key"
 # Maximum decoded package artifact size. npm's base64/JSON and multipart
 # envelopes get bounded protocol headroom, so this remains the real artifact

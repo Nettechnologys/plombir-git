@@ -80,6 +80,8 @@ pub(crate) struct ServerConfig {
     pub(crate) state_permissions: Option<rg_process::StateCreationPermissions>,
     pub(crate) http_addr: Option<String>,
     pub(crate) ssh_addr: Option<String>,
+    /// Port clients use for SSH clones when a proxy maps it to `ssh_addr`.
+    pub(crate) ssh_clone_port: Option<std::num::NonZeroU16>,
     pub(crate) host_key: Option<String>,
     /// Maximum decoded package artifact size in MiB. Protocol envelopes such
     /// as npm's base64 JSON receive bounded headroom above this value, but the
@@ -1173,6 +1175,19 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{CliSettings, ConfigFile};
+
+    #[test]
+    fn ssh_clone_port_accepts_a_nonzero_external_port() {
+        let configured: ConfigFile = toml::from_str("[server]\nssh_clone_port = 2233\n").unwrap();
+        assert_eq!(
+            configured
+                .server
+                .ssh_clone_port
+                .map(std::num::NonZeroU16::get),
+            Some(2233)
+        );
+        assert!(toml::from_str::<ConfigFile>("[server]\nssh_clone_port = 0\n").is_err());
+    }
 
     #[allow(dead_code)]
     mod rust_source {

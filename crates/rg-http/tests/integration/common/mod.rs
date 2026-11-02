@@ -354,6 +354,8 @@ pub struct StateOverrides {
     /// `[server].external_url` for this state. The default leaves it unset,
     /// so client-facing URLs come from the request `Host`.
     pub external_url: Option<String>,
+    /// External SSH clone port advertised by the test instance.
+    pub ssh_clone_port: Option<std::num::NonZeroU16>,
     /// Reports this state as terminating TLS itself, as `[tls]` does in
     /// production. The harness still serves plain HTTP; what changes is the
     /// scheme the server writes into the URLs it hands back.
@@ -483,6 +485,7 @@ pub fn build_test_app_state_with(
         log_write_queue: rg_core::ci::log_write_queue::LogWriteQueue::spawn(db_for_queue),
         delivery_tracker: overrides.delivery_tracker.unwrap_or_default(),
         external_url: overrides.external_url,
+        ssh_clone_port: overrides.ssh_clone_port,
         tls_enabled: overrides.tls_enabled,
         hsts_preload: overrides.hsts_preload,
         job_timeout_secs: rg_core::ci::DEFAULT_JOB_TIMEOUT_SECS,

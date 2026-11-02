@@ -135,6 +135,14 @@ HTTP is published on `127.0.0.1:8080` only — put a TLS-terminating reverse
 proxy in front of it ([Reverse proxy](#reverse-proxy) below has working nginx
 and Caddy configurations). Git-over-SSH listens on `0.0.0.0:2222`.
 
+If a host port or TCP proxy exposes SSH on a different port, set
+`[server].ssh_clone_port` in `plombir-git.toml` to that external port. The
+instance endpoint passes it to the web UI, so copied SSH clone URLs match the
+address clients can reach. This does not change `[server].ssh_addr`, which is
+the listener inside the container. For example, a proxy forwarding public
+port 2233 to container port 2222 needs `ssh_clone_port = 2233`. Leaving the
+key unset preserves the existing UI fallback to port 2222.
+
 `plombir-git.toml` and `data/` are git-ignored, so a rebuilt container keeps
 reading the settings and data you edited on the host.
 

@@ -1,6 +1,7 @@
 // Plombir Git API Client — shared internals
 
 import { ApiError } from './error';
+import { getSshClonePort } from '$lib/stores/instance.svelte';
 
 export { ApiError } from './error';
 
@@ -67,7 +68,7 @@ export function buildSshCloneUrl(owner: string, repo: string, fallbackHost?: str
   const host = (configuredSshHost || fallbackHost || '').trim();
   if (!host) return '';
 
-  const port = (configuredSshPort || '2222').trim();
+  const port = String(getSshClonePort() || configuredSshPort || '2222').trim();
   const portPart = port ? `:${port}` : '';
   return `ssh://git@${normalizeSshHost(host)}${portPart}/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
 }
