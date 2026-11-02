@@ -2541,7 +2541,7 @@ mod tests {
     /// rows that happen to be right today — a new `key = 42` line is either
     /// paired with the code that produces the 42, or declared here with a
     /// reason.
-    const TEMPLATE_VALUES_NOT_DEFAULTS: [(&str, &str, &str, &str); 31] = [
+    const TEMPLATE_VALUES_NOT_DEFAULTS: [(&str, &str, &str, &str); 33] = [
         (
             "plombir-git.example.toml",
             "observability",
@@ -2561,6 +2561,12 @@ mod tests {
             "server",
             "external_url",
             "no default: left unset, links point at the address the server bound to",
+        ),
+        (
+            "plombir-git.example.toml",
+            "server",
+            "ssh_clone_port",
+            "an example external port; unset leaves the UI's existing fallback in place",
         ),
         (
             "plombir-git.example.toml",
@@ -2679,6 +2685,12 @@ mod tests {
             "server",
             "external_url",
             "no default: left unset, links point at the address the server bound to",
+        ),
+        (
+            "deploy/plombir-git.docker.toml",
+            "server",
+            "ssh_clone_port",
+            "an example external port; the operator must match the host's SSH mapping",
         ),
         (
             "deploy/plombir-git.docker.toml",
