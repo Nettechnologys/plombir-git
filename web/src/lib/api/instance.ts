@@ -33,6 +33,8 @@ export interface InstanceInfo {
   source_url: string;
   /** The commit this binary was built from, or `null` when the build was not told. */
   source_commit: string | null;
+  /** Public SSH port for clone URLs, omitted by older servers. */
+  ssh_clone_port?: number;
   /**
    * Whether the instance is still waiting for its first account. That one
    * registration needs the one-time setup token from the server's startup

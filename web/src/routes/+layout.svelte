@@ -17,6 +17,7 @@ import {
   setRegistrationOpen,
   setSetupRequired,
   setSourceLink,
+  setSshClonePort,
   setTrialMode,
 } from '$lib/stores/instance.svelte';
 import { instance } from '$lib/api/client.svelte';
@@ -71,6 +72,7 @@ import { withBackendBase } from '$lib/api/_base';
       // The source offer (AGPL §13) rides on the same answer: one request, and
       // the link exists only once the server has said where its source is.
       setSourceLink({ url: info.source_url, commit: info.source_commit });
+      setSshClonePort(info.ssh_clone_port ?? null);
       setRegistrationOpen(info.registration_open ?? null);
       setSetupRequired(info.setup_required === true);
       setTrialMode(info.trial_mode === true);

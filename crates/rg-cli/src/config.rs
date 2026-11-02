@@ -80,6 +80,8 @@ pub(crate) struct ServerConfig {
     pub(crate) state_permissions: Option<rg_process::StateCreationPermissions>,
     pub(crate) http_addr: Option<String>,
     pub(crate) ssh_addr: Option<String>,
+    /// Port clients use for SSH clones when a proxy maps it to `ssh_addr`.
+    pub(crate) ssh_clone_port: Option<std::num::NonZeroU16>,
     pub(crate) host_key: Option<String>,
     /// Maximum decoded package artifact size in MiB. Protocol envelopes such
     /// as npm's base64 JSON receive bounded headroom above this value, but the
@@ -1173,6 +1175,19 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{CliSettings, ConfigFile};
+
+    #[test]
+    fn ssh_clone_port_accepts_a_nonzero_external_port() {
+        let configured: ConfigFile = toml::from_str("[server]\nssh_clone_port = 2233\n").unwrap();
+        assert_eq!(
+            configured
+                .server
+                .ssh_clone_port
+                .map(std::num::NonZeroU16::get),
+            Some(2233)
+        );
+        assert!(toml::from_str::<ConfigFile>("[server]\nssh_clone_port = 0\n").is_err());
+    }
 
     #[allow(dead_code)]
     mod rust_source {
@@ -2526,7 +2541,7 @@ mod tests {
     /// rows that happen to be right today — a new `key = 42` line is either
     /// paired with the code that produces the 42, or declared here with a
     /// reason.
-    const TEMPLATE_VALUES_NOT_DEFAULTS: [(&str, &str, &str, &str); 31] = [
+    const TEMPLATE_VALUES_NOT_DEFAULTS: [(&str, &str, &str, &str); 33] = [
         (
             "plombir-git.example.toml",
             "observability",
@@ -2546,6 +2561,12 @@ mod tests {
             "server",
             "external_url",
             "no default: left unset, links point at the address the server bound to",
+        ),
+        (
+            "plombir-git.example.toml",
+            "server",
+            "ssh_clone_port",
+            "an example external port; unset leaves the UI's existing fallback in place",
         ),
         (
             "plombir-git.example.toml",
@@ -2664,6 +2685,12 @@ mod tests {
             "server",
             "external_url",
             "no default: left unset, links point at the address the server bound to",
+        ),
+        (
+            "deploy/plombir-git.docker.toml",
+            "server",
+            "ssh_clone_port",
+            "an example external port; the operator must match the host's SSH mapping",
         ),
         (
             "deploy/plombir-git.docker.toml",

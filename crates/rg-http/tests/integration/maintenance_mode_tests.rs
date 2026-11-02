@@ -10,8 +10,8 @@
 use std::path::Path;
 
 use crate::common::{
-    build_test_app_state, register_full, setup_test_db, spawn_test_app_with_db, wait_for_listener,
-    TEST_SOURCE_URL,
+    build_test_app_state, register_full, setup_test_db, spawn_test_app_with_db,
+    spawn_test_app_with_overrides, wait_for_listener, StateOverrides, TEST_SOURCE_URL,
 };
 use crate::security_headers_tests::assert_security_headers;
 use base64::Engine as _;
@@ -569,4 +569,32 @@ async fn the_instance_offers_the_source_of_the_running_build_to_anyone() {
             "a build that recorded no commit must say null rather than guess: {info}"
         ),
     }
+}
+
+#[tokio::test]
+async fn the_instance_advertises_its_configured_ssh_clone_port() {
+    let (base, _db) = spawn_test_app_with_overrides(StateOverrides {
+        ssh_clone_port: Some(std::num::NonZeroU16::new(2233).unwrap()),
+        ..Default::default()
+    })
+    .await;
+    let info: serde_json::Value = reqwest::get(format!("{base}/api/v1/instance"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info["ssh_clone_port"], 2233, "{info}");
+
+    let (default_base, _db) = spawn_test_app_with_db().await;
+    let default_info: serde_json::Value = reqwest::get(format!("{default_base}/api/v1/instance"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        default_info.get("ssh_clone_port").is_none(),
+        "{default_info}"
+    );
 }

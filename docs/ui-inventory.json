@@ -26070,7 +26070,7 @@
         {
           "tag": "a",
           "label": "i18n:help.tokens_link",
-          "line": 42,
+          "line": 44,
           "via": null,
           "href": "/settings/tokens",
           "handler": null,
@@ -26080,7 +26080,7 @@
         {
           "tag": "a",
           "label": "i18n:help.agent_link",
-          "line": 48,
+          "line": 50,
           "via": null,
           "href": "/settings/agents",
           "handler": null,
@@ -26090,7 +26090,7 @@
         {
           "tag": "a",
           "label": "i18n:help.find_explore",
-          "line": 54,
+          "line": 56,
           "via": null,
           "href": "/explore",
           "handler": null,
@@ -26100,7 +26100,7 @@
         {
           "tag": "a",
           "label": "i18n:help.find_search",
-          "line": 55,
+          "line": 57,
           "via": null,
           "href": "/search",
           "handler": null,
@@ -26110,7 +26110,7 @@
         {
           "tag": "a",
           "label": "i18n:help.find_imports",
-          "line": 56,
+          "line": 58,
           "via": null,
           "href": "/imports",
           "handler": null,

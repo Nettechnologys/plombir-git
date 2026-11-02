@@ -67,6 +67,9 @@ pub struct InstanceInfo {
     /// the repository without claiming a commit, and the UI can say the commit
     /// is unknown instead of linking a wrong one.
     pub source_commit: Option<String>,
+    /// External SSH clone port, when the operator configured one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_clone_port: Option<u16>,
     /// Whether this instance is still waiting for its first account, which
     /// `POST /users/register` admits only with the one-time setup token from
     /// the server's startup log. The register page shows the token field on
@@ -152,6 +155,7 @@ pub async fn get_instance(State(state): State<AppState>) -> impl IntoResponse {
             agents_enabled: state.agents_enabled,
             source_url: build_info::source_link(&state.source_url, source_commit),
             source_commit: source_commit.map(str::to_string),
+            ssh_clone_port: state.ssh_clone_port.map(std::num::NonZeroU16::get),
             setup_required,
             registration_open,
             email_confirmation: super::account::mailer(&state).is_some(),

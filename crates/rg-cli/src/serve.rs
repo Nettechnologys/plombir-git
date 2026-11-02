@@ -1129,6 +1129,7 @@ struct ServeSettings {
     trusted_import_origins: rg_core::import::trust::TrustedImportOrigins,
     transports: TransportPolicies,
     external_url: Option<String>,
+    ssh_clone_port: Option<std::num::NonZeroU16>,
     hsts_preload: bool,
     external_webhook_secret: Option<String>,
     metrics_enabled: bool,
@@ -1291,6 +1292,7 @@ impl ServeSettings {
                 .as_ref()
                 .and_then(|c| c.external_url.clone())
                 .or_else(|| cfg.as_ref().and_then(|c| c.server.external_url.clone())),
+            ssh_clone_port: cfg.as_ref().and_then(|c| c.server.ssh_clone_port),
             hsts_preload: cfg
                 .as_ref()
                 .and_then(|c| c.server.hsts_preload)
@@ -2248,6 +2250,7 @@ fn build_transports(
         smtp_config,
         tls_config,
         external_url: settings.external_url,
+        ssh_clone_port: settings.ssh_clone_port,
         hsts_preload: settings.hsts_preload,
         job_timeout_secs: settings.timeouts.job,
         git_stream_timeout_secs: settings.timeouts.git_stream,

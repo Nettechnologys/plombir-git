@@ -17,6 +17,8 @@
 repo_root = "/data/repos"
 http_addr = "0.0.0.0:8080"
 ssh_addr = "0.0.0.0:2222"
+# Public SSH port in clone URLs when the host or proxy maps another port here.
+# ssh_clone_port = 2222
 # The SSH host key is generated on first start and kept in the data directory,
 # so client `known_hosts` entries survive a rebuild. Deliberately NOT a
 # separate bind-mount: mounting a file that does not exist yet gets you a

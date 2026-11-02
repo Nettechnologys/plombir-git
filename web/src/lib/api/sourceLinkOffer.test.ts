@@ -5,7 +5,8 @@ import RootLayout from '../../routes/+layout.svelte';
 import LandingPage from '../../routes/+page.svelte';
 import SourceFooter from '../components/SourceFooter.svelte';
 import { logout } from '../stores/auth.svelte';
-import { getSourceLink, setSourceLink } from '../stores/instance.svelte';
+import { getSourceLink, setSourceLink, setSshClonePort } from '../stores/instance.svelte';
+import { buildSshCloneUrl } from './_base.svelte';
 import { instance, repos, resetTestClient } from '../test/client';
 import { renderComponent, type RenderedComponent } from '../test/render';
 
@@ -36,6 +37,7 @@ beforeEach(async () => {
 	await logout();
 	resetTestClient();
 	setSourceLink(null);
+	setSshClonePort(null);
 	vi.stubGlobal(
 		'fetch',
 		vi.fn(async () => new Response(JSON.stringify({ status: 'ok' }), { status: 200 })),
@@ -46,6 +48,7 @@ afterEach(async () => {
 	await rendered?.destroy();
 	rendered = undefined;
 	vi.unstubAllGlobals();
+	setSshClonePort(null);
 });
 
 function sourceAnchors(container: ParentNode): HTMLAnchorElement[] {
@@ -55,6 +58,16 @@ function sourceAnchors(container: ParentNode): HTMLAnchorElement[] {
 }
 
 describe('source code offer', () => {
+	it('uses the SSH clone port advertised by this instance', async () => {
+		instance.get.mockResolvedValue({ ...instanceInfo(FORK, null), ssh_clone_port: 2233 });
+		rendered = await renderComponent(RootLayout, {
+			children: createRawSnippet(() => ({ render: () => '<p>page</p>' })),
+		});
+		expect(buildSshCloneUrl('alice', 'project', 'git.lan.example')).toBe(
+			'ssh://git@git.lan.example:2233/alice/project',
+		);
+	});
+
 	it('links the commit the server reported, from every page through the root layout', async () => {
 		instance.get.mockResolvedValue(instanceInfo(FORK_AT_COMMIT, COMMIT));
 

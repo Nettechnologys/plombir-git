@@ -41,6 +41,18 @@ export function setSourceLink(link: SourceLink | null) {
   sourceLink = link;
 }
 
+// The server can publish a different SSH port from its container listener.
+// Keep the build-time setting as a fallback for older servers.
+let sshClonePort = $state<number | null>(null);
+
+export function getSshClonePort(): number | null {
+  return sshClonePort;
+}
+
+export function setSshClonePort(port: number | null) {
+  sshClonePort = port;
+}
+
 // ── Self-service registration ───────────────────────────
 
 /// Whether `/users/register` would accept a sign-up, as `GET /api/v1/instance`
