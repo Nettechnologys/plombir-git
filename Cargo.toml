@@ -76,7 +76,7 @@ tower-http = { version = "0.6", features = ["catch-panic", "cors", "trace", "fs"
 # during rekey. osv-scanner in `security-audit` is the gate that sees those.
 # russh-keys was folded into `russh::keys` in 0.52+, so all key code goes
 # through `russh::keys::*`.
-russh = "0.64.1"
+russh = "0.65"
 
 # Database — SeaORM's default features already bundle all three sqlx backends
 # (sqlite + postgres + mysql) plus with-chrono/with-uuid, so Plombir Git can select
@@ -216,7 +216,7 @@ tar = "0.4"
 # The formats zip 2.x read by default, less bzip2: zip 9 links it through
 # `libbz2-rs-sys`, whose bzip2-1.0.6 license deny.toml does not list, and no
 # package client writes a bzip2 entry into a .nupkg, wheel or Composer zip.
-zip = { version = "9", default-features = false, features = [
+zip = { version = "9.0.5", default-features = false, features = [
     "aes-crypto",
     "deflate",
     "deflate64",

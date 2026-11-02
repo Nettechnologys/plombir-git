@@ -1023,11 +1023,14 @@ impl Handler for SshHandler {
     async fn auth_publickey_offered(
         &mut self,
         _user: &str,
-        public_key: &russh::keys::PublicKey,
+        public_key: russh::server::PublicKeyOffer<'_>,
     ) -> Result<Auth, Self::Error> {
         self.auth_attempts += 1;
         use russh::keys::ssh_key;
-        let fingerprint = public_key.fingerprint(ssh_key::HashAlg::Sha256).to_string();
+        let fingerprint = public_key
+            .public_key
+            .fingerprint(ssh_key::HashAlg::Sha256)
+            .to_string();
         let db = &*self.shared.db;
         let held = match rg_db::ops::ssh_key_ops::find_by_fingerprint(db, &fingerprint).await {
             Ok(Some(_)) => Ok(true),
@@ -1053,7 +1056,7 @@ impl Handler for SshHandler {
     async fn auth_publickey(
         &mut self,
         _user: &str,
-        public_key: &russh::keys::PublicKey,
+        public_key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
         let db = &*self.shared.db;
 
@@ -1061,7 +1064,7 @@ impl Handler for SshHandler {
         // internal-russh-forked-ssh-key. The fingerprint() method returns a
         // Fingerprint that implements Display as "SHA256:<base64>".
         use russh::keys::ssh_key;
-        let fp = public_key.fingerprint(ssh_key::HashAlg::Sha256);
+        let fp = public_key.public_key.fingerprint(ssh_key::HashAlg::Sha256);
         let fp_str = fp.to_string();
         tracing::debug!(fingerprint = %fp_str, "SSH pubkey auth attempt");
 
