@@ -31,6 +31,7 @@ afterEach(() => {
 describe('API response errors', () => {
 	it.each([
 		['JSON request', () => request('/instance')],
+		['byte request', () => requestBytes('/instance')],
 		['file download', () => downloadApiFile('/instance', 'instance.json')],
 	])('keeps the HTTP status and backend envelope for a failed %s', async (_name, operation) => {
 		fetchMock.mockResolvedValue(failedResponse(503));
@@ -45,6 +46,49 @@ describe('API response errors', () => {
 			code: 'storage_unavailable',
 			requestId: 'request-17',
 		});
+	});
+
+	it.each([
+		['JSON request', () => request('/users/logout', { method: 'POST' })],
+		['byte request', () => requestBytes('/instance')],
+		['file download', () => downloadApiFile('/instance', 'instance.json')],
+	])('reports an opaque refusal without disclosing its body or credentials for a %s', async (_name, operation) => {
+		setToken('private-session');
+		fetchMock.mockResolvedValue(new Response('<html>Forbidden private-body</html>', {
+			status: 403,
+			headers: {
+				'content-type': 'text/html; charset=utf-8',
+				server: 'nginx',
+				'x-request-id': 'proxy-request-17',
+				'set-cookie': 'private-cookie',
+				authorization: 'Bearer private-response-token',
+			},
+		}));
+
+		const error = await operation().catch((cause: unknown) => cause);
+
+		expect(error).toMatchObject({
+			status: 403,
+			message: 'HTTP 403 [content-type: text/html; charset=utf-8; server: nginx; request-id: proxy-request-17]',
+			requestId: 'proxy-request-17', code: null, reason: null,
+		});
+		expect(JSON.stringify(error)).not.toContain('private-');
+		expect(getToken()).toBe('private-session');
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
+	it('keeps a header request id when an API refusal omits it', async () => {
+		fetchMock.mockResolvedValue(new Response(JSON.stringify({ error: { message: 'Access denied' } }), {
+			status: 403, headers: { 'content-type': 'application/json', 'x-request-id': 'header-id' },
+		}));
+		await expect(request('/instance')).rejects.toMatchObject({ message: 'Access denied', requestId: 'header-id' });
+	});
+
+	it('bounds diagnostic headers and handles an empty error without headers', async () => {
+		fetchMock.mockResolvedValueOnce(new Response(null, { status: 403, headers: { server: 'x'.repeat(1000) } }))
+			.mockResolvedValueOnce(new Response(null, { status: 403 }));
+		await expect(request('/instance')).rejects.toMatchObject({ message: `HTTP 403 [server: ${'x'.repeat(128)}]` });
+		await expect(request('/instance')).rejects.toMatchObject({ message: 'HTTP 403' });
 	});
 });
 

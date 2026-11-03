@@ -150,14 +150,34 @@ async function responseError(res: Response): Promise<ApiError> {
   // Keep the older/plain shapes readable, but never discard the HTTP status:
   // consumers need it to separate a real absence from a failed read.
   const detail = body?.error && typeof body.error === 'object' ? body.error : null;
-  const message = detail?.message || body?.error || body?.message || `HTTP ${res.status}`;
+  const message = detail?.message || body?.error || body?.message;
+  const requestId = typeof detail?.request_id === 'string'
+    ? detail.request_id : diagnosticHeader(res, 'x-request-id');
   return new ApiError(
-    typeof message === 'string' ? message : `HTTP ${res.status}`,
+    typeof message === 'string' && message ? message : fallbackResponseMessage(res, requestId),
     res.status,
     typeof detail?.code === 'string' ? detail.code : null,
-    typeof detail?.request_id === 'string' ? detail.request_id : null,
+    requestId,
     typeof detail?.reason === 'string' ? detail.reason : null,
   );
+}
+
+function diagnosticHeader(res: Response, name: string): string | null {
+  const value = res.headers.get(name);
+  // Bound the few diagnostic fields we display. Never copy all headers or an
+  // HTML error body: an intermediary can include request credentials there.
+  return value?.replace(/[^\x20-\x7e]/g, '').slice(0, 128).trim() || null;
+}
+
+function fallbackResponseMessage(res: Response, requestId: string | null): string {
+  const fields = [
+    ['content-type', diagnosticHeader(res, 'content-type')],
+    ['server', diagnosticHeader(res, 'server')],
+    ['request-id', requestId?.replace(/[^\x20-\x7e]/g, '').slice(0, 128)],
+  ].filter(([, value]) => value).map(([name, value]) => `${name}: ${value}`);
+  // Keep opaque refusals distinguishable from API errors in an ordinary
+  // screenshot, even when opening DevTools changes a timing-dependent failure.
+  return `HTTP ${res.status}${fields.length ? ` [${fields.join('; ')}]` : ''}`;
 }
 
 function forgetRevokedBearer(error: ApiError, token: string | null) {

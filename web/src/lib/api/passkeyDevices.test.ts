@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { locale } from '$lib/i18n';
-import { setToken } from './_base.svelte';
+import { getToken, setToken } from './_base.svelte';
 import { passkeys, type PasskeyDevice } from './passkeys';
 
 const fetchMock = vi.fn();
@@ -64,7 +64,7 @@ describe('passkey device selection', () => {
     expect(options.excludeCredentials[0].transports).toEqual(['internal', 'hybrid']);
     expect(options.hints).toEqual(device === 'phone' ? ['hybrid'] : undefined);
     expect(options.authenticatorSelection.authenticatorAttachment)
-      .toBe(device === 'phone' ? 'cross-platform' : undefined);
+      .toBeUndefined();
     const sent = JSON.parse(fetchMock.mock.calls[1][1].body);
     expect(sent).toEqual({ name: 'Phone', credential: {
       id: 'AQID', rawId: 'AQID', type: 'public-key',
@@ -99,6 +99,7 @@ describe('passkey device selection', () => {
   });
 
   it.each(['register', 'login'] as const)('does not finish or silently retry a cancelled phone %s ceremony', async (operation) => {
+    setToken('current-session');
     fetchMock.mockResolvedValueOnce(reply({ publicKey: { challenge: 'AQID', user: { id: 'AQID' } } }));
     create.mockRejectedValue(new DOMException('Cancelled', 'NotAllowedError'));
     get.mockRejectedValue(new DOMException('Cancelled', 'NotAllowedError'));
@@ -107,6 +108,22 @@ describe('passkey device selection', () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(create.mock.calls.length + get.mock.calls.length).toBe(1);
+    expect(getToken()).toBe('current-session');
+  });
+
+  it('does not override a server attachment policy when hinting at a phone', async () => {
+    fetchMock.mockResolvedValueOnce(reply({ publicKey: {
+      challenge: 'AQID', user: { id: 'AQID' },
+      authenticatorSelection: { userVerification: 'required', authenticatorAttachment: 'platform' },
+    } }));
+    create.mockResolvedValue(null);
+
+    await expect(passkeys.register('Phone', 'phone')).rejects.toThrow('cancelled or timed out');
+
+    expect(create.mock.calls[0][0].publicKey.authenticatorSelection).toEqual({
+      userVerification: 'required', authenticatorAttachment: 'platform',
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('accepts registration responses from browsers without getTransports', async () => {

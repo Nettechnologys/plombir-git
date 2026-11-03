@@ -20,7 +20,10 @@
 {#if unavailable}
   <div class="session-status" role="alert">
     <span class="session-status-icon" aria-hidden="true">🚫</span>
-    <span class="session-status-text">{t('errors.session_check_failed')}</span>
+    <span class="session-status-text">
+      {t('errors.session_check_failed')}
+      <span class="session-status-detail">{getSessionCheckError()}</span>
+    </span>
     <button type="button" disabled={retrying} onclick={retrySessionCheck}>
       {retrying ? t('errors.session_check_retrying') : t('errors.session_check_retry')}
     </button>
@@ -43,6 +46,13 @@
 
   .session-status-text {
     flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .session-status-detail {
+    display: block;
+    font-weight: 400;
   }
 
   button {

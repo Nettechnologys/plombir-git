@@ -1369,7 +1369,7 @@ CI runners, and webhooks. A browser test cannot cover these routes.
 | GET | `/metrics` | `Public` | rust+smoke |
 | POST | `/api/v1/users/register` | `Public` | rust+web+smoke |
 | POST | `/api/v1/users/login` | `Public` | rust+web+smoke |
-| POST | `/api/v1/users/logout` | `User` | rust |
+| POST | `/api/v1/users/logout` | `User` | rust+web |
 | POST | `/api/v1/users/me/sudo` | `User` | rust+smoke |
 | POST | `/api/v1/users/password/initial` | `Public` | rust+web |
 | GET | `/api/v1/avatars/{username}` | `Public` | rust |

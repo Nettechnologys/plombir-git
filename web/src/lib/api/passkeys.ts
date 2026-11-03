@@ -84,13 +84,11 @@ export const passkeys = {
       }));
     }
     if (device === 'phone') {
-      // Only guide the browser's authenticator picker. Preserve every server
-      // requirement, especially user verification, and let WebAuthn own QR.
+      // Hint at a phone without restricting the authenticator attachment.
+      // Safari versions that ignore hints can otherwise show only a USB key
+      // prompt for "cross-platform" instead of their normal device picker.
+      // Keep the server's selection policy, especially UV, unchanged.
       publicKey.hints = ['hybrid'];
-      publicKey.authenticatorSelection = {
-        ...publicKey.authenticatorSelection,
-        authenticatorAttachment: 'cross-platform',
-      };
     }
 
     let credential: PublicKeyCredential | null;

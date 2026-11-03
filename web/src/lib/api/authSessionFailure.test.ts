@@ -54,14 +54,14 @@ async function renderLoggedInNavbar(): Promise<RenderedComponent> {
 }
 
 describe('session probe failure semantics', () => {
-	it('keeps a 500 unknown, does not clear credentials or redirect, and can retry', async () => {
-		auth.me.mockRejectedValueOnce(new ApiError('database unavailable', 500));
+	it.each([403, 500])('keeps a %i unknown, does not clear credentials or redirect, and can retry', async (status) => {
+		auth.me.mockRejectedValueOnce(new ApiError('session probe refused', status));
 
 		await fetchUser();
 
 		expect(isLoggedIn()).toBeNull();
 		expect(isAuthReady()).toBe(false);
-		expect(getSessionCheckError()).toBe('database unavailable');
+		expect(getSessionCheckError()).toBe('session probe refused');
 		expect(setToken).not.toHaveBeenCalled();
 
 		rendered = await renderComponent(SecurityPage);
@@ -70,6 +70,8 @@ describe('session probe failure semantics', () => {
 
 		auth.me.mockResolvedValueOnce(user);
 		rendered = await renderComponent(SessionStatusBanner);
+		expect(rendered.container.querySelector('[role="alert"]')?.textContent)
+			.toContain('session probe refused');
 		await click(button(rendered.container, 'Retry'));
 
 		expect(isLoggedIn()).toBe(true);
@@ -78,7 +80,7 @@ describe('session probe failure semantics', () => {
 		expect(rendered.container.querySelector('[role="alert"]')).toBeNull();
 	});
 
-	it.each([401, 403])(
+	it.each([401])(
 		'still treats an explicit %i as anonymous and redirects a protected page',
 		async (status) => {
 			auth.me.mockRejectedValueOnce(new ApiError('authentication required', status));
@@ -94,6 +96,20 @@ describe('session probe failure semantics', () => {
 			expect(navigation.goto).toHaveBeenCalledWith('/login');
 		},
 	);
+
+	it('preserves a known user when a profile refresh is forbidden', async () => {
+		auth.me.mockResolvedValueOnce(user);
+		await fetchUser();
+		setToken.mockClear();
+		auth.me.mockRejectedValueOnce(new ApiError('HTTP 403 [content-type: text/html; server: nginx]', 403));
+
+		await fetchUser();
+
+		expect(isLoggedIn()).toBe(true);
+		expect(isAuthReady()).toBe(true);
+		expect(getSessionCheckError()).toContain('HTTP 403');
+		expect(setToken).not.toHaveBeenCalled();
+	});
 });
 
 describe('logout failure semantics', () => {

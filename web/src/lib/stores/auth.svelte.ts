@@ -267,7 +267,7 @@ export async function fetchUser() {
     sessionCheckError = null;
   } catch (cause: unknown) {
     if (generation !== sessionGeneration) return;
-    if (cause instanceof ApiError && (cause.status === 401 || cause.status === 403)) {
+    if (cause instanceof ApiError && cause.status === 401) {
       setToken(null);
       currentUser = null;
       authReady = true;
@@ -275,7 +275,8 @@ export async function fetchUser() {
       return;
     }
 
-    // A failed session probe is not proof that the session ended. Preserve a
+    // A 403 can come from an intermediary's access policy, not a revoked
+    // session. A failed probe is not proof that the session ended. Preserve a
     // profile we already know, and keep a first-load route behind the root
     // layout until Retry can establish whether this browser is authenticated.
     sessionCheckError = cause instanceof Error ? cause.message : 'Session check failed';

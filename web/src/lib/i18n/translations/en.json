@@ -2254,7 +2254,7 @@
       "device": "Passkey device",
       "device_auto": "Let the browser choose",
       "device_phone": "Phone or tablet (QR code)",
-      "phone_hint": "Your browser displays a QR code if supported. Keep your phone nearby and enable Bluetooth on both devices. If unavailable, use the default picker or open the site on your phone. If this Mac and your iPhone sync passkeys through iCloud Keychain, an existing passkey may already be on your phone; use it to sign in instead of registering it again.",
+      "phone_hint": "Your browser displays a QR code if supported. If it opens another sign-in option, choose More Options and then Scan QR Code (wording varies by browser). Keep your phone nearby and enable Bluetooth on both devices. If unavailable, use the default picker or open the site on your phone. If this Mac and your iPhone sync passkeys through iCloud Keychain, an existing passkey may already be on your phone; use it to sign in instead of registering it again.",
       "cancelled": "The passkey request was cancelled or timed out.",
       "already_registered": "This authenticator is already registered.",
       "waiting": "Waiting for authenticator...",

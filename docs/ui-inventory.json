@@ -408,7 +408,8 @@
       "access": "User",
       "handler": "api::users::logout",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": false
     },
