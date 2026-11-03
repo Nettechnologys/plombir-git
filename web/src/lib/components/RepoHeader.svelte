@@ -635,6 +635,7 @@
 
   .repo-actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
     align-items: center;
   }
@@ -918,6 +919,16 @@
     .repo-actions {
       width: 100%;
       justify-content: flex-start;
+    }
+
+    /* Translated labels can wrap the clone button onto its own row. Keep
+       its right-aligned dialog inside the viewport in either position. */
+    .clone-area {
+      margin-left: auto;
+    }
+
+    .clone-dropdown {
+      width: min(340px, calc(100vw - 64px));
     }
 
     .action-btn {

@@ -127,13 +127,14 @@
 
       <div class="nav-preferences">
         <div class="lang-menu-container">
-          <Dropdown ariaLabel={t('nav.change_language', 'Change language')} triggerClass="lang-btn">
+          <Dropdown ariaLabel={t('nav.change_language', 'Change language')} triggerClass="lang-btn" placement="left">
             {#snippet trigger()}
-              {$locale === 'zh-CN' ? t('nav.chinese_short') : t('nav.english_short')}
+              {$locale === 'ru' ? t('nav.russian_short') : $locale === 'zh-CN' ? t('nav.chinese_short') : t('nav.english_short')}
             {/snippet}
             {#snippet menu(close)}
               <button onclick={() => { setLocale('en'); close(); }} class:active={$locale === 'en'} role="menuitem" title={t('nav.english')}>{t('nav.english_short')}</button>
               <button onclick={() => { setLocale('zh-CN'); close(); }} class:active={$locale === 'zh-CN'} role="menuitem" title={t('nav.chinese')}>{t('nav.chinese_short')}</button>
+              <button onclick={() => { setLocale('ru'); close(); }} class:active={$locale === 'ru'} role="menuitem" title={t('nav.russian')}>{t('nav.russian_short')}</button>
             {/snippet}
           </Dropdown>
         </div>

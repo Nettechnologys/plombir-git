@@ -10,7 +10,7 @@
 // A `$state` rune read inside `t()` makes every caller — a template expression,
 // a `$derived`, an `$effect` — depend on the locale without knowing it does.
 
-export type Locale = 'en' | 'zh-CN';
+export type Locale = 'en' | 'zh-CN' | 'ru';
 
 let current = $state<Locale>('en');
 

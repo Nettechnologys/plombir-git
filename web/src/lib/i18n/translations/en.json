@@ -69,6 +69,8 @@
     "chinese": "Chinese",
     "english_short": "EN",
     "chinese_short": "CN",
+    "russian": "Russian",
+    "russian_short": "RU",
     "security": "Security",
     "ssh_keys": "SSH Keys",
     "signing_keys": "Commit Signing Keys",
@@ -755,6 +757,7 @@
       "cancel": "Cancel"
     },
     "empty": "No {state} issues.",
+    "empty_all": "No issues.",
     "meta": "#{number} opened {date} by {author}",
     "opened_by": "opened {date} by {author}",
     "commented": "{author} commented {date}",
@@ -864,6 +867,11 @@
       "no_text_diff": "Binary file — no line diff to show."
     },
     "empty": "No {state} pull requests.",
+    "state_label": {
+      "open": "open",
+      "closed": "closed",
+      "merged": "merged"
+    },
     "meta": "#{number} opened {date} by {author}",
     "draft": "Draft",
     "mark_ready": "Mark ready for review",
@@ -1675,7 +1683,7 @@
     "users": {
       "title": "User Management",
       "desc": "View and manage all users on this instance",
-      "total": "users total",
+      "total": "{count} users total",
       "edit": "Edit User: {username}",
       "is_admin": "Site Admin",
       "is_active": "Active",
@@ -1718,7 +1726,7 @@
     "orgs": {
       "title": "Organization Management",
       "desc": "View and manage all organizations",
-      "total": "organizations total",
+      "total": "{count} organizations total",
       "delete_confirm": "Delete Organization",
       "delete_warning": "Are you sure you want to delete organization \"{name}\"? All associated data will be lost.",
       "columns": {
@@ -1732,7 +1740,7 @@
     "audit": {
       "title": "Audit Log",
       "desc": "View security events and operational history",
-      "total": "records total",
+      "total": "{count} records total",
       "detail_title": "Audit Log #{id}",
       "filter_all": "All Actions",
       "no_details": "No additional details",
@@ -1757,7 +1765,7 @@
     "runners": {
       "title": "Runner Management",
       "desc": "Register and manage CI/CD runners",
-      "total": "runners total",
+      "total": "{count} runners total",
       "register": "Register Runner",
       "name": "Name",
       "repository": "Repository",

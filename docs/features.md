@@ -22,7 +22,7 @@
 | Operations | TLS/HTTPS, TOML config, rate limiting, log rotation, unified pagination, registered GPG/SSH commit-signature verification, audit log, health checks | [Server startup](../crates/rg-cli/src/serve.rs) |
 | AI agents | Model Context Protocol built into the server (`POST /api/v1/mcp`) and as a stdio binary (`plombir-git-mcp`); bot accounts, narrowed tokens, per-bot rate limits and audit ([details](mcp.md#mcp-over-http-and-agent-accounts)) | [MCP API](../crates/rg-http/src/api/mcp.rs) |
 | Releases | Release assets with optional in-toto / DSSE attestations signed by the instance key | [Release API](../crates/rg-http/src/api/releases.rs) |
-| Web UI | SvelteKit (Svelte 5) SPA (login, repos, issues, PRs, wiki, CI, review, orgs, notifications, search and file blame), English + Chinese i18n | [App layout](../web/src/routes/+layout.svelte) |
+| Web UI | SvelteKit (Svelte 5) SPA (login, repos, issues, PRs, wiki, CI, review, orgs, notifications, search and file blame), English, Chinese and Russian i18n | [App layout](../web/src/routes/+layout.svelte) |
 
 Databases: SQLite, PostgreSQL, and MySQL are all supported and selected at
 runtime from the scheme of `--db-url` / `[database].url` — no feature rebuild

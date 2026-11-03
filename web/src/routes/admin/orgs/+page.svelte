@@ -99,7 +99,7 @@
   <div class="header">
     <a href="/admin" class="back">← {t('admin.back')}</a>
     <h1>{t('admin.orgs.title')}</h1>
-    <p class="meta">{total} {t('admin.orgs.total')}</p>
+    <p class="meta">{t('admin.orgs.total', { count: total })}</p>
   </div>
 
   {#if error}

@@ -12,7 +12,7 @@
     LatestRepositoryRequestFence,
     LatestRepositoryResourceRequestFence,
   } from '$lib/asyncStateOwnership';
-  import { createT, formatDate } from '$lib/i18n';
+  import { createT, formatDate, formatTranslationFallback } from '$lib/i18n';
 
   const t = createT();
 
@@ -483,7 +483,7 @@
   {#if loading}
     <p class="text-secondary">{t('common.loading')}</p>
   {:else if prList.length === 0}
-    <div class="empty"><p>{t('pulls.empty', { state: filterState === 'all' ? '' : filterState })}</p></div>
+    <div class="empty"><p>{t('pulls.empty', { state: t(`pulls.state_label.${filterState}`, undefined, formatTranslationFallback(filterState)) })}</p></div>
   {:else}
     <div class="pr-list gh-list">
       {#each prList as pr}

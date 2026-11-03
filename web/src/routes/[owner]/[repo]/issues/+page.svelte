@@ -336,7 +336,7 @@
     <p class="text-secondary">{t('common.loading')}</p>
   {:else if issueList.length === 0}
     <div class="empty">
-      <p>{t('issues.empty', { state: emptyStateLabel() })}</p>
+      <p>{filterState === 'all' ? t('issues.empty_all') : t('issues.empty', { state: emptyStateLabel() })}</p>
     </div>
   {:else}
     <div class="issue-list gh-list">

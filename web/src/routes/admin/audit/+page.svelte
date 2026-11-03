@@ -167,7 +167,7 @@
   <div class="header">
     <a href="/admin" class="back">← {t('admin.back')}</a>
     <h1>{t('admin.audit.title')}</h1>
-    <p class="meta">{total} {t('admin.audit.total')}</p>
+    <p class="meta">{t('admin.audit.total', { count: total })}</p>
   </div>
 
   <!-- Filters -->

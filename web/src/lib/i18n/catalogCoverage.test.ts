@@ -13,7 +13,6 @@ declare const process: { cwd(): string };
 
 import { formatTranslationFallback, t } from '.';
 import en from './translations/en.json';
-import zhCN from './translations/zh-CN.json';
 
 type TranslationCall = {
 	file: string;
@@ -66,6 +65,9 @@ const productionSources = sourceFiles(sourceRoot, new Set(['.js', '.svelte', '.t
 // the only place that question can still be asked is the source.
 const catalogRoot = join(sourceRoot, 'lib', 'i18n', 'translations');
 const catalogSources = sourceFiles(catalogRoot, new Set(['.json']), catalogRoot);
+const catalogs = Object.entries(catalogSources).map(([file, source]) =>
+	[file.replace(/\.json$/, ''), JSON.parse(source) as unknown] as const
+);
 
 type DuplicateKey = { path: string; key: string };
 
@@ -316,17 +318,31 @@ describe('translation catalogs', () => {
 	});
 
 	// The coverage checks below only ask whether a key a source file *uses* is
-	// present. A key that exists in one catalog and not the other passes them
+	// present. A key that exists in one catalog and not another passes them
 	// untouched — which is how the two files drift apart, one untranslated
 	// string at a time.
 	it('carry the same set of keys as each other', () => {
 		const english = new Set(stringKeyPaths(en));
-		const chinese = new Set(stringKeyPaths(zhCN));
+		for (const [locale, catalog] of catalogs) {
+			const keys = new Set(stringKeyPaths(catalog));
+			expect({
+				missing: [...english].filter((key) => !keys.has(key)).sort(),
+				extra: [...keys].filter((key) => !english.has(key)).sort()
+			}, locale).toEqual({ missing: [], extra: [] });
+		}
+	});
 
-		expect({
-			missingFromChinese: [...english].filter((key) => !chinese.has(key)).sort(),
-			missingFromEnglish: [...chinese].filter((key) => !english.has(key)).sort()
-		}).toEqual({ missingFromChinese: [], missingFromEnglish: [] });
+	it('preserves interpolation parameters in every language', () => {
+		const valueAt = (catalog: unknown, key: string): string => key.split('.').reduce(
+			(value, part) => (value as Record<string, unknown>)?.[part], catalog
+		) as string;
+		const parameters = (value: string) => (value.match(/\{\w+\}/g) ?? []).sort();
+		for (const [locale, catalog] of catalogs) {
+			for (const key of stringKeyPaths(en)) {
+				expect(parameters(valueAt(catalog, key)), `${locale}: ${key}`)
+					.toEqual(parameters(valueAt(en, key)));
+			}
+		}
 	});
 });
 
@@ -336,12 +352,8 @@ describe('translation catalog coverage', () => {
 	// every locale and nothing turns red: the profile settings page and the
 	// email confirmation page shipped that way, every line of them, to zh-CN
 	// users (card_0c8035b42097). The fallback stays legitimate as a guard for a
-	// catalog that has not loaded; the key still has to exist in both.
-	it('keeps every static translation in both catalogs, with a fallback or without', () => {
-		const catalogs = [
-			['en', en],
-			['zh-CN', zhCN]
-		] as const;
+	// catalog that has not loaded; the key still has to exist in every language.
+	it('keeps every static translation in every catalog, with a fallback or without', () => {
 		const missing = calls
 			.filter((call): call is TranslationCall & { key: string } =>
 				call.key !== null

@@ -69,6 +69,8 @@
     "chinese": "中文",
     "english_short": "EN",
     "chinese_short": "CN",
+    "russian": "俄语",
+    "russian_short": "RU",
     "security": "安全",
     "ssh_keys": "SSH 密钥",
     "signing_keys": "提交签名密钥",
@@ -755,6 +757,7 @@
       "cancel": "取消"
     },
     "empty": "暂无 {state} 问题。",
+    "empty_all": "暂无问题。",
     "meta": "#{number} 由 {author} 于 {date} 创建",
     "opened_by": "由 {author} 于 {date} 创建",
     "commented": "{author} 于 {date} 评论",
@@ -864,6 +867,11 @@
       "no_text_diff": "二进制文件，没有可显示的行差异。"
     },
     "empty": "暂无 {state} 拉取请求。",
+    "state_label": {
+      "open": "开放",
+      "closed": "已关闭",
+      "merged": "已合并"
+    },
     "meta": "#{number} 由 {author} 于 {date} 创建",
     "draft": "草稿",
     "mark_ready": "标记为可审查",
@@ -1675,7 +1683,7 @@
     "users": {
       "title": "用户管理",
       "desc": "查看和管理此实例上的所有用户",
-      "total": "用户总数",
+      "total": "{count} 用户总数",
       "edit": "编辑用户：{username}",
       "is_admin": "站点管理员",
       "is_active": "活跃",
@@ -1718,7 +1726,7 @@
     "orgs": {
       "title": "组织管理",
       "desc": "查看和管理所有组织",
-      "total": "组织总数",
+      "total": "{count} 组织总数",
       "delete_confirm": "删除组织",
       "delete_warning": "确定要删除组织 \"{name}\" 吗？所有关联数据将丢失。",
       "columns": {
@@ -1732,7 +1740,7 @@
     "audit": {
       "title": "审计日志",
       "desc": "查看安全事件和操作历史",
-      "total": "记录总数",
+      "total": "{count} 记录总数",
       "detail_title": "审计日志 #{id}",
       "filter_all": "所有操作",
       "no_details": "无额外详情",
@@ -1757,7 +1765,7 @@
     "runners": {
       "title": "Runner 管理",
       "desc": "注册和管理 CI/CD Runner",
-      "total": "Runner 总数",
+      "total": "{count} Runner 总数",
       "register": "注册 Runner",
       "name": "名称",
       "repository": "仓库",

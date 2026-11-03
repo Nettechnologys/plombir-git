@@ -1,6 +1,7 @@
 import { writable, derived } from 'svelte/store';
 import en from './translations/en.json';
 import zhCN from './translations/zh-CN.json';
+import ru from './translations/ru.json';
 import { activeLocale, setActiveLocale, type Locale } from './locale.svelte';
 import { parseServerTime } from '../serverTime';
 
@@ -12,15 +13,27 @@ type TranslationCatalog = typeof en;
 const translations: Record<Locale, TranslationCatalog> = {
   'en': en,
   'zh-CN': zhCN,
+  'ru': ru,
+};
+
+const dateLocales: Record<Locale, string> = {
+  'en': 'en-US',
+  'zh-CN': 'zh-CN',
+  'ru': 'ru-RU',
 };
 
 // Locale detection
 function detectLocale(): Locale {
   if (typeof window === 'undefined') return 'en';
-  const stored = localStorage.getItem('locale') as Locale;
-  if (stored && translations[stored]) return stored;
-  const browser = navigator.language;
-  if (browser.startsWith('zh')) return 'zh-CN';
+  try {
+    const stored = localStorage.getItem('locale');
+    if (stored && Object.hasOwn(translations, stored)) return stored as Locale;
+  } catch {
+    // Storage can be blocked by browser policy; language selection still works.
+  }
+  const language = navigator.language.toLowerCase().split('-')[0];
+  if (language === 'zh') return 'zh-CN';
+  if (language === 'ru') return 'ru';
   return 'en';
 }
 
@@ -41,7 +54,11 @@ function createLocaleStore() {
     subscribe,
     set: (locale: Locale) => {
       if (typeof window !== 'undefined') {
-        localStorage.setItem('locale', locale);
+        try {
+          localStorage.setItem('locale', locale);
+        } catch {
+          // Keep the choice for this page even when it cannot be persisted.
+        }
       }
       apply(locale);
     },
@@ -145,13 +162,13 @@ export function formatDate(dateStr: string, options?: Intl.DateTimeFormatOptions
     month: 'short',
     day: 'numeric',
   };
-  return date.toLocaleDateString($locale === 'zh-CN' ? 'zh-CN' : 'en-US', options ?? defaultOptions);
+  return date.toLocaleDateString(dateLocales[$locale], options ?? defaultOptions);
 }
 
 export function formatDateTime(dateStr: string): string {
   const $locale = activeLocale();
   const date = parseServerTime(dateStr);
-  return date.toLocaleString($locale === 'zh-CN' ? 'zh-CN' : 'en-US', {
+  return date.toLocaleString(dateLocales[$locale], {
     year: 'numeric',
     month: 'short',
     day: 'numeric',
