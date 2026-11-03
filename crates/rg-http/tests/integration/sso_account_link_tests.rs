@@ -665,9 +665,23 @@ async fn the_last_way_into_an_sso_only_account_cannot_be_removed() {
         .bearer_auth(&session)
         .send()
         .await
-        .unwrap()
-        .status();
-    assert_eq!(delete_passkey, StatusCode::CONFLICT);
+        .unwrap();
+    assert_eq!(delete_passkey.status(), StatusCode::FORBIDDEN);
+    let refusal: serde_json::Value = delete_passkey.json().await.unwrap();
+    assert_eq!(refusal["error"]["reason"], "sudo_required");
+
+    // A normal SSO login does not prove recent user presence. Even after a
+    // successful step-up, the last remaining way into the account must stay.
+    let claims = rg_core::auth::jwt::validate_token(&session, TEST_JWT_SECRET).unwrap();
+    let elevated = rg_core::auth::jwt::reissue_with_sudo(&claims, TEST_JWT_SECRET).unwrap();
+    let delete_passkey = app
+        .client
+        .delete(format!("{}/api/v1/users/passkeys/{}", app.base, passkey.id))
+        .bearer_auth(&elevated)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete_passkey.status(), StatusCode::CONFLICT);
     assert_eq!(
         rg_db::ops::passkey_credential_ops::list_by_user(&app.db, user_id)
             .await
