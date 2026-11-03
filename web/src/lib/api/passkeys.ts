@@ -1,4 +1,7 @@
 import { request } from './_base.svelte';
+import { t } from '$lib/i18n';
+
+export type PasskeyDevice = 'auto' | 'phone';
 
 export interface PasskeyInfo {
   id: number;
@@ -48,10 +51,10 @@ function bufToB64url(buf: ArrayBuffer): string {
 function ceremonyError(err: unknown, fallback: string): Error {
   if (err instanceof DOMException) {
     if (err.name === 'NotAllowedError') {
-      return new Error('The request was cancelled or timed out.');
+      return new Error(t('account_security.passkeys.cancelled'));
     }
     if (err.name === 'InvalidStateError') {
-      return new Error('This authenticator is already registered.');
+      return new Error(t('account_security.passkeys.already_registered'));
     }
     return new Error(err.message || fallback);
   }
@@ -65,8 +68,8 @@ export const passkeys = {
     request<void>(`/users/passkeys/${id}`, { method: 'DELETE' }),
 
   /** Full registration ceremony: begin → browser prompt → finish. */
-  async register(name: string): Promise<PasskeyInfo[]> {
-    if (!isPasskeySupported()) throw new Error('This browser does not support passkeys.');
+  async register(name: string, device: PasskeyDevice = 'auto'): Promise<PasskeyInfo[]> {
+    if (!isPasskeySupported()) throw new Error(t('account_security.passkeys.unsupported'));
 
     const options = await request<{ publicKey: any }>('/users/passkeys/register/start', {
       method: 'POST',
@@ -80,14 +83,23 @@ export const passkeys = {
         id: b64urlToBuf(cred.id),
       }));
     }
+    if (device === 'phone') {
+      // Only guide the browser's authenticator picker. Preserve every server
+      // requirement, especially user verification, and let WebAuthn own QR.
+      publicKey.hints = ['hybrid'];
+      publicKey.authenticatorSelection = {
+        ...publicKey.authenticatorSelection,
+        authenticatorAttachment: 'cross-platform',
+      };
+    }
 
     let credential: PublicKeyCredential | null;
     try {
       credential = (await navigator.credentials.create({ publicKey })) as PublicKeyCredential | null;
     } catch (err) {
-      throw ceremonyError(err, 'Passkey registration failed.');
+      throw ceremonyError(err, t('account_security.passkeys.register_failed'));
     }
-    if (!credential) throw new Error('Passkey registration was cancelled.');
+    if (!credential) throw new Error(t('account_security.passkeys.cancelled'));
 
     const response = credential.response as AuthenticatorAttestationResponse;
     return request<PasskeyInfo[]>('/users/passkeys/register/finish', {
@@ -101,6 +113,7 @@ export const passkeys = {
           response: {
             attestationObject: bufToB64url(response.attestationObject),
             clientDataJSON: bufToB64url(response.clientDataJSON),
+            transports: response.getTransports?.(),
           },
         },
       }),
@@ -108,8 +121,8 @@ export const passkeys = {
   },
 
   /** Full authentication ceremony: begin → browser prompt → finish. */
-  async login(username: string): Promise<PasskeyLoginResponse> {
-    if (!isPasskeySupported()) throw new Error('This browser does not support passkeys.');
+  async login(username: string, device: PasskeyDevice = 'auto'): Promise<PasskeyLoginResponse> {
+    if (!isPasskeySupported()) throw new Error(t('account_security.passkeys.unsupported'));
 
     const options = await request<{ publicKey: any }>('/users/passkeys/login/start', {
       method: 'POST',
@@ -118,19 +131,24 @@ export const passkeys = {
     const publicKey = options.publicKey;
     publicKey.challenge = b64urlToBuf(publicKey.challenge);
     if (Array.isArray(publicKey.allowCredentials)) {
-      publicKey.allowCredentials = publicKey.allowCredentials.map((cred: any) => ({
-        ...cred,
-        id: b64urlToBuf(cred.id),
-      }));
+      publicKey.allowCredentials = publicKey.allowCredentials.map((cred: any) => {
+        const decoded = { ...cred, id: b64urlToBuf(cred.id) };
+        // Older browsers may report only "internal" for synced passkeys.
+        // Omit that routing hint for phone selection; keep the credential ID
+        // and the server's allow-list verification unchanged.
+        if (device === 'phone') delete decoded.transports;
+        return decoded;
+      });
     }
+    if (device === 'phone') publicKey.hints = ['hybrid'];
 
     let credential: PublicKeyCredential | null;
     try {
       credential = (await navigator.credentials.get({ publicKey })) as PublicKeyCredential | null;
     } catch (err) {
-      throw ceremonyError(err, 'Passkey login failed.');
+      throw ceremonyError(err, t('auth.login.passkey_failed'));
     }
-    if (!credential) throw new Error('Passkey login was cancelled.');
+    if (!credential) throw new Error(t('account_security.passkeys.cancelled'));
 
     const response = credential.response as AuthenticatorAssertionResponse;
     return request<PasskeyLoginResponse>('/users/passkeys/login/finish', {

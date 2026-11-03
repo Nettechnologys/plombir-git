@@ -160,15 +160,24 @@ async function responseError(res: Response): Promise<ApiError> {
   );
 }
 
+function forgetRevokedBearer(error: ApiError, token: string | null) {
+  // A wrong sudo password is also a 401, but does not revoke the session.
+  if (error.status === 401 && error.reason === 'session_revoked' && getToken() === token) {
+    setToken(null);
+  }
+}
+
 /** `RequestInit` plus the knobs `request` reads itself. */
 type RequestOptions = RequestInit & {
   timeoutMs?: number;
+  /** Logout can retry the ambient cookie after an explicit bearer is rejected. */
+  omitBearer?: boolean;
   /** Set on the one retry a sudo step-up earns, so a second refusal is final. */
   sudoRetried?: boolean;
 };
 
 export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const token = getToken();
+  const token = options.omitBearer ? null : getToken();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(options.headers as Record<string, string> || {}),
@@ -179,7 +188,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
 
   // M-3: Add timeout via AbortSignal to prevent indefinite hangs.
   // If the caller already provided a signal, respect it.
-  const { timeoutMs = DEFAULT_TIMEOUT_MS, sudoRetried = false, ...init } = options;
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, sudoRetried = false, omitBearer: _omitBearer, ...init } = options;
   let signal = init.signal;
   if (!signal && timeoutMs > 0) {
     signal = AbortSignal.timeout(timeoutMs);
@@ -191,7 +200,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     const error = await responseError(res);
     // Stop replaying a rejected bearer on login and public requests. A late
     // response from an older request must not erase a newly adopted session.
-    if (error.status === 401 && getToken() === token) setToken(null);
+    forgetRevokedBearer(error, token);
     // A sudo refusal is a question, not an answer: ask once, then send the
     // same request again on the re-issued session. Once — a second refusal
     // means something other than the window and reaches the caller.
@@ -231,8 +240,9 @@ export async function requestBytes(path: string, options: { timeoutMs?: number }
     credentials: 'include',
   });
   if (!res.ok) {
-    if (res.status === 401 && getToken() === token) setToken(null);
-    throw await responseError(res);
+    const error = await responseError(res);
+    forgetRevokedBearer(error, token);
+    throw error;
   }
   return res.arrayBuffer();
 }
@@ -271,8 +281,9 @@ export async function downloadApiFile(path: string, fallbackFilename: string): P
     credentials: 'include',
   });
   if (!res.ok) {
-    if (res.status === 401 && getToken() === token) setToken(null);
-    throw await responseError(res);
+    const error = await responseError(res);
+    forgetRevokedBearer(error, token);
+    throw error;
   }
 
   const blob = await res.blob();

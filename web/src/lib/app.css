@@ -22,6 +22,9 @@
   --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
   --radius: 6px;
   --radius-lg: 8px;
+  --control-height: 36px;
+  --control-height-sm: 28px;
+  --control-height-lg: 42px;
   --layout-gutter: clamp(12px, 4vw, 24px);
   --layout-block-padding: clamp(16px, 3.2vw, 24px);
   --layout-max: min(1280px, calc(100vw - 2 * var(--layout-gutter)));
@@ -181,6 +184,13 @@ button {
   cursor: pointer;
 }
 
+/* Legacy pages use variant classes without .btn. Keep their normal controls
+   the same height as text fields, while allowing long button labels to wrap. */
+:where(.btn, .btn-primary, .btn-secondary, .btn-outline, .btn-danger, .btn-ghost) {
+  min-height: var(--control-height);
+  line-height: 1.25;
+}
+
 .btn {
   display: inline-flex;
   align-items: center;
@@ -212,9 +222,9 @@ button {
   background: var(--bg-hover);
 }
 
-.btn-sm { padding: 3px 8px; font-size: 12px; }
+.btn-sm { min-height: var(--control-height-sm); padding: 3px 8px; font-size: 12px; }
 .btn-md { padding: 5px 12px; font-size: 13px; }
-.btn-lg { padding: 8px 16px; font-size: 14px; }
+.btn-lg { min-height: var(--control-height-lg); padding: 8px 16px; font-size: 14px; }
 
 .btn-primary {
   background: var(--accent);
@@ -310,6 +320,14 @@ input, textarea, select {
   color: var(--text-primary);
   padding: 5px 12px;
   outline: none;
+}
+
+/* Only single-line text controls share a height. Native checkboxes, radios,
+   sliders, file/color pickers and multiline controls retain their own sizing. */
+:where(input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='file']):not([type='color']):not([type='hidden']):not([type='image']):not([type='button']):not([type='submit']):not([type='reset']), select:not([multiple]):not([size])) {
+  height: var(--control-height);
+  min-height: var(--control-height);
+  line-height: 1.25;
 }
 
 input:focus, textarea:focus, select:focus {

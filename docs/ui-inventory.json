@@ -408,8 +408,7 @@
       "access": "User",
       "handler": "api::users::logout",
       "testedIn": [
-        "rust",
-        "web"
+        "rust"
       ],
       "reachedFromUi": false
     },
@@ -26356,7 +26355,7 @@
         {
           "tag": "form",
           "label": ")}",
-          "line": 169,
+          "line": 172,
           "via": null,
           "href": null,
           "handler": "handleInitialPassword",
@@ -26366,7 +26365,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.login.set_password",
-          "line": 193,
+          "line": 196,
           "via": null,
           "href": null,
           "handler": null,
@@ -26376,7 +26375,7 @@
         {
           "tag": "form",
           "label": "i18n:auth.login.mfa_code",
-          "line": 198,
+          "line": 201,
           "via": null,
           "href": null,
           "handler": "handleMfaSubmit",
@@ -26386,7 +26385,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 212,
+          "line": 215,
           "via": null,
           "href": null,
           "handler": null,
@@ -26396,7 +26395,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.login.verifying",
-          "line": 216,
+          "line": 219,
           "via": null,
           "href": null,
           "handler": null,
@@ -26406,7 +26405,7 @@
         {
           "tag": "form",
           "label": "i18n:auth.login.username",
-          "line": 221,
+          "line": 224,
           "via": null,
           "href": null,
           "handler": "handleSubmit",
@@ -26416,7 +26415,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.login.submitting",
-          "line": 232,
+          "line": 235,
           "via": null,
           "href": null,
           "handler": null,
@@ -26426,7 +26425,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.login.passkey_sign_in",
-          "line": 237,
+          "line": 241,
           "via": null,
           "href": null,
           "handler": "handlePasskeyLogin",
@@ -26436,7 +26435,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.login.sso_retry",
-          "line": 259,
+          "line": 263,
           "via": null,
           "href": null,
           "handler": "loadSsoProviders",
@@ -26461,7 +26460,7 @@
         {
           "tag": "a",
           "label": ")}",
-          "line": 267,
+          "line": 271,
           "via": null,
           "href": "auth.ssoAuthorizeUrl(provider.slug)",
           "handler": null,
@@ -26471,7 +26470,7 @@
         {
           "tag": "a",
           "label": "i18n:auth.login.footer_link",
-          "line": 280,
+          "line": 284,
           "via": null,
           "href": "/register",
           "handler": null,
@@ -26481,9 +26480,19 @@
         {
           "tag": "a",
           "label": "i18n:auth.login.forgot_password",
-          "line": 283,
+          "line": 287,
           "via": null,
           "href": "/forgot-password",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "select",
+          "label": "i18n:account_security.passkeys.device_auto",
+          "line": 16,
+          "via": "PasskeyDeviceSelector",
+          "href": null,
           "handler": null,
           "calls": [],
           "unresolved": false
@@ -28897,7 +28906,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.retry",
-          "line": 423,
+          "line": 426,
           "via": null,
           "href": null,
           "handler": "loadBackupStatus",
@@ -28922,7 +28931,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.mfa.current_password",
-          "line": 438,
+          "line": 441,
           "via": null,
           "href": null,
           "handler": "regenerateBackupCodes",
@@ -29002,7 +29011,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.working",
-          "line": 450,
+          "line": 453,
           "via": null,
           "href": null,
           "handler": null,
@@ -29012,7 +29021,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.mfa.current_password",
-          "line": 458,
+          "line": 461,
           "via": null,
           "href": null,
           "handler": "disableMfa",
@@ -29092,7 +29101,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.disabling",
-          "line": 465,
+          "line": 468,
           "via": null,
           "href": null,
           "handler": null,
@@ -29102,7 +29111,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.starting",
-          "line": 471,
+          "line": 474,
           "via": null,
           "href": null,
           "handler": "startSetup",
@@ -29128,7 +29137,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.passkeys.retry",
-          "line": 501,
+          "line": 504,
           "via": null,
           "href": null,
           "handler": "loadPasskeyList",
@@ -29153,7 +29162,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.passkeys.remove",
-          "line": 515,
+          "line": 518,
           "via": null,
           "href": null,
           "handler": "() => removePasskey(key.id)",
@@ -29177,7 +29186,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.passkeys.name",
-          "line": 530,
+          "line": 533,
           "via": null,
           "href": null,
           "handler": "addPasskey",
@@ -29187,7 +29196,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.passkeys.waiting",
-          "line": 540,
+          "line": 544,
           "via": null,
           "href": null,
           "handler": null,
@@ -29197,7 +29206,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.sso.retry",
-          "line": 568,
+          "line": 572,
           "via": null,
           "href": null,
           "handler": "loadSsoLinks",
@@ -29222,7 +29231,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.sso.unlink",
-          "line": 583,
+          "line": 587,
           "via": null,
           "href": null,
           "handler": "() => unlinkSsoProvider(link)",
@@ -29247,7 +29256,7 @@
         {
           "tag": "button",
           "label": ")}",
-          "line": 601,
+          "line": 605,
           "via": null,
           "href": null,
           "handler": "() => linkSsoProvider(provider)",
@@ -29272,7 +29281,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.setup.code",
-          "line": 626,
+          "line": 630,
           "via": null,
           "href": null,
           "handler": "enableMfa",
@@ -29353,7 +29362,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.setup.verifying",
-          "line": 637,
+          "line": 641,
           "via": null,
           "href": null,
           "handler": null,
@@ -29363,12 +29372,22 @@
         {
           "tag": "button",
           "label": "i18n:account_security.backup.copy",
-          "line": 653,
+          "line": 657,
           "via": null,
           "href": null,
           "handler": "copyBackupCodes",
           "calls": [],
           "unresolved": true
+        },
+        {
+          "tag": "select",
+          "label": "i18n:account_security.passkeys.device_auto",
+          "line": 16,
+          "via": "PasskeyDeviceSelector",
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
         },
         {
           "tag": "button",

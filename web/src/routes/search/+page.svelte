@@ -416,6 +416,7 @@
   }
 
   .search-input-wrapper {
+    height: var(--control-height);
     display: flex;
     align-items: center;
     /* Take the row minus the help button; `min-width: 0` keeps a long value in
@@ -441,10 +442,13 @@
 
   .search-input {
     flex: 1;
+    min-width: 0;
+    height: 100%;
+    min-height: 0;
     background: none;
     border: none;
     outline: none;
-    padding: 12px;
+    padding: 0 12px;
     font-size: 15px;
     color: var(--text-primary);
   }
@@ -465,12 +469,16 @@
 
   .search-btn {
     flex-shrink: 0;
+    height: 100%;
+    min-height: 0;
+    border: 0;
     border-radius: 0 var(--radius) var(--radius) 0;
   }
 
   .help-btn {
-    width: 36px;
-    height: 36px;
+    width: var(--control-height);
+    height: var(--control-height);
+    flex-shrink: 0;
     margin-left: 8px;
     background: var(--bg-secondary);
     border: 1px solid var(--border);

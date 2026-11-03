@@ -426,3 +426,35 @@ async fn admin_routes_that_grant_lasting_access_refuse_a_session_outside_its_sud
         );
     }
 }
+
+#[tokio::test]
+async fn deleting_a_passkey_requires_recent_confirmation() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (fresh, user_id) =
+        register_full(&base, "sudo-delete-key", "sudo-delete@example.test").await;
+    let ordinary = ordinary_session(&db, user_id).await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/v1/users/passkeys/999");
+    let refused = client
+        .delete(&url)
+        .bearer_auth(&ordinary)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+    assert_eq!(
+        refused.json::<serde_json::Value>().await.unwrap()["error"]["reason"],
+        "sudo_required"
+    );
+    // The same account with recent proof reaches the resource lookup.
+    assert_eq!(
+        client
+            .delete(url)
+            .bearer_auth(&fresh)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+}

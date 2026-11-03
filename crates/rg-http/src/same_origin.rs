@@ -106,19 +106,7 @@ fn changes_state(method: &Method, headers: &HeaderMap) -> bool {
 }
 
 fn carries_session_cookie(headers: &HeaderMap) -> bool {
-    headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .any(|cookies| {
-            cookies.split(';').any(|pair| {
-                pair.trim_start()
-                    .split_once('=')
-                    .is_some_and(|(name, value)| {
-                        name == crate::api::auth::AUTH_COOKIE_NAME && !value.is_empty()
-                    })
-            })
-        })
+    crate::api::auth::cookie_value(headers, crate::api::auth::AUTH_COOKIE_NAME).is_some()
 }
 
 fn header_str(headers: &HeaderMap, name: impl header::AsHeaderName) -> Option<&str> {

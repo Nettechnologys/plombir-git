@@ -343,6 +343,7 @@
     font-size: 0.85rem;
   }
   .filters .btn-sm {
+    min-height: var(--control-height);
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     color: var(--text-secondary);

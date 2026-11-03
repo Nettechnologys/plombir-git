@@ -1,4 +1,6 @@
 <script lang="ts">
+  import PasskeyDeviceSelector from '$lib/components/PasskeyDeviceSelector.svelte';
+  import type { PasskeyDevice } from '$lib/api/passkeys';
   import Logo from '$lib/components/Logo.svelte';
   import {
     login,
@@ -38,6 +40,7 @@
     ssoProviders === SSO_UNAVAILABLE ? [] : ssoProviders,
   );
   const passkeySupported = isPasskeySupported();
+  let passkeyDevice = $state<PasskeyDevice>('auto');
 
   // A refused SSO round trip comes back here as `?sso_error=<code>&provider=`.
   // The sentence is derived, not stored, so it follows a language switch and
@@ -126,7 +129,7 @@
       localError = t('auth.login.passkey_username_first');
       return;
     }
-    const ok = await loginWithPasskey(username);
+    const ok = await loginWithPasskey(username, passkeyDevice);
     if (ok) {
       window.location.href = '/dashboard';
     } else {
@@ -234,6 +237,7 @@
         </button>
 
         {#if passkeySupported}
+          <PasskeyDeviceSelector bind:value={passkeyDevice} disabled={getAuthLoading()} />
           <button
             type="button"
             class="btn-passkey"

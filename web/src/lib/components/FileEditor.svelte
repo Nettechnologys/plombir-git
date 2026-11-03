@@ -378,7 +378,7 @@
   .path-input,
   .text-input {
     width: 100%;
-    min-height: 38px;
+    min-height: var(--control-height);
     padding: 8px 10px;
     border: 1px solid var(--border);
     border-radius: 6px;

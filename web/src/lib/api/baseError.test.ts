@@ -4,11 +4,12 @@ import { ApiError, downloadApiFile, request, requestBytes, getToken, setToken } 
 
 const fetchMock = vi.fn();
 
-function failedResponse(status: number): Response {
+function failedResponse(status: number, reason?: string): Response {
 	return new Response(
 		JSON.stringify({
 			error: {
 				code: 'storage_unavailable',
+                reason,
 				message: 'attestation store unavailable',
 				request_id: 'request-17',
 			},
@@ -55,12 +56,19 @@ describe('rejected session recovery', () => {
     ['download', () => downloadApiFile('/instance', 'instance.json')],
   ])('stops replaying a rejected bearer after a %s request', async (_name, operation) => {
     setToken('revoked');
-    fetchMock.mockResolvedValueOnce(failedResponse(401));
+    fetchMock.mockResolvedValueOnce(failedResponse(401, 'session_revoked'));
     await expect(operation()).rejects.toMatchObject({ status: 401 });
     expect(getToken()).toBeNull();
     fetchMock.mockResolvedValueOnce(new Response('{}'));
     await request('/users/passkeys/login/start', { method: 'POST' });
     expect(fetchMock.mock.calls[1][1].headers.Authorization).toBeUndefined();
+  });
+
+  it.each(['/users/me/sudo', '/users/mfa/verify'])('preserves a valid bearer on a wrong proof at %s', async (path) => {
+    setToken('valid');
+    fetchMock.mockResolvedValueOnce(failedResponse(401));
+    await expect(request(path, { method: 'POST' })).rejects.toMatchObject({ status: 401 });
+    expect(getToken()).toBe('valid');
   });
 
   it('does not clear a fresh login when an older request is refused late', async () => {
@@ -69,7 +77,7 @@ describe('rejected session recovery', () => {
     setToken('old');
     const pending = request('/users/me');
     setToken('new');
-    resolve(failedResponse(401));
+    resolve(failedResponse(401, 'session_revoked'));
     await expect(pending).rejects.toMatchObject({ status: 401 });
     expect(getToken()).toBe('new');
   });

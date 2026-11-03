@@ -1,4 +1,5 @@
-import { request, withApiBase } from './_base.svelte';
+import { getToken, request, withApiBase } from './_base.svelte';
+import { ApiError } from './error';
 
 export interface AuthLoginResponse {
   token: string;
@@ -211,10 +212,26 @@ export const auth = {
       method: 'POST',
       body: JSON.stringify({ token, new_password: newPassword }),
     }),
-  logout: () =>
-    request<{ logged_out: boolean }>('/users/logout', {
-      method: 'POST',
-    }),
+  async logout(): Promise<{ logged_out: boolean }> {
+    const hadBearer = getToken() !== null;
+    try {
+      return await request<{ logged_out: boolean }>('/users/logout', { method: 'POST' });
+    } catch (cause) {
+      if (!(cause instanceof ApiError && cause.status === 401)) throw cause;
+      if (!hadBearer) return { logged_out: true };
+    }
+    // A rejected bearer says nothing about a newer HttpOnly cookie. Revoke
+    // that session too before confirming logout. Never retry other mutations.
+    try {
+      return await request<{ logged_out: boolean }>('/users/logout', {
+        method: 'POST',
+        omitBearer: true,
+      });
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 401) return { logged_out: true };
+      throw cause;
+    }
+  },
   listSsoProviders: () =>
     request<PublicSsoProvider[]>('/auth/sso/providers'),
   ssoAuthorizeUrl: (slug: string) =>

@@ -1,4 +1,6 @@
 <script lang="ts">
+  import PasskeyDeviceSelector from '$lib/components/PasskeyDeviceSelector.svelte';
+  import type { PasskeyDevice } from '$lib/api/passkeys';
   import { copyToClipboard } from '$lib/clipboard';
   import { goto } from '$app/navigation';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
@@ -56,6 +58,7 @@
 
   let passkeyList = $state<PasskeyInfo[] | Unknown>([]);
   let passkeyName = $state('');
+  let passkeyDevice = $state<PasskeyDevice>('auto');
   let passkeyBusy = $state(false);
   const passkeySupported = isPasskeySupported();
 
@@ -207,7 +210,7 @@
       passkeyBusy = true;
       error = '';
       success = '';
-      const next = await passkeys.register(passkeyName.trim());
+      const next = await passkeys.register(passkeyName.trim(), passkeyDevice);
       if (passkeyRequests.owns(claim, 'passkeys')) passkeyList = next;
       passkeyName = '';
       success = t('account_security.passkeys.registered');
@@ -537,6 +540,7 @@
             disabled={passkeyBusy}
           />
         </label>
+        <PasskeyDeviceSelector bind:value={passkeyDevice} disabled={passkeyBusy} />
         <button type="submit" class="btn btn-primary" disabled={passkeyBusy}>
           {passkeyBusy ? t('account_security.passkeys.waiting') : t('account_security.passkeys.add')}
         </button>

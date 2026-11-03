@@ -142,15 +142,25 @@ describe('logout failure semantics', () => {
 		expect(navigation.goto).toHaveBeenCalledWith('/login');
 	});
 
-	it.each([401, 403])('treats an explicit %i as an already-complete logout', async (status) => {
-		auth.logout.mockRejectedValueOnce(new ApiError('authentication required', status));
-		rendered = await renderLoggedInNavbar();
+	it.each([401, 403])('does not claim logout succeeded after an unhandled %i', async (status) => {
+        auth.logout.mockRejectedValueOnce(new ApiError('request refused', status));
+        rendered = await renderLoggedInNavbar();
+        await click(button(rendered.container, 'Sign out'));
+        expect(isLoggedIn()).toBe(true);
+        expect(setToken).not.toHaveBeenCalled();
+        expect(navigation.goto).not.toHaveBeenCalled();
+        expect(rendered.container.querySelector('[role="alert"]')?.textContent)
+            .toContain('Sign out failed; your session is still active.');
+    });
 
-		await click(button(rendered.container, 'Sign out'));
-
-		expect(isLoggedIn()).toBe(false);
-		expect(setToken).toHaveBeenCalledWith(null);
-		expect(navigation.goto).toHaveBeenCalledWith('/login');
-		expect(rendered.container.querySelector('[role="alert"]')).toBeNull();
-	});
+    it('ignores a profile response that arrives after logout', async () => {
+        rendered = await renderLoggedInNavbar();
+        let resolve!: (value: typeof user) => void;
+        auth.me.mockImplementationOnce(() => new Promise<typeof user>((done) => { resolve = done; }));
+        const pending = fetchUser();
+        await logout();
+        resolve(user);
+        await pending;
+        expect(isLoggedIn()).toBe(false);
+    });
 });

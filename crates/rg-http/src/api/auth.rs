@@ -182,16 +182,18 @@ pub(crate) const AUTH_COOKIE_NAME: &str = "plombir_git_token";
 /// rename would have quietly stopped authenticating browser WebSockets
 /// (card_24a8ef566056).
 fn extract_token_from_cookie(headers: &HeaderMap) -> Option<String> {
-    let cookie_header = headers.get("cookie")?.to_str().ok()?;
-    for cookie in cookie_header.split(';') {
-        let cookie = cookie.trim();
-        if let Some(token) = cookie.strip_prefix(&format!("{}=", AUTH_COOKIE_NAME)) {
-            if !token.is_empty() {
-                return Some(token.to_string());
-            }
-        }
-    }
-    None
+    cookie_value(headers, AUTH_COOKIE_NAME).map(str::to_owned)
+}
+
+/// Read cookies consistently when HTTP/2 splits them across header fields.
+pub(crate) fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|cookie| cookie.trim().split_once('='))
+        .find_map(|(key, value)| (key == name && !value.is_empty()).then_some(value))
 }
 
 /// Extract authenticated user_id from either the HttpOnly cookie (M-4, preferred)
@@ -489,6 +491,7 @@ pub(crate) async fn session_standing_middleware(
                 // requests can proceed anonymously. Explicit credentials still
                 // fail closed, and protected handlers still require a session.
                 if cookie_session == Some((user_id, session_version)) {
+                    tracing::debug!(user_id, "stripping revoked ambient session cookie");
                     remove_auth_cookie(req.headers_mut());
                     clear_cookie = true;
                     if !presented_session_versions(req.headers(), &state.jwt_secret)
@@ -607,7 +610,7 @@ fn session_refusal(path: &str, kind: SessionRefusal) -> Response {
             crate::refusal::pre_router_refusal_response(
                 path,
                 StatusCode::UNAUTHORIZED,
-                || AppError::unauthorized(message).into_response(),
+                || AppError::SessionRevoked(message.to_string()).into_response(),
                 rg_core::package_registry::oci::types::error_codes::UNAUTHORIZED,
                 message,
             )
@@ -698,6 +701,32 @@ pub(crate) async fn ci_job_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_and_ceremony_cookies_can_use_separate_header_fields() {
+        let token = session(17);
+        let mut headers = headers("cookie", "theme=light".to_string());
+        headers.append(
+            "cookie",
+            format!("{AUTH_COOKIE_NAME}={token}").parse().unwrap(),
+        );
+        headers.append(
+            "cookie",
+            "plombir_git_passkey_auth=ceremony".parse().unwrap(),
+        );
+        assert_eq!(extract_token_from_cookie(&headers), Some(token));
+        assert_eq!(
+            cookie_value(&headers, "plombir_git_passkey_auth"),
+            Some("ceremony")
+        );
+        remove_auth_cookie(&mut headers);
+        assert_eq!(extract_token_from_cookie(&headers), None);
+        assert_eq!(
+            cookie_value(&headers, "plombir_git_passkey_auth"),
+            Some("ceremony")
+        );
+        assert_eq!(cookie_value(&headers, "theme"), Some("light"));
+    }
 
     const SECRET: &str = "gate-secret";
 

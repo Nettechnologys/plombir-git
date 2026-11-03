@@ -364,7 +364,7 @@
 
   input,
   select {
-    min-height: 38px;
+    min-height: var(--control-height);
     padding: 0.55rem 0.7rem;
     background: var(--bg-primary);
     border: 1px solid var(--border);

@@ -296,3 +296,87 @@ async fn revoked_browser_cookie_recovers_public_pages_but_not_private_access() {
     assert_eq!(explicit.status(), StatusCode::UNAUTHORIZED);
     assert!(!explicit.headers().contains_key(header::WWW_AUTHENTICATE));
 }
+
+/// Reproduce the stale-tab logout: a gate refusal has not ended the newer
+/// cookie session. Only the subsequent cookie-only logout revokes it.
+#[tokio::test]
+async fn logout_with_a_stale_bearer_must_complete_against_the_current_cookie() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (stale, user_id) = register_full(&base, "logout-recovery", "logout@example.test").await;
+    rg_db::ops::user_ops::invalidate_sessions(&db, user_id)
+        .await
+        .unwrap();
+    let user = rg_db::ops::user_ops::find_by_id(&db, user_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let fresh = rg_core::auth::jwt::generate_token(
+        user.id,
+        &user.username,
+        user.session_version,
+        "test-secret-key",
+        7,
+    )
+    .unwrap();
+    let cookie = format!("plombir_git_token={fresh}");
+    let client = reqwest::Client::new();
+    let refused = client
+        .post(format!("{base}/api/v1/users/logout"))
+        .header(header::COOKIE, &cookie)
+        .header(header::ORIGIN, &base)
+        .bearer_auth(&stale)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 401);
+    assert!(!refused.headers().contains_key(header::SET_COOKIE));
+    assert_eq!(
+        refused.json::<serde_json::Value>().await.unwrap()["error"]["reason"],
+        "session_revoked"
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/api/v1/users/me"))
+            .header(header::COOKIE, &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    let logged_out = client
+        .post(format!("{base}/api/v1/users/logout"))
+        .header(header::COOKIE, &cookie)
+        .header(header::ORIGIN, &base)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logged_out.status(), 200);
+    assert!(logged_out.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .contains("Max-Age=0"));
+    // Even replaying the old cookie after reload must no longer authenticate.
+    let reload = client
+        .get(format!("{base}/api/v1/users/me"))
+        .header(header::COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reload.status(), 401);
+
+    let both_stale = client
+        .post(format!("{base}/api/v1/users/logout"))
+        .header(header::COOKIE, &cookie)
+        .header(header::ORIGIN, &base)
+        .bearer_auth(&fresh)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(both_stale.status(), 401);
+    assert!(both_stale.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .contains("Max-Age=0"));
+}

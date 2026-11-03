@@ -65,7 +65,7 @@ pub struct ErrorBody {
     pub request_id: Option<String>,
     /// A machine-readable qualifier for a refusal the client can act on
     /// rather than only show: `sudo_required` says the session is fine and
-    /// has to prove itself again first. Absent everywhere else.
+    /// has to prove itself again first; `session_revoked` rejects its session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
 }
@@ -82,6 +82,9 @@ pub enum AppError {
     BadRequest(String),
     #[error("{0}")]
     Unauthorized(String),
+    /// An explicitly presented session was revoked, rather than a bad password.
+    #[error("{0}")]
+    SessionRevoked(String),
     #[error("{0}")]
     Forbidden(String),
     /// 403 with `reason: "sudo_required"` — a login session that has not
@@ -124,7 +127,7 @@ impl AppError {
         match self {
             Self::NotFound(_) => "NOT_FOUND",
             Self::BadRequest(_) => "BAD_REQUEST",
-            Self::Unauthorized(_) => "UNAUTHORIZED",
+            Self::Unauthorized(_) | Self::SessionRevoked(_) => "UNAUTHORIZED",
             Self::Forbidden(_) | Self::SudoRequired(_) => "FORBIDDEN",
             Self::Conflict(_) => "CONFLICT",
             Self::Gone(_) => "GONE",
@@ -142,7 +145,7 @@ impl AppError {
         match self {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
-            Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::Unauthorized(_) | Self::SessionRevoked(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) | Self::SudoRequired(_) => StatusCode::FORBIDDEN,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Gone(_) => StatusCode::GONE,
@@ -190,7 +193,11 @@ impl IntoResponse for AppError {
                 code,
                 message: sanitized_message,
                 request_id: None,
-                reason: matches!(self, Self::SudoRequired(_)).then_some(SUDO_REQUIRED_REASON),
+                reason: match self {
+                    Self::SudoRequired(_) => Some(SUDO_REQUIRED_REASON),
+                    Self::SessionRevoked(_) => Some("session_revoked"),
+                    _ => None,
+                },
             },
         };
         (status, axum::Json(body)).into_response()

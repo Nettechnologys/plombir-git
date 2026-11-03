@@ -115,7 +115,6 @@
     </div>
 
     <div class="navbar-right">
-      <ThemeToggle />
       {#if !isAuthReady()}
         <span class="nav-link" aria-live="polite">{t('nav.checking_session')}</span>
       {:else if isLoggedIn()}
@@ -124,19 +123,24 @@
         </a>
         <a href="/orgs" class="nav-link">{t('nav.organizations')}</a>
         <a href="/imports" class="nav-link">{t('nav.imports', 'Imports')}</a>
+      {/if}
 
+      <div class="nav-preferences">
         <div class="lang-menu-container">
           <Dropdown ariaLabel={t('nav.change_language', 'Change language')} triggerClass="lang-btn">
             {#snippet trigger()}
-              {$locale === 'zh-CN' ? t('nav.chinese', '中文') : t('nav.english', 'EN')}
+              {$locale === 'zh-CN' ? t('nav.chinese_short') : t('nav.english_short')}
             {/snippet}
             {#snippet menu(close)}
-              <button onclick={() => { setLocale('en'); close(); }} class:active={$locale === 'en'} role="menuitem">{t('nav.english', 'English')}</button>
-              <button onclick={() => { setLocale('zh-CN'); close(); }} class:active={$locale === 'zh-CN'} role="menuitem">{t('nav.chinese', '中文')}</button>
+              <button onclick={() => { setLocale('en'); close(); }} class:active={$locale === 'en'} role="menuitem" title={t('nav.english')}>{t('nav.english_short')}</button>
+              <button onclick={() => { setLocale('zh-CN'); close(); }} class:active={$locale === 'zh-CN'} role="menuitem" title={t('nav.chinese')}>{t('nav.chinese_short')}</button>
             {/snippet}
           </Dropdown>
         </div>
+        <ThemeToggle />
+      </div>
 
+      {#if isAuthReady() && isLoggedIn()}
         <div class="user-menu-container">
           <Dropdown ariaLabel={t('nav.user_menu')} triggerClass="user-btn">
             {#snippet trigger()}
@@ -173,11 +177,11 @@
             {/snippet}
           </Dropdown>
         </div>
-      {:else}
+      {:else if isAuthReady()}
         {#if getRegistrationOpen() !== false}
-          <a href="/register" class="btn-outline">{t('nav.sign_up')}</a>
+          <a href="/register" class="btn btn-outline">{t('nav.sign_up')}</a>
         {/if}
-        <a href="/login" class="btn-outline">{t('nav.sign_in')}</a>
+        <a href="/login" class="btn btn-outline">{t('nav.sign_in')}</a>
       {/if}
     </div>
   </div>
@@ -259,6 +263,12 @@
     gap: 12px;
   }
 
+  .nav-preferences {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
   .navbar-left {
     min-width: 0;
     justify-self: start;
@@ -304,7 +314,7 @@
   }
 
   .navbar-search {
-    height: 36px;
+    height: var(--control-height);
     display: inline-flex;
     align-items: center;
     gap: 8px;
@@ -331,7 +341,9 @@
     min-width: 0;
     border: 0;
     background: transparent;
-    padding: 4px 0;
+    height: 100%;
+    min-height: 0;
+    padding: 0;
     color: var(--text-primary);
   }
 
@@ -342,6 +354,7 @@
   }
 
   .search-btn {
+    height: 100%;
     border: 0;
     background: transparent;
     color: var(--text-secondary);
@@ -355,7 +368,8 @@
     color: var(--text-primary);
   }
 
-  :global(.user-btn) {
+  .user-menu-container :global(.user-btn) {
+    min-height: var(--control-height);
     display: inline-flex;
     align-items: center;
     gap: 8px;
@@ -367,7 +381,7 @@
     font-size: 13px;
   }
 
-  :global(.user-btn:hover) {
+  .user-menu-container :global(.user-btn:hover) {
     background: var(--bg-hover);
   }
 
@@ -386,6 +400,8 @@
   }
 
   .lang-menu-container :global(.lang-btn) {
+    min-height: var(--control-height);
+    min-width: var(--control-height);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     padding: 4px 10px;

@@ -18,9 +18,16 @@
 
 <button
   type="button"
-  class="btn btn-sm"
+  class="btn theme-toggle"
   onclick={toggle}
   aria-label={t('nav.light_theme', 'Light theme')}
   aria-pressed={light}
   title={light ? t('nav.use_dark_theme', 'Use dark theme') : t('nav.use_light_theme', 'Use light theme')}
 >{light ? '☀' : '☾'}</button>
+
+<style>
+  .theme-toggle {
+    min-width: var(--control-height);
+    padding: 0;
+  }
+</style>

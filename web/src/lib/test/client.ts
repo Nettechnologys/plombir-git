@@ -54,6 +54,7 @@ export const admin = namespace();
 export const artifacts = namespace();
 export const attachments = namespace();
 export const auth = namespace();
+auth.logout.mockResolvedValue({ logged_out: true });
 export const boards = namespace();
 export const bots = namespace();
 export const branchProtections = namespace();
@@ -127,4 +128,5 @@ export function resetTestClient(): void {
 	isSudoRequired.mockReturnValue(false);
 	getToken.mockReturnValue('test-token');
 	isPasskeySupported.mockReturnValue(true);
+	auth.logout.mockResolvedValue({ logged_out: true });
 }

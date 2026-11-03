@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_credential};
-use crate::api::auth::{AuthUser, SessionUser, SudoUser, AUTH_COOKIE_NAME};
+use crate::api::auth::{AuthUser, SudoUser, AUTH_COOKIE_NAME};
 use crate::error::AppError;
 use crate::AppState;
 use rg_core::auth::webauthn as wa;
@@ -81,14 +81,7 @@ fn build_auth_cookie(token: &str, is_https: bool) -> String {
 }
 
 fn extract_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers
-        .get(axum::http::header::COOKIE)?
-        .to_str()
-        .ok()?
-        .split(';')
-        .map(str::trim)
-        .find_map(|cookie| cookie.strip_prefix(&format!("{}=", name)))
-        .filter(|token| !token.is_empty())
+    crate::api::auth::cookie_value(headers, name)
 }
 
 // ── Relying-party resolution ──────────────────────────────────────────────
@@ -751,13 +744,14 @@ pub async fn list_passkeys(
     responses(
         (status = 204, description = "Passkey deleted"),
         (status = 401, description = "Authentication required", body = serde_json::Value),
+        (status = 403, description = "Recent authentication required", body = serde_json::Value),
         (status = 404, description = "Passkey not found", body = serde_json::Value),
         (status = 409, description = "The passkey is the account's last way to sign in", body = serde_json::Value),
     ),
 )]
 pub async fn delete_passkey(
     State(state): State<AppState>,
-    SessionUser(user_id): SessionUser,
+    SudoUser(user_id): SudoUser,
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, AppError> {

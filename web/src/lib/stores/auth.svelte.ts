@@ -1,7 +1,9 @@
 // Auth state store using Svelte 5 runes
 
 import { setToken, getToken, auth, passkeys } from '$lib/api/client.svelte';
+import type { PasskeyDevice } from '$lib/api/passkeys';
 import { ApiError } from '$lib/api/error';
+import { t } from '$lib/i18n';
 
 interface User {
   id: number;
@@ -20,6 +22,7 @@ let pendingMfaUsername = $state<string | null>(null);
 // The login (username or email) whose administrator-chosen password has to be
 // replaced before any session exists.
 let pendingPasswordChangeLogin = $state<string | null>(null);
+let sessionGeneration = 0;
 
 function sessionUser(me: Awaited<ReturnType<typeof auth.me>>): User {
   return {
@@ -188,7 +191,7 @@ export async function verifyMfa(code: string, backup = false) {
   }
 }
 
-export async function loginWithPasskey(username: string) {
+export async function loginWithPasskey(username: string, device: PasskeyDevice = 'auto') {
   if (!username.trim()) {
     error = 'Enter your username to sign in with a passkey';
     return false;
@@ -197,7 +200,7 @@ export async function loginWithPasskey(username: string) {
   isLoading = true;
   error = null;
   try {
-    const res = await passkeys.login(username.trim());
+    const res = await passkeys.login(username.trim(), device);
     pendingMfaUsername = null;
     setToken(res.token);
     const me = await auth.me();
@@ -247,10 +250,12 @@ export async function register(
 }
 
 export async function fetchUser() {
+  const generation = sessionGeneration;
   // M-4: Always try to fetch user profile — the HttpOnly cookie is sent
   // automatically. If the cookie is absent or invalid, the API returns 401.
   try {
     const me = await auth.me();
+    if (generation !== sessionGeneration) return;
     currentUser = {
       id: me.id,
       username: me.username,
@@ -261,6 +266,7 @@ export async function fetchUser() {
     authReady = true;
     sessionCheckError = null;
   } catch (cause: unknown) {
+    if (generation !== sessionGeneration) return;
     if (cause instanceof ApiError && (cause.status === 401 || cause.status === 403)) {
       setToken(null);
       currentUser = null;
@@ -278,17 +284,13 @@ export async function fetchUser() {
 }
 
 export async function logout() {
-  // M-4: Call backend to clear the HttpOnly cookie (JS cannot clear it directly)
+  // Invalidate pending profile probes so a late answer cannot undo logout.
+  sessionGeneration++;
   try {
-    await auth.logout();
-  } catch (cause: unknown) {
-    // An explicit authentication rejection means there is no live server
-    // session left to revoke, so logout is already complete. Transport and 5xx
-    // failures prove no such thing: keep the known local session and let the UI
-    // offer a retry instead of falsely confirming a security operation.
-    if (!(cause instanceof ApiError && (cause.status === 401 || cause.status === 403))) {
-      throw cause;
-    }
+    const result = await auth.logout();
+    if (!result?.logged_out) throw new Error(t('nav.sign_out_failed_detail'));
+  } finally {
+    sessionGeneration++;
   }
   setToken(null);
   currentUser = null;
