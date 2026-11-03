@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { ApiError, downloadApiFile, request } from './_base.svelte';
+import { ApiError, downloadApiFile, request, requestBytes, getToken, setToken } from './_base.svelte';
 
 const fetchMock = vi.fn();
 
@@ -24,6 +24,7 @@ beforeEach(() => {
 afterEach(() => {
 	vi.unstubAllGlobals();
 	vi.clearAllMocks();
+	setToken(null);
 });
 
 describe('API response errors', () => {
@@ -44,4 +45,32 @@ describe('API response errors', () => {
 			requestId: 'request-17',
 		});
 	});
+});
+
+
+describe('rejected session recovery', () => {
+  it.each([
+    ['JSON', () => request('/users/me')],
+    ['bytes', () => requestBytes('/repos/owner/repo/raw/main/file')],
+    ['download', () => downloadApiFile('/instance', 'instance.json')],
+  ])('stops replaying a rejected bearer after a %s request', async (_name, operation) => {
+    setToken('revoked');
+    fetchMock.mockResolvedValueOnce(failedResponse(401));
+    await expect(operation()).rejects.toMatchObject({ status: 401 });
+    expect(getToken()).toBeNull();
+    fetchMock.mockResolvedValueOnce(new Response('{}'));
+    await request('/users/passkeys/login/start', { method: 'POST' });
+    expect(fetchMock.mock.calls[1][1].headers.Authorization).toBeUndefined();
+  });
+
+  it('does not clear a fresh login when an older request is refused late', async () => {
+    let resolve!: (response: Response) => void;
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((done) => { resolve = done; }));
+    setToken('old');
+    const pending = request('/users/me');
+    setToken('new');
+    resolve(failedResponse(401));
+    await expect(pending).rejects.toMatchObject({ status: 401 });
+    expect(getToken()).toBe('new');
+  });
 });

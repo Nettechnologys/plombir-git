@@ -189,6 +189,9 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
 
   if (!res.ok) {
     const error = await responseError(res);
+    // Stop replaying a rejected bearer on login and public requests. A late
+    // response from an older request must not erase a newly adopted session.
+    if (error.status === 401 && getToken() === token) setToken(null);
     // A sudo refusal is a question, not an answer: ask once, then send the
     // same request again on the re-issued session. Once — a second refusal
     // means something other than the window and reaches the caller.
@@ -228,6 +231,7 @@ export async function requestBytes(path: string, options: { timeoutMs?: number }
     credentials: 'include',
   });
   if (!res.ok) {
+    if (res.status === 401 && getToken() === token) setToken(null);
     throw await responseError(res);
   }
   return res.arrayBuffer();
@@ -267,6 +271,7 @@ export async function downloadApiFile(path: string, fallbackFilename: string): P
     credentials: 'include',
   });
   if (!res.ok) {
+    if (res.status === 401 && getToken() === token) setToken(null);
     throw await responseError(res);
   }
 

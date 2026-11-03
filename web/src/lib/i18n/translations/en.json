@@ -41,6 +41,9 @@
     "copy_failed": "Copying failed. Select the text and copy it yourself."
   },
   "nav": {
+    "light_theme": "Light theme",
+    "use_light_theme": "Use light theme",
+    "use_dark_theme": "Use dark theme",
     "dashboard": "Dashboard",
     "notifications": "Notifications",
     "notifications_unread": "{count} unread notifications",

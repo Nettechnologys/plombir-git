@@ -912,7 +912,8 @@
       "access": "Public",
       "handler": "api::passkeys::login_start",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": false
     },

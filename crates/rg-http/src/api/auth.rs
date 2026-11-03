@@ -466,19 +466,46 @@ fn presented_session_versions(headers: &HeaderMap, jwt_secret: &str) -> Vec<(i64
 /// trip rather than a page fetch.
 pub(crate) async fn session_standing_middleware(
     State(state): State<crate::AppState>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    let is_https = crate::public_url::request_is_https(&state, req.headers());
+    let cookie = extract_token_from_cookie(req.headers());
+    let cookie_session = cookie.as_deref().and_then(|token| {
+        rg_core::auth::jwt::validate_token(token, &state.jwt_secret)
+            .and_then(|claims| Some((claims.sub.parse::<i64>().ok()?, claims.session_version)))
+    });
+    let mut clear_cookie = cookie.is_some() && cookie_session.is_none();
+    if clear_cookie {
+        remove_auth_cookie(req.headers_mut());
+    }
     let presented = presented_session_versions(req.headers(), &state.jwt_secret);
     for (user_id, session_version) in presented {
         match rg_db::ops::user_ops::find_by_id(&state.db, user_id).await {
             Ok(Some(user)) if user.is_usable() && user.session_version == session_version => {}
             Ok(_) => {
+                // A browser attaches its cookie to public pages and to a new
+                // login too. Drop a revoked cookie before routing, so those
+                // requests can proceed anonymously. Explicit credentials still
+                // fail closed, and protected handlers still require a session.
+                if cookie_session == Some((user_id, session_version)) {
+                    remove_auth_cookie(req.headers_mut());
+                    clear_cookie = true;
+                    if !presented_session_versions(req.headers(), &state.jwt_secret)
+                        .contains(&(user_id, session_version))
+                    {
+                        continue;
+                    }
+                }
                 tracing::warn!(
                     user_id,
                     "rejecting session token: account is disabled, gone, or its session was revoked"
                 );
-                return session_refusal(req.uri().path(), SessionRefusal::Revoked);
+                return clear_revoked_cookie(
+                    session_refusal(req.uri().path(), SessionRefusal::Revoked),
+                    clear_cookie,
+                    is_https,
+                );
             }
             Err(e) => {
                 // Fail closed, but say which of the two it is: "revoked" and
@@ -493,7 +520,52 @@ pub(crate) async fn session_standing_middleware(
             }
         }
     }
-    next.run(req).await
+    clear_revoked_cookie(next.run(req).await, clear_cookie, is_https)
+}
+
+/// Preserve ceremony and other cookies while removing the ambient session.
+fn remove_auth_cookie(headers: &mut HeaderMap) {
+    let retained = headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .map(str::trim)
+        .filter(|cookie| {
+            !cookie.is_empty()
+                && !cookie
+                    .split_once('=')
+                    .is_some_and(|(name, _)| name == AUTH_COOKIE_NAME)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    headers.remove(axum::http::header::COOKIE);
+    if let Ok(value) = axum::http::HeaderValue::from_str(&retained) {
+        if !retained.is_empty() {
+            headers.insert(axum::http::header::COOKIE, value);
+        }
+    }
+}
+
+fn clear_revoked_cookie(mut response: Response, clear: bool, is_https: bool) -> Response {
+    // A successful login may already have replaced the revoked cookie. Never
+    // append a deletion after it, which would immediately erase the new login.
+    let replaced = response
+        .headers()
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|cookie| cookie.starts_with(&format!("{AUTH_COOKIE_NAME}=")));
+    if clear && !replaced {
+        if let Ok(value) =
+            axum::http::HeaderValue::from_str(&crate::api::users::build_clear_cookie(is_https))
+        {
+            response
+                .headers_mut()
+                .append(axum::http::header::SET_COOKIE, value);
+        }
+    }
+    response
 }
 
 /// Which of the two answers `session_standing_middleware` is giving back.
@@ -523,11 +595,9 @@ enum SessionRefusal {
 ///
 /// `/api/v1/...` → [`crate::error::AppError`] JSON (`{error:{code,message}}`).
 /// `/v2` and `/v2/...` → OCI JSON (`{errors:[{code,message}]}`).
-/// Everything else (git transport under `/{owner}/{repo}/...` and `/git/...`,
-/// SPA fallback, `/health`, `/metrics`) → keeps the plain-text body it had
-/// before the fix. Git-HTTP clients recognise `WWW-Authenticate: Basic` and
-/// prompt for credentials on a 401, so the challenge is attached there for the
-/// same reason [`crate::git_http`] carries one on its own denials.
+/// Other paths keep a plain-text body. Only Git smart-HTTP endpoints carry a
+/// Basic challenge: attaching it to the SPA or health check opens a browser
+/// password dialog unrelated to the site's login form.
 fn session_refusal(path: &str, kind: SessionRefusal) -> Response {
     use crate::error::AppError;
 

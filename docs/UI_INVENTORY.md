@@ -1376,7 +1376,7 @@ CI runners, and webhooks. A browser test cannot cover these routes.
 | POST | `/api/v1/users/mfa/verify` | `Public` | rust |
 | POST | `/api/v1/users/passkeys/register/start` | `User` | rust |
 | POST | `/api/v1/users/passkeys/register/finish` | `User` | rust |
-| POST | `/api/v1/users/passkeys/login/start` | `Public` | rust |
+| POST | `/api/v1/users/passkeys/login/start` | `Public` | rust+web |
 | POST | `/api/v1/users/passkeys/login/finish` | `Public` | rust |
 | GET | `/api/v1/auth/sso/{slug}` | `Public` | rust |
 | GET | `/api/v1/auth/sso/{slug}/callback` | `Public` | rust |

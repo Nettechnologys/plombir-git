@@ -400,7 +400,11 @@
     color: var(--text-secondary);
   }
 
-  .profile-page { max-width: 760px; }
+  .profile-page {
+    max-width: 808px;
+    margin: 0 auto;
+    padding: var(--layout-block-padding) var(--layout-gutter);
+  }
 
   .page-header { margin-bottom: 24px; }
 

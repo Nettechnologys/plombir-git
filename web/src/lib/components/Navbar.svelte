@@ -4,6 +4,7 @@
   import { locale, createT, type Locale } from '$lib/i18n';
   import Dropdown from './Dropdown.svelte';
   import Logo from './Logo.svelte';
+  import ThemeToggle from './ThemeToggle.svelte';
   import { getRegistrationOpen } from '$lib/stores/instance.svelte';
   import { getUnreadCount, watchUnreadNotifications } from '$lib/stores/unreadNotifications.svelte';
 
@@ -114,6 +115,7 @@
     </div>
 
     <div class="navbar-right">
+      <ThemeToggle />
       {#if !isAuthReady()}
         <span class="nav-link" aria-live="polite">{t('nav.checking_session')}</span>
       {:else if isLoggedIn()}
@@ -440,7 +442,7 @@
     .search-input { min-width: 180px; }
 
     .navbar-left { width: 100%; }
-    .menu-toggle { display: inline-flex; margin-left: auto; }
+    .navbar .menu-toggle { display: inline-flex; margin-left: auto; }
 
     .navbar:not(.menu-open) .navbar-left .nav-link,
     .navbar:not(.menu-open) .navbar-search,

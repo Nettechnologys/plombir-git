@@ -693,7 +693,7 @@
   .form-group input, .form-group select { width: 100%; padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--radius); font-size: 14px; background: var(--bg-primary); color: var(--text-primary); box-sizing: border-box; }
   .field-hint { margin: 4px 0 0; color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
   .field-hint code { font-size: 11px; }
-  .actions { margin-top: 16px; }
+  .actions { margin: 16px 0 24px; }
   .inline-actions { display: flex; gap: 8px; margin-top: 16px; }
   .btn-primary { padding: 8px 20px; background: var(--accent); color: #fff; border: none; border-radius: var(--radius); font-size: 14px; cursor: pointer; }
   .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }

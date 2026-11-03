@@ -27,8 +27,7 @@
   --layout-max: min(1280px, calc(100vw - 2 * var(--layout-gutter)));
   --layout-narrow-max: min(980px, calc(100vw - 2 * var(--layout-gutter)));
 
-  /* The app is dark only: native controls — selects, date pickers, scroll
-     bars — follow this instead of the browser's light default. */
+  /* Dark is the default; the saved light palette overrides native controls. */
   color-scheme: dark;
 
   /* Names pages reached for that the palette above never defined. Each one
@@ -55,6 +54,46 @@
   --warning: var(--yellow);
   --success-bg: rgba(63, 185, 80, 0.15);
   --success-text: var(--green);
+  --syntax-keyword: #ff7b72;
+  --syntax-string: #a5d6ff;
+  --syntax-number: #79c0ff;
+  --syntax-comment: #8b949e;
+  --syntax-title: #d2a8ff;
+  --syntax-deletion: #ffa198;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg-primary: #ffffff;
+  --bg-secondary: #f6f8fa;
+  --bg-tertiary: #eaeef2;
+  --bg-hover: #e2e7ed;
+  --border: #d0d7de;
+  --border-light: #d8dee4;
+  --text-primary: #1f2328;
+  --text-secondary: #59636e;
+  --text-muted: #636c76;
+  --accent: #0969da;
+  --accent-hover: #0550ae;
+  --accent-rgb: 9, 105, 218;
+  --accent-weak: rgba(9, 105, 218, 0.1);
+  --green: #1a7f37;
+  --green-dim: #1f883d;
+  --red: #cf222e;
+  --red-dim: #a40e26;
+  --yellow: #7d4e00;
+  --yellow-dim: #9a6700;
+  --purple: #8250df;
+  --orange: #953800;
+  --danger-bg: rgba(207, 34, 46, 0.08);
+  --error-bg: rgba(207, 34, 46, 0.08);
+  --success-bg: rgba(26, 127, 55, 0.1);
+  --syntax-keyword: #cf222e;
+  --syntax-string: #0a3069;
+  --syntax-number: #0550ae;
+  --syntax-comment: #59636e;
+  --syntax-title: #6639ba;
+  --syntax-deletion: #82071e;
 }
 
 * {
@@ -91,42 +130,42 @@ code, pre {
 .hljs-type,
 .hljs-literal,
 .hljs-selector-tag {
-  color: #ff7b72;
+  color: var(--syntax-keyword);
 }
 
 .hljs-string,
 .hljs-regexp,
 .hljs-addition,
 .hljs-attribute {
-  color: #a5d6ff;
+  color: var(--syntax-string);
 }
 
 .hljs-number,
 .hljs-symbol,
 .hljs-variable,
 .hljs-template-variable {
-  color: #79c0ff;
+  color: var(--syntax-number);
 }
 
 .hljs-comment,
 .hljs-quote {
-  color: #8b949e;
+  color: var(--syntax-comment);
   font-style: italic;
 }
 
 .hljs-title,
 .hljs-function,
 .hljs-section {
-  color: #d2a8ff;
+  color: var(--syntax-title);
 }
 
 .hljs-meta,
 .hljs-preprocessor {
-  color: #79c0ff;
+  color: var(--syntax-number);
 }
 
 .hljs-deletion {
-  color: #ffa198;
+  color: var(--syntax-deletion);
 }
 
 pre {

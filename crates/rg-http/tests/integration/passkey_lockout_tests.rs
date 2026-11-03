@@ -214,3 +214,72 @@ async fn a_locked_account_answers_a_genuine_assertion_as_it_answers_a_forged_one
     let (status, body) = finish(&base, &cookie, &assertion(&key, &challenge, 2, true)).await;
     assert_eq!(status, 200, "the unlocked login failed: {body}");
 }
+
+/// A second browser may carry a cookie invalidated by a logout elsewhere.
+/// It must still be able to complete a fresh, genuinely signed assertion.
+#[tokio::test]
+async fn passkey_login_replaces_a_revoked_cookie_with_a_current_session() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (old_token, user_id) =
+        register_full(&base, "pk-recovery", "pk-recovery@example.test").await;
+    let key = authenticator();
+    rg_db::ops::passkey_credential_ops::create(
+        &db,
+        user_id,
+        &b64(CREDENTIAL_ID),
+        &stored_passkey(&key),
+        "software key",
+        RP_ID,
+    )
+    .await
+    .unwrap();
+    let (challenge, ceremony_cookie) = start(&base, "pk-recovery").await;
+    // Revoke the browser's existing session while its platform prompt is open.
+    rg_db::ops::user_ops::invalidate_sessions(&db, user_id)
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{base}/api/v1/users/passkeys/login/finish"))
+        .header(reqwest::header::HOST, RP_ID)
+        .header(
+            reqwest::header::COOKIE,
+            format!("plombir_git_token={old_token}; {ceremony_cookie}"),
+        )
+        .json(&assertion(&key, &challenge, 1, true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let cookies = response
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let sessions = cookies
+        .iter()
+        .filter(|c| c.starts_with("plombir_git_token="))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "a new cookie must not be followed by its deletion"
+    );
+    assert!(!sessions[0].contains("Max-Age=0"));
+    let session_cookie = sessions[0].split(';').next().unwrap();
+    let body: serde_json::Value = response.json().await.unwrap();
+    let me = client
+        .get(format!("{base}/api/v1/users/me"))
+        .header(reqwest::header::COOKIE, session_cookie)
+        .bearer_auth(body["token"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        me.status(),
+        200,
+        "fresh cookie and bearer must survive the standing gate"
+    );
+    assert_eq!(me.json::<serde_json::Value>().await.unwrap()["id"], user_id);
+}

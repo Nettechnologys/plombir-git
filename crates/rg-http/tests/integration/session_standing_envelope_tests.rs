@@ -247,3 +247,52 @@ async fn an_anonymous_v1_request_falls_through_the_session_gate() {
         "anonymous public request must not be refused by the session gate"
     );
 }
+
+#[tokio::test]
+async fn revoked_browser_cookie_recovers_public_pages_but_not_private_access() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (jwt, user_id) = register_full(&base, "browser-recovery", "recovery@example.test").await;
+    rg_db::ops::user_ops::invalidate_sessions(&db, user_id)
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+    for path in [
+        "/api/v1/instance",
+        "/api/v1/auth/sso/providers",
+        "/health",
+        "/",
+    ] {
+        let anonymous = client.get(format!("{base}{path}")).send().await.unwrap();
+        let recovered = client
+            .get(format!("{base}{path}"))
+            .header(header::COOKIE, format!("plombir_git_token={jwt}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(recovered.status(), anonymous.status(), "{path}");
+        assert!(
+            !recovered.headers().contains_key(header::WWW_AUTHENTICATE),
+            "{path}"
+        );
+        assert!(recovered.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0"));
+    }
+    let protected = client
+        .get(format!("{base}/api/v1/users/me"))
+        .header(header::COOKIE, format!("plombir_git_token={jwt}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(protected.status(), StatusCode::UNAUTHORIZED);
+    // Explicit stale bearer credentials still fail, even on public routes.
+    let explicit = client
+        .get(format!("{base}/"))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(explicit.status(), StatusCode::UNAUTHORIZED);
+    assert!(!explicit.headers().contains_key(header::WWW_AUTHENTICATE));
+}

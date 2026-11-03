@@ -4,14 +4,14 @@
 // launches it with `web/` as cwd. Both the imported checker and the CLI writer
 // must still read and write the repository tree anchored beside this script.
 
-import { readFileSync, rmSync } from 'node:fs';
+import { readFileSync, realpathSync, rmSync } from 'node:fs';
 import { scratchDir } from './lib/scratch-dir.mjs';
 import { spawnSync } from 'node:child_process';
 import { dirname, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
-const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const root = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..'));
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 function run(label, command, args) {
@@ -33,7 +33,9 @@ function assertSame(actual, expected, label) {
   }
 }
 
-const fixture = scratchDir(join(tmpdir(), 'plombir-git-ui-inventory-root.'));
+// Canonical paths prevent a symlinked TMPDIR from making relative paths climb
+// past the filesystem root, where root and web cwd can resolve identically.
+const fixture = realpathSync(scratchDir(join(tmpdir(), 'plombir-git-ui-inventory-root.')));
 try {
   const rootJson = join(fixture, 'root.json');
   const rootMd = join(fixture, 'root.md');

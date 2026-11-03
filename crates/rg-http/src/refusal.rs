@@ -30,7 +30,7 @@ pub(crate) fn pre_router_refusal_response(
     }
 
     let mut response = (status, message.to_string()).into_response();
-    if status == StatusCode::UNAUTHORIZED {
+    if status == StatusCode::UNAUTHORIZED && crate::middleware::transport_of(path) == Some("git") {
         response.headers_mut().insert(
             header::WWW_AUTHENTICATE,
             HeaderValue::from_static("Basic realm=\"Plombir Git\""),

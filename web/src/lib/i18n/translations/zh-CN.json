@@ -41,6 +41,9 @@
     "copy_failed": "复制失败。请选中文本后手动复制。"
   },
   "nav": {
+    "light_theme": "浅色主题",
+    "use_light_theme": "使用浅色主题",
+    "use_dark_theme": "使用深色主题",
     "dashboard": "仪表板",
     "notifications": "通知",
     "notifications_unread": "{count} 条未读通知",
