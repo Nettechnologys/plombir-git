@@ -489,6 +489,9 @@
       "delete_failed": "无法删除标签。"
     },
     "tabs": {
+      "more": "更多",
+      "more_active": "更多仓库标签；当前：{tab}",
+      "navigation": "仓库导航",
       "code": "代码",
       "network": "关系网",
       "issues": "问题",

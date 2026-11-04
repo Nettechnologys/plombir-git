@@ -5972,7 +5972,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -5982,7 +5982,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -5992,7 +5992,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -6036,7 +6036,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -6097,7 +6097,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -6126,7 +6126,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -6136,7 +6136,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -6146,7 +6146,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -6156,7 +6156,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -6166,7 +6166,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -6191,19 +6191,9 @@
           "unresolved": false
         },
         {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
-          "unresolved": false
-        },
-        {
           "tag": "button",
           "label": "",
-          "line": 64,
+          "line": 150,
           "via": "Dropdown",
           "href": null,
           "handler": "toggle",
@@ -6507,7 +6497,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -6517,7 +6507,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -6527,7 +6517,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -6567,7 +6557,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -6620,7 +6610,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -6645,7 +6635,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -6655,7 +6645,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -6665,7 +6655,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -6675,7 +6665,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -6685,7 +6675,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -6707,16 +6697,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         }
       ],
@@ -7318,7 +7298,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -7328,7 +7308,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -7338,7 +7318,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -7378,7 +7358,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -7431,7 +7411,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -7456,7 +7436,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -7466,7 +7446,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -7476,7 +7456,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -7486,7 +7466,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -7496,7 +7476,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -7518,16 +7498,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         },
         {
@@ -7815,7 +7785,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -7825,7 +7795,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -7835,7 +7805,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -7875,7 +7845,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -7928,7 +7898,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -7953,7 +7923,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -7963,7 +7933,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -7973,7 +7943,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -7983,7 +7953,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -7993,7 +7963,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -8015,16 +7985,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         },
         {
@@ -8133,7 +8093,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -8143,7 +8103,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -8153,7 +8113,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -8193,7 +8153,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -8246,7 +8206,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -8271,7 +8231,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -8281,7 +8241,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -8291,7 +8251,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -8301,7 +8261,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -8311,7 +8271,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -8336,19 +8296,9 @@
           "unresolved": false
         },
         {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
-          "unresolved": false
-        },
-        {
           "tag": "button",
           "label": "",
-          "line": 64,
+          "line": 150,
           "via": "Dropdown",
           "href": null,
           "handler": "toggle",
@@ -8663,7 +8613,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -8673,7 +8623,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -8683,7 +8633,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -8723,7 +8673,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -8776,7 +8726,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -8801,7 +8751,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -8811,7 +8761,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -8821,7 +8771,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -8831,7 +8781,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -8841,7 +8791,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -8863,16 +8813,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         }
       ],
@@ -8921,7 +8861,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -8931,7 +8871,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -8941,7 +8881,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -8981,7 +8921,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -9034,7 +8974,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -9059,7 +8999,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -9069,7 +9009,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -9079,7 +9019,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -9089,7 +9029,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -9099,7 +9039,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -9121,16 +9061,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         }
       ],
@@ -9563,7 +9493,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -9573,7 +9503,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -9583,7 +9513,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -9623,7 +9553,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -9676,7 +9606,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -9701,7 +9631,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -9711,7 +9641,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -9721,7 +9651,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -9731,7 +9661,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -9741,7 +9671,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -9763,16 +9693,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         },
         {
@@ -10286,7 +10206,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -10296,7 +10216,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -10306,7 +10226,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -10346,7 +10266,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -10399,7 +10319,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -10424,7 +10344,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -10434,7 +10354,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -10444,7 +10364,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -10454,7 +10374,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -10464,7 +10384,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -10486,16 +10406,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         },
         {
@@ -11074,7 +10984,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -11084,7 +10994,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -11094,7 +11004,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -11134,7 +11044,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -11187,7 +11097,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -11212,7 +11122,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -11222,7 +11132,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -11232,7 +11142,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -11242,7 +11152,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -11252,7 +11162,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -11274,16 +11184,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         },
         {
@@ -11450,7 +11350,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -11460,7 +11360,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -11470,7 +11370,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -11510,7 +11410,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -11563,7 +11463,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -11588,7 +11488,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -11598,7 +11498,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -11608,7 +11508,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -11618,7 +11518,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -11628,7 +11528,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -11650,16 +11550,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         }
       ],
@@ -12108,7 +11998,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -12118,7 +12008,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -12128,7 +12018,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -12168,7 +12058,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -12221,7 +12111,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -12246,7 +12136,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -12256,7 +12146,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -12266,7 +12156,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -12276,7 +12166,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -12286,7 +12176,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -12308,16 +12198,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         },
         {
@@ -12376,7 +12256,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -12386,7 +12266,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -12396,7 +12276,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -12436,7 +12316,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -12489,7 +12369,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -12514,7 +12394,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -12524,7 +12404,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -12534,7 +12414,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -12544,7 +12424,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -12554,7 +12434,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -12576,16 +12456,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         }
       ],
@@ -12772,7 +12642,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -12782,7 +12652,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -12792,7 +12662,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -12832,7 +12702,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -12885,7 +12755,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -12910,7 +12780,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -12920,7 +12790,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -12930,7 +12800,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -12940,7 +12810,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -12950,7 +12820,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -12972,16 +12842,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         }
       ],
@@ -13099,7 +12959,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -13109,7 +12969,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -13119,7 +12979,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -13159,7 +13019,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -13212,7 +13072,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -13237,7 +13097,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -13247,7 +13107,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -13257,7 +13117,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -13267,7 +13127,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -13277,7 +13137,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -13299,16 +13159,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         }
       ],
@@ -13755,7 +13605,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -13765,7 +13615,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -13775,7 +13625,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -13815,7 +13665,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -13868,7 +13718,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -13893,7 +13743,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -13903,7 +13753,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -13913,7 +13763,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -13923,7 +13773,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -13933,7 +13783,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -13955,16 +13805,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         },
         {
@@ -14405,7 +14245,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -14415,7 +14255,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -14425,7 +14265,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -14465,7 +14305,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -14518,7 +14358,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -14543,7 +14383,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -14553,7 +14393,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -14563,7 +14403,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -14573,7 +14413,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -14583,7 +14423,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -14605,16 +14445,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         },
         {
@@ -16719,7 +16549,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -16729,7 +16559,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -16739,7 +16569,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -16779,7 +16609,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -16832,7 +16662,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -16857,7 +16687,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -16867,7 +16697,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -16877,7 +16707,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -16887,7 +16717,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -16897,7 +16727,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -16919,16 +16749,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         },
         {
@@ -17844,7 +17664,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -17854,7 +17674,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -17864,7 +17684,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -17904,7 +17724,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -17957,7 +17777,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -17982,7 +17802,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -17992,7 +17812,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -18002,7 +17822,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -18012,7 +17832,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -18022,7 +17842,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -18044,16 +17864,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         }
       ],
@@ -18167,7 +17977,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -18177,7 +17987,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -18187,7 +17997,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -18227,7 +18037,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -18280,7 +18090,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -18305,7 +18115,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -18315,7 +18125,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -18325,7 +18135,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -18335,7 +18145,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -18345,7 +18155,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -18367,16 +18177,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         }
       ],
@@ -18534,7 +18334,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -18544,7 +18344,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -18554,7 +18354,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -18594,7 +18394,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -18647,7 +18447,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -18672,7 +18472,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -18682,7 +18482,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -18692,7 +18492,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -18702,7 +18502,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -18712,7 +18512,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -18734,16 +18534,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         }
       ],
@@ -21690,7 +21480,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -21700,7 +21490,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -21710,7 +21500,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -21750,7 +21540,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -21803,7 +21593,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -21828,7 +21618,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -21838,7 +21628,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -21848,7 +21638,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -21858,7 +21648,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -21868,7 +21658,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -21890,16 +21680,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         },
         {
@@ -22184,7 +21964,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -22194,7 +21974,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -22204,7 +21984,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -22244,7 +22024,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -22297,7 +22077,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -22322,7 +22102,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -22332,7 +22112,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -22342,7 +22122,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -22352,7 +22132,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -22362,7 +22142,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -22384,16 +22164,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         },
         {
@@ -22535,7 +22305,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -22545,7 +22315,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -22555,7 +22325,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -22595,7 +22365,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -22648,7 +22418,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -22673,7 +22443,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -22683,7 +22453,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -22693,7 +22463,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -22703,7 +22473,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -22713,7 +22483,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -22735,16 +22505,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         }
       ],
@@ -23049,7 +22809,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -23059,7 +22819,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -23069,7 +22829,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -23109,7 +22869,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -23162,7 +22922,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -23187,7 +22947,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -23197,7 +22957,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -23207,7 +22967,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -23217,7 +22977,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -23227,7 +22987,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -23249,16 +23009,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         },
         {
@@ -23362,7 +23112,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 426,
+          "line": 427,
           "via": "RepoHeader",
           "href": "`/${owner}`",
           "handler": null,
@@ -23372,7 +23122,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 428,
+          "line": 429,
           "via": "RepoHeader",
           "href": "`/${owner}/${repo}`",
           "handler": null,
@@ -23382,7 +23132,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 437,
+          "line": 438,
           "via": "RepoHeader",
           "href": null,
           "handler": "toggleStar",
@@ -23422,7 +23172,7 @@
         {
           "tag": "button",
           "label": "👁",
-          "line": 453,
+          "line": 454,
           "via": "RepoHeader",
           "href": null,
           "handler": "cycleWatch",
@@ -23475,7 +23225,7 @@
         {
           "tag": "button",
           "label": "⚡",
-          "line": 469,
+          "line": 470,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleFork",
@@ -23500,7 +23250,7 @@
         {
           "tag": "button",
           "label": "⌄ ▾",
-          "line": 483,
+          "line": 484,
           "via": "RepoHeader",
           "href": null,
           "handler": "handleCloneClick",
@@ -23510,7 +23260,7 @@
         {
           "tag": "button",
           "label": "HTTPS",
-          "line": 512,
+          "line": 513,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'http'",
@@ -23520,7 +23270,7 @@
         {
           "tag": "button",
           "label": "SSH",
-          "line": 520,
+          "line": 521,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => cloneTab = 'ssh'",
@@ -23530,7 +23280,7 @@
         {
           "tag": "button",
           "label": "✓",
-          "line": 539,
+          "line": 540,
           "via": "RepoHeader",
           "href": null,
           "handler": "() => copyUrl(cloneTab === 'http' ? httpCloneUrl : sshCloneUrl)",
@@ -23540,7 +23290,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.download_zip",
-          "line": 558,
+          "line": 559,
           "via": "RepoHeader",
           "href": null,
           "handler": "downloadArchive",
@@ -23562,16 +23312,6 @@
               ]
             }
           ],
-          "unresolved": false
-        },
-        {
-          "tag": "a",
-          "label": "",
-          "line": 586,
-          "via": "RepoHeader",
-          "href": "tabHref(tab)",
-          "handler": null,
-          "calls": [],
           "unresolved": false
         }
       ],

@@ -489,6 +489,9 @@
       "delete_failed": "The tag could not be deleted."
     },
     "tabs": {
+      "more": "More",
+      "more_active": "More repository tabs; current: {tab}",
+      "navigation": "Repository navigation",
       "code": "Code",
       "network": "Network",
       "issues": "Issues",

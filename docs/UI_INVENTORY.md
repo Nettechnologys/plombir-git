@@ -23,9 +23,9 @@
 | Reachable from the browser | 316 (69%) |
 | Layout modules | 2 |
 | Pages | 75 |
-| Interactive controls | 1086 |
+| Interactive controls | 1060 |
 | Controls calling an API | 378 |
-| Controls from shared components | 448 |
+| Controls from shared components | 422 |
 | Browser sweep: scenarios / inventory entries / routes | 52 / 197 / 187 |
 | **UI routes without a web/smoke/browser test** | **22** |
 | UI routes without corpus or browser coverage | 0 |
@@ -57,44 +57,44 @@
 
 | Page | controls | call an API | from components |
 |---|---:|---:|---:|
-| `/[owner]/[repo]/pulls/[number]` | 73 | 36 | 27 |
-| `/[owner]/[repo]/boards` | 42 | 14 | 15 |
-| `/[owner]/[repo]/issues/[number]` | 40 | 17 | 23 |
-| `/[owner]/[repo]/pulls` | 28 | 12 | 12 |
+| `/[owner]/[repo]/pulls/[number]` | 72 | 36 | 26 |
+| `/[owner]/[repo]/boards` | 41 | 14 | 14 |
+| `/[owner]/[repo]/issues/[number]` | 39 | 17 | 22 |
 | `/orgs/[name]` | 28 | 10 | 2 |
-| `/[owner]/[repo]/pipelines` | 27 | 13 | 14 |
-| `/[owner]/[repo]/releases` | 27 | 12 | 11 |
-| `/[owner]/[repo]/issues` | 26 | 9 | 12 |
-| `/[owner]/[repo]` | 25 | 5 | 12 |
-| `/[owner]/[repo]/blob/[...path]` | 25 | 8 | 11 |
+| `/[owner]/[repo]/pulls` | 27 | 12 | 11 |
+| `/[owner]/[repo]/pipelines` | 26 | 13 | 13 |
+| `/[owner]/[repo]/releases` | 26 | 12 | 10 |
+| `/[owner]/[repo]/issues` | 25 | 9 | 11 |
 | `/admin/users` 🔒 | 25 | 8 | 4 |
-| `/[owner]/[repo]/wiki/[title]` | 24 | 9 | 13 |
+| `/[owner]/[repo]` | 24 | 5 | 11 |
+| `/[owner]/[repo]/blob/[...path]` | 24 | 8 | 10 |
 | `/settings/security` | 24 | 11 | 6 |
-| `/[owner]/[repo]/packages` | 23 | 11 | 12 |
-| `/[owner]/[repo]/branches` | 22 | 6 | 12 |
-| `/[owner]/[repo]/milestones` | 22 | 8 | 13 |
-| `/[owner]/[repo]/releases/new` | 21 | 5 | 11 |
+| `/[owner]/[repo]/wiki/[title]` | 23 | 9 | 12 |
+| `/[owner]/[repo]/packages` | 22 | 11 | 11 |
+| `/[owner]/[repo]/branches` | 21 | 6 | 11 |
+| `/[owner]/[repo]/milestones` | 21 | 8 | 12 |
 | `/settings/agents` | 21 | 7 | 10 |
+| `/[owner]/[repo]/releases/new` | 20 | 5 | 10 |
 | `/[owner]/[repo]/settings` | 20 | 5 | 4 |
-| `/[owner]/[repo]/time_tracking` | 20 | 10 | 13 |
-| `/[owner]/[repo]/network` | 19 | 6 | 11 |
+| `/[owner]/[repo]/time_tracking` | 19 | 10 | 12 |
 | `/admin/settings` 🔒 | 19 | 9 | 2 |
-| `/[owner]/[repo]/releases/edit/[id]` | 18 | 5 | 11 |
-| `/[owner]/[repo]/tags` | 18 | 5 | 12 |
+| `/[owner]/[repo]/network` | 18 | 6 | 10 |
 | `/dashboard` | 18 | 4 | 0 |
-| `/[owner]/[repo]/packages/[format]/[...name]` | 17 | 6 | 11 |
-| `/[owner]/[repo]/packages/upload` | 17 | 5 | 11 |
-| `/[owner]/[repo]/wiki` | 17 | 5 | 11 |
-| `/[owner]/[repo]/commits` | 16 | 6 | 12 |
+| `/[owner]/[repo]/releases/edit/[id]` | 17 | 5 | 10 |
+| `/[owner]/[repo]/tags` | 17 | 5 | 11 |
+| `/[owner]/[repo]/packages/[format]/[...name]` | 16 | 6 | 10 |
+| `/[owner]/[repo]/packages/upload` | 16 | 5 | 10 |
+| `/[owner]/[repo]/wiki` | 16 | 5 | 10 |
 | `/imports` | 16 | 3 | 2 |
-| `/[owner]/[repo]/commits/[sha]` | 15 | 7 | 11 |
+| `/[owner]/[repo]/commits` | 15 | 6 | 11 |
 | `/[owner]/[repo]/settings/branches` | 15 | 2 | 2 |
-| `/[owner]/[repo]/wiki/[title]/history` | 15 | 5 | 11 |
 | `/settings/profile` | 15 | 8 | 2 |
+| `/[owner]/[repo]/commits/[sha]` | 14 | 7 | 10 |
+| `/[owner]/[repo]/wiki/[title]/history` | 14 | 5 | 10 |
 | `/login` | 14 | 1 | 1 |
-| `/[owner]/[repo]/compare/[...spec]` | 13 | 4 | 11 |
-| `/[owner]/[repo]/packages/[format]` | 13 | 4 | 11 |
 | `/[owner]/[repo]/settings/webhooks` | 13 | 6 | 2 |
+| `/[owner]/[repo]/compare/[...spec]` | 12 | 4 | 10 |
+| `/[owner]/[repo]/packages/[format]` | 12 | 4 | 10 |
 | `/admin/hooks` 🔒 | 12 | 6 | 12 |
 | `/orgs/[name]/hooks` | 12 | 6 | 12 |
 | `/admin/runners` 🔒 | 11 | 4 | 1 |

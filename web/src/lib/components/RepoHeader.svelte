@@ -9,6 +9,7 @@
   import { browser } from '$app/environment';
   import { canWriteRepo } from '$lib/repoPermission';
   import type { RepoPermission } from '$lib/api/client.svelte';
+  import OverflowTabs from './OverflowTabs.svelte';
 
   const t = createT();
 
@@ -581,18 +582,13 @@
     <div class="repo-action-message success" role="status">{forkSuccess}</div>
   {/if}
 
-  <nav class="repo-tabs">
-    {#each tabs as tab}
-      <a
-        href={tabHref(tab)}
-        class="tab"
-        class:active={activeTab === tab.id}
-      >
-        <span class="tab-icon">{tab.icon}</span>
-        {tab.label}
-      </a>
-    {/each}
-  </nav>
+  <OverflowTabs
+    tabs={tabs.map(tab => ({ ...tab, href: tabHref(tab) }))}
+    {activeTab}
+    label={t('repo.tabs.navigation')}
+    moreLabel={t('repo.tabs.more')}
+    moreActiveLabel={t('repo.tabs.more_active', { tab: tabs.find(tab => tab.id === activeTab)?.label ?? '' })}
+  />
 </div>
 
 <style>
@@ -716,40 +712,6 @@
 
   .label {
     white-space: nowrap;
-  }
-
-  /* Thirteen tabs do not fit a phone; they scroll sideways in one row
-     instead of wrapping into three (card_c30077df5603). */
-  .repo-tabs {
-    display: flex;
-    flex-wrap: nowrap;
-    gap: 0;
-    overflow-x: auto;
-    scrollbar-width: thin;
-  }
-
-  .tab {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 8px 16px;
-    color: var(--text-secondary);
-    font-size: 14px;
-    border-bottom: 2px solid transparent;
-    text-decoration: none;
-    white-space: nowrap;
-  }
-  .tab:hover {
-    color: var(--text-primary);
-    text-decoration: none;
-  }
-  .tab.active {
-    color: var(--text-primary);
-    font-weight: 600;
-    border-bottom-color: var(--accent);
-  }
-  .tab-icon {
-    font-size: 14px;
   }
 
   /* Clone dropdown — GitHub style */
