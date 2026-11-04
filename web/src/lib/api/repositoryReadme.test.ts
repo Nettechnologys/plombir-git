@@ -5,7 +5,7 @@ import BlobPage from '../../routes/[owner]/[repo]/blob/[...path]/+page.svelte';
 import { findReadme, readmeDirectories, repositoryLinkTarget } from '../repoReadme';
 import { setTestPage } from '../test/app';
 import { repos, resetTestClient } from '../test/client';
-import { element, renderComponent, settle, type RenderedComponent } from '../test/render';
+import { click, element, renderComponent, settle, type RenderedComponent } from '../test/render';
 
 let rendered: RenderedComponent | undefined;
 
@@ -41,6 +41,21 @@ beforeEach(() => {
 	});
 	repos.branches.mockResolvedValue([{ name: 'main', is_default: true }]);
 	repos.log.mockResolvedValue({ commits: [] });
+});
+
+it('keeps the repository browser available and retries a failed README read', async () => {
+	showReadme('README.md', '# Recovered README');
+	repos.blob.mockRejectedValueOnce(new Error('temporary read failure'));
+	rendered = await renderComponent(RepositoryPage);
+	expect(rendered.container.querySelector('.repo-toolbar')).not.toBeNull();
+	const retry = element<HTMLButtonElement>(rendered.container, '.readme-unavailable button');
+	expect(retry.type).toBe('button');
+	expect(retry.disabled).toBe(false);
+	await click(retry);
+	expect(repos.blob).toHaveBeenCalledTimes(2);
+	expect(repos.blob).toHaveBeenLastCalledWith('alice', 'demo', 'README.md', undefined);
+	expect(rendered.container.querySelector('.readme-unavailable')).toBeNull();
+	expect(element(rendered.container, '.readme-section').textContent).toContain('Recovered README');
 });
 
 afterEach(async () => {

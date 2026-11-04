@@ -342,9 +342,9 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
     <!-- Branch selector + path breadcrumb -->
     <div class="repo-toolbar">
       <div class="branch-selector">
-        <Dropdown ariaLabel={t('repo.select_branch')} triggerClass="btn-outline" placement="left">
+        <Dropdown ariaLabel={t('repo.select_branch')} triggerClass="btn btn-outline" placement="left" fitViewport>
           {#snippet trigger()}
-            🌿 {currentRefLabel} <span aria-hidden="true">▾</span>
+            <span aria-hidden="true">🌿</span><span class="branch-name" title={currentRefLabel}>{currentRefLabel}</span><span aria-hidden="true">▾</span>
           {/snippet}
           {#snippet menu(close)}
             {#each branches as b}
@@ -362,23 +362,27 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
       </div>
 
       <div class="toolbar-actions">
-        <input
-          type="search"
-          class="repo-code-query"
-          bind:value={codeQuery}
-          onkeydown={(event) => { if (event.key === 'Enter') searchCode(); }}
-          placeholder={t('search.code_in_repo', 'Search code in this repository')}
-          aria-label={t('search.code_in_repo', 'Search code in this repository')}
-        />
-        <button type="button" class="btn-outline btn-sm" onclick={searchCode}>{t('search.code', 'Code')}</button>
-        <a href={`/${owner}/${repo}/branches`} class="btn-outline btn-sm branches-link">
-          {t('repo.branches.title')}
-        </a>
-        <a href={`/${owner}/${repo}/tags`} class="btn-outline btn-sm tags-link">
-          {t('repo.tags.title')}
-        </a>
+        <div class="code-search">
+          <input
+            type="search"
+            class="repo-code-query"
+            bind:value={codeQuery}
+            onkeydown={(event) => { if (event.key === 'Enter') searchCode(); }}
+            placeholder={t('search.code_in_repo', 'Search code in this repository')}
+            aria-label={t('search.code_in_repo', 'Search code in this repository')}
+          />
+          <button type="button" class="btn btn-outline" onclick={searchCode}>{t('common.search')}</button>
+        </div>
+        <div class="ref-links">
+          <a href={`/${owner}/${repo}/branches`} class="btn btn-outline branches-link">
+            {t('repo.branches.title')}
+          </a>
+          <a href={`/${owner}/${repo}/tags`} class="btn btn-outline tags-link">
+            {t('repo.tags.title')}
+          </a>
+        </div>
         {#if canWriteRepo(repoInfo?.viewer_permission)}
-          <a href={`/${owner}/${repo}/new`} class="btn-outline btn-sm">
+          <a href={`/${owner}/${repo}/new`} class="btn btn-primary new-file-link">
             ➕ {t('repo.new_file', 'New file')}
           </a>
         {/if}
@@ -452,7 +456,7 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
         <span>{t('repo.browser.readme_unavailable')}</span>
         <button
           type="button"
-          class="btn-outline btn-sm"
+          class="btn btn-outline btn-sm"
           onclick={() => loadReadme(owner, repo, queryRef, queryPath, entries)}
           disabled={readmeLoading}
         >
@@ -483,14 +487,28 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
 <style>
   .repo-toolbar {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
-    gap: 16px;
+    gap: 12px;
     margin-bottom: 16px;
   }
 
+  .branch-selector { min-width: 0; max-width: 100%; }
+  .branch-name { min-width: 0; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+  .toolbar-actions { display: flex; flex: 1 1 480px; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+  .code-search { display: flex; flex: 1 1 240px; align-items: center; gap: 8px; min-width: 0; }
+  .repo-code-query { flex: 1; min-width: 0; width: 100%; }
+  .code-search button { flex-shrink: 0; }
+  .ref-links { display: flex; flex-wrap: wrap; gap: 8px; }
+  .new-file-link { margin-left: auto; }
+
   .breadcrumb {
     display: flex;
+    flex-wrap: wrap;
+    min-width: 0;
+    max-width: 100%;
+    overflow-wrap: anywhere;
     align-items: center;
     gap: 4px;
     font-size: 14px;

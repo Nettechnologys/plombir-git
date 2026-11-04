@@ -163,8 +163,8 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:common.retry | :453 | `GET /api/v1/repos/{owner}/{name}/tree` | `RepoRead` | rust+web |
-| i18n:common.retry | :453 | `GET /api/v1/repos/{owner}/{name}/blob/{*path}` | `RepoRead` | rust+web |
+| i18n:common.retry | :457 | `GET /api/v1/repos/{owner}/{name}/tree` | `RepoRead` | rust+web |
+| i18n:common.retry | :457 | `GET /api/v1/repos/{owner}/{name}/blob/{*path}` | `RepoRead` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke+browser |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web+browser |

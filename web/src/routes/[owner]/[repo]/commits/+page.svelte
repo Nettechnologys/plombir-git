@@ -146,9 +146,9 @@
 
   <div class="commits-header">
     <h1>{t('repo.tabs.commits')}</h1>
-    <Dropdown ariaLabel={t('repo.select_branch')} triggerClass="btn-outline" placement="right">
+    <Dropdown ariaLabel={t('repo.select_branch')} triggerClass="btn btn-outline" placement="right" fitViewport>
       {#snippet trigger()}
-        🌿 {currentRefLabel} <span aria-hidden="true">▾</span>
+        <span aria-hidden="true">🌿</span><span class="branch-name" title={currentRefLabel}>{currentRefLabel}</span><span aria-hidden="true">▾</span>
       {/snippet}
       {#snippet menu(close)}
         {#each branches as b (b.name)}
@@ -218,11 +218,14 @@
 <style>
   .commits-header {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
     margin-bottom: 16px;
   }
+
+  .branch-name { min-width: 0; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
 
   h1 {
     font-size: 24px;

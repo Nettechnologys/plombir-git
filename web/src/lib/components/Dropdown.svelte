@@ -146,7 +146,7 @@
   });
 </script>
 
-<div class="dropdown-wrapper">
+<div class="dropdown-wrapper" class:button-trigger={triggerClass.split(/\s+/).includes('btn')}>
   <button
     bind:this={triggerEl}
     id={triggerId}
@@ -192,6 +192,12 @@
     align-items: center;
     justify-content: center;
     cursor: pointer;
+  }
+
+  /* A button-styled trigger keeps the shared button surface and spacing. */
+  .button-trigger { min-width: 0; max-width: 100%; }
+  .dropdown-trigger:global(.btn) { min-width: 0; max-width: 100%; font-family: inherit; }
+  .dropdown-trigger:where(:not(:global(.btn))) {
     font: inherit;
     color: inherit;
     background: none;

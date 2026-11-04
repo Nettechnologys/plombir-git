@@ -75,6 +75,63 @@ afterEach(async () => {
 });
 
 describe('repository read and create state ownership', () => {
+	it('searches repository code from the button or Enter while retaining ordinary reference links', async () => {
+		repos.tree.mockResolvedValue({ entries: [{ name: 'lib.rs', kind: 'blob' }] });
+		repos.branches.mockResolvedValue([{ name: 'main', is_default: true }]);
+		repos.log.mockResolvedValue({ commits: [] });
+		setTestPage('/alice/demo?ref=main&path=src', { owner: 'alice', repo: 'demo' });
+		rendered = await renderComponent(RepositoryPage);
+		const query = element<HTMLInputElement>(rendered.container, '.repo-code-query');
+		await input(query, '  needle & value  ');
+		const search = element<HTMLButtonElement>(rendered.container, '.code-search button');
+		expect(search.textContent?.trim()).toBe('Search');
+		expect(search.type).toBe('button');
+		await click(search);
+		const destination = `/search?q=${encodeURIComponent('needle & value repo:alice/demo')}&type=code`;
+		expect(navigation.goto).toHaveBeenLastCalledWith(destination);
+		query.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+		await settle();
+		expect(navigation.goto).toHaveBeenCalledTimes(2);
+		expect(navigation.goto).toHaveBeenLastCalledWith(destination);
+		for (const destination of ['branches', 'tags', 'new']) {
+			const link = element<HTMLAnchorElement>(rendered.container, `.toolbar-actions a[href="/alice/demo/${destination}"]`);
+			expect(link.getAttribute('role')).not.toBe('tab');
+		}
+	});
+
+	it.each(['tree', 'commits'])('keeps branch navigation and keyboard menu behavior on the %s page', async page => {
+		repos.tree.mockResolvedValue({ entries: [{ name: 'lib.rs', kind: 'blob' }] });
+		repos.branches.mockResolvedValue([{ name: 'main', is_default: true }, { name: 'feature/fix', is_default: false }]);
+		repos.log.mockResolvedValue({ commits: [] });
+		setTestPage(page === 'tree' ? '/alice/demo?ref=main&path=src%2Flib' : '/alice/demo/commits?ref=main', { owner: 'alice', repo: 'demo' });
+		rendered = await renderComponent(page === 'tree' ? RepositoryPage : CommitsPage);
+		const selector = page === 'tree' ? '.branch-selector' : '.commits-header';
+		const trigger = element<HTMLButtonElement>(rendered.container, `${selector} .dropdown-trigger`);
+		// The viewport-aware menu needs a visible trigger; jsdom has no layout.
+		trigger.getBoundingClientRect = () => new DOMRect(20, 80, 100, 36);
+		const query = rendered.container.querySelector<HTMLInputElement>('.repo-code-query');
+		if (query) await input(query, 'keep my query');
+		trigger.focus();
+		trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+		await settle();
+		expect(trigger.getAttribute('aria-expanded')).toBe('true');
+		expect(document.activeElement?.textContent).toContain('main');
+		expect(element(rendered.container, `${selector} .dropdown-item.active`).textContent).toContain('main');
+		document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+		await settle();
+		expect(document.activeElement).toBe(trigger);
+		expect(trigger.getAttribute('aria-expanded')).toBe('false');
+		trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true }));
+		await settle();
+		expect(document.activeElement?.textContent).toContain('feature/fix');
+		(document.activeElement as HTMLButtonElement).click();
+		await settle();
+		const expected = page === 'tree' ? '/alice/demo?ref=feature%2Ffix&path=src%2Flib' : '/alice/demo/commits?ref=feature%2Ffix';
+		expect(navigation.goto.mock.calls.at(-1)?.[0]).toBe(expected);
+		expect(trigger.getAttribute('aria-expanded')).toBe('false');
+		if (query) expect(query.value).toBe('keep my query');
+	});
+
 	it('renders a submodule as a non-blob entry with no broken file link', async () => {
 		repos.tree.mockResolvedValue({
 			entries: [
