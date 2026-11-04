@@ -4,7 +4,7 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 import { loadUtoipaPaths, rustStructBody } from './lib/rust-source.mjs';
-import { OPAQUE_SEGMENT, extractRequestCalls, productionTsSource } from './lib/ts-source.mjs';
+import { OPAQUE_SEGMENT, extractRequestCalls, productionTsSource, tsFunctionBody } from './lib/ts-source.mjs';
 
 const BACKEND_URL = (process.env.BACKEND_URL || 'http://127.0.0.1:8080').replace(/\/$/, '');
 const OPENAPI_SPEC_FILE = process.env.OPENAPI_SPEC_FILE || process.env.OPENAPI_SPEC_PATH || '';
@@ -454,21 +454,25 @@ function inspectFrontendFlowContracts() {
     return;
   }
 
-  const loginFunctionMatch = authStoreSource.match(/export async function login\(username: string, password: string\)\s*\{([\s\S]*?)\n\}/);
-  if (!loginFunctionMatch) {
+  const loginBody = tsFunctionBody(authStoreSource, 'login');
+  if (loginBody === null) {
     ISSUE.count += 1;
-    ISSUE.lines.push(`❌ Frontend flow missing: login(username, password) not found in auth store (source: ${authStoreFile})`);
+    ISSUE.lines.push(`❌ Frontend flow missing: login function not found in auth store (source: ${authStoreFile})`);
   } else {
-    const loginBody = loginFunctionMatch[1];
     if (!/res\.mfa_required/.test(loginBody)) {
       ISSUE.count += 1;
       ISSUE.lines.push(`❌ Login contract does not handle MFA: /users/login can return mfa_required=true, but the auth store has no branch for it (source: ${authStoreFile})`);
     }
     const mfaIndex = loginBody.indexOf('res.mfa_required');
-    const tokenIndex = loginBody.indexOf('setToken(res.token)');
+    const tokenIndex = loginBody.indexOf('await adoptSession(res.token)');
+    const adoptionBody = tsFunctionBody(authStoreSource, 'adoptSession');
+    if (adoptionBody === null || !/setToken\(token\)/.test(adoptionBody)) {
+      ISSUE.count += 1;
+      ISSUE.lines.push('❌ Login session adoption must install the authenticated token');
+    }
     if (mfaIndex === -1 || tokenIndex === -1 || tokenIndex < mfaIndex) {
       ISSUE.count += 1;
-      ISSUE.lines.push(`❌ Login contract would store an empty MFA token: setToken(res.token) must occur after the mfa_required branch (source: ${authStoreFile})`);
+      ISSUE.lines.push(`❌ Login contract would store an empty MFA token: adoptSession(res.token) must occur after the mfa_required branch (source: ${authStoreFile})`);
     }
   }
 

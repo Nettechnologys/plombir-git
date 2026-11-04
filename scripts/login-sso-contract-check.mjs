@@ -70,15 +70,15 @@ if (!/listSsoProviders:\s*\(\)\s*=>\s*\n?\s*request<PublicSsoProvider\[\]>\('\/a
   failures.push('API client must call GET /auth/sso/providers for login provider discovery');
 }
 
-if (!/ssoAuthorizeUrl:\s*\(slug:\s*string\)\s*=>\s*\n?\s*withApiBase\(`\/auth\/sso\/\$\{encodeURIComponent\(slug\)\}`\)/.test(client)) {
-  failures.push('API client must build encoded SSO authorize URLs');
+if (!/ssoAuthorizeUrl:\s*\(slug:\s*string,\s*rememberMe\?:\s*boolean\)\s*=>\s*withApiBase\(`\/auth\/sso\/\$\{encodeURIComponent\(slug\)\}\$\{rememberMe === undefined \? '' : `\?remember_me=\$\{rememberMe\}`\}`\)/.test(client)) {
+  failures.push('API client must build encoded SSO authorize URLs with the optional persistence choice');
 }
 
 if (!/auth\.listSsoProviders\(\)/.test(login)) {
   failures.push('Login page must load public SSO providers');
 }
 
-if (!/knownSsoProviders\.length\s*>\s*0/.test(login) || !/auth\.ssoAuthorizeUrl\(provider\.slug\)/.test(login)) {
+if (!/knownSsoProviders\.length\s*>\s*0/.test(login) || !/auth\.ssoAuthorizeUrl\(provider\.slug,\s*rememberMe\)/.test(login)) {
   failures.push('Login page must render provider links to backend SSO authorize URLs');
 }
 
