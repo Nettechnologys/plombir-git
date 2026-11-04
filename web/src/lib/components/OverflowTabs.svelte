@@ -29,6 +29,7 @@
   let hiddenActive = $derived(hidden.some(tab => tab.id === activeTab));
   let schedule = () => {};
   let pendingFocus: HTMLElement | null = null;
+  let mounted = false;
 
   $effect.pre(() => {
     tabs;
@@ -37,7 +38,8 @@
   });
 
   async function measure() {
-    if (!nav || !measurements) return;
+    if (!mounted || !nav || !measurements) return;
+    const measuredNav = nav;
     const available = nav.getBoundingClientRect().width;
     // A detached/hidden container will be measured when it becomes visible.
     if (available <= 0) return;
@@ -55,6 +57,7 @@
     if (next === visibleCount && focused?.isConnected) return;
     visibleCount = next;
     await tick();
+    if (!mounted || nav !== measuredNav || !measuredNav.isConnected) return;
 
     // Moving between the row and the menu replaces a link. Preserve keyboard
     // focus only when this navigation owned it before the redistribution.
@@ -76,6 +79,7 @@
   });
 
   onMount(() => {
+    mounted = true;
     let frame = 0;
     let disposed = false;
     const requestFrame = window.requestAnimationFrame?.bind(window)
@@ -98,6 +102,7 @@
     void document.fonts?.ready.then(schedule);
     void measure();
     return () => {
+      mounted = false;
       disposed = true;
       cancelFrame(frame);
       observer?.disconnect();

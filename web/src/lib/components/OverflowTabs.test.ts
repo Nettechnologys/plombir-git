@@ -182,4 +182,23 @@ describe('adaptive repository tabs', () => {
     await flushLayout();
     expect(trigger().getAttribute('aria-expanded')).toBe('false');
   });
+
+  it('discards pending focus restoration when navigation unmounts during redistribution', async () => {
+    rendered = await renderComponent(OverflowTabsHarness);
+    await resize(440);
+    element<HTMLAnchorElement>(rendered.container, 'a[href="/settings"]').focus();
+    const nav = element<HTMLElement>(rendered.container, 'nav');
+    const query = vi.spyOn(nav, 'querySelectorAll');
+    available = 180;
+    for (const callback of observers) callback([], {} as ResizeObserver);
+    const pending = [...frames.values()];
+    frames.clear();
+    pending.forEach(callback => callback(0));
+    await rendered.destroy();
+    rendered = undefined;
+    await flushLayout();
+    expect(nav.isConnected).toBe(false);
+    expect(query).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(document.body);
+  });
 });
