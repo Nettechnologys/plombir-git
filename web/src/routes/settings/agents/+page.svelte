@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { copyToClipboard } from '$lib/clipboard';
+  import CopyableValue from '$lib/components/CopyableValue.svelte';
   import { goto } from '$app/navigation';
   import { bots, splitList, type Bot, type BotToken } from '$lib/api/client.svelte';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
@@ -214,12 +214,6 @@
     }
   }
 
-  async function copyNewToken() {
-    if (!newToken) return;
-    if (await copyToClipboard(newToken)) success = t('agents.token_copied');
-    else error = t('common.copy_failed', 'Copying failed. Select the text and copy it yourself.');
-  }
-
   function formatDate(value?: string | null) {
     if (!value) return t('common.never');
     const date = new Date(value);
@@ -317,8 +311,7 @@
                         <strong>{t('agents.new_token')}</strong>
                         <p>{t('agents.new_token_hint')}</p>
                       </div>
-                      <code>{newToken}</code>
-                      <button type="button" class="btn btn-primary copy-token" onclick={copyNewToken}>{t('common.copy')}</button>
+                      <CopyableValue value={newToken} label={t('agents.new_token_label')} copyLabel={t('common.copy_token')} />
                     </section>
                   {/if}
 
@@ -463,7 +456,7 @@
 
   .access-tokens h3 { margin: 0 0 6px; font-size: 16px; }
   .token-hint { margin-bottom: 16px; }
-  .token-actions { padding-top: 4px; }
+  .token-actions { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 8px; padding-bottom: 4px; }
 
   .token-form .wide {
     grid-column: 1 / -1;
@@ -534,20 +527,10 @@
 
   .token-created {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr);
     gap: 12px;
     align-items: center;
     background: var(--bg-secondary);
-  }
-
-  .token-created code {
-    grid-column: 1 / -1;
-    display: block;
-    padding: 10px;
-    overflow-x: auto;
-    background: var(--bg-primary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
   }
 
   .error-box {

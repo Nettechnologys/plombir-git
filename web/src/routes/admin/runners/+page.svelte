@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { copyToClipboard } from '$lib/clipboard';
+  import CopyableValue from '$lib/components/CopyableValue.svelte';
   import { goto } from '$app/navigation';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDateTime } from '$lib/i18n';
@@ -114,11 +114,6 @@
     newRunnerLabels = newRunnerLabels.filter((_, itemIndex) => itemIndex !== index);
   }
 
-  async function copyRunnerToken() {
-    if (!registeredRunner) return;
-    if (!(await copyToClipboard(registeredRunner.token))) error = t('common.copy_failed', 'Copying failed. Select the text and copy it yourself.');
-  }
-
   function confirmDelete(runner: any) {
     deleteTarget = runner;
   }
@@ -177,11 +172,8 @@
       <div>
         <strong>{t('admin.runners.token_title', { name: registeredRunner.name })}</strong>
         <p>{t('admin.runners.token_help')}</p>
-        <code>{registeredRunner.token}</code>
       </div>
-      <button class="btn-secondary" type="button" onclick={copyRunnerToken}>
-        {t('common.copy')}
-      </button>
+      <CopyableValue value={registeredRunner.token} label={t('common.token_value')} copyLabel={t('common.copy_token')} />
     </div>
   {/if}
 
@@ -325,9 +317,8 @@
   .empty { font-style: italic; }
   .error { color: #f85149; background: rgba(248, 81, 73, 0.1); padding: 0.5rem 0.75rem; border-radius: 6px; margin-bottom: 1rem; }
   .panel, .token-banner { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
-  .token-banner { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
+  .token-banner { display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; }
   .token-banner p { color: var(--text-secondary); margin: 0.25rem 0 0.75rem; }
-  .token-banner code { display: block; max-width: 100%; overflow-x: auto; padding: 0.5rem; background: var(--bg-primary); border: 1px solid var(--border); border-radius: 6px; }
   .form-grid { display: grid; grid-template-columns: minmax(160px, 1fr) minmax(220px, 1.5fr); gap: 0.75rem; align-items: end; }
   label { display: flex; flex-direction: column; gap: 0.35rem; }
   label span { color: var(--text-secondary); font-size: 0.85rem; font-weight: 600; }
@@ -365,6 +356,5 @@
 
   @media (max-width: 720px) {
     .form-grid { grid-template-columns: 1fr; }
-    .token-banner { flex-direction: column; }
   }
 </style>

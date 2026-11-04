@@ -25,7 +25,7 @@
 | Pages | 75 |
 | Interactive controls | 1060 |
 | Controls calling an API | 378 |
-| Controls from shared components | 422 |
+| Controls from shared components | 425 |
 | Browser sweep: scenarios / inventory entries / routes | 52 / 197 / 187 |
 | **UI routes without a web/smoke/browser test** | **22** |
 | UI routes without corpus or browser coverage | 0 |
@@ -73,7 +73,7 @@
 | `/[owner]/[repo]/packages` | 22 | 11 | 11 |
 | `/[owner]/[repo]/branches` | 21 | 6 | 11 |
 | `/[owner]/[repo]/milestones` | 21 | 8 | 12 |
-| `/settings/agents` | 21 | 7 | 10 |
+| `/settings/agents` | 21 | 7 | 11 |
 | `/[owner]/[repo]/releases/new` | 20 | 5 | 10 |
 | `/[owner]/[repo]/settings` | 20 | 5 | 4 |
 | `/[owner]/[repo]/time_tracking` | 19 | 10 | 12 |
@@ -97,7 +97,7 @@
 | `/[owner]/[repo]/packages/[format]` | 12 | 4 | 10 |
 | `/admin/hooks` 🔒 | 12 | 6 | 12 |
 | `/orgs/[name]/hooks` | 12 | 6 | 12 |
-| `/admin/runners` 🔒 | 11 | 4 | 1 |
+| `/admin/runners` 🔒 | 11 | 4 | 2 |
 | `/search` | 11 | 0 | 0 |
 | `/[owner]/[repo]/settings/labels` | 10 | 2 | 2 |
 | `/[owner]/[repo]/settings/push-mirrors` | 9 | 4 | 2 |
@@ -117,7 +117,7 @@
 | `/[owner]/[repo]/settings/ci-secrets` | 6 | 2 | 2 |
 | `/admin` 🔒 | 6 | 0 | 0 |
 | `/settings/ssh-keys` | 6 | 2 | 2 |
-| `/settings/tokens` | 6 | 2 | 2 |
+| `/settings/tokens` | 6 | 2 | 3 |
 | `/help` | 5 | 0 | 0 |
 | `/reset-password` | 5 | 1 | 0 |
 | `/[owner]` | 4 | 0 | 0 |
@@ -1053,12 +1053,12 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:common.loading | :239 | `POST /api/v1/runners/register` | `InstanceAdmin` | rust+web+smoke+browser |
-| i18n:common.loading | :239 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke+browser |
-| i18n:common.previous | :295 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke |
-| i18n:common.next | :297 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke |
-| i18n:common.loading | :309 | `DELETE /api/v1/admin/runners/{id}` | `InstanceAdmin` | rust+web+smoke+browser |
-| i18n:common.loading | :309 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke+browser |
+| i18n:common.loading | :231 | `POST /api/v1/runners/register` | `InstanceAdmin` | rust+web+smoke+browser |
+| i18n:common.loading | :231 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke+browser |
+| i18n:common.previous | :287 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke |
+| i18n:common.next | :289 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke |
+| i18n:common.loading | :301 | `DELETE /api/v1/admin/runners/{id}` | `InstanceAdmin` | rust+web+smoke+browser |
+| i18n:common.loading | :301 | `GET /api/v1/admin/runners` | `InstanceAdmin` | web+smoke+browser |
 
 ### `/admin/settings` 🔒
 
@@ -1228,15 +1228,15 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:agents.username | :261 | `POST /api/v1/users/bots` | `User` | rust+web |
-| i18n:agents.username | :261 | `GET /api/v1/users/bots` | `User` | rust+web |
-| i18n:common.close | :295 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
-| i18n:agents.deleting | :298 | `DELETE /api/v1/users/bots/{bot}` | `User` | rust+web |
-| i18n:agents.deleting | :298 | `GET /api/v1/users/bots` | `User` | rust+web |
-| i18n:agents.token_name | :325 | `POST /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
-| i18n:agents.token_name | :325 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
-| i18n:agents.revoking | :381 | `DELETE /api/v1/users/bots/{bot}/tokens/{id}` | `User` | web |
-| i18n:agents.revoking | :381 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
+| i18n:agents.username | :255 | `POST /api/v1/users/bots` | `User` | rust+web |
+| i18n:agents.username | :255 | `GET /api/v1/users/bots` | `User` | rust+web |
+| i18n:common.close | :289 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
+| i18n:agents.deleting | :292 | `DELETE /api/v1/users/bots/{bot}` | `User` | rust+web |
+| i18n:agents.deleting | :292 | `GET /api/v1/users/bots` | `User` | rust+web |
+| i18n:agents.token_name | :318 | `POST /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
+| i18n:agents.token_name | :318 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
+| i18n:agents.revoking | :374 | `DELETE /api/v1/users/bots/{bot}/tokens/{id}` | `User` | web |
+| i18n:agents.revoking | :374 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
 | i18n:agents.profile.enabled | `AgentProfilePanel` | `PUT /api/v1/users/bots/{bot}/agent` | `User` | web |
 | i18n:agents.deleting | `AgentProfilePanel` | `DELETE /api/v1/users/bots/{bot}/agent` | `User` | web |
 | _(page load)_ | — | `GET /api/v1/users/bots/{bot}/agent` | `User` | rust+web |
@@ -1315,10 +1315,10 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:access_tokens.name | :191 | `POST /api/v1/users/tokens` | `User` | rust+web |
-| i18n:access_tokens.name | :191 | `GET /api/v1/users/tokens` | `User` | rust+web |
-| i18n:access_tokens.revoking | :242 | `DELETE /api/v1/users/tokens/{id}` | `User` | rust |
-| i18n:access_tokens.revoking | :242 | `GET /api/v1/users/tokens` | `User` | rust+web |
+| i18n:access_tokens.name | :184 | `POST /api/v1/users/tokens` | `User` | rust+web |
+| i18n:access_tokens.name | :184 | `GET /api/v1/users/tokens` | `User` | rust+web |
+| i18n:access_tokens.revoking | :235 | `DELETE /api/v1/users/tokens/{id}` | `User` | rust |
+| i18n:access_tokens.revoking | :235 | `GET /api/v1/users/tokens` | `User` | rust+web |
 
 ### `/verify-email`
 

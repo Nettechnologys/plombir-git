@@ -140,6 +140,29 @@ afterEach(async () => {
 });
 
 describe('account and admin collection state ownership', () => {
+	it('copies the issued personal token with local failure feedback and a retry', async () => {
+		tokens.list.mockResolvedValue([]);
+		tokens.create.mockResolvedValue({ token: 'fixture-personal-token' });
+		rendered = await renderComponent(TokensPage);
+		await input(element(rendered.container, '.create-form input'), 'client');
+		await submit(element(rendered.container, '.create-form'));
+		expect(element<HTMLInputElement>(rendered.container, '.token-created .value').value).toBe('fixture-personal-token');
+		const writeText = vi.fn().mockRejectedValueOnce(new Error('denied')).mockResolvedValue(undefined);
+		vi.stubGlobal('navigator', { clipboard: { writeText } });
+		const originalExecCommand = document.execCommand;
+		document.execCommand = vi.fn(() => false);
+		try {
+			await click(element(rendered.container, '.token-created .copy-button'));
+			expect(element(rendered.container, '.token-created [role="status"]').textContent).toContain('Copying failed');
+			await click(element(rendered.container, '.token-created .copy-button'));
+			expect(writeText).toHaveBeenCalledWith('fixture-personal-token');
+			expect(element(rendered.container, '.token-created [role="status"]').textContent?.trim()).toBe('Copied');
+			expect(tokens.create).toHaveBeenCalledOnce();
+		} finally {
+			document.execCommand = originalExecCommand;
+		}
+	});
+
 	it('keeps the post-create token list when the initial list finishes last', async () => {
 		const initial = deferred<ReturnType<typeof token>[]>();
 		const mutation = deferred<{ token: string }>();

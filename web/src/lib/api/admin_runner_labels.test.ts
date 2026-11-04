@@ -31,6 +31,7 @@ beforeEach(() => {
 afterEach(async () => {
 	await rendered?.destroy();
 	rendered = undefined;
+	vi.unstubAllGlobals();
 });
 
 async function renderRegistrationForm() {
@@ -58,6 +59,13 @@ describe('admin runner label registration', () => {
 			name: 'builder-1',
 			labels: ['gpu,a100', 'linux'],
 		});
+		const writeText = vi.fn().mockResolvedValue(undefined);
+		vi.stubGlobal('navigator', { clipboard: { writeText } });
+		expect(element<HTMLInputElement>(rendered!.container, '.token-banner .value').value).toBe('runner-secret');
+		await click(element(rendered!.container, '.token-banner .copy-button'));
+		expect(writeText).toHaveBeenCalledWith('runner-secret');
+		expect(element(rendered!.container, '.token-banner [role="status"]').textContent?.trim()).toBe('Copied');
+		expect(runners.register).toHaveBeenCalledOnce();
 	});
 
 	it('omits labels when the structural editor is empty', async () => {

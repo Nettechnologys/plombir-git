@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { copyToClipboard } from '$lib/clipboard';
+  import CopyableValue from '$lib/components/CopyableValue.svelte';
   import { goto } from '$app/navigation';
   import { tokens } from '$lib/api/client.svelte';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
@@ -141,12 +141,6 @@
     }
   }
 
-  async function copyNewToken() {
-    if (!newToken) return;
-    if (await copyToClipboard(newToken)) success = t('access_tokens.copied');
-    else error = t('common.copy_failed', 'Copying failed. Select the text and copy it yourself.');
-  }
-
   function formatDate(value?: string | null) {
     if (!value) return t('common.never');
     const date = new Date(value);
@@ -181,8 +175,7 @@
         <strong>{t('access_tokens.new_token')}</strong>
         <p>{t('access_tokens.copy_hint')}</p>
       </div>
-      <code>{newToken}</code>
-      <button type="button" class="btn btn-primary" onclick={copyNewToken}>{t('common.copy')}</button>
+      <CopyableValue value={newToken} label={t('access_tokens.new_token_label')} copyLabel={t('common.copy_token')} />
     </section>
   {/if}
 
@@ -296,7 +289,10 @@
     gap: 12px;
   }
 
+  .create-form > button { justify-self: start; max-width: 100%; }
+
   label {
+    min-width: 0;
     display: flex;
     flex-direction: column;
     gap: 6px;
@@ -322,20 +318,10 @@
 
   .token-created {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr);
     gap: 12px;
     align-items: center;
     background: var(--bg-secondary);
-  }
-
-  .token-created code {
-    grid-column: 1 / -1;
-    display: block;
-    padding: 10px;
-    overflow-x: auto;
-    background: var(--bg-primary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
   }
 
   .error-box {
@@ -388,8 +374,10 @@
 
   @media (max-width: 760px) {
     .create-form {
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr);
     }
+
+    .create-form > button { margin-top: 4px; }
 
     .token-created {
       grid-template-columns: 1fr;

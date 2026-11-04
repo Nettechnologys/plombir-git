@@ -24211,7 +24211,7 @@
         {
           "tag": "a",
           "label": "←",
-          "line": 166,
+          "line": 161,
           "via": null,
           "href": "/admin",
           "handler": null,
@@ -24220,18 +24220,8 @@
         },
         {
           "tag": "button",
-          "label": "i18n:common.copy",
-          "line": 182,
-          "via": null,
-          "href": null,
-          "handler": "copyRunnerToken",
-          "calls": [],
-          "unresolved": true
-        },
-        {
-          "tag": "button",
           "label": "i18n:common.delete",
-          "line": 217,
+          "line": 209,
           "via": null,
           "href": null,
           "handler": "() => removeRunnerLabel(index)",
@@ -24241,7 +24231,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.runners.add_label",
-          "line": 229,
+          "line": 221,
           "via": null,
           "href": null,
           "handler": "addRunnerLabel",
@@ -24251,7 +24241,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 239,
+          "line": 231,
           "via": null,
           "href": null,
           "handler": "handleRegister",
@@ -24299,7 +24289,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 285,
+          "line": 277,
           "via": null,
           "href": null,
           "handler": "() => confirmDelete(runner)",
@@ -24309,7 +24299,7 @@
         {
           "tag": "button",
           "label": "i18n:common.previous",
-          "line": 295,
+          "line": 287,
           "via": null,
           "href": null,
           "handler": "prevPage",
@@ -24334,7 +24324,7 @@
         {
           "tag": "button",
           "label": "i18n:common.next",
-          "line": 297,
+          "line": 289,
           "via": null,
           "href": null,
           "handler": "nextPage",
@@ -24359,7 +24349,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 309,
+          "line": 301,
           "via": null,
           "href": null,
           "handler": "handleDelete",
@@ -24407,10 +24397,20 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 312,
+          "line": 304,
           "via": null,
           "href": null,
           "handler": "() => deleteTarget = null",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 40,
+          "via": "CopyableValue",
+          "href": null,
+          "handler": "copy",
           "calls": [],
           "unresolved": true
         },
@@ -27925,7 +27925,7 @@
         {
           "tag": "form",
           "label": "i18n:agents.username",
-          "line": 261,
+          "line": 255,
           "via": null,
           "href": null,
           "handler": "createBot",
@@ -27964,7 +27964,7 @@
         {
           "tag": "button",
           "label": "i18n:agents.creating",
-          "line": 270,
+          "line": 264,
           "via": null,
           "href": null,
           "handler": null,
@@ -27974,7 +27974,7 @@
         {
           "tag": "a",
           "label": "@",
-          "line": 289,
+          "line": 283,
           "via": null,
           "href": "`/${bot.username}`",
           "handler": null,
@@ -27984,7 +27984,7 @@
         {
           "tag": "button",
           "label": "i18n:common.close",
-          "line": 295,
+          "line": 289,
           "via": null,
           "href": null,
           "handler": "() => openTokens(bot)",
@@ -28009,7 +28009,7 @@
         {
           "tag": "button",
           "label": "i18n:agents.deleting",
-          "line": 298,
+          "line": 292,
           "via": null,
           "href": null,
           "handler": "() => deleteBot(bot)",
@@ -28046,19 +28046,9 @@
           "unresolved": false
         },
         {
-          "tag": "button",
-          "label": "i18n:common.copy",
-          "line": 321,
-          "via": null,
-          "href": null,
-          "handler": "copyNewToken",
-          "calls": [],
-          "unresolved": true
-        },
-        {
           "tag": "form",
           "label": "i18n:agents.token_name",
-          "line": 325,
+          "line": 318,
           "via": null,
           "href": null,
           "handler": "mintToken",
@@ -28097,7 +28087,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 336,
+          "line": 329,
           "via": null,
           "href": null,
           "handler": null,
@@ -28107,7 +28097,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 343,
+          "line": 336,
           "via": null,
           "href": null,
           "handler": null,
@@ -28117,7 +28107,7 @@
         {
           "tag": "button",
           "label": "i18n:agents.creating",
-          "line": 347,
+          "line": 340,
           "via": null,
           "href": null,
           "handler": null,
@@ -28127,7 +28117,7 @@
         {
           "tag": "button",
           "label": "i18n:agents.revoking",
-          "line": 381,
+          "line": 374,
           "via": null,
           "href": null,
           "handler": "() => revokeToken(token)",
@@ -28161,6 +28151,16 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 40,
+          "via": "CopyableValue",
+          "href": null,
+          "handler": "copy",
+          "calls": [],
+          "unresolved": true
         },
         {
           "tag": "form",
@@ -29542,19 +29542,9 @@
       "admin": false,
       "controls": [
         {
-          "tag": "button",
-          "label": "i18n:common.copy",
-          "line": 185,
-          "via": null,
-          "href": null,
-          "handler": "copyNewToken",
-          "calls": [],
-          "unresolved": true
-        },
-        {
           "tag": "form",
           "label": "i18n:access_tokens.name",
-          "line": 191,
+          "line": 184,
           "via": null,
           "href": null,
           "handler": "createToken",
@@ -29593,7 +29583,7 @@
         {
           "tag": "button",
           "label": "i18n:access_tokens.creating",
-          "line": 204,
+          "line": 197,
           "via": null,
           "href": null,
           "handler": null,
@@ -29603,7 +29593,7 @@
         {
           "tag": "button",
           "label": "i18n:access_tokens.revoking",
-          "line": 242,
+          "line": 235,
           "via": null,
           "href": null,
           "handler": "() => revokeToken(token)",
@@ -29637,6 +29627,16 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 40,
+          "via": "CopyableValue",
+          "href": null,
+          "handler": "copy",
+          "calls": [],
+          "unresolved": true
         },
         {
           "tag": "button",

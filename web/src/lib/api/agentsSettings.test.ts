@@ -126,7 +126,13 @@ describe('agents settings', () => {
 			mcp_tools: ['get_issue', 'create_pr'],
 			deny_protected_merge: false,
 		});
-		expect(rendered!.container.textContent).toContain('ifp_secret');
+		expect(element<HTMLInputElement>(rendered!.container, '.token-created .value').value).toBe('ifp_secret');
+		const writeText = vi.fn().mockResolvedValue(undefined);
+		vi.stubGlobal('navigator', { clipboard: { writeText } });
+		await click(element(rendered!.container, '.token-created .copy-button'));
+		expect(writeText).toHaveBeenCalledWith('ifp_secret');
+		expect(element(rendered!.container, '.token-created [role="status"]').textContent?.trim()).toBe('Copied');
+		expect(bots.createToken).toHaveBeenCalledOnce();
 		expect(bots.listTokens).toHaveBeenCalledTimes(2);
 	});
 
