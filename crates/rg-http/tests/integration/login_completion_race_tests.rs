@@ -338,7 +338,11 @@ fn every_http_login_path_finalizes_before_it_publishes_success() {
         password_finalize
             < code_position(&password, "rg_core::audit::record(", "password/LDAP login")
             && password_finalize
-                < code_position(&password, "generate_mfa_challenge(", "password/LDAP login")
+                < code_position(
+                    &password,
+                    "generate_mfa_challenge_with_remember(",
+                    "password/LDAP login",
+                )
             && password_finalize
                 < code_position(&password, "build_auth_cookie(", "password/LDAP login"),
         "password/LDAP login published audit, challenge, or session before lifecycle finalization"
@@ -369,7 +373,12 @@ fn every_http_login_path_finalizes_before_it_publishes_success() {
     let sso_finalize = code_position(&sso, "finalize_primary_login(", "SSO callback");
     assert!(
         sso_finalize < code_position(&sso, "log_attempt(", "SSO callback")
-            && sso_finalize < code_position(&sso, "generate_mfa_challenge(", "SSO callback")
+            && sso_finalize
+                < code_position(
+                    &sso,
+                    "generate_mfa_challenge_with_remember(",
+                    "SSO callback"
+                )
             && sso_finalize < code_position(&sso, "generate_token(", "SSO callback"),
         "SSO callback published success, challenge, or session before lifecycle finalization"
     );
