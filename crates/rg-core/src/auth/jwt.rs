@@ -47,6 +47,10 @@ pub struct Claims {
     /// minted before the claim existed decodes as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sudo_exp: Option<i64>,
+    /// Browser persistence selected at login. Absent on legacy and API sessions.
+    /// `false` means a session cookie; `true` allows thirty-day idle renewal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remember_me: Option<bool>,
     /// Issued-at (Unix timestamp seconds).
     pub iat: i64,
     /// Expiry (Unix timestamp seconds).
@@ -58,6 +62,8 @@ pub struct MfaChallengeClaims {
     pub sub: String,
     pub username: String,
     pub auth_provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remember_me: Option<bool>,
     pub iat: i64,
     pub exp: i64,
 }
@@ -69,6 +75,13 @@ pub struct MfaChallengeClaims {
 /// again before it is likely to be used. Counted from the proof, never
 /// extended by use.
 pub const SUDO_TTL: Duration = Duration::minutes(10);
+
+/// A remembered browser may remain idle for thirty days.
+pub const REMEMBERED_SESSION_TTL: Duration = Duration::days(30);
+/// Require fresh proof at least every ninety days, even with daily activity.
+pub const REMEMBERED_SESSION_MAX: Duration = Duration::days(90);
+/// Avoid issuing a new cookie for every navigation within the same visit.
+pub const SESSION_RENEW_INTERVAL: Duration = Duration::minutes(5);
 
 impl Claims {
     /// Whether this session is in sudo mode at `now` (Unix seconds).
@@ -164,6 +177,7 @@ fn encode_claims(
         session_version,
         pat_id,
         sudo_exp: sudo.then(|| (now + SUDO_TTL).timestamp().min(exp.timestamp())),
+        remember_me: None,
         iat: now.timestamp(),
         exp: exp.timestamp(),
     };
@@ -193,7 +207,8 @@ pub fn reissue_with_sudo(claims: &Claims, secret: &str) -> Result<String> {
         session_version: claims.session_version,
         pat_id: None,
         sudo_exp: Some((now + SUDO_TTL).timestamp().min(claims.exp)),
-        iat: now.timestamp(),
+        remember_me: claims.remember_me,
+        iat: claims.iat,
         exp: claims.exp,
     };
     encode(
@@ -202,6 +217,72 @@ pub fn reissue_with_sudo(claims: &Claims, secret: &str) -> Result<String> {
         &EncodingKey::from_secret(secret.as_bytes()),
     )
     .context("sudo jwt encode failed")
+}
+
+/// Apply an explicit browser choice immediately after successful authentication.
+/// Callers must not use this to promote an existing session without a new proof.
+/// Omitted choices preserve the behavior of older API clients.
+pub fn with_browser_session(
+    token: &str,
+    remember_me: Option<bool>,
+    secret: &str,
+) -> Result<String> {
+    let Some(remember_me) = remember_me else {
+        return Ok(token.to_owned());
+    };
+    let mut claims = validate_token(token, secret).context("invalid login session")?;
+    let now = Utc::now();
+    anyhow::ensure!(
+        claims.pat_id.is_none() && claims.exp > now.timestamp(),
+        "invalid login session"
+    );
+    claims.remember_me = Some(remember_me);
+    claims.exp = (now
+        + if remember_me {
+            REMEMBERED_SESSION_TTL
+        } else {
+            Duration::days(7)
+        })
+    .timestamp();
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .context("browser session encode failed")
+}
+
+/// Extend only the idle deadline of a remembered session. Account standing is
+/// checked by the HTTP caller; browsing never extends sudo or changes identity.
+pub fn renew_remembered_session(claims: &Claims, secret: &str) -> Result<Option<String>> {
+    let now = Utc::now().timestamp();
+    anyhow::ensure!(
+        claims.pat_id.is_none() && claims.exp > now,
+        "invalid browser session"
+    );
+    anyhow::ensure!(
+        claims.remember_me == Some(true),
+        "session is not remembered"
+    );
+    let absolute_exp = claims
+        .iat
+        .saturating_add(REMEMBERED_SESSION_MAX.num_seconds());
+    anyhow::ensure!(absolute_exp > now, "browser session requires a new login");
+    if claims.exp - now >= (REMEMBERED_SESSION_TTL - SESSION_RENEW_INTERVAL).num_seconds() {
+        return Ok(None);
+    }
+    let mut renewed = claims.clone();
+    renewed.exp = (now + REMEMBERED_SESSION_TTL.num_seconds()).min(absolute_exp);
+    if renewed.exp == claims.exp {
+        return Ok(None);
+    }
+    encode(
+        &Header::default(),
+        &renewed,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map(Some)
+    .context("browser session renewal failed")
 }
 
 /// Validate and decode a JWT. Returns `None` if invalid/expired.
@@ -224,11 +305,23 @@ pub fn generate_mfa_challenge(
     auth_provider: &str,
     secret: &str,
 ) -> Result<String> {
+    generate_mfa_challenge_with_remember(user_id, username, auth_provider, secret, None)
+}
+
+/// Carry the login's persistence choice through the signed second-factor proof.
+pub fn generate_mfa_challenge_with_remember(
+    user_id: i64,
+    username: &str,
+    auth_provider: &str,
+    secret: &str,
+    remember_me: Option<bool>,
+) -> Result<String> {
     let now = Utc::now();
     let claims = MfaChallengeClaims {
         sub: user_id.to_string(),
         username: username.to_string(),
         auth_provider: auth_provider.to_string(),
+        remember_me,
         iat: now.timestamp(),
         exp: (now + Duration::minutes(5)).timestamp(),
     };
@@ -359,6 +452,7 @@ mod tests {
             session_version: 0,
             pat_id: None,
             sudo_exp: None,
+            remember_me: None,
             iat: Utc::now().timestamp(),
             exp: Utc::now().timestamp() + 60,
         };
@@ -372,6 +466,41 @@ mod tests {
         .unwrap();
         assert!(reissue_with_sudo(&pat, secret).is_err());
         assert_eq!(pat.sudo_exp, None);
+    }
+
+    #[test]
+    fn remembered_session_renewal_cannot_upgrade_or_extend_privilege() {
+        let secret = "remember-test";
+        let token = generate_authenticated_token(7, "alice", 3, secret, 7).unwrap();
+        let legacy = validate_token(&token, secret).unwrap();
+        assert!(renew_remembered_session(&legacy, secret).is_err());
+        let browser = with_browser_session(&token, Some(false), secret).unwrap();
+        assert!(
+            renew_remembered_session(&validate_token(&browser, secret).unwrap(), secret).is_err()
+        );
+        let remembered = with_browser_session(&token, Some(true), secret).unwrap();
+        let mut claims = validate_token(&remembered, secret).unwrap();
+        assert!(renew_remembered_session(&claims, secret).unwrap().is_none());
+        claims.iat -= Duration::days(2).num_seconds();
+        claims.exp -= Duration::days(2).num_seconds();
+        claims.sudo_exp = Some(Utc::now().timestamp() - 1);
+        let renewed = validate_token(
+            &renew_remembered_session(&claims, secret).unwrap().unwrap(),
+            secret,
+        )
+        .unwrap();
+        assert_eq!(renewed.iat, claims.iat);
+        assert_eq!(renewed.sudo_exp, claims.sudo_exp);
+        assert_eq!(renewed.session_version, claims.session_version);
+        assert!(!renewed.sudo_active_at(Utc::now().timestamp()));
+        let elevated =
+            validate_token(&reissue_with_sudo(&renewed, secret).unwrap(), secret).unwrap();
+        assert_eq!(elevated.remember_me, Some(true));
+        assert_eq!(elevated.iat, claims.iat);
+        assert_eq!(elevated.exp, renewed.exp);
+        let pat = generate_token_for_pat(7, "alice", 3, 99, secret, 7).unwrap();
+        assert!(with_browser_session(&pat, Some(true), secret).is_err());
+        assert!(renew_remembered_session(&validate_token(&pat, secret).unwrap(), secret).is_err());
     }
 
     #[test]

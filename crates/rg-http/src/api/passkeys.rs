@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_credential};
-use crate::api::auth::{AuthUser, SudoUser, AUTH_COOKIE_NAME};
+use crate::api::auth::{AuthUser, SudoUser};
 use crate::error::AppError;
 use crate::AppState;
 use rg_core::auth::webauthn as wa;
@@ -71,14 +71,7 @@ fn clear_state_cookie(name: &str, is_https: bool) -> String {
     )
 }
 
-fn build_auth_cookie(token: &str, is_https: bool) -> String {
-    format!(
-        "{}={}; HttpOnly; Path=/; SameSite=Strict; Max-Age=604800{}",
-        AUTH_COOKIE_NAME,
-        token,
-        if is_https { "; Secure" } else { "" }
-    )
-}
+use crate::api::users::build_auth_cookie;
 
 fn extract_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     crate::api::auth::cookie_value(headers, name)
@@ -200,6 +193,8 @@ struct AuthState {
     ceremony_id: String,
     rp: RelyingParty,
     auth: wa::PasskeyAuthentication,
+    #[serde(default)]
+    remember_me: Option<bool>,
 }
 
 /// Spend the challenge of the ceremony that just verified, answering whether
@@ -814,6 +809,8 @@ pub async fn delete_passkey(
 #[derive(Deserialize, ToSchema)]
 pub struct LoginStartRequest {
     pub username: String,
+    #[serde(default)]
+    pub remember_me: Option<bool>,
 }
 
 /// POST /users/passkeys/login/start
@@ -866,6 +863,13 @@ pub async fn login_start(
             ceremony_id: wa::new_ceremony_id(),
             rp,
             auth,
+            // Passkey step-up is a new proof and opens a new session lifetime,
+            // unlike password sudo, which reissues the existing session.
+            remember_me: req.remember_me.or_else(|| {
+                crate::api::auth::session_claims(&headers, &state.jwt_secret)
+                    .filter(|claims| claims.pat_id.is_none() && claims.sub == user.id.to_string())
+                    .and_then(|claims| claims.remember_me)
+            }),
         },
         "auth",
         &state.jwt_secret,
@@ -1084,6 +1088,9 @@ pub async fn login_finish(
         &state.jwt_secret,
         7,
     )
+    .and_then(|token| {
+        rg_core::auth::jwt::with_browser_session(&token, sealed.remember_me, &state.jwt_secret)
+    })
     .map_err(AppError::from)?;
 
     let is_https = crate::public_url::request_is_https(&state, &headers);
@@ -1091,7 +1098,7 @@ pub async fn login_finish(
         StatusCode::OK,
         [(
             axum::http::header::SET_COOKIE,
-            build_auth_cookie(&token, is_https),
+            build_auth_cookie(&token, is_https, &state.jwt_secret),
         )],
         Json(PasskeyLoginResponse {
             token,

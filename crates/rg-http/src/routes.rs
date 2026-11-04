@@ -1183,6 +1183,11 @@ pub(crate) fn build_all_routes(
         .post_with(Public, "/users/login", api::users::login, &auth_rl)
         .post(User, "/users/logout", api::users::logout)
         .get(User, "/users/me", api::users::me)
+        .post(
+            User,
+            "/users/me/session/refresh",
+            api::users::refresh_session,
+        )
         .patch(User, "/users/me", api::account::update_profile)
         .delete(User, "/users/me", api::account::delete_account)
         .put(User, "/users/me/password", api::account::change_password)

@@ -230,7 +230,9 @@
       "password_change_required": "此密码由管理员设置。请设置您自己的密码以继续。",
       "new_password": "新密码",
       "confirm_password": "再次输入新密码",
-      "set_password": "设置密码并登录"
+      "set_password": "设置密码并登录",
+      "remember_me": "记住我 30 天",
+      "remember_hint": "使用网站时自动续期；90 天后需重新登录。退出登录会结束所有设备上的会话。"
     },
     "register": {
       "title": "创建您的账号",

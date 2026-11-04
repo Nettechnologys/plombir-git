@@ -283,3 +283,65 @@ async fn passkey_login_replaces_a_revoked_cookie_with_a_current_session() {
     );
     assert_eq!(me.json::<serde_json::Value>().await.unwrap()["id"], user_id);
 }
+
+#[tokio::test]
+async fn remembered_passkey_choice_is_bound_to_the_verified_ceremony() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (_, user_id) = register_full(&base, "pk-remember", "pk-remember@example.test").await;
+    let key = authenticator();
+    rg_db::ops::passkey_credential_ops::create(
+        &db,
+        user_id,
+        &b64(CREDENTIAL_ID),
+        &stored_passkey(&key),
+        "key",
+        RP_ID,
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+    for (counter, choice) in [(1, false), (2, true)] {
+        let start = client
+            .post(format!("{base}/api/v1/users/passkeys/login/start"))
+            .header(reqwest::header::HOST, RP_ID)
+            .json(&serde_json::json!({"username":"pk-remember","remember_me":choice}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(start.status(), 200);
+        let cookie = start.headers()[reqwest::header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let options: serde_json::Value = start.json().await.unwrap();
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(options["publicKey"]["challenge"].as_str().unwrap())
+            .unwrap();
+        let mut proof = assertion(&key, &challenge, counter, true);
+        proof["remember_me"] = (!choice).into(); // Finish input cannot override the signed start choice.
+        let finish = client
+            .post(format!("{base}/api/v1/users/passkeys/login/finish"))
+            .header(reqwest::header::HOST, RP_ID)
+            .header(reqwest::header::COOKIE, cookie)
+            .json(&proof)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(finish.status(), 200);
+        let cookie = finish.headers()[reqwest::header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(cookie.contains("Max-Age="), choice);
+        let body: serde_json::Value = finish.json().await.unwrap();
+        assert_eq!(
+            rg_core::auth::jwt::validate_token(body["token"].as_str().unwrap(), "test-secret-key")
+                .unwrap()
+                .remember_me,
+            Some(choice)
+        );
+    }
+}

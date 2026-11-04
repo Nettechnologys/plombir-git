@@ -230,7 +230,9 @@
       "password_change_required": "An administrator set this password. Choose your own to continue.",
       "new_password": "New password",
       "confirm_password": "Repeat the new password",
-      "set_password": "Set password and sign in"
+      "set_password": "Set password and sign in",
+      "remember_me": "Remember me for 30 days",
+      "remember_hint": "Renews when you use the site; sign in again after 90 days. Signing out ends sessions on all devices."
     },
     "register": {
       "title": "Create your account",

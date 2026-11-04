@@ -8,7 +8,7 @@
 |------|------------|----------------|
 | Git transport | Smart Protocol V1 & V2 over HTTPS and SSH (`russh`); pkt-line, sideband-64k, packfile encode/decode | [V2 transport](../crates/rg-git/src/protocol/v2.rs) |
 | Repositories | Create / delete / transfer, fork, private & public, collaborators (read/write/admin), file & tree browsing, commit log, branches, tags, pull and push mirrors | [Repository API](../crates/rg-http/src/api/repos.rs) |
-| Auth | User registration & login (argon2 + JWT), SSH public-key auth, Personal Access Tokens, MFA, SSO | [Auth API](../crates/rg-http/src/api/auth.rs) |
+| Auth | User registration & login (argon2 + JWT), SSH public-key auth, Personal Access Tokens, MFA, SSO, remembered browser sessions | [Auth API](../crates/rg-http/src/api/auth.rs) |
 | Issues | Create, view, edit and delete issues and comments; close/reopen, labels, milestones, Gitea-compatible issue templates and chooser ([template reference](issue-templates.md)) | [Issue API](../crates/rg-http/src/api/issues.rs) |
 | Pull requests | Diff, three merge strategies (merge / squash / rebase), cross-repo (fork) PRs, code review (approve / request changes / inline comments), branch protection, repository pull-request template ([reference](issue-templates.md#pull-request-templates)), CODEOWNERS auto-review ([reference](codeowners.md)) | [PR API](../crates/rg-http/src/api/pulls.rs) |
 | Wiki | Markdown page CRUD with revision history stored in the database (no `.wiki.git` repository) | [Wiki API](../crates/rg-http/src/api/wiki.rs) |
@@ -38,6 +38,28 @@ image includes GnuPG and checks signatures with a temporary, instance-owned
 keyring and SSH allowed-signers file; the host account's keyring is never a
 source of trust. Configure email confirmation before enabling the rule on a
 fresh instance, then register at least one signing key.
+
+## Browser sessions
+
+The login form offers **Remember me for 30 days** for password, passkey and SSO
+sign-in, including accounts with a second factor. Checked sessions renew on
+page navigation, at most once every five minutes, for thirty days of inactivity.
+A session requires a new login after ninety days even when used every day.
+Background notification polling does not renew it, and renewal does not extend
+the ten-minute sudo window for sensitive account changes.
+
+With the checkbox clear, the auth cookie has no persistent lifetime and the
+signed token expires within seven days. Browsers may restore session cookies
+when restoring a previous browsing session; use **Sign out** on a shared device.
+Sign out invalidates the account's sessions on every device, as before.
+Existing sessions and API clients that omit `remember_me` keep their previous
+seven-day policy; a fresh login is needed to select the new behavior.
+
+Renewal requires the current HttpOnly session cookie, a remembered login and
+same-origin checks. A bearer token or PAT alone cannot renew a session. Deploy
+the browser UI and API on the same origin: a cross-site UI configured through
+`PLOMBIR_GIT_CORS_ORIGINS` cannot renew a `SameSite=Strict` cookie that its browser
+withholds. No weaker cookie setting or bearer refresh fallback is introduced.
 
 ## Tech stack
 

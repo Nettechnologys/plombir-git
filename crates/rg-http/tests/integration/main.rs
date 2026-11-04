@@ -313,3 +313,5 @@ mod websocket_session_revocation_tests;
 mod wiki_authz_tests;
 mod wiki_tests;
 mod wildcard_branch_protection_tests;
+
+mod remembered_session_tests;

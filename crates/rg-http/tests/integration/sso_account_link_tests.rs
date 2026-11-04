@@ -718,3 +718,53 @@ async fn an_account_cannot_hold_two_identities_from_one_provider() {
     assert!(app.link_of("victim-subject").await.is_none());
     assert_eq!(app.links_of_user(alice_id).await, 1);
 }
+
+#[tokio::test]
+async fn remembered_sso_choice_is_signed_and_bound_to_this_round_trip() {
+    let app = Harness::start(victim(Some(true)), true).await;
+    for choice in [false, true] {
+        let authorize = app
+            .client
+            .get(format!(
+                "{}/api/v1/auth/sso/idp?remember_me={choice}",
+                app.base
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(authorize.status().is_redirection());
+        let cookies: Vec<_> = [
+            "plombir_git_sso_state",
+            "plombir_git_sso_code_verifier",
+            "plombir_git_sso_session",
+        ]
+        .iter()
+        .map(|name| cookie_pair(authorize.headers(), name))
+        .collect();
+        let response = app.callback(&cookies).await;
+        let token = issued_session(&response.headers).expect("SSO issued a session");
+        assert_eq!(
+            rg_core::auth::jwt::validate_token(&token, TEST_JWT_SECRET)
+                .unwrap()
+                .remember_me,
+            Some(choice)
+        );
+        let next = app
+            .client
+            .get(format!(
+                "{}/api/v1/auth/sso/idp?remember_me=false",
+                app.base
+            ))
+            .send()
+            .await
+            .unwrap();
+        let mismatched = vec![
+            cookie_pair(next.headers(), "plombir_git_sso_state"),
+            cookie_pair(next.headers(), "plombir_git_sso_code_verifier"),
+            cookies[2].clone(),
+        ];
+        let refused = app.callback(&mismatched).await;
+        refused.outcome.assert_refused("/login", "state_invalid");
+        assert!(issued_session(&refused.headers).is_none());
+    }
+}

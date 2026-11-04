@@ -6,6 +6,7 @@ import { ApiError } from '$lib/api/error';
 import { t } from '$lib/i18n';
 
 interface User {
+  remember_me?: boolean;
   id: number;
   username: string;
   email: string;
@@ -23,6 +24,9 @@ let pendingMfaUsername = $state<string | null>(null);
 // replaced before any session exists.
 let pendingPasswordChangeLogin = $state<string | null>(null);
 let sessionGeneration = 0;
+let lastRefreshAttempt = -Infinity;
+let refreshInFlight: Promise<void> | null = null;
+const SESSION_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
 function sessionUser(me: Awaited<ReturnType<typeof auth.me>>): User {
   return {
@@ -31,15 +35,20 @@ function sessionUser(me: Awaited<ReturnType<typeof auth.me>>): User {
     email: me.email,
     is_admin: me.is_admin ?? false,
     display_name: me.display_name,
+    ...(me.remember_me ? { remember_me: true } : {}),
   };
 }
 
 /** Take the session a successful answer opened, and load who it belongs to. */
 async function adoptSession(token: string) {
+  const generation = ++sessionGeneration;
+  lastRefreshAttempt = -Infinity;
   pendingMfaUsername = null;
   pendingPasswordChangeLogin = null;
   setToken(token);
-  currentUser = sessionUser(await auth.me());
+  const me = await auth.me();
+  if (generation !== sessionGeneration) return;
+  currentUser = sessionUser(me);
   authReady = true;
   sessionCheckError = null;
 }
@@ -86,11 +95,12 @@ export function getSessionCheckError() {
   return sessionCheckError;
 }
 
-export async function login(username: string, password: string) {
+export async function login(username: string, password: string, rememberMe = false) {
+  sessionGeneration++;
   isLoading = true;
   error = null;
   try {
-    const res = await auth.login(username, password);
+    const res = await auth.login(username, password, rememberMe);
     if (res.password_change_required) {
       setToken(null);
       currentUser = null;
@@ -109,19 +119,7 @@ export async function login(username: string, password: string) {
       return false;
     }
 
-    pendingMfaUsername = null;
-    setToken(res.token);
-    // Fetch full profile to get is_admin
-    const me = await auth.me();
-    currentUser = {
-      id: me.id,
-      username: me.username,
-      email: me.email,
-      is_admin: me.is_admin ?? false,
-      display_name: me.display_name,
-    };
-    authReady = true;
-    sessionCheckError = null;
+    await adoptSession(res.token);
     return true;
   } catch (e: any) {
     error = e.message || 'Login failed';
@@ -136,7 +134,7 @@ export async function login(username: string, password: string) {
  * `password_change_required`. `password` is that password, proved again by
  * the server. Ends signed in, or at the second-factor form.
  */
-export async function completeInitialPassword(password: string, newPassword: string) {
+export async function completeInitialPassword(password: string, newPassword: string, rememberMe = false) {
   if (!pendingPasswordChangeLogin) {
     error = 'No password change is pending';
     return false;
@@ -144,7 +142,7 @@ export async function completeInitialPassword(password: string, newPassword: str
   isLoading = true;
   error = null;
   try {
-    const res = await auth.setInitialPassword(pendingPasswordChangeLogin, password, newPassword);
+    const res = await auth.setInitialPassword(pendingPasswordChangeLogin, password, newPassword, rememberMe);
     if (res.mfa_required) {
       pendingMfaUsername = res.username;
       pendingPasswordChangeLogin = null;
@@ -161,6 +159,7 @@ export async function completeInitialPassword(password: string, newPassword: str
 }
 
 export async function verifyMfa(code: string, backup = false) {
+  sessionGeneration++;
   if (!pendingMfaUsername) {
     error = 'MFA verification is not pending';
     return false;
@@ -170,18 +169,7 @@ export async function verifyMfa(code: string, backup = false) {
   error = null;
   try {
     const res = await auth.verifyMfa(pendingMfaUsername, code, backup);
-    setToken(res.token);
-    pendingMfaUsername = null;
-    const me = await auth.me();
-    currentUser = {
-      id: me.id,
-      username: me.username,
-      email: me.email,
-      is_admin: me.is_admin ?? false,
-      display_name: me.display_name,
-    };
-    authReady = true;
-    sessionCheckError = null;
+    await adoptSession(res.token);
     return true;
   } catch (e: any) {
     error = e.message || 'MFA verification failed';
@@ -191,7 +179,8 @@ export async function verifyMfa(code: string, backup = false) {
   }
 }
 
-export async function loginWithPasskey(username: string, device: PasskeyDevice = 'auto') {
+export async function loginWithPasskey(username: string, device: PasskeyDevice = 'auto', rememberMe = false) {
+  sessionGeneration++;
   if (!username.trim()) {
     error = 'Enter your username to sign in with a passkey';
     return false;
@@ -200,19 +189,8 @@ export async function loginWithPasskey(username: string, device: PasskeyDevice =
   isLoading = true;
   error = null;
   try {
-    const res = await passkeys.login(username.trim(), device);
-    pendingMfaUsername = null;
-    setToken(res.token);
-    const me = await auth.me();
-    currentUser = {
-      id: me.id,
-      username: me.username,
-      email: me.email,
-      is_admin: me.is_admin ?? false,
-      display_name: me.display_name,
-    };
-    authReady = true;
-    sessionCheckError = null;
+    const res = await passkeys.login(username.trim(), device, rememberMe);
+    await adoptSession(res.token);
     return true;
   } catch (e: any) {
     error = e.message || 'Passkey login failed';
@@ -256,13 +234,7 @@ export async function fetchUser() {
   try {
     const me = await auth.me();
     if (generation !== sessionGeneration) return;
-    currentUser = {
-      id: me.id,
-      username: me.username,
-      email: me.email,
-      is_admin: me.is_admin ?? false,
-      display_name: me.display_name,
-    };
+    currentUser = sessionUser(me);
     authReady = true;
     sessionCheckError = null;
   } catch (cause: unknown) {
@@ -308,8 +280,48 @@ export async function adoptConfirmedSession(token: string) {
 
 /** Forget the account locally once the server has deleted it. */
 export function forgetDeletedAccount() {
+  sessionGeneration++;
   setToken(null);
   currentUser = null;
   authReady = true;
   sessionCheckError = null;
+}
+
+/** Renew on navigation only. Notification polls and idle tabs never call this. */
+export function refreshSessionAfterNavigation(): Promise<void> {
+  if (refreshInFlight) return refreshInFlight;
+  if (!authReady || !currentUser?.remember_me || document.visibilityState === 'hidden'
+      || Date.now() - lastRefreshAttempt < SESSION_REFRESH_INTERVAL_MS) return Promise.resolve();
+  const generation = sessionGeneration;
+  const userId = currentUser.id;
+  lastRefreshAttempt = Date.now();
+  refreshInFlight = (async () => {
+    try {
+      const result = await auth.refreshSession();
+      if (generation !== sessionGeneration || currentUser?.id !== userId) return;
+      if (result.user_id !== userId || !result.remember_me) {
+        // Another tab changed the browser identity. Never adopt its bearer
+        // while rendering the previous account, and never replay a mutation.
+        setToken(null);
+        await fetchUser();
+        return;
+      }
+      // The refreshed HttpOnly cookie is authoritative. Retire any stale
+      // in-memory copy; refresh never exports a cookie token to JavaScript.
+      setToken(null);
+    } catch (cause) {
+      if (generation !== sessionGeneration) return;
+      // A renewal failure is not proof of logout. Let a profile probe decide
+      // who is signed in; do not turn transient proxy failures into logout.
+      if (cause instanceof ApiError && cause.status === 401) {
+        lastRefreshAttempt = Infinity;
+        // A cross-site frontend may still have a valid bearer while the
+        // browser withholds its Strict cookie. Let the probe verify it.
+        await fetchUser();
+      }
+    } finally {
+      refreshInFlight = null;
+    }
+  })();
+  return refreshInFlight;
 }

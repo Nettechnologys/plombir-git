@@ -5,7 +5,7 @@ import RegisterPage from '../../routes/register/+page.svelte';
 import { isPasswordChangeRequired, logout } from '../stores/auth.svelte';
 import { setSetupRequired } from '../stores/instance.svelte';
 import { auth, resetTestClient } from '../test/client';
-import { element, input, renderComponent, submit, type RenderedComponent } from '../test/render';
+import { check, element, input, renderComponent, submit, type RenderedComponent } from '../test/render';
 
 let rendered: RenderedComponent | undefined;
 let warn: ReturnType<typeof vi.spyOn>;
@@ -49,6 +49,7 @@ describe('first sign-in with an administrator-chosen password', () => {
 		const login = rendered.container.querySelectorAll<HTMLInputElement>('form input');
 		await input(login[0], 'carol');
 		await input(login[1], 'abcde-FGHJK-23456-mnpqr');
+		await check(element<HTMLInputElement>(rendered.container, 'input[type=checkbox]'), true);
 		await submit(element<HTMLFormElement>(rendered.container, 'form'));
 
 		expect(isPasswordChangeRequired()).toBe(true);
@@ -61,6 +62,7 @@ describe('first sign-in with an administrator-chosen password', () => {
 			'carol',
 			'abcde-FGHJK-23456-mnpqr',
 			'Carol-own-9',
+			true,
 		);
 		expect(isPasswordChangeRequired()).toBe(false);
 	});

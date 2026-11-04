@@ -30,7 +30,7 @@ use tracing;
 use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_credential};
-use crate::api::auth::{require_sudo, AuthUser, LoginSession, AUTH_COOKIE_NAME};
+use crate::api::auth::{require_sudo, AuthUser, LoginSession};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -540,16 +540,14 @@ pub async fn verify_mfa(
         &state.jwt_secret,
         7,
     )
+    .and_then(|token| {
+        rg_core::auth::jwt::with_browser_session(&token, challenge.remember_me, &state.jwt_secret)
+    })
     .map_err(AppError::from)?;
 
     // M-4: Set HttpOnly cookie for browser-based auth
     let is_https = crate::public_url::request_is_https(&state, &headers);
-    let cookie_value = format!(
-        "{}={}; HttpOnly; Path=/; SameSite=Strict; Max-Age=604800{}",
-        AUTH_COOKIE_NAME,
-        token,
-        if is_https { "; Secure" } else { "" }
-    );
+    let cookie_value = crate::api::users::build_auth_cookie(&token, is_https, &state.jwt_secret);
 
     let mut response = (
         StatusCode::OK,

@@ -426,6 +426,17 @@
       "reachedFromUi": true
     },
     {
+      "method": "POST",
+      "url": "/api/v1/users/me/session/refresh",
+      "access": "User",
+      "handler": "api::users::refresh_session",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": false
+    },
+    {
       "method": "PATCH",
       "url": "/api/v1/users/me",
       "access": "User",
@@ -944,7 +955,8 @@
       "access": "Public",
       "handler": "api::sso::authorize",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": false
     },
@@ -26356,7 +26368,7 @@
         {
           "tag": "form",
           "label": ")}",
-          "line": 172,
+          "line": 173,
           "via": null,
           "href": null,
           "handler": "handleInitialPassword",
@@ -26366,7 +26378,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.login.set_password",
-          "line": 196,
+          "line": 197,
           "via": null,
           "href": null,
           "handler": null,
@@ -26376,7 +26388,7 @@
         {
           "tag": "form",
           "label": "i18n:auth.login.mfa_code",
-          "line": 201,
+          "line": 202,
           "via": null,
           "href": null,
           "handler": "handleMfaSubmit",
@@ -26386,7 +26398,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 215,
+          "line": 216,
           "via": null,
           "href": null,
           "handler": null,
@@ -26396,7 +26408,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.login.verifying",
-          "line": 219,
+          "line": 220,
           "via": null,
           "href": null,
           "handler": null,
@@ -26406,7 +26418,7 @@
         {
           "tag": "form",
           "label": "i18n:auth.login.username",
-          "line": 224,
+          "line": 225,
           "via": null,
           "href": null,
           "handler": "handleSubmit",
@@ -26414,9 +26426,19 @@
           "unresolved": true
         },
         {
+          "tag": "input",
+          "label": "",
+          "line": 237,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
           "tag": "button",
           "label": "i18n:auth.login.submitting",
-          "line": 235,
+          "line": 242,
           "via": null,
           "href": null,
           "handler": null,
@@ -26426,7 +26448,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.login.passkey_sign_in",
-          "line": 241,
+          "line": 248,
           "via": null,
           "href": null,
           "handler": "handlePasskeyLogin",
@@ -26436,7 +26458,7 @@
         {
           "tag": "button",
           "label": "i18n:auth.login.sso_retry",
-          "line": 263,
+          "line": 270,
           "via": null,
           "href": null,
           "handler": "loadSsoProviders",
@@ -26461,9 +26483,9 @@
         {
           "tag": "a",
           "label": ")}",
-          "line": 271,
+          "line": 278,
           "via": null,
-          "href": "auth.ssoAuthorizeUrl(provider.slug)",
+          "href": "auth.ssoAuthorizeUrl(provider.slug, rememberMe)",
           "handler": null,
           "calls": [],
           "unresolved": false
@@ -26471,7 +26493,7 @@
         {
           "tag": "a",
           "label": "i18n:auth.login.footer_link",
-          "line": 284,
+          "line": 291,
           "via": null,
           "href": "/register",
           "handler": null,
@@ -26481,7 +26503,7 @@
         {
           "tag": "a",
           "label": "i18n:auth.login.forgot_password",
-          "line": 287,
+          "line": 294,
           "via": null,
           "href": "/forgot-password",
           "handler": null,

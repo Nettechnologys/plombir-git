@@ -283,6 +283,7 @@ pub(crate) fn stamp_security(
         crate::api::sudo::step_up,
         crate::api::users::logout,
         crate::api::users::me,
+        crate::api::users::refresh_session,
         crate::api::users::list_tokens,
         crate::api::users::create_token,
         crate::api::users::delete_token,

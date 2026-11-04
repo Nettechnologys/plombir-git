@@ -7,10 +7,11 @@
   import SudoPrompt from '$lib/components/SudoPrompt.svelte';
   import Layout from '$lib/components/Layout.svelte';
   import SourceFooter from '$lib/components/SourceFooter.svelte';
-import { fetchUser, isAuthReady } from '$lib/stores/auth.svelte';
+import { fetchUser, isAuthReady, refreshSessionAfterNavigation } from '$lib/stores/auth.svelte';
 import { registerKeyboardShortcuts } from '$lib/stores/instance.svelte';
 import { locale, t } from '$lib/i18n';
 import { onMount } from 'svelte';
+import { afterNavigate } from '$app/navigation';
 import type { Snippet } from 'svelte';
 import {
   setBanner,
@@ -31,7 +32,8 @@ import { withBackendBase } from '$lib/api/_base';
 
   // Initialize i18n and fetch user on first load
   locale.init();
-  fetchUser();
+  const initialSession = fetchUser();
+  afterNavigate(() => { void initialSession.then(() => refreshSessionAfterNavigation()); });
 
   // Register global keyboard shortcuts
   onMount(() => {

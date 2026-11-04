@@ -136,7 +136,7 @@ pub async fn step_up(
         StatusCode::OK,
         [(
             axum::http::header::SET_COOKIE,
-            build_auth_cookie(&token, is_https),
+            build_auth_cookie(&token, is_https, &state.jwt_secret),
         )],
         Json(AuthResponse {
             token,

@@ -26,6 +26,7 @@
 
   let username = $state('');
   let password = $state('');
+  let rememberMe = $state(false);
   let mfaCode = $state('');
   let newPassword = $state('');
   let confirmPassword = $state('');
@@ -96,7 +97,7 @@
   async function handleSubmit(e: Event) {
     e.preventDefault();
     localError = '';
-    const ok = await login(username, password);
+    const ok = await login(username, password, rememberMe);
     if (ok) {
       window.location.href = '/dashboard';
     } else if (isMfaRequired()) {
@@ -115,7 +116,7 @@
       localError = t('auth.login.passwords_differ', 'The two new passwords differ.');
       return;
     }
-    const ok = await completeInitialPassword(password, newPassword);
+    const ok = await completeInitialPassword(password, newPassword, rememberMe);
     if (ok) {
       window.location.href = '/dashboard';
     } else if (!isMfaRequired()) {
@@ -129,7 +130,7 @@
       localError = t('auth.login.passkey_username_first');
       return;
     }
-    const ok = await loginWithPasskey(username, passkeyDevice);
+    const ok = await loginWithPasskey(username, passkeyDevice, rememberMe);
     if (ok) {
       window.location.href = '/dashboard';
     } else {
@@ -232,6 +233,12 @@
           <input type="password" bind:value={password} required autocomplete="current-password" />
         </label>
 
+        <label class="checkbox-label remember-me">
+          <input type="checkbox" bind:checked={rememberMe} disabled={getAuthLoading()} />
+          {t('auth.login.remember_me')}
+        </label>
+        <p class="remember-hint">{t('auth.login.remember_hint')}</p>
+
         <button type="submit" class="btn-primary" disabled={getAuthLoading()}>
           {getAuthLoading() ? t('auth.login.submitting') : t('auth.login.submit')}
         </button>
@@ -268,7 +275,7 @@
       <div class="sso-divider"><span>{t('auth.login.sso_or')}</span></div>
       <div class="sso-providers">
         {#each knownSsoProviders as provider (provider.slug)}
-          <a class="sso-button" href={auth.ssoAuthorizeUrl(provider.slug)}>
+          <a class="sso-button" href={auth.ssoAuthorizeUrl(provider.slug, rememberMe)}>
             {#if provider.icon_url}
               <img src={provider.icon_url} alt="" width="20" height="20" />
             {/if}
@@ -290,6 +297,9 @@
 </div>
 
 <style>
+  .remember-me { gap: 8px; }
+  .remember-hint { margin: -8px 0 12px; font-size: 12px; color: var(--text-secondary); }
+
   .brand-mark {
     display: inline-flex;
     color: var(--accent);

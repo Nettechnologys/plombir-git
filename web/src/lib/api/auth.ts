@@ -24,6 +24,7 @@ export type RegisterResponse =
 
 /** The signed-in account, as `/users/me` describes it. */
 export interface Me {
+  remember_me?: boolean;
   id: number;
   username: string;
   email: string;
@@ -124,10 +125,10 @@ export const auth = {
         setupToken ? { username, email, password, setup_token: setupToken } : { username, email, password },
       ),
     }),
-  login: (username: string, password: string) =>
+  login: (username: string, password: string, rememberMe?: boolean) =>
     request<AuthLoginResponse>('/users/login', {
       method: 'POST',
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ username, password, remember_me: rememberMe }),
     }),
   verifyMfa: (username: string, code: string, backup = false) =>
     request<AuthLoginResponse>('/users/mfa/verify', {
@@ -135,6 +136,9 @@ export const auth = {
       body: JSON.stringify({ username, code, backup }),
     }),
   me: () => request<Me>('/users/me'),
+  refreshSession: () => request<{ user_id: number; remember_me: boolean; refreshed: boolean }>(
+    '/users/me/session/refresh', { method: 'POST', omitBearer: true },
+  ),
   // Sudo mode: the same session re-issued for ten minutes, answered like
   // `login`. `request` calls the prompt that calls this when a route answers
   // `reason: sudo_required`.
@@ -159,10 +163,10 @@ export const auth = {
       body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
     }),
   // The second half of a login that answered `password_change_required`.
-  setInitialPassword: (login: string, password: string, newPassword: string) =>
+  setInitialPassword: (login: string, password: string, newPassword: string, rememberMe?: boolean) =>
     request<AuthLoginResponse>('/users/password/initial', {
       method: 'POST',
-      body: JSON.stringify({ login, password, new_password: newPassword }),
+      body: JSON.stringify({ login, password, new_password: newPassword, remember_me: rememberMe }),
     }),
   // `null` clears a field; leaving a key out keeps it.
   updateProfile: (data: { display_name?: string | null; bio?: string | null }) =>
@@ -234,8 +238,8 @@ export const auth = {
   },
   listSsoProviders: () =>
     request<PublicSsoProvider[]>('/auth/sso/providers'),
-  ssoAuthorizeUrl: (slug: string) =>
-    withApiBase(`/auth/sso/${encodeURIComponent(slug)}`),
+  ssoAuthorizeUrl: (slug: string, rememberMe?: boolean) =>
+    withApiBase(`/auth/sso/${encodeURIComponent(slug)}${rememberMe === undefined ? '' : `?remember_me=${rememberMe}`}`),
   listSsoLinks: () => request<SsoLink[]>('/users/me/sso'),
   listImportedAuthorship: () =>
     request<ClaimableImportedRepository[]>('/users/me/imported-authorship'),

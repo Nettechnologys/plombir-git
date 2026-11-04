@@ -68,6 +68,7 @@ fn session_response(
     headers: &HeaderMap,
     status: StatusCode,
     user: &rg_db::entities::user::Model,
+    remember_me: Option<bool>,
 ) -> Response {
     let token = match rg_core::auth::jwt::generate_token(
         user.id,
@@ -75,14 +76,20 @@ fn session_response(
         user.session_version,
         &state.jwt_secret,
         7,
-    ) {
+    )
+    .and_then(|token| {
+        rg_core::auth::jwt::with_browser_session(&token, remember_me, &state.jwt_secret)
+    }) {
         Ok(token) => token,
         Err(error) => return AppError::from(error).into_response(),
     };
     let is_https = crate::public_url::request_is_https(state, headers);
     (
         status,
-        [(header::SET_COOKIE, build_auth_cookie(&token, is_https))],
+        [(
+            header::SET_COOKIE,
+            build_auth_cookie(&token, is_https, &state.jwt_secret),
+        )],
         Json(serde_json::json!({
             "token": token,
             "user_id": user.id,
@@ -99,12 +106,14 @@ fn second_factor_response(
     state: &AppState,
     headers: &HeaderMap,
     user: &rg_db::entities::user::Model,
+    remember_me: Option<bool>,
 ) -> Response {
-    let challenge = match rg_core::auth::jwt::generate_mfa_challenge(
+    let challenge = match rg_core::auth::jwt::generate_mfa_challenge_with_remember(
         user.id,
         &user.username,
         "password",
         &state.jwt_secret,
+        remember_me,
     ) {
         Ok(challenge) => challenge,
         Err(error) => return AppError::from(error).into_response(),
@@ -196,7 +205,14 @@ pub async fn change_password(
                 serde_json::json!({ "other_sessions_revoked": true }),
             )
             .await;
-            session_response(&state, &headers, StatusCode::OK, &updated)
+            session_response(
+                &state,
+                &headers,
+                StatusCode::OK,
+                &updated,
+                crate::api::auth::session_claims(&headers, &state.jwt_secret)
+                    .and_then(|claims| claims.remember_me),
+            )
         }
         Err(error) => AppError::from(error).into_response(),
     }
@@ -209,6 +225,8 @@ pub struct InitialPasswordRequest {
     /// The password the administrator handed over.
     pub password: String,
     pub new_password: String,
+    #[serde(default)]
+    pub remember_me: Option<bool>,
 }
 
 /// POST /api/v1/users/password/initial
@@ -312,9 +330,9 @@ pub async fn set_initial_password(
             )
             .await;
             if updated.mfa_enabled {
-                second_factor_response(&state, &headers, &updated)
+                second_factor_response(&state, &headers, &updated, body.remember_me)
             } else {
-                session_response(&state, &headers, StatusCode::OK, &updated)
+                session_response(&state, &headers, StatusCode::OK, &updated, body.remember_me)
             }
         }
         Err(error) => AppError::from(error).into_response(),
@@ -538,7 +556,7 @@ pub async fn confirm_email(
             .await;
             crate::metrics::recorder::user_registered();
             crate::metrics::recorder::auth_event("register", "success");
-            session_response(&state, &headers, StatusCode::CREATED, &user)
+            session_response(&state, &headers, StatusCode::CREATED, &user, None)
         }
         Ok(Confirmed::EmailChanged {
             user,

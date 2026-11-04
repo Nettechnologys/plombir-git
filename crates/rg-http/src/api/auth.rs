@@ -74,7 +74,7 @@ impl FromRequestParts<crate::AppState> for SessionUser {
 }
 
 /// A login session together with the claims it was minted with, for the one
-/// handler that re-issues it (`POST /users/me/sudo`). Refuses a PAT as
+/// handlers that re-issue it (sudo and remembered session renewal). Refuses a PAT as
 /// [`SessionUser`] does.
 #[derive(Debug, Clone)]
 pub struct LoginSession {

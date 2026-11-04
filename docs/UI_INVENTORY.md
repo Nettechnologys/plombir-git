@@ -19,11 +19,11 @@
 
 | | |
 |---|---|
-| Router routes (with declared `Access`) | 455 |
+| Router routes (with declared `Access`) | 456 |
 | Reachable from the browser | 316 (69%) |
 | Layout modules | 2 |
 | Pages | 75 |
-| Interactive controls | 1081 |
+| Interactive controls | 1082 |
 | Controls calling an API | 378 |
 | Controls from shared components | 446 |
 | Browser sweep: scenarios / inventory entries / routes | 52 / 197 / 187 |
@@ -36,7 +36,7 @@
 |---|---:|---:|---:|---:|
 | `RepoRead` | 111 | 72 | 4 | 0 |
 | `RepoWrite` | 81 | 62 | 12 | 2 |
-| `User` | 60 | 50 | 5 | 0 |
+| `User` | 61 | 50 | 5 | 0 |
 | `RepoAdmin` | 54 | 49 | 0 | 4 |
 | `InstanceAdmin` | 33 | 28 | 0 | 1 |
 | `Public` | 25 | 10 | 2 | 0 |
@@ -91,10 +91,10 @@
 | `/[owner]/[repo]/settings/branches` | 15 | 2 | 2 |
 | `/[owner]/[repo]/wiki/[title]/history` | 15 | 5 | 11 |
 | `/settings/profile` | 15 | 8 | 2 |
+| `/login` | 14 | 1 | 1 |
 | `/[owner]/[repo]/compare/[...spec]` | 13 | 4 | 11 |
 | `/[owner]/[repo]/packages/[format]` | 13 | 4 | 11 |
 | `/[owner]/[repo]/settings/webhooks` | 13 | 6 | 2 |
-| `/login` | 13 | 1 | 1 |
 | `/admin/hooks` 🔒 | 12 | 6 | 12 |
 | `/orgs/[name]/hooks` | 12 | 6 | 12 |
 | `/admin/runners` 🔒 | 11 | 4 | 1 |
@@ -1136,7 +1136,7 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:auth.login.sso_retry | :263 | `GET /api/v1/auth/sso/providers` | `Public` | rust+web |
+| i18n:auth.login.sso_retry | :270 | `GET /api/v1/auth/sso/providers` | `Public` | rust+web |
 
 ### `/notifications`
 
@@ -1370,6 +1370,7 @@ CI runners, and webhooks. A browser test cannot cover these routes.
 | POST | `/api/v1/users/register` | `Public` | rust+web+smoke |
 | POST | `/api/v1/users/login` | `Public` | rust+web+smoke |
 | POST | `/api/v1/users/logout` | `User` | rust+web |
+| POST | `/api/v1/users/me/session/refresh` | `User` | rust+web |
 | POST | `/api/v1/users/me/sudo` | `User` | rust+smoke |
 | POST | `/api/v1/users/password/initial` | `Public` | rust+web |
 | GET | `/api/v1/avatars/{username}` | `Public` | rust |
@@ -1378,7 +1379,7 @@ CI runners, and webhooks. A browser test cannot cover these routes.
 | POST | `/api/v1/users/passkeys/register/finish` | `User` | rust |
 | POST | `/api/v1/users/passkeys/login/start` | `Public` | rust+web |
 | POST | `/api/v1/users/passkeys/login/finish` | `Public` | rust |
-| GET | `/api/v1/auth/sso/{slug}` | `Public` | rust |
+| GET | `/api/v1/auth/sso/{slug}` | `Public` | rust+web |
 | GET | `/api/v1/auth/sso/{slug}/callback` | `Public` | rust |
 | POST | `/api/v1/auth/sso/{slug}/reauthenticate` | `User` | rust |
 | GET | `/api/v1/repos/{owner}/{name}/labels/{id}` | `RepoRead` | rust |

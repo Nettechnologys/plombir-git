@@ -13,16 +13,29 @@ use axum::{
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use crate::api::auth::{AuthUser, SudoUser, AUTH_COOKIE_NAME};
+use crate::api::auth::{AuthUser, LoginSession, SudoUser, AUTH_COOKIE_NAME};
 use crate::error::AppError;
 use crate::AppState;
 
 /// M-4: Build a `Set-Cookie` header value for the HttpOnly auth cookie.
-pub(crate) fn build_auth_cookie(token: &str, is_https: bool) -> String {
+pub(crate) fn build_auth_cookie(token: &str, is_https: bool, secret: &str) -> String {
+    let claims = rg_core::auth::jwt::validate_token(token, secret);
+    debug_assert!(
+        claims.is_some(),
+        "auth cookies must contain a freshly validated session"
+    );
+    let max_age = match claims.as_ref() {
+        Some(claims) if claims.remember_me == Some(false) => None,
+        Some(claims) => Some((claims.exp - chrono::Utc::now().timestamp()).max(0)),
+        None => Some(604800),
+    };
     let mut cookie = format!(
-        "{}={}; HttpOnly; Path=/; SameSite=Strict; Max-Age=604800",
+        "{}={}; HttpOnly; Path=/; SameSite=Strict",
         AUTH_COOKIE_NAME, token
     );
+    if let Some(max_age) = max_age {
+        cookie.push_str(&format!("; Max-Age={max_age}"));
+    }
     if is_https {
         cookie.push_str("; Secure");
     }
@@ -72,6 +85,10 @@ pub struct LoginRequest {
     #[serde(alias = "username")]
     pub login: String,
     pub password: String,
+    /// Persist for thirty idle days when true; use a browser session cookie
+    /// when false. Omitted by older API clients to keep their existing policy.
+    #[serde(default)]
+    pub remember_me: Option<bool>,
 }
 
 /// Login/Register success response.
@@ -100,6 +117,7 @@ pub struct UserProfile {
     /// When the account proved, by a mailed link, that it receives mail at
     /// `email`; `null` when it has not (card_2296f052332b).
     pub email_verified_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub remember_me: bool,
 }
 
 #[utoipa::path(
@@ -424,7 +442,14 @@ pub async fn login(
                     finalized.session_version,
                     &state.jwt_secret,
                     7,
-                ) {
+                )
+                .and_then(|token| {
+                    rg_core::auth::jwt::with_browser_session(
+                        &token,
+                        body.remember_me,
+                        &state.jwt_secret,
+                    )
+                }) {
                     Ok(token) => token,
                     Err(error) => return AppError::from(error).into_response(),
                 };
@@ -472,11 +497,12 @@ pub async fn login(
             if mfa_required {
                 // Prove the first factor with a short-lived, HttpOnly challenge
                 // cookie. The MFA endpoint refuses username-only verification.
-                let challenge = match rg_core::auth::jwt::generate_mfa_challenge(
+                let challenge = match rg_core::auth::jwt::generate_mfa_challenge_with_remember(
                     resp.user_id,
                     &resp.username,
                     login_method,
                     &state.jwt_secret,
+                    body.remember_me,
                 ) {
                     Ok(challenge) => challenge,
                     Err(error) => return AppError::from(error).into_response(),
@@ -506,7 +532,7 @@ pub async fn login(
             } else {
                 // M-4: Set HttpOnly cookie with JWT for browser-based auth
                 let is_https = crate::public_url::request_is_https(&state, &headers);
-                let cookie = build_auth_cookie(&resp.token, is_https);
+                let cookie = build_auth_cookie(&resp.token, is_https, &state.jwt_secret);
                 (
                     StatusCode::OK,
                     [(axum::http::header::SET_COOKIE, cookie)],
@@ -684,6 +710,79 @@ pub async fn logout(
         .into_response()
 }
 
+/// A browser refresh reuses the cookie identity, never an explicit bearer.
+#[derive(serde::Serialize, ToSchema)]
+pub struct SessionRefreshResponse {
+    pub user_id: i64,
+    pub remember_me: bool,
+    pub refreshed: bool,
+}
+
+#[utoipa::path(
+    post,
+    path = "/users/me/session/refresh",
+    tag = "Users",
+    responses(
+        (status = 200, description = "Remembered cookie renewed or still fresh", body = SessionRefreshResponse),
+        (status = 401, description = "A current browser cookie is required"),
+        (status = 403, description = "Only remembered login sessions can be renewed"),
+    ),
+    security(("bearer_auth" = [])),
+)]
+pub async fn refresh_session(
+    State(state): State<AppState>,
+    session: LoginSession,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    use rg_core::auth::jwt;
+    let token = crate::api::auth::cookie_value(&headers, AUTH_COOKIE_NAME)
+        .ok_or_else(|| AppError::unauthorized("a browser session cookie is required"))?;
+    let claims = jwt::validate_token(token, &state.jwt_secret)
+        .ok_or_else(|| AppError::unauthorized("authentication required"))?;
+    if claims.pat_id.is_some() || claims.remember_me != Some(true) {
+        return Err(AppError::forbidden(
+            "only remembered login sessions can be renewed",
+        ));
+    }
+    let user = rg_db::ops::user_ops::find_by_id(&state.db, session.user_id)
+        .await
+        .map_err(AppError::from)?
+        .filter(|user| {
+            user.is_usable()
+                && claims.sub == user.id.to_string()
+                && claims.session_version == user.session_version
+        })
+        .ok_or_else(|| AppError::unauthorized("authentication required"))?;
+    let renewed = jwt::renew_remembered_session(&claims, &state.jwt_secret)
+        .map_err(|_| AppError::unauthorized("sign in again to renew this browser session"))?;
+    let refreshed = renewed.is_some();
+    let token = renewed.unwrap_or_else(|| token.to_owned());
+    let mut response = Json(SessionRefreshResponse {
+        user_id: user.id,
+        remember_me: true,
+        refreshed,
+    })
+    .into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    if refreshed {
+        let cookie = build_auth_cookie(
+            &token,
+            crate::public_url::request_is_https(&state, &headers),
+            &state.jwt_secret,
+        );
+        response.headers_mut().insert(
+            axum::http::header::SET_COOKIE,
+            axum::http::HeaderValue::from_str(&cookie)
+                .map_err(|_| AppError::internal("invalid session cookie"))?,
+        );
+        tracing::debug!(user_id = user.id, "remembered browser session renewed");
+    }
+    Ok(response)
+}
+
 #[utoipa::path(
     get,
     path = "/users/me",
@@ -695,7 +794,11 @@ pub async fn logout(
     )
 )]
 /// GET /api/v1/users/me — returns the current user's profile.
-pub async fn me(State(state): State<AppState>, AuthUser(user_id): AuthUser) -> impl IntoResponse {
+pub async fn me(
+    State(state): State<AppState>,
+    AuthUser(user_id): AuthUser,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     match rg_db::ops::user_ops::find_by_id(&state.db, user_id).await {
         Ok(Some(user)) => (
             StatusCode::OK,
@@ -714,6 +817,8 @@ pub async fn me(State(state): State<AppState>, AuthUser(user_id): AuthUser) -> i
                 "is_admin": user.is_admin,
                 "created_at": user.created_at,
                 "email_verified_at": user.email_verified_at,
+                "remember_me": crate::api::auth::session_claims(&headers, &state.jwt_secret)
+                    .is_some_and(|claims| claims.pat_id.is_none() && claims.remember_me == Some(true)),
             })),
         )
             .into_response(),
@@ -1178,7 +1283,7 @@ pub async fn reset_password(
             journal_password_reset(&state, &headers, resp.user_id, &resp.username, false).await;
             // M-4: Set HttpOnly cookie so the user stays logged in after reset
             let is_https = crate::public_url::request_is_https(&state, &headers);
-            let cookie = build_auth_cookie(&resp.token, is_https);
+            let cookie = build_auth_cookie(&resp.token, is_https, &state.jwt_secret);
             (
                 StatusCode::OK,
                 [(axum::http::header::SET_COOKIE, cookie)],

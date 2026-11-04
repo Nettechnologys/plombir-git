@@ -51,6 +51,73 @@ const SSO_REAUTH_COOKIE: &str = "plombir_git_sso_reauth";
 /// cookies, and checked to be a path on this site before it is used.
 const SSO_RETURN_COOKIE: &str = "plombir_git_sso_return";
 
+const SSO_SESSION_COOKIE: &str = "plombir_git_sso_session";
+
+#[derive(Deserialize, Serialize)]
+struct SsoSessionChoice {
+    slug: String,
+    csrf_state: String,
+    remember_me: Option<bool>,
+}
+
+fn set_session_choice(
+    response: &mut axum::response::Response,
+    state: &AppState,
+    headers: &HeaderMap,
+    slug: &str,
+    csrf_state: &str,
+    remember_me: Option<bool>,
+) -> Result<(), AppError> {
+    let value = rg_core::auth::webauthn::seal_state(
+        SsoSessionChoice {
+            slug: slug.to_owned(),
+            csrf_state: csrf_state.to_owned(),
+            remember_me,
+        },
+        "sso-session-choice",
+        &state.jwt_secret,
+        600,
+    )
+    .map_err(AppError::from)?;
+    append_set_cookie(
+        response,
+        format!(
+            "{SSO_SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600{}",
+            if crate::public_url::request_is_https(state, headers) {
+                "; Secure"
+            } else {
+                ""
+            }
+        ),
+    );
+    Ok(())
+}
+
+fn read_session_choice(
+    headers: &HeaderMap,
+    slug: &str,
+    csrf_state: &str,
+    secret: &str,
+) -> Result<Option<bool>, AppError> {
+    let Some(raw) = crate::api::auth::cookie_value(headers, SSO_SESSION_COOKIE) else {
+        return Ok(None);
+    };
+    let choice = rg_core::auth::webauthn::unseal_state::<SsoSessionChoice>(
+        raw,
+        "sso-session-choice",
+        secret,
+    )
+    .filter(|choice| choice.slug == slug && choice.csrf_state == csrf_state)
+    .ok_or_else(|| AppError::bad_request("invalid SSO browser session choice"))?;
+    Ok(choice.remember_me)
+}
+
+#[derive(Deserialize)]
+pub struct SsoAuthorizeQuery {
+    #[serde(default)]
+    pub remember_me: Option<bool>,
+}
+
 fn append_set_cookie(response: &mut axum::response::Response, cookie: String) {
     if let Ok(header_value) = HeaderValue::from_str(&cookie) {
         response
@@ -87,17 +154,7 @@ fn clear_state_cookie(response: &mut axum::response::Response, name: &str) {
     );
 }
 
-fn build_auth_cookie(token: &str, is_https: bool) -> String {
-    let mut cookie = format!(
-        "{}={}; HttpOnly; Path=/; SameSite=Strict; Max-Age=604800",
-        crate::api::auth::AUTH_COOKIE_NAME,
-        token
-    );
-    if is_https {
-        cookie.push_str("; Secure");
-    }
-    cookie
-}
+use crate::api::users::build_auth_cookie;
 
 fn build_clear_auth_cookie(is_https: bool) -> String {
     format!(
@@ -584,6 +641,7 @@ pub async fn list_my_links(
     tag = "SSO",
     params(
         ("slug" = String, Path, description = "SSO provider slug"),
+        ("remember_me" = Option<bool>, Query, description = "Persist this browser session for thirty idle days"),
     ),
     responses(
         (status = 302, description = "Redirect to provider authorization page"),
@@ -595,6 +653,7 @@ pub async fn authorize(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(slug): Path<String>,
+    Query(query): Query<SsoAuthorizeQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let provider = resolve_usable_provider(&state, &slug).await?;
 
@@ -635,6 +694,14 @@ pub async fn authorize(
     // it here keeps that from surfacing as a refused sign-in.
     clear_state_cookie(&mut redirect, SSO_LINK_COOKIE);
 
+    set_session_choice(
+        &mut redirect,
+        &state,
+        &headers,
+        &slug,
+        &csrf_state,
+        query.remember_me,
+    )?;
     Ok(redirect)
 }
 
@@ -731,6 +798,7 @@ pub async fn start_link(
             )
         ),
     );
+    clear_state_cookie(&mut response, SSO_SESSION_COOKIE);
     Ok(response)
 }
 
@@ -878,6 +946,16 @@ pub async fn reauthenticate(
             )
         ),
     );
+    let remember_me = crate::api::auth::session_claims(&headers, &state.jwt_secret)
+        .and_then(|claims| claims.remember_me);
+    set_session_choice(
+        &mut response,
+        &state,
+        &headers,
+        &slug,
+        &csrf_state,
+        remember_me,
+    )?;
     Ok(response)
 }
 
@@ -889,6 +967,7 @@ async fn complete_reauthentication(
     provider: &rg_db::entities::sso_provider::Model,
     user_info: &rg_core::auth::sso::SsoIdentity,
     requester: (i64, i64),
+    remember_me: Option<bool>,
 ) -> Result<axum::response::Response, SsoRefusal> {
     let (user_id, session_version) = requester;
     let db = &state.db;
@@ -940,11 +1019,12 @@ async fn complete_reauthentication(
     // An account with a second factor proves it too, through the login's own
     // second step, which answers a session in sudo mode.
     if user.mfa_enabled {
-        let challenge = rg_core::auth::jwt::generate_mfa_challenge(
+        let challenge = rg_core::auth::jwt::generate_mfa_challenge_with_remember(
             user.id,
             &user.username,
             &provider.slug,
             &state.jwt_secret,
+            remember_me,
         )
         .map_err(AppError::from)?;
         let target = format!(
@@ -967,6 +1047,9 @@ async fn complete_reauthentication(
         &state.jwt_secret,
         7,
     )
+    .and_then(|token| {
+        rg_core::auth::jwt::with_browser_session(&token, remember_me, &state.jwt_secret)
+    })
     .map_err(AppError::from)?;
     let actor = grant_actor(state, user.id).await?;
     record_credential(
@@ -984,7 +1067,10 @@ async fn complete_reauthentication(
     .await;
 
     let mut redirect = Redirect::temporary(&return_to).into_response();
-    append_set_cookie(&mut redirect, build_auth_cookie(&token, is_https));
+    append_set_cookie(
+        &mut redirect,
+        build_auth_cookie(&token, is_https, &state.jwt_secret),
+    );
     clear_round_trip_cookies(&mut redirect);
     Ok(redirect)
 }
@@ -995,6 +1081,7 @@ fn clear_round_trip_cookies(response: &mut axum::response::Response) {
         SSO_VERIFIER_COOKIE,
         SSO_REAUTH_COOKIE,
         SSO_RETURN_COOKIE,
+        SSO_SESSION_COOKIE,
     ] {
         clear_state_cookie(response, cookie);
     }
@@ -1123,6 +1210,7 @@ fn link_completed_redirect(slug: &str) -> axum::response::Response {
     .into_response();
     clear_state_cookie(&mut redirect, SSO_STATE_COOKIE);
     clear_state_cookie(&mut redirect, SSO_VERIFIER_COOKIE);
+    clear_state_cookie(&mut redirect, SSO_SESSION_COOKIE);
     clear_state_cookie(&mut redirect, SSO_LINK_COOKIE);
     redirect
 }
@@ -1291,6 +1379,7 @@ impl SsoRefusal {
         let mut redirect = Redirect::temporary(&target).into_response();
         clear_state_cookie(&mut redirect, SSO_STATE_COOKIE);
         clear_state_cookie(&mut redirect, SSO_VERIFIER_COOKIE);
+        clear_state_cookie(&mut redirect, SSO_SESSION_COOKIE);
         clear_state_cookie(&mut redirect, SSO_LINK_COOKIE);
         redirect
     }
@@ -1342,6 +1431,14 @@ async fn callback_inner(
             return Err(state_invalid("missing CSRF state parameter"));
         }
     }
+
+    let remember_me = read_session_choice(
+        &headers,
+        &slug,
+        query.state.as_deref().unwrap_or_default(),
+        &state.jwt_secret,
+    )
+    .map_err(|_| state_invalid("invalid SSO browser session choice"))?;
 
     let code_verifier = code_verifier.ok_or_else(|| {
         tracing::warn!("SSO PKCE: no code verifier cookie found");
@@ -1454,6 +1551,7 @@ async fn callback_inner(
             &provider,
             &user_info,
             (user_id, session_version),
+            remember_me,
         )
         .await;
     }
@@ -1517,11 +1615,12 @@ async fn callback_inner(
 
     // ── If MFA enabled, require second factor ────────────────────
     if user.mfa_enabled {
-        let challenge = rg_core::auth::jwt::generate_mfa_challenge(
+        let challenge = rg_core::auth::jwt::generate_mfa_challenge_with_remember(
             user.id,
             &user.username,
             &provider.slug,
             &state.jwt_secret,
+            remember_me,
         )
         .map_err(AppError::from)?;
         let target = format!(
@@ -1542,6 +1641,7 @@ async fn callback_inner(
         );
         clear_state_cookie(&mut redirect, SSO_STATE_COOKIE);
         clear_state_cookie(&mut redirect, SSO_VERIFIER_COOKIE);
+        clear_state_cookie(&mut redirect, SSO_SESSION_COOKIE);
         return Ok(redirect);
     }
 
@@ -1553,6 +1653,9 @@ async fn callback_inner(
         &state.jwt_secret,
         7,
     )
+    .and_then(|token| {
+        rg_core::auth::jwt::with_browser_session(&token, remember_me, &state.jwt_secret)
+    })
     .map_err(AppError::from)?;
 
     let mut redirect = Redirect::temporary("/dashboard").into_response();
@@ -1561,10 +1664,12 @@ async fn callback_inner(
         build_auth_cookie(
             &token,
             crate::public_url::request_is_https(&state, &headers),
+            &state.jwt_secret,
         ),
     );
     clear_state_cookie(&mut redirect, SSO_STATE_COOKIE);
     clear_state_cookie(&mut redirect, SSO_VERIFIER_COOKIE);
+    clear_state_cookie(&mut redirect, SSO_SESSION_COOKIE);
     Ok(redirect)
 }
 
@@ -2646,8 +2751,18 @@ mod tests {
 
     #[test]
     fn sso_auth_cookie_uses_secure_flag_only_for_https() {
-        assert!(!build_auth_cookie("token", false).contains("; Secure"));
-        assert!(build_auth_cookie("token", true).contains("; Secure"));
+        assert!(!build_auth_cookie(
+            &rg_core::auth::jwt::generate_token(1, "alice", 0, "secret", 7).unwrap(),
+            false,
+            "secret"
+        )
+        .contains("; Secure"));
+        assert!(build_auth_cookie(
+            &rg_core::auth::jwt::generate_token(1, "alice", 0, "secret", 7).unwrap(),
+            true,
+            "secret"
+        )
+        .contains("; Secure"));
     }
 
     #[test]
