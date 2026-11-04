@@ -29984,6 +29984,6 @@
     "inventoryEntries": 836,
     "coveredEntries": 197,
     "coveredRoutes": 187,
-    "maxUiRoutesWithoutFrontendTest": 24
+    "maxUiRoutesWithoutFrontendTest": 22
   }
 }

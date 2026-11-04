@@ -2400,7 +2400,43 @@ async fn drive(fx: &Fixture, fact: &RouteFact, persona: Persona, path: &str) -> 
         other => panic!("route table produced an unroutable method {other}"),
     };
     if let Some(token) = fx.token(persona) {
-        req = req.bearer_auth(token);
+        if fact.handler == "rg_http::api::users::refresh_session" {
+            // Renewal deliberately accepts only remembered browser cookies.
+            // Obtain one through login for this persona; a Bearer-only probe
+            // cannot exercise the authenticated side of this route's gate.
+            let username = match persona {
+                Persona::Owner => OWNER,
+                Persona::Outsider => OUTSIDER,
+                Persona::Anonymous => unreachable!("anonymous has no token"),
+            };
+            let login = fx
+                .client
+                .post(format!("{}/api/v1/users/login", fx.base))
+                .json(&serde_json::json!({
+                    "username": username,
+                    "password": PW,
+                    "remember_me": true,
+                }))
+                .send()
+                .await
+                .expect("fixture: remembered browser login");
+            assert_eq!(login.status(), StatusCode::OK);
+            let cookie = login
+                .headers()
+                .get_all(reqwest::header::SET_COOKIE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .find(|value| value.starts_with("plombir_git_token="))
+                .expect("fixture: remembered login issued a session cookie")
+                .split(';')
+                .next()
+                .expect("fixture: nonempty session cookie");
+            req = req
+                .header(reqwest::header::COOKIE, cookie)
+                .header(reqwest::header::ORIGIN, &fx.base);
+        } else {
+            req = req.bearer_auth(token);
+        }
     }
     if matches!(fact.method, "POST" | "PUT" | "PATCH") {
         // Most handlers have a `FromRequestParts` gate, so `{}` is enough: it
@@ -2527,9 +2563,9 @@ async fn every_route_answers_its_declared_access_level() {
     // shape this whole sweep exists to prevent (card_00b2bd65060e).
     rg_http::metrics::init_registry().expect("install the Prometheus registry for the sweep");
     let (base, facts, db, repo_root) = spawn_test_app_with_routes_and_db_and_repo_root().await;
-    // No cookie jar: every persona is identified by the bearer token this test
-    // attaches, never by a `Set-Cookie` a previous request happened to leave
-    // behind.
+    // No cookie jar: credentials belong to the persona of this probe, never
+    // to a cookie a previous request happened to leave behind. Only the
+    // browser renewal probe explicitly obtains and attaches its own cookie.
     let client = Client::builder().build().expect("http client");
 
     // The sweep's owner is deliberately an ordinary repository owner, not an
