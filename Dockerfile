@@ -142,7 +142,7 @@ RUN set -eu; \
     test -n "$(find /out -maxdepth 1 -type f -print -quit)"
 
 # ── Stage 3: Runtime ────────────────────────────────────────
-FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
 LABEL org.opencontainers.image.source="https://github.com/Nettechnologys/plombir-git"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
