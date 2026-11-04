@@ -145,18 +145,24 @@ describe('manual pipeline trigger production wiring', () => {
 			'main',
 		);
 		expect(element<HTMLInputElement>(rendered.container, '#pipeline-trigger-input-deploy')).toMatchObject(
-			{ type: 'checkbox', checked: false },
+			{ type: 'checkbox', checked: false, required: false },
 		);
-		expect(element<HTMLSelectElement>(rendered.container, '#pipeline-trigger-input-target').value).toBe(
-			'staging',
+		expect(element<HTMLSelectElement>(rendered.container, '#pipeline-trigger-input-target')).toMatchObject(
+			{ value: 'staging', required: true },
 		);
 		expect(element<HTMLInputElement>(rendered.container, '#pipeline-trigger-input-replicas')).toMatchObject(
-			{ type: 'number', value: '2' },
+			{ type: 'number', value: '2', required: false },
 		);
 		expect(element<HTMLInputElement>(rendered.container, '#pipeline-trigger-input-environment')).toMatchObject(
-			{ type: 'text', value: '' },
+			{ type: 'text', value: '', required: false },
 		);
-		expect(rendered.container.textContent).toContain('deploy *');
+		for (const [name, required] of [['deploy', true], ['target', true], ['replicas', false], ['environment', false]] as const) {
+			const control = element<HTMLInputElement | HTMLSelectElement>(rendered.container, `#pipeline-trigger-input-${name}`);
+			const labels = Array.from(control.labels ?? [], label => label.textContent?.replace(/\s+/g, ' ').trim());
+			expect(labels).toEqual([required ? `${name} *` : name]);
+		}
+		// A supplied boolean false is valid; HTML required would force it to true.
+		expect(element<HTMLInputElement>(rendered.container, '#pipeline-trigger-input-deploy').checkValidity()).toBe(true);
 		expect(rendered.container.textContent).toContain('Deploy after the build');
 	});
 

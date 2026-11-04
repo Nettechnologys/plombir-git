@@ -4,13 +4,16 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { productionRustSource, rustFnBlock } from './lib/rust-source.mjs';
-import { productionTsSource } from './lib/ts-source.mjs';
+import { productionTsSource, tsFunctionBody } from './lib/ts-source.mjs';
+import { parsePageInventory } from './lib/ui-surface.mjs';
 
 const root = process.cwd();
 const clientPath = path.join(root, 'web/src/lib/api/timeTracking.ts');
 const pagePath = path.join(root, 'web/src/routes/[owner]/[repo]/time_tracking/+page.svelte');
 const backendPath = path.join(root, 'crates/rg-http/src/api/time_tracking.rs');
 const repoHeaderPath = path.join(root, 'web/src/lib/components/RepoHeader.svelte');
+const overflowTabsPath = path.join(root, 'web/src/lib/components/OverflowTabs.svelte');
+const dropdownPath = path.join(root, 'web/src/lib/components/Dropdown.svelte');
 const enTranslationsPath = path.join(root, 'web/src/lib/i18n/translations/en.json');
 const zhTranslationsPath = path.join(root, 'web/src/lib/i18n/translations/zh-CN.json');
 
@@ -21,6 +24,8 @@ const page = productionTsSource(readFileSync(pagePath, 'utf8'));
 // stand in for the handler the server ships.
 const backend = productionRustSource(readFileSync(backendPath, 'utf8'));
 const repoHeader = productionTsSource(readFileSync(repoHeaderPath, 'utf8'));
+const overflowTabs = productionTsSource(readFileSync(overflowTabsPath, 'utf8'));
+const dropdown = productionTsSource(readFileSync(dropdownPath, 'utf8'));
 const enTranslations = JSON.parse(readFileSync(enTranslationsPath, 'utf8'));
 const zhTranslations = JSON.parse(readFileSync(zhTranslationsPath, 'utf8'));
 
@@ -75,12 +80,60 @@ if (/href="\/\{owner\}\/\{repo\}\/issues\/\{selectedIssue\.number\}"/.test(page)
   failures.push('Time tracking selected issue link still uses literal Svelte braces');
 }
 
-if (!/\{\s*id:\s*'time_tracking'[\s\S]*label:\s*t\('repo\.tabs\.time_tracking'\)/.test(repoHeader)) {
+const timeTab = repoHeader.match(/\{\s*id:\s*'time_tracking'[^{}]*\}/)?.[0] ?? '';
+if (!/label:\s*t\('repo\.tabs\.time_tracking'\)/.test(timeTab)) {
   failures.push('Repo header must expose a time-tracking tab for the implemented page/API flow');
 }
 
-if (!repoHeader.includes("activeTab === tab.id")) {
-  failures.push('Repo header tabs must continue using activeTab ids so time_tracking can be highlighted');
+const tabHref = tsFunctionBody(repoHeader, 'tabHref') ?? '';
+if ((/\bpath\s*:/.test(timeTab) && !/\bpath\s*:\s*'time_tracking'/.test(timeTab))
+  || !/const\s+suffix\s*=\s*tab\.id\s*===\s*'code'\s*\?\s*''\s*:\s*`\/\$\{tab\.path\s*\|\|\s*tab\.id\}`/.test(tabHref)
+  || !/return\s+`\/\$\{owner\}\/\$\{repo\}\$\{suffix\}`/.test(tabHref)) {
+  failures.push('Repo header must link the time_tracking tab to /{owner}/{repo}/time_tracking');
+}
+
+// Follow the mounted component, not an incidental activeTab reference in a
+// script, measurement span or sibling link. The inventory reader resolves the
+// real import and tabs prop; markup checks cover the shorthand activeTab prop.
+const markup = (source) => source.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/g, '');
+const headerMarkup = markup(repoHeader);
+const overflowMarkup = markup(overflowTabs);
+const mount = headerMarkup.match(/<OverflowTabs\b[\s\S]*?\/>/)?.[0] ?? '';
+const mounted = parsePageInventory(repoHeader, repoHeaderPath, { includeDirectTransports: false }).mounts
+  .filter(component => component.name === 'OverflowTabs' && component.source === './OverflowTabs.svelte');
+if (mounted.length !== 1
+  || mounted[0].props.tabs?.replace(/\s+/g, '') !== 'tabs.map(tab=>({...tab,href:tabHref(tab)}))'
+  || !/(?:\s\{\s*activeTab\s*\}|\sactiveTab\s*=\s*\{\s*activeTab\s*\})/.test(mount)) {
+  failures.push('Repo header must pass its tab ids, URLs and activeTab to the mounted OverflowTabs');
+}
+
+if (!/<RepoHeader\b[^>]*\bactiveTab="time_tracking"/.test(markup(page))) {
+  failures.push('Time tracking page must select activeTab="time_tracking" on RepoHeader');
+}
+
+if (!/let\s*\{[^}]*\bactiveTab\b[^}]*\}\s*:\s*Props\s*=\s*\$props\(\)/.test(overflowTabs)) {
+  failures.push('OverflowTabs must consume the activeTab prop from RepoHeader');
+}
+
+for (const collection of ['visible', 'hidden']) {
+  const anchor = overflowMarkup.match(new RegExp(`\\{#each\\s+${collection}\\s+as\\s+tab\\s*\\(tab\\.id\\)\\}\\s*(<a\\s[^>]*>)`))?.[1] ?? '';
+  if (!/\bhref=\{tab\.href\}/.test(anchor)
+    || !/\bclass:active=\{activeTab\s*===\s*tab\.id\}/.test(anchor)
+    || !/\baria-current=\{activeTab\s*===\s*tab\.id\s*\?\s*'page'\s*:\s*undefined\}/.test(anchor)) {
+    failures.push(`OverflowTabs ${collection} links must preserve tab URLs, active styling and aria-current`);
+  }
+}
+
+const menuMount = overflowMarkup.match(/<Dropdown\b[^>]*>/)?.[0] ?? '';
+if (!/hiddenActive\s*=\s*\$derived\(hidden\.some\(tab\s*=>\s*tab\.id\s*===\s*activeTab\)\)/.test(overflowTabs)
+  || !/triggerClass="overflow-trigger\s+\{hiddenActive\s*\?\s*'active'\s*:\s*''\}"/.test(menuMount)
+  || !/ariaLabel=\{hiddenActive\s*\?\s*moreActiveLabel\s*:\s*moreLabel\}/.test(menuMount)) {
+  failures.push('OverflowTabs More trigger must identify the active hidden tab visually and accessibly');
+}
+
+if (!/\.tab\.active\s*,\s*\.repo-tabs\s+:global\(\.overflow-trigger\.active\)\s*\{[^}]*border-bottom-color:\s*var\(--accent\)/.test(overflowTabs)
+  || !/\.dropdown-menu\s+:global\(a\.active\)\s*,\s*\.dropdown-menu\s+:global\(button\.active\)\s*\{[^}]*color:\s*var\(--accent\)/.test(dropdown)) {
+  failures.push('Active repository tabs must retain visible row, More trigger and dropdown item styles');
 }
 
 if (enTranslations?.repo?.tabs?.time_tracking !== 'Time') {
