@@ -71,8 +71,13 @@ describe('commit history ref and paging', () => {
 		setTestPage('/alice/demo/commits', { owner: 'alice', repo: 'demo' });
 		rendered = await renderComponent(CommitsPage);
 
-		await click(element(rendered.container, '.dropdown-trigger'));
+		const trigger = element<HTMLButtonElement>(rendered.container, '.commits-header .dropdown-trigger');
+		// jsdom has no layout; the viewport-aware menu needs an onscreen trigger.
+		trigger.getBoundingClientRect = () => new DOMRect(20, 80, 100, 36);
+		await click(trigger);
+		expect(trigger.getAttribute('aria-expanded')).toBe('true');
 		await click(button(rendered.container, 'dev'));
+		expect(trigger.getAttribute('aria-expanded')).toBe('false');
 		expect(navigation.goto).toHaveBeenCalledWith(
 			'/alice/demo/commits?ref=dev',
 			expect.objectContaining({ replaceState: true }),
@@ -81,6 +86,7 @@ describe('commit history ref and paging', () => {
 		setTestPage('/alice/demo/commits?ref=dev', { owner: 'alice', repo: 'demo' });
 		await settle();
 		expect(repos.log).toHaveBeenLastCalledWith('alice', 'demo', 'dev', undefined, 50);
+		expect(trigger.textContent).toContain('dev');
 	});
 
 	it('shows the empty state for a repository without commits', async () => {
