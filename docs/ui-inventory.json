@@ -831,6 +831,7 @@
       "handler": "api::mfa::enable_mfa",
       "testedIn": [
         "rust",
+        "web",
         "smoke"
       ],
       "reachedFromUi": true
@@ -862,7 +863,8 @@
       "access": "User",
       "handler": "api::mfa::regenerate_backup_codes",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": true
     },
@@ -872,7 +874,8 @@
       "access": "User",
       "handler": "api::mfa::disable_mfa",
       "testedIn": [
-        "rust"
+        "rust",
+        "web"
       ],
       "reachedFromUi": true
     },
@@ -28929,7 +28932,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.retry",
-          "line": 426,
+          "line": 442,
           "via": null,
           "href": null,
           "handler": "loadBackupStatus",
@@ -28954,7 +28957,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.mfa.current_password",
-          "line": 441,
+          "line": 457,
           "via": null,
           "href": null,
           "handler": "regenerateBackupCodes",
@@ -28969,7 +28972,8 @@
               "handler": "api::mfa::regenerate_backup_codes",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             },
             {
@@ -29034,7 +29038,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.working",
-          "line": 453,
+          "line": 469,
           "via": null,
           "href": null,
           "handler": null,
@@ -29044,7 +29048,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.mfa.current_password",
-          "line": 461,
+          "line": 477,
           "via": null,
           "href": null,
           "handler": "disableMfa",
@@ -29059,7 +29063,8 @@
               "handler": "api::mfa::disable_mfa",
               "matched": true,
               "testedIn": [
-                "rust"
+                "rust",
+                "web"
               ]
             },
             {
@@ -29124,7 +29129,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.disabling",
-          "line": 468,
+          "line": 484,
           "via": null,
           "href": null,
           "handler": null,
@@ -29134,7 +29139,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.starting",
-          "line": 474,
+          "line": 490,
           "via": null,
           "href": null,
           "handler": "startSetup",
@@ -29160,7 +29165,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.passkeys.retry",
-          "line": 504,
+          "line": 520,
           "via": null,
           "href": null,
           "handler": "loadPasskeyList",
@@ -29185,7 +29190,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.passkeys.remove",
-          "line": 518,
+          "line": 534,
           "via": null,
           "href": null,
           "handler": "() => removePasskey(key.id)",
@@ -29209,7 +29214,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.passkeys.name",
-          "line": 533,
+          "line": 549,
           "via": null,
           "href": null,
           "handler": "addPasskey",
@@ -29219,7 +29224,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.passkeys.waiting",
-          "line": 544,
+          "line": 560,
           "via": null,
           "href": null,
           "handler": null,
@@ -29229,7 +29234,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.sso.retry",
-          "line": 572,
+          "line": 588,
           "via": null,
           "href": null,
           "handler": "loadSsoLinks",
@@ -29254,7 +29259,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.sso.unlink",
-          "line": 587,
+          "line": 603,
           "via": null,
           "href": null,
           "handler": "() => unlinkSsoProvider(link)",
@@ -29279,7 +29284,7 @@
         {
           "tag": "button",
           "label": ")}",
-          "line": 605,
+          "line": 621,
           "via": null,
           "href": null,
           "handler": "() => linkSsoProvider(provider)",
@@ -29304,7 +29309,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.setup.code",
-          "line": 630,
+          "line": 651,
           "via": null,
           "href": null,
           "handler": "enableMfa",
@@ -29320,6 +29325,7 @@
               "matched": true,
               "testedIn": [
                 "rust",
+                "web",
                 "smoke"
               ]
             },
@@ -29385,7 +29391,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.setup.verifying",
-          "line": 641,
+          "line": 662,
           "via": null,
           "href": null,
           "handler": null,
@@ -29394,11 +29400,31 @@
         },
         {
           "tag": "button",
+          "label": "i18n:common.cancel",
+          "line": 669,
+          "via": null,
+          "href": null,
+          "handler": "closeSetup",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
           "label": "i18n:account_security.backup.copy",
-          "line": 657,
+          "line": 696,
           "via": null,
           "href": null,
           "handler": "copyBackupCodes",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "i18n:common.close",
+          "line": 697,
+          "via": null,
+          "href": null,
+          "handler": "closeBackupCodes",
           "calls": [],
           "unresolved": true
         },
@@ -29436,6 +29462,26 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 116,
+          "via": "Modal",
+          "href": null,
+          "handler": "onclose",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 116,
+          "via": "Modal",
+          "href": null,
+          "handler": "onclose",
+          "calls": [],
+          "unresolved": true
         },
         {
           "tag": "button",

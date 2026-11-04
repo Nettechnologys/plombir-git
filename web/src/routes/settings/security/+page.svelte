@@ -20,6 +20,7 @@
   import { createT, formatDate } from '$lib/i18n';
   import { readSsoError, ssoErrorMessage, type SsoError } from '$lib/ssoError';
   import ConfirmModal from '$lib/components/ConfirmModal.svelte';
+  import Modal from '$lib/components/Modal.svelte';
   import ImportedAuthorshipSection from '$lib/components/ImportedAuthorshipSection.svelte';
   import { createConfirmer } from '$lib/confirm.svelte';
 
@@ -284,6 +285,21 @@
     }
   }
 
+  function closeSetup() {
+    if (saving) return;
+    setup = null;
+    verificationCode = '';
+    enablePassword = '';
+    error = '';
+  }
+
+  function closeBackupCodes() {
+    if (saving) return;
+    newBackupCodes = [];
+    error = '';
+    success = '';
+  }
+
   async function enableMfa(event: SubmitEvent) {
     event.preventDefault();
     if (saving) return;
@@ -396,8 +412,8 @@
     <div class="error-box" role="alert">{ssoErrorText}</div>
   {/if}
 
-  {#if error}
-    <div class="error-box">{error}</div>
+  {#if error && !setup && newBackupCodes.length === 0}
+    <div class="error-box" role="alert">{error}</div>
   {/if}
 
   {#if success}
@@ -618,10 +634,15 @@
   </section>
 
   <ImportedAuthorshipSection {confirmer} />
+</div>
 
-  {#if setup}
-    <section class="section setup-section">
-      <h2>{t('account_security.setup.title')}</h2>
+{#if setup}
+  <Modal onclose={closeSetup} labelledby="mfa-setup-title" width="720px">
+    <div class="setup-section">
+      <h2 id="mfa-setup-title" class="dialog-title">{t('account_security.setup.title')}</h2>
+      {#if error}
+        <div class="error-box" role="alert">{error}</div>
+      {/if}
       <div class="setup-grid">
         <div class="qr" aria-label={t('account_security.setup.qr_label')}>{@html setup.qr_svg}</div>
         <div>
@@ -630,7 +651,7 @@
           <form class="enable-form" onsubmit={enableMfa}>
             <label>
               {t('account_security.setup.code')}
-              <input inputmode="numeric" autocomplete="one-time-code" bind:value={verificationCode} disabled={saving} />
+              <input inputmode="numeric" autocomplete="one-time-code" bind:value={verificationCode} disabled={saving} data-autofocus />
             </label>
             {#if hasPassword}
               <label>
@@ -644,26 +665,40 @@
           </form>
         </div>
       </div>
-    </section>
-  {/if}
+      <div class="dialog-actions">
+        <button type="button" class="btn btn-secondary" onclick={closeSetup} disabled={saving}>{t('common.cancel')}</button>
+      </div>
+    </div>
+  </Modal>
+{/if}
 
-  {#if newBackupCodes.length > 0}
-    <section class="section backup-section" aria-label={t('account_security.backup.label')}>
+{#if newBackupCodes.length > 0}
+  <Modal onclose={closeBackupCodes} labelledby="mfa-backup-title" width="640px">
+    <div class="backup-section" aria-label={t('account_security.backup.label')}>
       <div class="section-heading">
         <div>
-          <h2>{t('account_security.backup.title')}</h2>
+          <h2 id="mfa-backup-title" tabindex="-1" data-autofocus>{t('account_security.backup.title')}</h2>
           <p>{t('account_security.backup.description')}</p>
         </div>
-        <button type="button" class="btn btn-secondary" onclick={copyBackupCodes}>{t('account_security.backup.copy')}</button>
       </div>
+      {#if success}
+        <div class="success-box" role="status">{success}</div>
+      {/if}
+      {#if error}
+        <div class="error-box" role="alert">{error}</div>
+      {/if}
       <div class="code-grid">
         {#each newBackupCodes as code}
           <code>{code}</code>
         {/each}
       </div>
-    </section>
-  {/if}
-</div>
+      <div class="dialog-actions">
+        <button type="button" class="btn btn-secondary" onclick={copyBackupCodes}>{t('account_security.backup.copy')}</button>
+        <button type="button" class="btn btn-primary" onclick={closeBackupCodes} disabled={saving}>{t('common.close')}</button>
+      </div>
+    </div>
+  </Modal>
+{/if}
 
 <ConfirmModal {confirmer} />
 
@@ -780,6 +815,18 @@
     align-items: start;
   }
 
+  .dialog-title {
+    margin-bottom: 18px;
+  }
+
+  .dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-top: 20px;
+  }
+
   .qr {
     display: grid;
     place-items: center;
@@ -812,6 +859,7 @@
     border: 1px solid var(--border);
     border-radius: var(--radius);
     background: var(--bg-primary);
+    overflow-wrap: anywhere;
   }
 
   .sso-link-actions {
