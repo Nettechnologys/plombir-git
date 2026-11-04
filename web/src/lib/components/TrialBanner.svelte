@@ -21,8 +21,8 @@
     gap: 6px 10px;
     padding: 8px 16px;
     font-size: 13px;
-    background: rgba(255, 211, 88, 0.12);
-    color: #f2cc60;
-    border-bottom: 1px solid rgba(210, 153, 34, 0.5);
+    background: var(--warning-bg);
+    color: var(--warning-text);
+    border-bottom: 1px solid var(--warning-border);
   }
 </style>

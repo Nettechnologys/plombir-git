@@ -594,10 +594,10 @@
     justify-content: space-between;
     gap: 12px;
     padding: 10px 12px;
-    border: 1px solid var(--yellow);
+    border: 1px solid var(--warning-border);
     border-radius: var(--radius);
-    background: var(--yellow-dim);
-    color: var(--text-primary);
+    background: var(--warning-bg);
+    color: var(--warning-text);
     font-size: 13px;
     font-weight: 400;
   }

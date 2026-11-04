@@ -185,6 +185,12 @@ describe('agents settings', () => {
 	});
 });
 
+async function openProfile() {
+	await openTokens();
+	await click(element(rendered!.container, '.agent-profile summary'));
+	expect(element<HTMLDetailsElement>(rendered!.container, '.agent-profile').open).toBe(true);
+}
+
 describe('agent profile', () => {
 	const profileForm = () => element<HTMLFormElement>(rendered!.container, 'form.profile-form');
 	const field = (label: string) => {
@@ -197,7 +203,7 @@ describe('agent profile', () => {
 
 	it('sets up a profile for an agent that has none, key and repositories included', async () => {
 		bots.saveAgentProfile.mockResolvedValue(storedProfile());
-		await openTokens();
+		await openProfile();
 		expect(bots.getAgentProfile).toHaveBeenCalledWith('alice-agent');
 		expect(field('Model API key').getAttribute('placeholder')).toBe('No key stored');
 		expect(rendered!.container.querySelector('.delete-profile')).toBeNull();
@@ -228,7 +234,7 @@ describe('agent profile', () => {
 	it('keeps the stored key when the field is left empty and removes it only when asked', async () => {
 		bots.getAgentProfile.mockResolvedValue(storedProfile());
 		bots.saveAgentProfile.mockResolvedValue(storedProfile({ has_model_key: false }));
-		await openTokens();
+		await openProfile();
 
 		await submit(profileForm());
 		expect(bots.saveAgentProfile.mock.calls[0][1]).toMatchObject({
@@ -240,7 +246,7 @@ describe('agent profile', () => {
 		bots.saveAgentProfile.mockResolvedValue(storedProfile({ has_model_key: false }));
 		bots.getAgentProfile.mockResolvedValue(storedProfile());
 		await rendered!.destroy();
-		await openTokens();
+		await openProfile();
 		await check(field('Remove the stored key') as HTMLInputElement, true);
 		await submit(profileForm());
 		expect(bots.saveAgentProfile.mock.calls[1][1]).toMatchObject({
@@ -251,19 +257,86 @@ describe('agent profile', () => {
 
 	it('says when this instance does not run agents', async () => {
 		instance.get.mockResolvedValue({ agents_enabled: false });
-		await openTokens();
-		expect(element(rendered!.container, '.agents-off').textContent).toContain('[agents] enabled = false');
+		await openProfile();
+		expect(element(rendered!.container, '.agents-off').textContent).toContain('Automatic runs are disabled');
+		expect(element(rendered!.container, '.agents-off').textContent).toContain('access tokens still work');
+		expect(element(rendered!.container, '.agents-off').textContent).not.toContain('profile is saved');
 	});
 
 	it('deletes the profile after confirmation', async () => {
 		bots.getAgentProfile.mockResolvedValue(storedProfile());
 		bots.deleteAgentProfile.mockResolvedValue(undefined);
-		await openTokens();
+		await openProfile();
 		await click(element(rendered!.container, '.delete-profile'));
 		expect(bots.deleteAgentProfile).not.toHaveBeenCalled();
 		expect(await answerConfirm()).toContain('@alice-agent');
 		expect(bots.deleteAgentProfile).toHaveBeenCalledWith('alice-agent');
 		expect(rendered!.container.textContent).toContain('Agent profile deleted');
+	});
+
+	it('keeps tokens first and the optional run profile collapsed with its stored status visible', async () => {
+		bots.getAgentProfile.mockResolvedValue(storedProfile({ agents_enabled: false }));
+		await openTokens();
+		const details = element<HTMLDetailsElement>(rendered!.container, '.agent-profile');
+		const tokenForm = element<HTMLFormElement>(rendered!.container, '.token-form');
+		expect(details.open).toBe(false);
+		expect(element(details, 'summary').textContent).toContain('Profile configured');
+		expect(element(details, 'summary').textContent).toContain('Automatic runs disabled');
+		expect(tokenForm.compareDocumentPosition(details) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+		expect(rendered!.container.querySelector('form form')).toBeNull();
+		expect(element<HTMLButtonElement>(rendered!.container, '.mint-token').form).toBe(tokenForm);
+		expect(element<HTMLButtonElement>(rendered!.container, '.save-profile').form).toBe(profileForm());
+	});
+
+	it('preserves unsaved fields in both forms through native disclosure toggles', async () => {
+		await openProfile();
+		const form = profileForm();
+		const tokenName = element<HTMLInputElement>(rendered!.container, '.token-form input');
+		await input(tokenName, 'git-client');
+		await input(field('Image'), 'example.test/unsaved:1');
+		await input(field('Model API key'), 'fixture-only-key');
+		await input(field('Repositories it may work in'), 'alice/draft');
+		await input(field('Runs per day'), '37');
+		const details = element<HTMLDetailsElement>(rendered!.container, '.agent-profile');
+		const summary = element(details, 'summary');
+		await click(summary);
+		expect(details.open).toBe(false);
+		await click(summary);
+		expect(details.open).toBe(true);
+		expect(profileForm()).toBe(form);
+		expect(field('Image').value).toBe('example.test/unsaved:1');
+		expect(field('Model API key').value).toBe('fixture-only-key');
+		expect(field('Repositories it may work in').value).toBe('alice/draft');
+		expect(field('Runs per day').value).toBe('37');
+		expect(tokenName.value).toBe('git-client');
+		expect(bots.getAgentProfile).toHaveBeenCalledOnce();
+		expect(bots.saveAgentProfile).not.toHaveBeenCalled();
+		expect(bots.createToken).not.toHaveBeenCalled();
+	});
+
+	it('saves the run profile and creates a token independently while server runs are disabled', async () => {
+		instance.get.mockResolvedValue({ agents_enabled: false });
+		bots.saveAgentProfile.mockResolvedValue(storedProfile({ agents_enabled: false }));
+		bots.createToken.mockResolvedValue({ ...botToken(6, 'git-client'), token: 'fixture-only-token' });
+		await openProfile();
+		const tokenForm = element<HTMLFormElement>(rendered!.container, '.token-form');
+		const tokenName = element<HTMLInputElement>(tokenForm, 'input');
+		await input(tokenName, 'git-client');
+		await submit(profileForm());
+		expect(bots.saveAgentProfile).toHaveBeenCalledOnce();
+		expect(bots.createToken).not.toHaveBeenCalled();
+		expect(tokenName.value).toBe('git-client');
+
+		await input(field('Image'), 'example.test/still-unsaved:2');
+		// An unfinished profile cannot make the separate token form invalid.
+		await input(field('Runs per day'), '0');
+		expect(profileForm().checkValidity()).toBe(false);
+		expect(tokenForm.checkValidity()).toBe(true);
+		await submit(tokenForm);
+		expect(bots.createToken).toHaveBeenCalledOnce();
+		expect(bots.saveAgentProfile).toHaveBeenCalledOnce();
+		expect(field('Image').value).toBe('example.test/still-unsaved:2');
+		expect(field('Runs per day').value).toBe('0');
 	});
 });
 

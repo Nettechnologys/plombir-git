@@ -2052,9 +2052,9 @@
     "revoking": "正在撤销...",
     "revoke": "撤销",
     "profile": {
-      "title": "智能体配置",
-      "description": "当有人把问题指派给这个智能体时它运行什么：智能体及其镜像、使用的模型密钥、允许工作的仓库以及各项限制。它提交的内容仍需人工批准。",
-      "instance_off": "本实例已关闭智能体（[agents] enabled = false）：配置会被保存，但在管理员开启之前，指派给该智能体不会启动任何运行。",
+      "title": "自动运行智能体（可选）",
+      "description": "仅当需要在分配议题时由此服务器运行智能体，才需要设置此配置。选择智能体、模型密钥、允许访问的仓库和运行限制。智能体提交的更改仍需人工批准。",
+      "instance_off": "此服务器已禁用自动运行。您仍可配置并保存运行配置，但在管理员启用自动运行前，分配议题不会启动智能体。机器人账户及其访问令牌仍可正常使用。",
       "load_failed": "加载智能体配置失败",
       "enabled": "当有人把问题指派给这个智能体时启动运行",
       "preset": "智能体",
@@ -2082,8 +2082,15 @@
       "delete_confirm_title": "删除智能体配置",
       "delete_confirm": "删除 @{username} 的智能体配置？已保存的模型密钥会一并删除。智能体本身及其令牌保留。",
       "deleted": "智能体配置已删除",
-      "delete_failed": "删除智能体配置失败"
-    }
+      "delete_failed": "删除智能体配置失败",
+      "configured": "已设置运行配置",
+      "not_configured": "尚未设置运行配置",
+      "state_unavailable": "无法获取配置状态",
+      "runs_off": "服务器已禁用自动运行",
+      "save": "保存配置"
+    },
+    "access_tokens_title": "访问令牌",
+    "access_tokens_hint": "供通过 Git、REST API 或 MCP 连接的外部客户端使用。无需配置自动运行配置或模型 API 密钥。"
   },
   "imports": {
     "title": "导入",

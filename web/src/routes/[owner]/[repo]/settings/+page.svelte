@@ -638,8 +638,8 @@
     display: flex;
     gap: 0.75rem;
     padding: 1rem;
-    background: rgba(255, 165, 0, 0.1);
-    border: 1px solid var(--orange, #ff8800);
+    background: var(--warning-bg);
+    border: 1px solid var(--warning-border);
     border-radius: 6px;
     margin-bottom: 1.5rem;
   }
@@ -650,7 +650,7 @@
   }
   
   .warning-box p {
-    color: var(--text-primary);
+    color: var(--warning-text);
     font-size: 0.9rem;
     margin: 0;
   }

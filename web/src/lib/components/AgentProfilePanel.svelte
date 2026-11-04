@@ -158,111 +158,128 @@
   }
 </script>
 
-<section class="agent-profile" aria-label={t('agents.profile.title')}>
-  <h3>{t('agents.profile.title')}</h3>
-  <p class="muted">{t('agents.profile.description')}</p>
+<details class="agent-profile">
+  <summary>
+    <span class="profile-title">{t('agents.profile.title')}</span>
+    <span class="profile-state">
+      {loading ? t('common.loading') : profile ? t('agents.profile.configured') : error ? t('agents.profile.state_unavailable') : t('agents.profile.not_configured')}
+    </span>
+    {#if agentsEnabled === false}<span class="runs-off">{t('agents.profile.runs_off')}</span>{/if}
+  </summary>
+  <div class="profile-content">
+    <p class="muted">{t('agents.profile.description')}</p>
 
-  {#if agentsEnabled === false}
-    <div class="notice agents-off">{t('agents.profile.instance_off')}</div>
-  {/if}
-  {#if error}
-    <div class="error-box">{error}</div>
-  {/if}
-  {#if success}
-    <div class="success-box">{success}</div>
-  {/if}
+    {#if agentsEnabled === false}
+      <div class="notice agents-off" role="status">{t('agents.profile.instance_off')}</div>
+    {/if}
+    {#if error}
+      <div class="error-box">{error}</div>
+    {/if}
+    {#if success}
+      <div class="success-box">{success}</div>
+    {/if}
 
-  {#if loading}
-    <p class="muted">{t('common.loading')}</p>
-  {:else}
-    <form class="profile-form" onsubmit={save}>
-      <label class="checkbox wide">
-        <input type="checkbox" bind:checked={enabled} disabled={saving} />
-        {t('agents.profile.enabled')}
-      </label>
-      <label>
-        {t('agents.profile.preset')}
-        <select bind:value={preset} disabled={saving}>
-          {#each presets as option (option)}
-            <option value={option}>{presetLabel(option)}</option>
-          {/each}
-        </select>
-      </label>
-      <label>
-        {t('agents.profile.image')}
-        <input bind:value={image} placeholder={preset === 'custom' ? 'ghcr.io/acme/agent:1' : t('agents.profile.image_default')} disabled={saving} />
-      </label>
-      {#if preset === 'custom'}
-        <label class="wide">
-          {t('agents.profile.command')}
-          <textarea bind:value={command} rows="3" disabled={saving}></textarea>
-        </label>
-      {/if}
-      <label class="wide">
-        {t('agents.profile.model_key')}
-        <input
-          type="password"
-          autocomplete="off"
-          bind:value={modelKey}
-          placeholder={profile?.has_model_key ? t('agents.profile.model_key_keep') : t('agents.profile.model_key_none')}
-          disabled={saving || clearModelKey}
-        />
-      </label>
-      {#if profile?.has_model_key}
+    {#if loading}
+      <p class="muted">{t('common.loading')}</p>
+    {:else}
+      <form class="profile-form" onsubmit={save}>
         <label class="checkbox wide">
-          <input type="checkbox" bind:checked={clearModelKey} disabled={saving} />
-          {t('agents.profile.clear_model_key')}
+          <input type="checkbox" bind:checked={enabled} disabled={saving} />
+          {t('agents.profile.enabled')}
         </label>
-      {/if}
-      <label class="wide">
-        {t('agents.profile.repositories')}
-        <textarea bind:value={repositories} rows="3" placeholder="alice/app" disabled={saving}></textarea>
-        <span class="muted small">{t('agents.profile.repositories_hint')}</span>
-      </label>
-      <label>
-        {t('agents.profile.runner_tags')}
-        <input bind:value={runnerTags} placeholder={t('agents.profile.runner_tags_placeholder')} disabled={saving} />
-      </label>
-      <label>
-        {t('agents.profile.timeout_minutes')}
-        <input type="number" min="1" max="240" bind:value={timeoutMinutes} disabled={saving} />
-      </label>
-      <label>
-        {t('agents.profile.max_runs_per_day')}
-        <input type="number" min="1" max="500" bind:value={maxRunsPerDay} disabled={saving} />
-      </label>
-      <label>
-        {t('agents.profile.max_iterations')}
-        <input type="number" min="1" max="50" bind:value={maxIterations} disabled={saving} />
-      </label>
-      <div class="profile-actions wide">
-        <button type="submit" class="btn btn-primary save-profile" disabled={saving}>
-          {saving ? t('agents.profile.saving') : t('common.save')}
-        </button>
-        {#if profile}
-          <button type="button" class="btn btn-danger delete-profile" disabled={deleting} onclick={remove}>
-            {deleting ? t('agents.deleting') : t('agents.profile.delete')}
-          </button>
+        <label>
+          {t('agents.profile.preset')}
+          <select bind:value={preset} disabled={saving}>
+            {#each presets as option (option)}
+              <option value={option}>{presetLabel(option)}</option>
+            {/each}
+          </select>
+        </label>
+        <label>
+          {t('agents.profile.image')}
+          <input bind:value={image} placeholder={preset === 'custom' ? 'ghcr.io/acme/agent:1' : t('agents.profile.image_default')} disabled={saving} />
+        </label>
+        {#if preset === 'custom'}
+          <label class="wide">
+            {t('agents.profile.command')}
+            <textarea bind:value={command} rows="3" disabled={saving}></textarea>
+          </label>
         {/if}
-      </div>
-    </form>
-  {/if}
-</section>
+        <label class="wide">
+          {t('agents.profile.model_key')}
+          <input
+            type="password"
+            autocomplete="off"
+            bind:value={modelKey}
+            placeholder={profile?.has_model_key ? t('agents.profile.model_key_keep') : t('agents.profile.model_key_none')}
+            disabled={saving || clearModelKey}
+          />
+        </label>
+        {#if profile?.has_model_key}
+          <label class="checkbox wide">
+            <input type="checkbox" bind:checked={clearModelKey} disabled={saving} />
+            {t('agents.profile.clear_model_key')}
+          </label>
+        {/if}
+        <label class="wide">
+          {t('agents.profile.repositories')}
+          <textarea bind:value={repositories} rows="3" placeholder="alice/app" disabled={saving}></textarea>
+          <span class="muted small">{t('agents.profile.repositories_hint')}</span>
+        </label>
+        <label>
+          {t('agents.profile.runner_tags')}
+          <input bind:value={runnerTags} placeholder={t('agents.profile.runner_tags_placeholder')} disabled={saving} />
+        </label>
+        <label>
+          {t('agents.profile.timeout_minutes')}
+          <input type="number" min="1" max="240" bind:value={timeoutMinutes} disabled={saving} />
+        </label>
+        <label>
+          {t('agents.profile.max_runs_per_day')}
+          <input type="number" min="1" max="500" bind:value={maxRunsPerDay} disabled={saving} />
+        </label>
+        <label>
+          {t('agents.profile.max_iterations')}
+          <input type="number" min="1" max="50" bind:value={maxIterations} disabled={saving} />
+        </label>
+        <div class="profile-actions wide">
+          <button type="submit" class="btn btn-primary save-profile" disabled={saving}>
+            {saving ? t('agents.profile.saving') : t('agents.profile.save')}
+          </button>
+          {#if profile}
+            <button type="button" class="btn btn-danger delete-profile" disabled={deleting} onclick={remove}>
+              {deleting ? t('agents.deleting') : t('agents.profile.delete')}
+            </button>
+          {/if}
+        </div>
+      </form>
+    {/if}
+  </div>
+</details>
 
 <ConfirmModal {confirmer} />
 
 <style>
   .agent-profile {
     border-top: 1px solid var(--border-color);
-    margin-top: 16px;
-    padding-top: 16px;
+    margin-top: 24px;
+    padding-top: 12px;
   }
+  summary { cursor: pointer; padding: 8px 0; }
+  summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: var(--radius); }
+  .profile-title { font-weight: 600; }
+  .profile-state, .runs-off { display: block; margin-top: 4px; color: var(--text-secondary); font-size: 12px; }
+  .runs-off { color: var(--warning-text); }
+  .profile-content { padding: 12px 0 4px; }
+  .profile-content > p { margin-bottom: 16px; color: var(--text-secondary); }
   .profile-form {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr));
+    align-items: end;
     gap: 12px;
   }
   .profile-form label {
+    min-width: 0;
     display: flex;
     flex-direction: column;
     gap: 4px;
@@ -277,14 +294,19 @@
   }
   .profile-actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
+    margin-top: 4px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
   }
   .notice {
     margin: 8px 0;
     padding: 8px 12px;
     border-radius: 6px;
-    border: 1px solid var(--warning);
-    background: var(--yellow-dim);
+    border: 1px solid var(--warning-border);
+    background: var(--warning-bg);
+    color: var(--warning-text);
   }
   .small {
     font-size: 12px;

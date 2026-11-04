@@ -28048,7 +28048,7 @@
         {
           "tag": "button",
           "label": "i18n:common.copy",
-          "line": 319,
+          "line": 321,
           "via": null,
           "href": null,
           "handler": "copyNewToken",
@@ -28058,7 +28058,7 @@
         {
           "tag": "form",
           "label": "i18n:agents.token_name",
-          "line": 323,
+          "line": 325,
           "via": null,
           "href": null,
           "handler": "mintToken",
@@ -28097,7 +28097,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 334,
+          "line": 336,
           "via": null,
           "href": null,
           "handler": null,
@@ -28107,7 +28107,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 341,
+          "line": 343,
           "via": null,
           "href": null,
           "handler": null,
@@ -28117,7 +28117,7 @@
         {
           "tag": "button",
           "label": "i18n:agents.creating",
-          "line": 344,
+          "line": 347,
           "via": null,
           "href": null,
           "handler": null,
@@ -28127,7 +28127,7 @@
         {
           "tag": "button",
           "label": "i18n:agents.revoking",
-          "line": 377,
+          "line": 381,
           "via": null,
           "href": null,
           "handler": "() => revokeToken(token)",
@@ -28165,7 +28165,7 @@
         {
           "tag": "form",
           "label": "i18n:agents.profile.enabled",
-          "line": 178,
+          "line": 185,
           "via": "AgentProfilePanel",
           "href": null,
           "handler": "save",
@@ -28189,7 +28189,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 180,
+          "line": 187,
           "via": "AgentProfilePanel",
           "href": null,
           "handler": null,
@@ -28199,7 +28199,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 185,
+          "line": 192,
           "via": "AgentProfilePanel",
           "href": null,
           "handler": null,
@@ -28209,7 +28209,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 198,
+          "line": 205,
           "via": "AgentProfilePanel",
           "href": null,
           "handler": null,
@@ -28219,7 +28219,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 213,
+          "line": 220,
           "via": "AgentProfilePanel",
           "href": null,
           "handler": null,
@@ -28229,7 +28229,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 219,
+          "line": 226,
           "via": "AgentProfilePanel",
           "href": null,
           "handler": null,
@@ -28239,7 +28239,7 @@
         {
           "tag": "button",
           "label": "i18n:agents.profile.saving",
-          "line": 239,
+          "line": 246,
           "via": "AgentProfilePanel",
           "href": null,
           "handler": null,
@@ -28249,7 +28249,7 @@
         {
           "tag": "button",
           "label": "i18n:agents.deleting",
-          "line": 243,
+          "line": 250,
           "via": "AgentProfilePanel",
           "href": null,
           "handler": "remove",

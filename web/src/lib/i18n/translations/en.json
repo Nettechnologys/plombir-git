@@ -2052,9 +2052,9 @@
     "revoking": "Revoking...",
     "revoke": "Revoke",
     "profile": {
-      "title": "Agent profile",
-      "description": "What this agent runs when a person assigns it an issue: the agent and its image, the model key it uses, the repositories it may work in, and its limits. A person still approves what it opens.",
-      "instance_off": "Agents are switched off on this instance ([agents] enabled = false): the profile is saved, but assigning the agent starts nothing until an administrator turns them on.",
+      "title": "Automatic agent runs (optional)",
+      "description": "Configure this only to run an agent on this server when a person assigns it an issue. Choose the agent, its model key, permitted repositories and limits. A person still approves what it opens.",
+      "instance_off": "Automatic runs are disabled on this server. You can configure and save a profile, but assigning an issue will not start a run until an administrator enables them. The bot account and its access tokens still work.",
       "load_failed": "Failed to load the agent profile",
       "enabled": "Start a run when a person assigns this agent an issue",
       "preset": "Agent",
@@ -2082,8 +2082,15 @@
       "delete_confirm_title": "Delete agent profile",
       "delete_confirm": "Delete the agent profile of @{username}? Its stored model key is deleted with it. The agent itself and its tokens stay.",
       "deleted": "Agent profile deleted",
-      "delete_failed": "Failed to delete the agent profile"
-    }
+      "delete_failed": "Failed to delete the agent profile",
+      "configured": "Profile configured",
+      "not_configured": "No run profile configured",
+      "state_unavailable": "Profile status unavailable",
+      "runs_off": "Automatic runs disabled on this server",
+      "save": "Save profile"
+    },
+    "access_tokens_title": "Access tokens",
+    "access_tokens_hint": "For an external client using Git, the REST API or MCP. A run profile and model API key are not required."
   },
   "imports": {
     "title": "Imports",

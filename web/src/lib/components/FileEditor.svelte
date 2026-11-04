@@ -653,9 +653,9 @@
 
   .conflict-message,
   .warning-message {
-    border: 1px solid color-mix(in srgb, #bf8700 35%, transparent);
-    background: color-mix(in srgb, #bf8700 11%, transparent);
-    color: var(--text-primary);
+    border: 1px solid var(--warning-border);
+    background: var(--warning-bg);
+    color: var(--warning-text);
   }
 
   .muted {

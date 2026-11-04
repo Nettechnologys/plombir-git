@@ -816,8 +816,8 @@
   }
 
   .delivery-status.pending {
-    background: rgba(210, 153, 34, 0.14);
-    color: var(--yellow, #d29922);
+    background: var(--warning-bg);
+    color: var(--warning-text);
   }
 
   .delivery-meta {

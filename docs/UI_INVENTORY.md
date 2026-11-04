@@ -1233,10 +1233,10 @@ succeed and which must be denied.
 | i18n:common.close | :295 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
 | i18n:agents.deleting | :298 | `DELETE /api/v1/users/bots/{bot}` | `User` | rust+web |
 | i18n:agents.deleting | :298 | `GET /api/v1/users/bots` | `User` | rust+web |
-| i18n:agents.token_name | :323 | `POST /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
-| i18n:agents.token_name | :323 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
-| i18n:agents.revoking | :377 | `DELETE /api/v1/users/bots/{bot}/tokens/{id}` | `User` | web |
-| i18n:agents.revoking | :377 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
+| i18n:agents.token_name | :325 | `POST /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
+| i18n:agents.token_name | :325 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
+| i18n:agents.revoking | :381 | `DELETE /api/v1/users/bots/{bot}/tokens/{id}` | `User` | web |
+| i18n:agents.revoking | :381 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
 | i18n:agents.profile.enabled | `AgentProfilePanel` | `PUT /api/v1/users/bots/{bot}/agent` | `User` | web |
 | i18n:agents.deleting | `AgentProfilePanel` | `DELETE /api/v1/users/bots/{bot}/agent` | `User` | web |
 | _(page load)_ | — | `GET /api/v1/users/bots/{bot}/agent` | `User` | rust+web |

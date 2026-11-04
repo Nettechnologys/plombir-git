@@ -55,6 +55,9 @@
   --red-dark: var(--red-dim);
   --orange-dark: var(--orange);
   --warning: var(--yellow);
+  --warning-bg: rgba(210, 153, 34, 0.12);
+  --warning-border: rgba(210, 153, 34, 0.5);
+  --warning-text: var(--yellow);
   --success-bg: rgba(63, 185, 80, 0.15);
   --success-text: var(--green);
   --syntax-keyword: #ff7b72;
@@ -86,6 +89,8 @@
   --red-dim: #a40e26;
   --yellow: #7d4e00;
   --yellow-dim: #9a6700;
+  --warning-bg: #fff8e6;
+  --warning-border: #d4a72c;
   --purple: #8250df;
   --orange: #953800;
   --danger-bg: rgba(207, 34, 46, 0.08);

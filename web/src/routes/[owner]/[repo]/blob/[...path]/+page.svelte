@@ -832,8 +832,9 @@
   }
 
   .warning-banner {
-    border-color: color-mix(in srgb, #bf8700 35%, transparent);
-    background: color-mix(in srgb, #bf8700 11%, transparent);
+    border-color: var(--warning-border);
+    background: var(--warning-bg);
+    color: var(--warning-text);
   }
 
   .delete-panel {

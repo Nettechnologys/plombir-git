@@ -188,7 +188,7 @@
   .receipt-flag.warn,
   .receipt-ci h4,
   .receipt-templates h4 {
-    color: #d29922;
+    color: var(--warning-text);
   }
 
   h4 {
@@ -216,7 +216,7 @@
   }
 
   .receipt-objects tr.missing td {
-    color: #d29922;
+    color: var(--warning-text);
   }
 
   .receipt-names {

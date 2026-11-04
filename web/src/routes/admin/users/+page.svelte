@@ -485,7 +485,7 @@
   .badge.active { color: #3fb950; border-color: #3fb950; }
   .badge.inactive { color: #f85149; border-color: #f85149; }
   .badge.locked { color: #f85149; border-color: #f85149; background: rgba(248, 81, 73, 0.1); }
-  .badge.warning { color: #d29922; border-color: #d29922; }
+  .badge.warning { color: var(--warning-text); border-color: var(--warning-border); background: var(--warning-bg); }
 
   .pagination { display: flex; align-items: center; gap: 1rem; margin-top: 1rem; }
   .pagination button { background: var(--bg-secondary); border: 1px solid var(--border); color: var(--text-primary); border-radius: 6px; padding: 0.4rem 0.8rem; cursor: pointer; }

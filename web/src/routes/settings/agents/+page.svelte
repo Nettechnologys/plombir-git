@@ -308,87 +308,93 @@
 
             {#if selected === bot.username}
               <div class="token-panel">
-                <AgentProfilePanel username={bot.username} />
-                {#if newToken}
-                  <section class="token-created" aria-label={t('agents.new_token_label')}>
-                    <div>
-                      <strong>{t('agents.new_token')}</strong>
-                      <p>{t('agents.new_token_hint')}</p>
+                <section class="access-tokens" aria-label={t('agents.access_tokens_title')}>
+                  <h3>{t('agents.access_tokens_title')}</h3>
+                  <p class="token-hint">{t('agents.access_tokens_hint')}</p>
+                  {#if newToken}
+                    <section class="token-created" aria-label={t('agents.new_token_label')}>
+                      <div>
+                        <strong>{t('agents.new_token')}</strong>
+                        <p>{t('agents.new_token_hint')}</p>
+                      </div>
+                      <code>{newToken}</code>
+                      <button type="button" class="btn btn-primary copy-token" onclick={copyNewToken}>{t('common.copy')}</button>
+                    </section>
+                  {/if}
+
+                  <form class="token-form" onsubmit={mintToken}>
+                    <label>
+                      {t('agents.token_name')}
+                      <input bind:value={tokenName} placeholder="claude-code" disabled={mintingToken} />
+                    </label>
+                    <label>
+                      {t('agents.expires')}
+                      <input type="date" bind:value={tokenExpires} disabled={mintingToken} />
+                    </label>
+                    <label class="wide">
+                      {t('agents.repositories_hint')}
+                      <textarea bind:value={tokenRepositories} rows="2" placeholder="alice/app" disabled={mintingToken}></textarea>
+                    </label>
+                    <label class="wide">
+                      {t('agents.mcp_tools_hint')}
+                      <input bind:value={tokenTools} placeholder="get_issue, create_issue, create_pr" disabled={mintingToken} />
+                    </label>
+                    <label class="checkbox wide">
+                      <input type="checkbox" bind:checked={denyProtectedMerge} disabled={mintingToken} />
+                      {t('agents.deny_protected_merge')}
+                    </label>
+                    <div class="token-actions wide">
+                      <button type="submit" class="btn btn-primary mint-token" disabled={mintingToken || !tokenName.trim()}>
+                        {mintingToken ? t('agents.creating') : t('agents.create_token')}
+                      </button>
                     </div>
-                    <code>{newToken}</code>
-                    <button type="button" class="btn btn-primary copy-token" onclick={copyNewToken}>{t('common.copy')}</button>
-                  </section>
-                {/if}
+                  </form>
 
-                <form class="token-form" onsubmit={mintToken}>
-                  <label>
-                    {t('agents.token_name')}
-                    <input bind:value={tokenName} placeholder="claude-code" disabled={mintingToken} />
-                  </label>
-                  <label>
-                    {t('agents.expires')}
-                    <input type="date" bind:value={tokenExpires} disabled={mintingToken} />
-                  </label>
-                  <label class="wide">
-                    {t('agents.repositories_hint')}
-                    <textarea bind:value={tokenRepositories} rows="2" placeholder="alice/app" disabled={mintingToken}></textarea>
-                  </label>
-                  <label class="wide">
-                    {t('agents.mcp_tools_hint')}
-                    <input bind:value={tokenTools} placeholder="get_issue, create_issue, create_pr" disabled={mintingToken} />
-                  </label>
-                  <label class="checkbox wide">
-                    <input type="checkbox" bind:checked={denyProtectedMerge} disabled={mintingToken} />
-                    {t('agents.deny_protected_merge')}
-                  </label>
-                  <button type="submit" class="btn btn-primary mint-token" disabled={mintingToken || !tokenName.trim()}>
-                    {mintingToken ? t('agents.creating') : t('agents.create_token')}
-                  </button>
-                </form>
-
-                {#if tokensLoading}
-                  <p class="muted">{t('common.loading')}</p>
-                {:else if tokenList.length === 0}
-                  <div class="empty-state">{t('agents.no_tokens', { username: bot.username })}</div>
-                {:else}
-                  <div class="table-wrap">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>{t('agents.table.name')}</th>
-                          <th>{t('agents.table.confined_to')}</th>
-                          <th>{t('agents.table.last_used')}</th>
-                          <th>{t('agents.expires')}</th>
-                          <th></th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {#each tokenList as token (token.id)}
+                  {#if tokensLoading}
+                    <p class="muted">{t('common.loading')}</p>
+                  {:else if tokenList.length === 0}
+                    <div class="empty-state">{t('agents.no_tokens', { username: bot.username })}</div>
+                  {:else}
+                    <div class="table-wrap">
+                      <table>
+                        <thead>
                           <tr>
-                            <td>{token.name}</td>
-                            <td class="narrowing">
-                              <div>{t('agents.narrowing.repositories', { list: token.repositories ? token.repositories.join(', ') || t('agents.narrowing.none') : t('agents.narrowing.any') })}</div>
-                              <div>{t('agents.narrowing.mcp_tools', { list: token.mcp_tools ? token.mcp_tools.join(', ') : t('agents.narrowing.any_rest') })}</div>
-                              <div>{token.deny_protected_merge ? t('agents.narrowing.kept_off') : t('agents.narrowing.may_write')}</div>
-                            </td>
-                            <td>{formatDate(token.last_used_at)}</td>
-                            <td>{formatDate(token.expires_at)}</td>
-                            <td class="actions">
-                              <button
-                                type="button"
-                                class="btn btn-danger revoke-token"
-                                disabled={busyTokenIds.has(token.id)}
-                                onclick={() => revokeToken(token)}
-                              >
-                                {busyTokenIds.has(token.id) ? t('agents.revoking') : t('agents.revoke')}
-                              </button>
-                            </td>
+                            <th>{t('agents.table.name')}</th>
+                            <th>{t('agents.table.confined_to')}</th>
+                            <th>{t('agents.table.last_used')}</th>
+                            <th>{t('agents.expires')}</th>
+                            <th></th>
                           </tr>
-                        {/each}
-                      </tbody>
-                    </table>
-                  </div>
-                {/if}
+                        </thead>
+                        <tbody>
+                          {#each tokenList as token (token.id)}
+                            <tr>
+                              <td>{token.name}</td>
+                              <td class="narrowing">
+                                <div>{t('agents.narrowing.repositories', { list: token.repositories ? token.repositories.join(', ') || t('agents.narrowing.none') : t('agents.narrowing.any') })}</div>
+                                <div>{t('agents.narrowing.mcp_tools', { list: token.mcp_tools ? token.mcp_tools.join(', ') : t('agents.narrowing.any_rest') })}</div>
+                                <div>{token.deny_protected_merge ? t('agents.narrowing.kept_off') : t('agents.narrowing.may_write')}</div>
+                              </td>
+                              <td>{formatDate(token.last_used_at)}</td>
+                              <td>{formatDate(token.expires_at)}</td>
+                              <td class="actions">
+                                <button
+                                  type="button"
+                                  class="btn btn-danger revoke-token"
+                                  disabled={busyTokenIds.has(token.id)}
+                                  onclick={() => revokeToken(token)}
+                                >
+                                  {busyTokenIds.has(token.id) ? t('agents.revoking') : t('agents.revoke')}
+                                </button>
+                              </td>
+                            </tr>
+                          {/each}
+                        </tbody>
+                      </table>
+                    </div>
+                  {/if}
+                </section>
+                <AgentProfilePanel username={bot.username} />
               </div>
             {/if}
           </li>
@@ -452,13 +458,19 @@
     grid-template-columns: minmax(180px, 1fr) minmax(150px, 0.6fr);
     gap: 12px;
     margin-bottom: 16px;
+    align-items: end;
   }
+
+  .access-tokens h3 { margin: 0 0 6px; font-size: 16px; }
+  .token-hint { margin-bottom: 16px; }
+  .token-actions { padding-top: 4px; }
 
   .token-form .wide {
     grid-column: 1 / -1;
   }
 
   label {
+    min-width: 0;
     display: flex;
     flex-direction: column;
     gap: 6px;

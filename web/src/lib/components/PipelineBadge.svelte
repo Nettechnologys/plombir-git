@@ -10,10 +10,10 @@
   let { status }: Props = $props();
 
   const statusConfig: Record<string, { color: string; bg: string }> = {
-    pending:  { color: 'var(--yellow)',  bg: 'rgba(210, 153, 34, 0.15)' },
+    pending:  { color: 'var(--warning-text)',  bg: 'var(--warning-bg)' },
     running:  { color: 'var(--accent)',  bg: 'rgba(88, 166, 255, 0.15)' },
-    manual:   { color: 'var(--yellow)',  bg: 'rgba(210, 153, 34, 0.15)' },
-    waiting_approval: { color: 'var(--yellow)', bg: 'rgba(210, 153, 34, 0.15)' },
+    manual:   { color: 'var(--warning-text)',  bg: 'var(--warning-bg)' },
+    waiting_approval: { color: 'var(--warning-text)', bg: 'var(--warning-bg)' },
     success:  { color: 'var(--green)',   bg: 'rgba(63, 185, 80, 0.15)' },
     failed:   { color: 'var(--red)',     bg: 'rgba(248, 81, 73, 0.15)' },
     failure:  { color: 'var(--red)',     bg: 'rgba(248, 81, 73, 0.15)' },
