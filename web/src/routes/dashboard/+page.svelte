@@ -308,14 +308,14 @@
 
         <!-- Repository name -->
         <label>
-          {t('dashboard.create_form.name')} <span class="required">*</span>
+          <span>{t('dashboard.create_form.name')}&nbsp;<span class="required">*</span></span>
           <input type="text" bind:value={newName} required placeholder={t('dashboard.create_form.name_placeholder')} />
           <span class="hint">{targetOwner}/{newName || t('dashboard.create_form.name_placeholder')}</span>
         </label>
 
         <!-- Description -->
         <label>
-          {t('dashboard.create_form.desc')} <span class="optional">{t('common.optional')}</span>
+          <span>{t('dashboard.create_form.desc')} <span class="optional">{t('common.optional')}</span></span>
           <input type="text" bind:value={newDesc} placeholder={t('common.no_description')} />
         </label>
 
@@ -679,7 +679,7 @@
 
   .empty-action p { margin: 0; flex: 1; }
 
-  a.btn-primary { display: inline-block; text-decoration: none; }
+  a.btn-primary { text-decoration: none; }
   a.btn-primary:hover { text-decoration: none; }
 
   .repo-list {

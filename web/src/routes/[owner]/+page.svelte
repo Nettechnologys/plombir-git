@@ -214,7 +214,6 @@
   }
 
   .empty-action {
-    display: inline-block;
     margin-top: 12px;
     text-decoration: none;
   }

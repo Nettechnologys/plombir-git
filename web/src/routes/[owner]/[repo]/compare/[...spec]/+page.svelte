@@ -181,7 +181,6 @@
     overflow-wrap: anywhere;
   }
   .btn-primary {
-    display: inline-block;
     padding: 6px 16px;
     background: var(--accent);
     color: #fff;

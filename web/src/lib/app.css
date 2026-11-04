@@ -184,11 +184,19 @@ button {
   cursor: pointer;
 }
 
-/* Legacy pages use variant classes without .btn. Keep their normal controls
-   the same height as text fields, while allowing long button labels to wrap. */
+/* Legacy pages use variant classes without .btn. Center their contents too:
+   min-height alone leaves spare space below the text of button-shaped links.
+   Keep long labels within the control and let them grow onto another line. */
 :where(.btn, .btn-primary, .btn-secondary, .btn-outline, .btn-danger, .btn-ghost) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   min-height: var(--control-height);
+  max-width: 100%;
   line-height: 1.25;
+  text-align: center;
+  vertical-align: middle;
 }
 
 .btn {

@@ -850,7 +850,7 @@
       {#each triggerInputDefinitions as input (input.name)}
         <div class="trigger-field">
           <label for={`pipeline-trigger-input-${input.name}`}>
-            {input.name}{input.required ? ' *' : ''}
+            {input.name}{input.required ? '\u00a0*' : ''}
           </label>
           {#if input.type === 'boolean'}
             <input

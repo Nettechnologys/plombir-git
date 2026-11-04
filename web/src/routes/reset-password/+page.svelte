@@ -89,14 +89,14 @@
       <div class="success-banner">
         {t('auth.reset_password.success')}
       </div>
-      <a href="/dashboard" class="btn-secondary" style="display:block;text-align:center;margin-top:16px;">
+      <a href="/dashboard" class="btn-secondary" style="display:flex;margin-top:16px;">
         {t('auth.reset_password.go_dashboard')}
       </a>
     {:else if !token}
       <div class="error-banner">
         {t('auth.reset_password.invalid_link')}
       </div>
-      <a href="/forgot-password" class="btn-secondary" style="display:block;text-align:center;margin-top:16px;">
+      <a href="/forgot-password" class="btn-secondary" style="display:flex;margin-top:16px;">
         {t('auth.reset_password.request_reset')}
       </a>
     {:else}

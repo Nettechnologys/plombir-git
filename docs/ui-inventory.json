@@ -18091,7 +18091,7 @@
         },
         {
           "tag": "form",
-          "label": "*",
+          "label": "&nbsp; *",
           "line": 205,
           "via": null,
           "href": null,
@@ -18418,7 +18418,7 @@
       "controls": [
         {
           "tag": "form",
-          "label": "* tagName = tag} > )} * selectedTargetType = 'tag'} > select",
+          "label": "&nbsp; * tagName = tag} > )} &nbsp; * selectedTargetType = '",
           "line": 155,
           "via": null,
           "href": null,
@@ -25658,7 +25658,7 @@
         },
         {
           "tag": "form",
-          "label": ")} * /",
+          "label": ")} &nbsp; * /",
           "line": 282,
           "via": null,
           "href": null,
@@ -26738,7 +26738,7 @@
         },
         {
           "tag": "form",
-          "label": "*",
+          "label": "&nbsp;*",
           "line": 119,
           "via": null,
           "href": null,

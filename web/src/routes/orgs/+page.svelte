@@ -120,7 +120,7 @@
       <h2>{t('orgs.create_title')}</h2>
 
       <div class="field">
-        <label for="name">{t('orgs.name')} *</label>
+        <label for="name">{t('orgs.name')}&nbsp;*</label>
         <input id="name" type="text" bind:value={name} placeholder={t('orgs.name_placeholder')} required disabled={creating} />
       </div>
 

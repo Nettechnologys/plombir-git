@@ -623,6 +623,9 @@
   }
 
   .btn-link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     border: none;
     background: transparent;
     color: var(--accent);

@@ -731,7 +731,7 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| * | :205 | `PATCH /api/v1/repos/{owner}/{name}/releases/{id}` | `RepoWrite` | rust+web |
+| &nbsp; * | :205 | `PATCH /api/v1/repos/{owner}/{name}/releases/{id}` | `RepoWrite` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
@@ -746,7 +746,7 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| * tagName = tag} > )} * selectedTargetType = 'tag'} > select | :155 | `POST /api/v1/repos/{owner}/{name}/releases` | `RepoWrite` | rust+web |
+| &nbsp; * tagName = tag} > )} &nbsp; * selectedTargetType = ' | :155 | `POST /api/v1/repos/{owner}/{name}/releases` | `RepoWrite` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
@@ -1101,7 +1101,7 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| )} * / | :282 | `POST /api/v1/repos` | `User` | rust+web+smoke+browser |
+| )} &nbsp; * / | :282 | `POST /api/v1/repos` | `User` | rust+web+smoke+browser |
 | i18n:common.loading | :290 | `GET /api/v1/orgs` | `User` | rust+web+smoke+browser |
 | i18n:common.loading | :347 | `GET /api/v1/repos/templates/gitignores` | `Public` | web |
 | i18n:common.loading | :347 | `GET /api/v1/repos/templates/licenses` | `Public` | web |
@@ -1157,7 +1157,7 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| * | :119 | `GET /api/v1/orgs` | `User` | rust+web+smoke |
+| &nbsp;* | :119 | `GET /api/v1/orgs` | `User` | rust+web+smoke |
 
 ### `/orgs/[name]`
 

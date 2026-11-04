@@ -209,7 +209,7 @@
       </div>
 
       <div class="form-group">
-        <label for="release-title">{t('releases.release_title')} <span class="required">*</span></label>
+        <label for="release-title">{t('releases.release_title')}&nbsp;<span class="required">*</span></label>
         <input
           type="text"
           id="release-title"
