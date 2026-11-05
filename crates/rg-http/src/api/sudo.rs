@@ -108,10 +108,16 @@ pub async fn step_up(
         Ok(actor) => actor,
         Err(error) => return error.into_response(),
     };
-    let token = match rg_core::auth::jwt::reissue_with_sudo(&claims, &state.jwt_secret) {
-        Ok(token) => token,
-        Err(error) => return AppError::from(error).into_response(),
+    let proved_factor = if second_factor.is_some() {
+        user.totp_secret.as_deref()
+    } else {
+        None
     };
+    let token =
+        match rg_core::auth::jwt::reissue_with_sudo(&claims, proved_factor, &state.jwt_secret) {
+            Ok(token) => token,
+            Err(error) => return AppError::from(error).into_response(),
+        };
     crate::metrics::recorder::auth_event(CHANNEL, "success");
 
     // The event that precedes a new key or token in the journal: without it a

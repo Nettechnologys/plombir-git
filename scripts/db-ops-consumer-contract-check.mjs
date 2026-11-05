@@ -159,6 +159,12 @@ if (declarations.length === 0) {
 // failure — the allowlist is a ratchet, not a parking lot.
 const ALLOWED_WITHOUT_CONSUMER = new Map([
   [
+    'crates/rg-db/src/ops/user_ops.rs::enable_mfa_with_backup_codes',
+    'legacy fixture seam for atomicity/contention tests and direct MFA fixture setup. ' +
+      'Production HTTP enrolment uses complete_mfa_enrolment with the exact verified ' +
+      'pending secret, live factor and session generation; this unchecked helper must not be used there',
+  ],
+  [
     'crates/rg-core/src/import/service.rs::import_wiki_pages_from_local_path',
     'an integration-test seam for exercising the complete wiki import against a real local bare ' +
       'repository. Production remote imports deliberately cannot call it: they enter through the ' +
@@ -173,7 +179,7 @@ const ALLOWED_WITHOUT_CONSUMER = new Map([
   [
     'crates/rg-db/src/ops/user_ops.rs::enable_mfa',
     'the read-before-write half of MFA enrolment, and its own doc comment forbids the production ' +
-      'caller this check looks for: enrolment must go through `enable_mfa_with_backup_codes`, ' +
+      'caller this check looks for: HTTP enrolment must go through `complete_mfa_enrolment`, ' +
       'because on its own this publishes a second factor whose recovery set is still a separate ' +
       'commit away. What is left calling it is ~15 test fixtures that want a user with MFA on and ' +
       'no backup codes. Not the defect this check hunts: the arc is live through the ' +

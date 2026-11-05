@@ -673,7 +673,7 @@ async fn the_last_way_into_an_sso_only_account_cannot_be_removed() {
     // A normal SSO login does not prove recent user presence. Even after a
     // successful step-up, the last remaining way into the account must stay.
     let claims = rg_core::auth::jwt::validate_token(&session, TEST_JWT_SECRET).unwrap();
-    let elevated = rg_core::auth::jwt::reissue_with_sudo(&claims, TEST_JWT_SECRET).unwrap();
+    let elevated = rg_core::auth::jwt::reissue_with_sudo(&claims, None, TEST_JWT_SECRET).unwrap();
     let delete_passkey = app
         .client
         .delete(format!("{}/api/v1/users/passkeys/{}", app.base, passkey.id))

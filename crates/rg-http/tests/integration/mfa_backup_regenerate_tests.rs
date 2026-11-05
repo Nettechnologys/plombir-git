@@ -158,9 +158,9 @@ async fn redeem(base: &str, username: &str, code: &str) -> u16 {
 
 #[tokio::test]
 async fn regenerating_backup_codes_rotates_the_live_set() {
-    let (base, _db) = spawn_test_app_with_db().await;
+    let (base, db) = spawn_test_app_with_db().await;
     let username = "backup_reissue";
-    let (token, _user_id) = register_full(&base, username, "backup_reissue@example.com").await;
+    let (token, user_id) = register_full(&base, username, "backup_reissue@example.com").await;
     let old_codes = enrol(&base, &token).await;
     assert_eq!(old_codes.len(), 10, "enrolment issues ten codes");
     let issued = backup_status(&base, &token).await;
@@ -173,6 +173,10 @@ async fn regenerating_backup_codes_rotates_the_live_set() {
     // No session at all: the re-issue is not a public door.
     let (anonymous, _) = regenerate(&base, None, PASSWORD).await;
     assert_eq!(anonymous, 401, "the re-issue must require a session");
+
+    let denied = regenerate(&base, Some(&token), PASSWORD).await;
+    assert_eq!(denied.0, 403, "password-only sudo cannot regenerate codes");
+    let token = crate::common::fresh_mfa_session(&db, user_id).await;
 
     // A session is not enough. This is the point of the card's acceptance
     // check: a stolen cookie must not be able to mint itself a permanent

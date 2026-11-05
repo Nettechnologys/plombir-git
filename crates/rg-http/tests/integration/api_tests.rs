@@ -334,7 +334,7 @@ async fn test_me_accepts_httponly_cookie_without_bearer() {
 }
 
 #[tokio::test]
-async fn test_disable_mfa_rejects_wrong_password() {
+async fn test_disable_mfa_requires_factor_proof_before_checking_a_password() {
     let (base, db) = spawn_test_app_with_db().await;
     let (token, user_id) = register_full(&base, "mfa_user", "mfa_user@example.com").await;
     rg_db::ops::user_ops::enable_mfa(&db, user_id)
@@ -350,7 +350,9 @@ async fn test_disable_mfa_rejects_wrong_password() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), 401);
+    assert_eq!(resp.status(), 403);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["reason"], "sudo_required");
     let user = rg_db::ops::user_ops::find_by_id(&db, user_id)
         .await
         .unwrap()

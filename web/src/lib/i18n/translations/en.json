@@ -2222,6 +2222,7 @@
     "status_none": "None",
     "password_required": "Current password is required",
     "mfa": {
+      "fresh_proof_hint": "Changing MFA or replacing backup codes requires a recent identity check: your password and an authenticator or backup code, or an existing passkey. The confirmation remains valid for 10 minutes.",
       "title": "Multi-Factor Authentication",
       "description": "Add a time-based authenticator code after password login.",
       "state_unknown": "The second factor of this account could not be read, so this page cannot say whether MFA is on. Starting a new setup from here would replace an authenticator that may still be live, so the read is offered again instead.",

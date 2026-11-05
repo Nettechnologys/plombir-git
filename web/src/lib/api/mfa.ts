@@ -24,9 +24,8 @@ export interface MfaBackupStatus {
 export const mfa = {
   setup: () =>
     request<MfaSetupResponse>('/users/mfa/setup', { method: 'POST' }),
-  // `password` is the account's own; an account without one here sends none
-  // and the server asks for sudo mode instead, which `request` turns into the
-  // confirmation prompt.
+  // First enrolment proves a local password. Changes to an existing factor
+  // require sudo, which `request` turns into the shared confirmation prompt.
   enable: (code: string, password?: string) =>
     request<MfaEnableResponse>('/users/mfa/enable', {
       method: 'POST',

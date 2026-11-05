@@ -1081,10 +1081,11 @@ pub async fn login_finish(
         tracing::warn!(user_id = user.id, error = %format!("{error:#}"), "failed to record passkey login attempt");
     }
 
-    let token = rg_core::auth::jwt::generate_authenticated_token(
+    let token = rg_core::auth::jwt::generate_authenticated_token_with_mfa(
         user.id,
         &user.username,
         user.session_version,
+        user.totp_secret.as_deref(),
         &state.jwt_secret,
         7,
     )

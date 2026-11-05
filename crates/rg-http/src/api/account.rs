@@ -25,7 +25,7 @@ use serde::Deserialize;
 use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_credential};
-use crate::api::auth::{AuthUser, SessionUser};
+use crate::api::auth::{require_sudo_for_user, AuthUser, LoginSession, SessionUser};
 use crate::api::users::{build_auth_cookie, build_clear_cookie};
 use crate::error::AppError;
 use crate::AppState;
@@ -158,13 +158,14 @@ pub struct ChangePasswordRequest {
             one continues with the token and cookie in the response. Personal access tokens and \
             SSH keys are separate credentials and stay valid.", body = serde_json::Value),
         (status = 400, description = "The new password breaks a rule, or the account's password lives with its identity provider", body = serde_json::Value),
+        (status = 403, description = "A login session and recent proof of the enrolled factor are required (`reason: sudo_required`)", body = serde_json::Value),
         (status = 401, description = "The current password is wrong, or the account is locked", body = serde_json::Value),
         (status = 409, description = "The password was replaced by a reset while this request was in flight", body = serde_json::Value),
     ),
 )]
 pub async fn change_password(
     State(state): State<AppState>,
-    SessionUser(user_id): SessionUser,
+    LoginSession { user_id, claims }: LoginSession,
     headers: HeaderMap,
     Json(body): Json<ChangePasswordRequest>,
 ) -> Response {
@@ -172,6 +173,11 @@ pub async fn change_password(
         Ok(user) => user,
         Err(error) => return error.into_response(),
     };
+    if user.mfa_enabled {
+        if let Err(error) = require_sudo_for_user(&claims, &user, &state.jwt_secret) {
+            return error.into_response();
+        }
+    }
     if user.auth_provider != "local" {
         return AppError::bad_request(format!(
             "this account signs in through {}, which holds its password",
@@ -396,16 +402,26 @@ pub struct ChangeEmailRequest {
     responses(
         (status = 202, description = "A confirmation link was mailed to the new address, if it can take one", body = serde_json::Value),
         (status = 400, description = "Not an address, the current one, or an account whose address comes from its identity provider", body = serde_json::Value),
+        (status = 403, description = "A login session and recent proof of the enrolled factor are required (`reason: sudo_required`)", body = serde_json::Value),
         (status = 401, description = "The password is wrong, or the account is locked", body = serde_json::Value),
         (status = 409, description = "This instance has no outbound mail to confirm an address with", body = serde_json::Value),
     ),
 )]
 pub async fn request_email_change(
     State(state): State<AppState>,
-    SessionUser(user_id): SessionUser,
+    LoginSession { user_id, claims }: LoginSession,
     headers: HeaderMap,
     Json(body): Json<ChangeEmailRequest>,
 ) -> Response {
+    let user = match load_user(&state, user_id).await {
+        Ok(user) => user,
+        Err(error) => return error.into_response(),
+    };
+    if user.mfa_enabled {
+        if let Err(error) = require_sudo_for_user(&claims, &user, &state.jwt_secret) {
+            return error.into_response();
+        }
+    }
     // `409`, not `403`: nothing about the caller is refused — the instance
     // cannot do this for anyone until its operator configures mail.
     let Some(mailer) = mailer(&state) else {
@@ -414,10 +430,6 @@ pub async fn request_email_change(
              configured ([smtp] and [server].external_url); ask an administrator",
         )
         .into_response();
-    };
-    let user = match load_user(&state, user_id).await {
-        Ok(user) => user,
-        Err(error) => return error.into_response(),
     };
     if user.auth_provider != "local" {
         return AppError::bad_request(format!(
@@ -632,13 +644,14 @@ pub struct DeleteAccountRequest {
     responses(
         (status = 200, description = "The account is deleted and the session cookie cleared", body = serde_json::Value),
         (status = 400, description = "The confirmation is missing or does not match", body = serde_json::Value),
+        (status = 403, description = "A login session and recent proof of the enrolled factor are required (`reason: sudo_required`)", body = serde_json::Value),
         (status = 401, description = "The password is wrong, or the account is locked", body = serde_json::Value),
         (status = 409, description = "The account is the instance's only administrator, or still owns organizations", body = serde_json::Value),
     ),
 )]
 pub async fn delete_account(
     State(state): State<AppState>,
-    SessionUser(user_id): SessionUser,
+    LoginSession { user_id, claims }: LoginSession,
     headers: HeaderMap,
     Json(body): Json<DeleteAccountRequest>,
 ) -> Response {
@@ -646,6 +659,11 @@ pub async fn delete_account(
         Ok(user) => user,
         Err(error) => return error.into_response(),
     };
+    if user.mfa_enabled || !crate::api::mfa::has_local_password(&user) {
+        if let Err(error) = require_sudo_for_user(&claims, &user, &state.jwt_secret) {
+            return error.into_response();
+        }
+    }
     if user.auth_provider == "local" {
         let Some(password) = body.password.as_deref() else {
             return AppError::bad_request("confirm with your password").into_response();

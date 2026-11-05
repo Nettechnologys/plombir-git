@@ -5,7 +5,8 @@ export class ApiError extends Error {
 	readonly requestId: string | null;
 	/**
 	 * A machine-readable qualifier the client acts on rather than shows:
-	 * `sudo_required` says the session is fine and has to prove itself again.
+	 * `sudo_required` asks for fresh proof; `session_revoked` rejects the session;
+	 * `identity_conflict` rejects credentials naming different accounts.
 	 */
 	readonly reason: string | null;
 

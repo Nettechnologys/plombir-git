@@ -1142,3 +1142,25 @@ impl SsoCallbackOutcome {
         );
     }
 }
+
+/// Fixture for tests of operations *after* a complete MFA/passkey proof. Tests
+/// of the proof itself must use /users/me/sudo or /users/mfa/verify instead.
+pub async fn fresh_mfa_session(db: &rg_db::DatabaseConnection, user_id: i64) -> String {
+    let user = rg_db::ops::user_ops::find_by_id(db, user_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        user.mfa_enabled && user.totp_secret.is_some(),
+        "fixture needs an enrolled factor"
+    );
+    rg_core::auth::jwt::generate_authenticated_token_with_mfa(
+        user.id,
+        &user.username,
+        user.session_version,
+        user.totp_secret.as_deref(),
+        "test-secret-key",
+        7,
+    )
+    .unwrap()
+}

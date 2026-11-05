@@ -760,6 +760,53 @@ pub async fn enable_mfa_with_backup_codes(
         .await
 }
 
+/// Publish exactly the pending factor verified by the HTTP caller. A competing
+/// setup, rotation, password change or account retirement invalidates that
+/// proof. The conditional promotion and recovery codes share one transaction.
+pub async fn complete_mfa_enrolment(
+    db: &DatabaseConnection,
+    expected: &User,
+    codes: &[String],
+) -> Result<bool> {
+    let Some(pending) = expected.pending_totp_secret.as_deref() else {
+        return Ok(false);
+    };
+    crate::contention::retry_transaction("complete MFA enrolment", || async {
+        let transaction = db.begin().await?;
+        let mut update = UserEntity::update_many()
+            .col_expr(user::Column::MfaEnabled, Expr::value(true))
+            .col_expr(user::Column::TotpSecret, Expr::value(pending))
+            .col_expr(
+                user::Column::PendingTotpSecret,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                user::Column::PendingTotpSecretAt,
+                Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+            )
+            .col_expr(user::Column::TotpLastStep, Expr::value(Option::<i64>::None))
+            .col_expr(user::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
+            .filter(user::Column::Id.eq(expected.id))
+            .filter(user::Column::SessionVersion.eq(expected.session_version))
+            .filter(user::Column::MfaEnabled.eq(expected.mfa_enabled))
+            .filter(user::Column::PendingTotpSecret.eq(pending))
+            .filter(user::Column::IsActive.eq(true))
+            .filter(user::Column::DeletedAt.is_null());
+        update = match expected.totp_secret.as_deref() {
+            Some(secret) => update.filter(user::Column::TotpSecret.eq(secret)),
+            None => update.filter(user::Column::TotpSecret.is_null()),
+        };
+        if update.exec(&transaction).await?.rows_affected != 1 {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        crate::ops::mfa_backup_code_ops::set_codes(&transaction, expected.id, codes).await?;
+        transaction.commit().await?;
+        Ok(true)
+    })
+    .await
+}
+
 /// Move a staged enrolment secret into the column the login path verifies
 /// against, inside the caller's transaction.
 ///

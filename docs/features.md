@@ -72,6 +72,45 @@ This check applies to mixed session credentials. A tab sending only its cookie
 uses the account currently selected in that browser. Use separate browser
 profiles to keep simultaneous accounts independent.
 
+## Sensitive account actions and MFA
+
+For an account with MFA enabled, changing or disabling its authenticator,
+regenerating backup codes, changing its password or recovery email, and deleting
+its account require a recent proof of the **existing** factor. Password alone
+cannot remove MFA. The shared confirmation dialog accepts password plus TOTP or
+an unused backup code, or an existing passkey with user verification. Provider
+reauthentication still completes the account's MFA challenge. Confirmation lasts
+10 minutes; remembered-session renewal never extends it.
+
+The same check protects issuance of personal and bot tokens, SSH and signing
+keys, repository deploy keys, passkey registration and removal, SSO linking,
+runner registration, agent-run profiles, and administrator actions that create
+users, grant administrator status, reset credentials or configure providers.
+PATs cannot use these login-session-only routes. Ordinary Git/API automation and
+emergency revocation of PATs and SSH/signing/deploy keys retain their existing
+permission checks; they do not acquire interactive MFA prompts.
+
+Fresh proof is bound to the enrolled authenticator. A password-only session
+issued before MFA enrolment, or a session that proved a retired authenticator,
+must confirm again before a sensitive action. Existing MFA sessions issued
+before this change also confirm once. Rotating the encryption key for stored
+TOTP secrets similarly retires their sudo proof. Sessions remain usable for
+ordinary work; enabling MFA does not sign out other sessions. Use sign-out to
+revoke all browser sessions if an account may already be compromised.
+
+First enrolment still requires the local password and a code from the new
+secret, or provider/passkey sudo for a passwordless account. Promotion checks
+the exact pending secret and account generation in the same transaction as the
+backup-code set. Concurrent setup cannot replace the verified secret. After
+initial enrolment or rotation, confirm with the new factor when next asked.
+Losing both the authenticator and all recovery methods requires administrator
+recovery; knowing the password alone is deliberately insufficient.
+
+Repository/org permission grants, CI secrets, webhooks, and administrator
+maintenance/deletion endpoints keep their existing role and PAT scope policies.
+These automation-capable APIs are distinct from credential issuance; this change
+does not claim that every write operation requires interactive MFA.
+
 ## Tech stack
 
 | Layer | Choice | Version |

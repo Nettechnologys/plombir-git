@@ -157,10 +157,11 @@ async fn verify(base: &str, challenge: &str, username: &str, code: &str) -> (u16
 /// makes the next morning.
 #[tokio::test]
 async fn an_abandoned_re_enrolment_leaves_the_live_factor_working() {
-    let (base, _db) = spawn_test_app_with_db().await;
+    let (base, db) = spawn_test_app_with_db().await;
     let username = "mfa_reenrol_abandoned";
-    let (token, _user_id) = register_full(&base, username, "mfa_reenrol@example.com").await;
+    let (token, user_id) = register_full(&base, username, "mfa_reenrol@example.com").await;
     let live = enrol(&base, &token).await;
+    let token = crate::common::fresh_mfa_session(&db, user_id).await;
 
     // Step 1 of 2, and then nothing: no `enable`, no code, the tab closed.
     let staged = setup(&base, &token).await;
@@ -202,23 +203,30 @@ async fn an_abandoned_re_enrolment_leaves_the_live_factor_working() {
 /// would take their code as proof. The password is what the thief does not have.
 #[tokio::test]
 async fn replacing_the_live_authenticator_requires_the_account_password() {
-    let (base, _db) = spawn_test_app_with_db().await;
+    let (base, db) = spawn_test_app_with_db().await;
     let username = "mfa_reenrol_rotation";
-    let (token, _user_id) = register_full(&base, username, "mfa_rotation@example.com").await;
+    let (token, user_id) = register_full(&base, username, "mfa_rotation@example.com").await;
     let live = enrol(&base, &token).await;
+    let password_only = token;
+    let token = crate::common::fresh_mfa_session(&db, user_id).await;
     let staged = setup(&base, &token).await;
 
-    let (refused, body) =
-        enable(&base, &token, &code_for_step(&staged, current_step()), None).await;
+    let (refused, body) = enable(
+        &base,
+        &password_only,
+        &code_for_step(&staged, current_step()),
+        None,
+    )
+    .await;
     assert_eq!(
-        refused, 400,
+        refused, 403,
         "a code alone replaced the factor protecting the account: {body}"
     );
     assert!(
         body["error"]["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("password"),
+            .contains("factor"),
         "the refusal must say what is missing: {body}"
     );
 
@@ -284,10 +292,11 @@ async fn replacing_the_live_authenticator_requires_the_account_password() {
 /// incident review is reading the journal for.
 #[tokio::test]
 async fn a_rotation_is_journalled_as_the_end_of_the_previous_factor() {
-    let (base, _db) = spawn_test_app_with_db().await;
+    let (base, db) = spawn_test_app_with_db().await;
     let username = "mfa_reenrol_journal";
-    let (token, _user_id) = register_full(&base, username, "mfa_journal@example.com").await;
+    let (token, user_id) = register_full(&base, username, "mfa_journal@example.com").await;
     let live = enrol(&base, &token).await;
+    let token = crate::common::fresh_mfa_session(&db, user_id).await;
     let staged = setup(&base, &token).await;
     let (accepted, body) = enable(
         &base,

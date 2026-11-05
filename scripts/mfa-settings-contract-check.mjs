@@ -111,13 +111,13 @@ expect(
 expect(page, /mfa\.backup\(\)/, 'Security page must load backup code status');
 expect(
   page,
-  /mfa\.disable\(hasPassword \? disablePassword : undefined\)/,
-  'Security page must disable MFA with the current password of an account that has one',
+  /mfa\.disable\(\)/,
+  'Security page must disable MFA through the shared sudo flow',
 );
 expect(
   page,
-  /mfa\.regenerateBackup\(hasPassword \? regeneratePassword : undefined\)/,
-  'Security page must offer a backup-code re-issue confirmed by the current password',
+  /mfa\.regenerateBackup\(\)/,
+  'Security page must re-issue backup codes through the shared sudo flow',
 );
 expect(page, /{@html setup\.qr_svg}/, 'Security page must render backend QR SVG from setup response');
 expect(navbar, /href="\/settings\/security"/, 'User menu must link to security settings');

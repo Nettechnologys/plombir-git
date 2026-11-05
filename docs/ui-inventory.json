@@ -28672,7 +28672,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.retry",
-          "line": 442,
+          "line": 430,
           "via": null,
           "href": null,
           "handler": "loadBackupStatus",
@@ -28696,8 +28696,8 @@
         },
         {
           "tag": "form",
-          "label": "i18n:account_security.mfa.current_password",
-          "line": 457,
+          "label": "i18n:account_security.mfa.working",
+          "line": 446,
           "via": null,
           "href": null,
           "handler": "regenerateBackupCodes",
@@ -28778,7 +28778,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.working",
-          "line": 469,
+          "line": 447,
           "via": null,
           "href": null,
           "handler": null,
@@ -28787,8 +28787,8 @@
         },
         {
           "tag": "form",
-          "label": "i18n:account_security.mfa.current_password",
-          "line": 477,
+          "label": "i18n:account_security.mfa.disabling",
+          "line": 455,
           "via": null,
           "href": null,
           "handler": "disableMfa",
@@ -28869,7 +28869,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.disabling",
-          "line": 484,
+          "line": 456,
           "via": null,
           "href": null,
           "handler": null,
@@ -28879,7 +28879,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.mfa.starting",
-          "line": 490,
+          "line": 462,
           "via": null,
           "href": null,
           "handler": "startSetup",
@@ -28905,7 +28905,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.passkeys.retry",
-          "line": 520,
+          "line": 492,
           "via": null,
           "href": null,
           "handler": "loadPasskeyList",
@@ -28930,7 +28930,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.passkeys.remove",
-          "line": 534,
+          "line": 506,
           "via": null,
           "href": null,
           "handler": "() => removePasskey(key.id)",
@@ -28954,7 +28954,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.passkeys.name",
-          "line": 549,
+          "line": 521,
           "via": null,
           "href": null,
           "handler": "addPasskey",
@@ -28964,7 +28964,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.passkeys.waiting",
-          "line": 560,
+          "line": 532,
           "via": null,
           "href": null,
           "handler": null,
@@ -28974,7 +28974,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.sso.retry",
-          "line": 588,
+          "line": 560,
           "via": null,
           "href": null,
           "handler": "loadSsoLinks",
@@ -28999,7 +28999,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.sso.unlink",
-          "line": 603,
+          "line": 575,
           "via": null,
           "href": null,
           "handler": "() => unlinkSsoProvider(link)",
@@ -29024,7 +29024,7 @@
         {
           "tag": "button",
           "label": ")}",
-          "line": 621,
+          "line": 593,
           "via": null,
           "href": null,
           "handler": "() => linkSsoProvider(provider)",
@@ -29049,7 +29049,7 @@
         {
           "tag": "form",
           "label": "i18n:account_security.setup.code",
-          "line": 651,
+          "line": 623,
           "via": null,
           "href": null,
           "handler": "enableMfa",
@@ -29131,7 +29131,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.setup.verifying",
-          "line": 662,
+          "line": 634,
           "via": null,
           "href": null,
           "handler": null,
@@ -29141,7 +29141,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 669,
+          "line": 641,
           "via": null,
           "href": null,
           "handler": "closeSetup",
@@ -29151,7 +29151,7 @@
         {
           "tag": "button",
           "label": "i18n:account_security.backup.copy",
-          "line": 696,
+          "line": 668,
           "via": null,
           "href": null,
           "handler": "copyBackupCodes",
@@ -29161,7 +29161,7 @@
         {
           "tag": "button",
           "label": "i18n:common.close",
-          "line": 697,
+          "line": 669,
           "via": null,
           "href": null,
           "handler": "closeBackupCodes",

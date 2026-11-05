@@ -57,6 +57,15 @@ async fn login_attempts(db: &rg_db::DatabaseConnection, user_id: i64) -> i32 {
 /// account, stepped up, gets past that refusal.
 #[tokio::test]
 async fn credential_routes_refuse_a_session_outside_its_sudo_window() {
+    credential_routes_require_complete_proof(false).await;
+}
+
+#[tokio::test]
+async fn credential_routes_require_the_enrolled_factor_even_with_fresh_password_sudo() {
+    credential_routes_require_complete_proof(true).await;
+}
+
+async fn credential_routes_require_complete_proof(enrol_mfa: bool) {
     let (base, db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
     let (fresh, user_id) = register_full(&base, "sudo_owner", "sudo_owner@example.com").await;
@@ -73,6 +82,28 @@ async fn credential_routes_refuse_a_session_outside_its_sudo_window() {
     )
     .await;
     assert!(status == 201 || status == 200, "create a bot: {status}");
+    let mut backup_code = None;
+    if enrol_mfa {
+        let (status, setup) = post(
+            &client,
+            format!("{base}/api/v1/users/mfa/setup"),
+            &fresh,
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, 200, "{setup}");
+        let secret = setup["secret"].as_str().unwrap();
+        let code = current_code(secret);
+        let (status, enabled) = post(
+            &client,
+            format!("{base}/api/v1/users/mfa/enable"),
+            &fresh,
+            serde_json::json!({"password": PASSWORD, "code": code}),
+        )
+        .await;
+        assert_eq!(status, 200, "{enabled}");
+        backup_code = Some(enabled["backup_codes"][0].as_str().unwrap().to_owned());
+    }
     let stale = ordinary_session(&db, user_id).await;
 
     let routes: Vec<(&str, String, serde_json::Value)> = vec![
@@ -125,6 +156,24 @@ async fn credential_routes_refuse_a_session_outside_its_sudo_window() {
         );
     }
 
+    if enrol_mfa {
+        for (what, url, body) in &routes {
+            let answer = post(&client, url.clone(), &fresh, body.clone()).await;
+            assert!(
+                sudo_refusal(&answer),
+                "password-only sudo minted {what}: {answer:?}"
+            );
+        }
+        let answer = post(
+            &client,
+            format!("{base}/api/v1/users/me/sudo"),
+            &fresh,
+            serde_json::json!({"password": PASSWORD}),
+        )
+        .await;
+        assert_eq!(answer.0, 400, "password-only step-up bypassed MFA");
+    }
+
     // The same account, stepped up: past the sudo refusal on every route
     // (some still refuse for their own reasons — a disabled provider, a
     // repeated key — which is not what this test is about).
@@ -132,7 +181,7 @@ async fn credential_routes_refuse_a_session_outside_its_sudo_window() {
         &client,
         format!("{base}/api/v1/users/me/sudo"),
         &stale,
-        serde_json::json!({ "password": PASSWORD }),
+        serde_json::json!({ "password": PASSWORD, "backup_code": backup_code }),
     )
     .await;
     assert_eq!(status, 200, "{stepped}");

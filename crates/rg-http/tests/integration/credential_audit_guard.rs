@@ -148,8 +148,8 @@ const CREDENTIALS: [Credential; 13] = [
     // is what access is PROTECTED by, which makes switching it off the sharper
     // event of the two: the classic takeover is a stolen password, then
     // `disable_mfa`, then everything else. It has no table of its own, hence
-    // the `None` above; `enable_mfa` also matches
-    // `enable_mfa_with_backup_codes`, which is the spelling enrolment uses.
+    // the `None` above. The guarded HTTP promotion is named separately from
+    // legacy fixture helpers so a missing audit call is still detected.
     // `stage_pending_totp_secret` — what `POST /users/mfa/setup` writes — is out
     // on purpose: it parks a secret nobody has confirmed in a slot no login
     // reads, so it protects nothing yet and destroys nothing either
@@ -159,7 +159,7 @@ const CREDENTIALS: [Credential; 13] = [
     Credential {
         entity: None,
         ops: "user_ops",
-        verbs: &["enable_mfa", "disable_mfa"],
+        verbs: &["enable_mfa", "complete_mfa_enrolment", "disable_mfa"],
     },
     // Backup codes are single-use passwords for the account, and re-issuing
     // them is interesting because the old set stops working — not because the
@@ -323,6 +323,28 @@ fn credential_sites(path: &str, text: &str) -> Vec<CredentialSite> {
         });
     }
     sites
+}
+
+#[test]
+fn http_enrolment_uses_the_verified_snapshot_not_the_legacy_fixture_helper() {
+    let mut files = Vec::new();
+    rust_files(&workspace_crates().join("rg-http/src"), &mut files);
+    assert!(!files.is_empty());
+    let mut guarded_promotions = 0;
+    for file in files {
+        let source = fs::read_to_string(&file).unwrap();
+        let code = production_rust_code_only(&source);
+        assert!(
+            !code.contains("enable_mfa_with_backup_codes"),
+            "{} bypasses the verified MFA snapshot",
+            file.display()
+        );
+        guarded_promotions += usize::from(calls(&code, "complete_mfa_enrolment"));
+    }
+    assert_eq!(
+        guarded_promotions, 1,
+        "the HTTP promotion must remain guarded"
+    );
 }
 
 #[test]

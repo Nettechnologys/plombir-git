@@ -155,13 +155,38 @@ impl FromRequestParts<crate::AppState> for SudoUser {
         state: &crate::AppState,
     ) -> Result<Self, Self::Rejection> {
         let (user_id, claims) = login_session(parts, state)?;
-        require_sudo(&claims)?;
+        let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
+            .await?
+            .filter(|user| user.is_usable())
+            .ok_or_else(|| crate::error::AppError::unauthorized("authentication required"))?;
+        require_sudo_for_user(&claims, &user, &state.jwt_secret)?;
         Ok(SudoUser(user_id))
     }
 }
 
+/// A fresh proof must cover the currently enrolled factor, not just the
+/// password proved before MFA was enabled. Rotation also retires old proof.
+pub(crate) fn require_sudo_for_user(
+    claims: &Claims,
+    user: &rg_db::entities::user::Model,
+    jwt_secret: &str,
+) -> Result<(), crate::error::AppError> {
+    if claims.session_version != user.session_version {
+        return Err(crate::error::AppError::SessionRevoked(
+            "session is no longer valid".to_owned(),
+        ));
+    }
+    require_sudo(claims)?;
+    if user.mfa_enabled && !claims.sudo_covers_mfa(user.totp_secret.as_deref(), jwt_secret) {
+        return Err(crate::error::AppError::sudo_required(
+            "confirm the current second factor before changing credentials",
+        ));
+    }
+    Ok(())
+}
+
 /// Refuse a session outside its sudo window.
-pub(crate) fn require_sudo(claims: &Claims) -> Result<(), crate::error::AppError> {
+fn require_sudo(claims: &Claims) -> Result<(), crate::error::AppError> {
     if claims.sudo_active_at(chrono::Utc::now().timestamp()) {
         Ok(())
     } else {

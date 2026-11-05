@@ -53,8 +53,6 @@
   let setup = $state<MfaSetupResponse | null>(null);
   let verificationCode = $state('');
   let enablePassword = $state('');
-  let disablePassword = $state('');
-  let regeneratePassword = $state('');
   let newBackupCodes = $state<string[]>([]);
 
   let passkeyList = $state<PasskeyInfo[] | Unknown>([]);
@@ -333,10 +331,6 @@
   async function disableMfa(event: SubmitEvent) {
     event.preventDefault();
     if (saving) return;
-    if (hasPassword && !disablePassword) {
-      error = t('account_security.password_required');
-      return;
-    }
     if (!(await confirmer.ask({
       title: t('account_security.mfa.disable'),
       message: t('account_security.mfa.disable_confirm'),
@@ -347,8 +341,7 @@
       saving = true;
       error = '';
       success = '';
-      await mfa.disable(hasPassword ? disablePassword : undefined);
-      disablePassword = '';
+      await mfa.disable();
       newBackupCodes = [];
       setup = null;
       success = t('account_security.mfa.disabled_notice');
@@ -363,10 +356,6 @@
   async function regenerateBackupCodes(event: SubmitEvent) {
     event.preventDefault();
     if (saving) return;
-    if (hasPassword && !regeneratePassword) {
-      error = t('account_security.password_required');
-      return;
-    }
     if (!(await confirmer.ask({
       title: t('account_security.mfa.regenerate'),
       message: t('account_security.mfa.regenerate_confirm'),
@@ -377,8 +366,7 @@
       saving = true;
       error = '';
       success = '';
-      const result = await mfa.regenerateBackup(hasPassword ? regeneratePassword : undefined);
-      regeneratePassword = '';
+      const result = await mfa.regenerateBackup();
       newBackupCodes = result.backup_codes;
       success = t('account_security.mfa.regenerated_notice');
       await loadSecurity();
@@ -454,19 +442,9 @@
         </div>
       </div>
 
+      <p class="muted">{t('account_security.mfa.fresh_proof_hint')}</p>
       <form class="disable-form" onsubmit={regenerateBackupCodes}>
-        {#if hasPassword}
-          <label>
-            {t('account_security.mfa.current_password')}
-            <input
-              type="password"
-              bind:value={regeneratePassword}
-              autocomplete="current-password"
-              disabled={saving}
-            />
-          </label>
-        {/if}
-        <button type="submit" class="btn btn-secondary" disabled={saving || (hasPassword && !regeneratePassword)}>
+        <button type="submit" class="btn btn-secondary" disabled={saving}>
           {saving ? t('account_security.mfa.working') : t('account_security.mfa.regenerate')}
         </button>
       </form>
@@ -475,13 +453,7 @@
       </p>
 
       <form class="disable-form" onsubmit={disableMfa}>
-        {#if hasPassword}
-          <label>
-            {t('account_security.mfa.current_password')}
-            <input type="password" bind:value={disablePassword} autocomplete="current-password" disabled={saving} />
-          </label>
-        {/if}
-        <button type="submit" class="btn btn-danger" disabled={saving || (hasPassword && !disablePassword)}>
+        <button type="submit" class="btn btn-danger" disabled={saving}>
           {saving ? t('account_security.mfa.disabling') : t('account_security.mfa.disable')}
         </button>
       </form>

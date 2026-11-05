@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ApiError, isSudoRequired, request, requestSudo, setSudoPrompt, setToken } from './_base.svelte';
+import { mfa } from './mfa';
 
 // Decision #10: the routes that mint keys, tokens, passkeys and SSO links
 // answer `403 { reason: "sudo_required" }` to a session outside its sudo
@@ -37,6 +38,25 @@ afterEach(() => {
 });
 
 describe('sudo_required interception', () => {
+	it.each(['disable', 'regenerateBackup'] as const)('confirms MFA %s once without putting a password in the action body', async (action) => {
+		fetchMock.mockResolvedValueOnce(sudoRefusal()).mockResolvedValueOnce(json(200, { backup_codes: ['fixture-code'] }));
+		const prompt = vi.fn(async () => { setToken('factor-confirmed'); return true; });
+		setSudoPrompt(prompt);
+		await mfa[action]();
+		expect(prompt).toHaveBeenCalledTimes(1);
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(authorization(1)).toBe('Bearer factor-confirmed');
+		expect(fetchMock.mock.calls[0][1].body).toBe('{}');
+		expect(fetchMock.mock.calls[1][1].body).toBe('{}');
+	});
+
+	it.each(['disable', 'regenerateBackup'] as const)('does not repeat MFA %s when confirmation is cancelled', async (action) => {
+		fetchMock.mockResolvedValueOnce(sudoRefusal());
+		setSudoPrompt(async () => false);
+		await expect(mfa[action]()).rejects.toMatchObject({ reason: 'sudo_required' });
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
 	it('prompts once and retries the same request on the re-issued session', async () => {
 		fetchMock.mockResolvedValueOnce(sudoRefusal()).mockResolvedValueOnce(json(201, { id: 7 }));
 		const prompt = vi.fn(async () => {

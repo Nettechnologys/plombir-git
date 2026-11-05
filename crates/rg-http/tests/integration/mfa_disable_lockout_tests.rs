@@ -66,10 +66,16 @@ async fn failed_log_rows(
 #[tokio::test]
 async fn failed_mfa_disable_passwords_lock_the_account() {
     let (base, db) = spawn_test_app_with_db().await;
-    let (token, user_id) = register_full(&base, "mfa_lock", "mfa_lock@example.com").await;
-    rg_db::ops::user_ops::enable_mfa(&db, user_id)
+    let (_token, user_id) = register_full(&base, "mfa_lock", "mfa_lock@example.com").await;
+    rg_db::ops::user_ops::stage_pending_totp_secret(&db, user_id, "fixture-encrypted-factor")
         .await
-        .expect("enable mfa");
+        .unwrap();
+    rg_db::ops::user_ops::enable_mfa_with_backup_codes(&db, user_id, &[])
+        .await
+        .unwrap();
+    // This suite exercises the optional legacy password field after a full
+    // factor proof. Missing proof is covered by mfa_change_authorization_tests.
+    let token = crate::common::fresh_mfa_session(&db, user_id).await;
 
     let threshold = rg_core::auth::lockout::MAX_FAILED_PASSWORD_ATTEMPTS;
     for attempt in 1..=threshold {
@@ -115,10 +121,16 @@ async fn failed_mfa_disable_passwords_lock_the_account() {
 #[tokio::test]
 async fn mfa_disable_shares_one_counter_with_the_login_form() {
     let (base, db) = spawn_test_app_with_db().await;
-    let (token, user_id) = register_full(&base, "mfa_lock", "mfa_lock@example.com").await;
-    rg_db::ops::user_ops::enable_mfa(&db, user_id)
+    let (_token, user_id) = register_full(&base, "mfa_lock", "mfa_lock@example.com").await;
+    rg_db::ops::user_ops::stage_pending_totp_secret(&db, user_id, "fixture-encrypted-factor")
         .await
-        .expect("enable mfa");
+        .unwrap();
+    rg_db::ops::user_ops::enable_mfa_with_backup_codes(&db, user_id, &[])
+        .await
+        .unwrap();
+    // This suite exercises the optional legacy password field after a full
+    // factor proof. Missing proof is covered by mfa_change_authorization_tests.
+    let token = crate::common::fresh_mfa_session(&db, user_id).await;
 
     let threshold = rg_core::auth::lockout::MAX_FAILED_PASSWORD_ATTEMPTS;
     // Spend all but one strike on the login form...
@@ -159,10 +171,16 @@ async fn mfa_disable_shares_one_counter_with_the_login_form() {
 #[tokio::test]
 async fn rejected_mfa_disable_passwords_reach_the_login_log() {
     let (base, db) = spawn_test_app_with_db().await;
-    let (token, user_id) = register_full(&base, "mfa_lock", "mfa_lock@example.com").await;
-    rg_db::ops::user_ops::enable_mfa(&db, user_id)
+    let (_token, user_id) = register_full(&base, "mfa_lock", "mfa_lock@example.com").await;
+    rg_db::ops::user_ops::stage_pending_totp_secret(&db, user_id, "fixture-encrypted-factor")
         .await
-        .expect("enable mfa");
+        .unwrap();
+    rg_db::ops::user_ops::enable_mfa_with_backup_codes(&db, user_id, &[])
+        .await
+        .unwrap();
+    // This suite exercises the optional legacy password field after a full
+    // factor proof. Missing proof is covered by mfa_change_authorization_tests.
+    let token = crate::common::fresh_mfa_session(&db, user_id).await;
 
     let threshold = rg_core::auth::lockout::MAX_FAILED_PASSWORD_ATTEMPTS;
     for _ in 1..=threshold {
@@ -210,10 +228,16 @@ async fn rejected_mfa_disable_passwords_reach_the_login_log() {
 #[tokio::test]
 async fn a_successful_mfa_disable_clears_the_strikes() {
     let (base, db) = spawn_test_app_with_db().await;
-    let (token, user_id) = register_full(&base, "mfa_lock", "mfa_lock@example.com").await;
-    rg_db::ops::user_ops::enable_mfa(&db, user_id)
+    let (_token, user_id) = register_full(&base, "mfa_lock", "mfa_lock@example.com").await;
+    rg_db::ops::user_ops::stage_pending_totp_secret(&db, user_id, "fixture-encrypted-factor")
         .await
-        .expect("enable mfa");
+        .unwrap();
+    rg_db::ops::user_ops::enable_mfa_with_backup_codes(&db, user_id, &[])
+        .await
+        .unwrap();
+    // This suite exercises the optional legacy password field after a full
+    // factor proof. Missing proof is covered by mfa_change_authorization_tests.
+    let token = crate::common::fresh_mfa_session(&db, user_id).await;
 
     for _ in 0..2 {
         assert_eq!(

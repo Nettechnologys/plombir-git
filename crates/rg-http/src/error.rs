@@ -65,7 +65,8 @@ pub struct ErrorBody {
     pub request_id: Option<String>,
     /// A machine-readable qualifier for a refusal the client can act on
     /// rather than only show: `sudo_required` says the session is fine and
-    /// has to prove itself again first; `session_revoked` rejects its session.
+    /// has to prove itself again first; `session_revoked` rejects its session;
+    /// `identity_conflict` rejects credentials naming different accounts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
 }

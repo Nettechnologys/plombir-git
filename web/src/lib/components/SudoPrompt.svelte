@@ -4,7 +4,7 @@
   Mounted once, in the root layout. It registers itself with the API client
   (`setSudoPrompt`), and `request` opens it when a route answers
   `403 { reason: "sudo_required" }`: the key, token, passkey and SSO-link
-  routes, and the MFA changes of an account without a password here, do so for
+  routes, MFA changes and sensitive account settings do so for
   a session that has not proved itself in the last ten minutes (decision #10).
 
   What it asks for follows the account, read fresh from `/users/me` each time

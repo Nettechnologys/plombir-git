@@ -4,8 +4,10 @@
 
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
+use hmac::{Hmac, Mac};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 
 /// JWT claims payload.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -47,6 +49,11 @@ pub struct Claims {
     /// minted before the claim existed decodes as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sudo_exp: Option<i64>,
+    /// Proof is bound to the enrolled factor. Password-only sudo issued before
+    /// enrolment, and proof of a retired factor, cannot manage credentials.
+    /// Legacy sessions remain usable but must step up again when MFA is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sudo_mfa: Option<String>,
     /// Browser persistence selected at login. Absent on legacy and API sessions.
     /// `false` means a session cookie; `true` allows thirty-day idle renewal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -88,6 +95,20 @@ impl Claims {
     pub fn sudo_active_at(&self, now: i64) -> bool {
         self.sudo_exp.is_some_and(|until| until > now)
     }
+
+    pub fn sudo_covers_mfa(&self, encrypted_factor: Option<&str>, secret: &str) -> bool {
+        encrypted_factor.is_some_and(|factor| {
+            self.sudo_mfa.as_deref() == Some(mfa_proof_binding(factor, secret).as_str())
+        })
+    }
+}
+
+fn mfa_proof_binding(encrypted_factor: &str, secret: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts a key of any length");
+    mac.update(b"plombir-git:sudo-mfa:");
+    mac.update(encrypted_factor.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
 }
 
 fn mfa_challenge_key(secret: &str) -> String {
@@ -136,6 +157,21 @@ pub fn generate_authenticated_token(
     )
 }
 
+/// Issue sudo after a complete authentication, binding it to the MFA factor
+/// that was proved (or to the current factor after a verified passkey).
+pub fn generate_authenticated_token_with_mfa(
+    user_id: i64,
+    username: &str,
+    session_version: i64,
+    encrypted_factor: Option<&str>,
+    secret: &str,
+    ttl_days: i64,
+) -> Result<String> {
+    let token = generate_authenticated_token(user_id, username, session_version, secret, ttl_days)?;
+    let claims = validate_token(&token, secret).context("invalid new session")?;
+    reissue_with_sudo(&claims, encrypted_factor, secret)
+}
+
 /// Generate the synthetic session a presented personal access token is
 /// translated into, tagged with the token it came from.
 ///
@@ -177,6 +213,7 @@ fn encode_claims(
         session_version,
         pat_id,
         sudo_exp: sudo.then(|| (now + SUDO_TTL).timestamp().min(exp.timestamp())),
+        sudo_mfa: None,
         remember_me: None,
         iat: now.timestamp(),
         exp: exp.timestamp(),
@@ -196,7 +233,11 @@ fn encode_claims(
 /// login, and a session that was going to end tomorrow still does. The window
 /// is clamped to it, and a PAT's synthetic session is refused — the step-up
 /// exists to tell a person at the keyboard from a delegated token.
-pub fn reissue_with_sudo(claims: &Claims, secret: &str) -> Result<String> {
+pub fn reissue_with_sudo(
+    claims: &Claims,
+    encrypted_factor: Option<&str>,
+    secret: &str,
+) -> Result<String> {
     if claims.pat_id.is_some() {
         anyhow::bail!("a personal access token cannot enter sudo mode");
     }
@@ -207,6 +248,7 @@ pub fn reissue_with_sudo(claims: &Claims, secret: &str) -> Result<String> {
         session_version: claims.session_version,
         pat_id: None,
         sudo_exp: Some((now + SUDO_TTL).timestamp().min(claims.exp)),
+        sudo_mfa: encrypted_factor.map(|factor| mfa_proof_binding(factor, secret)),
         remember_me: claims.remember_me,
         iat: claims.iat,
         exp: claims.exp,
@@ -427,7 +469,8 @@ mod tests {
         assert!(fresh.sudo_active_at(now));
         assert!(fresh.sudo_exp.unwrap() <= now + SUDO_TTL.num_seconds());
 
-        let elevated = validate_token(&reissue_with_sudo(&plain, secret).unwrap(), secret).unwrap();
+        let elevated =
+            validate_token(&reissue_with_sudo(&plain, None, secret).unwrap(), secret).unwrap();
         assert_eq!(
             (
                 elevated.sub.as_str(),
@@ -452,11 +495,13 @@ mod tests {
             session_version: 0,
             pat_id: None,
             sudo_exp: None,
+            sudo_mfa: None,
             remember_me: None,
             iat: Utc::now().timestamp(),
             exp: Utc::now().timestamp() + 60,
         };
-        let elevated = validate_token(&reissue_with_sudo(&short, secret).unwrap(), secret).unwrap();
+        let elevated =
+            validate_token(&reissue_with_sudo(&short, None, secret).unwrap(), secret).unwrap();
         assert_eq!(elevated.sudo_exp, Some(short.exp));
 
         let pat = validate_token(
@@ -464,8 +509,39 @@ mod tests {
             secret,
         )
         .unwrap();
-        assert!(reissue_with_sudo(&pat, secret).is_err());
+        assert!(reissue_with_sudo(&pat, None, secret).is_err());
         assert_eq!(pat.sudo_exp, None);
+    }
+
+    #[test]
+    fn sudo_proof_is_bound_to_the_factor_and_renewal_never_creates_it() {
+        let secret = "proof-test";
+        let password = generate_authenticated_token(7, "alice", 3, secret, 7).unwrap();
+        let password_claims = validate_token(&password, secret).unwrap();
+        assert!(!password_claims.sudo_covers_mfa(Some("factor-a"), secret));
+        let token =
+            generate_authenticated_token_with_mfa(7, "alice", 3, Some("factor-a"), secret, 7)
+                .unwrap();
+        let remembered = with_browser_session(&token, Some(true), secret).unwrap();
+        let mut claims = validate_token(&remembered, secret).unwrap();
+        assert!(claims.sudo_covers_mfa(Some("factor-a"), secret));
+        assert!(!claims.sudo_covers_mfa(Some("factor-b"), secret));
+        assert!(!claims.sudo_covers_mfa(None, secret));
+        assert!(!claims.sudo_covers_mfa(Some("factor-a"), "another-signing-key"));
+        claims.exp -= SESSION_RENEW_INTERVAL.num_seconds() + 1;
+        let renewed = renew_remembered_session(&claims, secret).unwrap().unwrap();
+        let renewed = validate_token(&renewed, secret).unwrap();
+        assert_eq!(renewed.sudo_mfa, claims.sudo_mfa);
+        assert_eq!(renewed.sudo_exp, claims.sudo_exp);
+        let stepped = reissue_with_sudo(&renewed, Some("factor-b"), secret).unwrap();
+        let stepped = validate_token(&stepped, secret).unwrap();
+        assert!(stepped.sudo_covers_mfa(Some("factor-b"), secret));
+        assert!(!stepped.sudo_covers_mfa(Some("factor-a"), secret));
+        let password_only = reissue_with_sudo(&stepped, None, secret).unwrap();
+        assert!(validate_token(&password_only, secret)
+            .unwrap()
+            .sudo_mfa
+            .is_none());
     }
 
     #[test]
@@ -494,7 +570,7 @@ mod tests {
         assert_eq!(renewed.session_version, claims.session_version);
         assert!(!renewed.sudo_active_at(Utc::now().timestamp()));
         let elevated =
-            validate_token(&reissue_with_sudo(&renewed, secret).unwrap(), secret).unwrap();
+            validate_token(&reissue_with_sudo(&renewed, None, secret).unwrap(), secret).unwrap();
         assert_eq!(elevated.remember_me, Some(true));
         assert_eq!(elevated.iat, claims.iat);
         assert_eq!(elevated.exp, renewed.exp);

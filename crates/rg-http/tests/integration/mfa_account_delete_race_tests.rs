@@ -176,6 +176,7 @@ async fn disable_deleted_inside_the_flag_write_is_404_with_no_codes_or_audit() {
         backup_code_count(&db, user_id).await > 0,
         "fixture enrolment published no recovery credentials"
     );
+    let token = crate::common::fresh_mfa_session(&db, user_id).await;
     let audit_before = audit_count(&db).await;
     install_delete_before_update(
         &db,

@@ -2,8 +2,8 @@
 //!
 //! An authenticator the owner never held locks them out at the next sign-in,
 //! so arming, rotating or removing one must need more than a stolen session:
-//! the password for an account that has one, sudo mode for one whose password
-//! lives with its SSO provider or directory, and never a PAT. When the owner
+//! first enrolment proves the password and new factor; an enrolled account
+//! proves its existing factor through sudo, and never a PAT. When the owner
 //! is locked out anyway, an administrator (in sudo mode) takes every factor
 //! off — passkeys included — and signs every session out.
 
@@ -53,10 +53,11 @@ async fn session(db: &rg_db::DatabaseConnection, user_id: i64, sudo: bool) -> St
         .unwrap()
         .unwrap();
     if sudo {
-        rg_core::auth::jwt::generate_authenticated_token(
+        rg_core::auth::jwt::generate_authenticated_token_with_mfa(
             user.id,
             &user.username,
             user.session_version,
+            user.totp_secret.as_deref(),
             SECRET,
             7,
         )
@@ -76,10 +77,10 @@ fn sudo_refusal(answer: &(u16, serde_json::Value)) -> bool {
     answer.0 == 403 && answer.1["error"]["reason"] == "sudo_required"
 }
 
-/// A local account confirms every enrolment with its password — the first
-/// one too — and a PAT may not touch the factor at all.
+/// First enrolment proves the password and new code; subsequent changes
+/// require current-factor proof. A PAT may not touch the factor at all.
 #[tokio::test]
-async fn a_local_account_confirms_every_change_with_its_password_and_a_pat_never_can() {
+async fn an_enrolled_account_requires_its_existing_factor_and_a_pat_never_can() {
     let (base, db) = spawn_test_app_with_db().await;
     let (fresh, user_id) = register_full(&base, "mfa_local", "mfa_local@example.com").await;
     let plain = session(&db, user_id, false).await;
@@ -113,6 +114,43 @@ async fn a_local_account_confirms_every_change_with_its_password_and_a_pat_never
     .await;
     assert_eq!(status, 200, "{body}");
 
+    // Neither an ordinary session nor still-fresh password-only sudo can
+    // remove the newly enrolled factor or mint a lasting credential.
+    for token in [&plain, &fresh] {
+        for path in [
+            "/users/mfa/setup",
+            "/users/mfa/disable",
+            "/users/mfa/backup/regenerate",
+            "/users/tokens",
+        ] {
+            let answer = post(
+                &base,
+                path,
+                token,
+                serde_json::json!({"password": PASSWORD, "name": "refused"}),
+            )
+            .await;
+            assert!(sudo_refusal(&answer), "{path}: {answer:?}");
+        }
+        let answer = post(
+            &base,
+            "/users/me/sudo",
+            token,
+            serde_json::json!({"password": PASSWORD}),
+        )
+        .await;
+        assert_eq!(answer.0, 400, "password alone cannot step up");
+    }
+    let (status, elevated) = post(
+        &base,
+        "/users/me/sudo",
+        &plain,
+        serde_json::json!({"password": PASSWORD, "backup_code": body["backup_codes"][0]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{elevated}");
+    let fresh = elevated["token"].as_str().unwrap().to_owned();
+
     let (status, created) = post(
         &base,
         "/users/tokens",
@@ -139,7 +177,7 @@ async fn a_local_account_confirms_every_change_with_its_password_and_a_pat_never
     }
 
     let (status, _) = post(&base, "/users/mfa/disable", &plain, serde_json::json!({})).await;
-    assert_eq!(status, 400, "disabling without the password");
+    assert_eq!(status, 403, "disabling without current-factor proof");
     let (status, _) = post(
         &base,
         "/users/mfa/disable",
@@ -147,7 +185,12 @@ async fn a_local_account_confirms_every_change_with_its_password_and_a_pat_never
         serde_json::json!({ "password": PASSWORD }),
     )
     .await;
-    assert_eq!(status, 200);
+    assert_eq!(
+        status, 403,
+        "the correct password does not replace the factor"
+    );
+    let answer = post(&base, "/users/mfa/disable", &fresh, serde_json::json!({})).await;
+    assert_eq!(answer.0, 200, "{answer:?}");
 }
 
 /// An account with no password here — SSO or directory — changes its factor
@@ -190,6 +233,9 @@ async fn a_passwordless_account_changes_its_factor_only_in_sudo_mode() {
     .await;
     assert_eq!(status, 200, "{body}");
 
+    // Model a new full provider+MFA/passkey proof after enrolment, not the
+    // passwordless first-factor session issued before it.
+    let fresh = session(&db, user.id, true).await;
     for path in ["/users/mfa/backup/regenerate", "/users/mfa/disable"] {
         let answer = post(&base, path, &stolen, serde_json::json!({})).await;
         assert!(

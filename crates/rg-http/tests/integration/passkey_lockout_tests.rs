@@ -288,6 +288,12 @@ async fn passkey_login_replaces_a_revoked_cookie_with_a_current_session() {
 async fn remembered_passkey_choice_is_bound_to_the_verified_ceremony() {
     let (base, db) = spawn_test_app_with_db().await;
     let (_, user_id) = register_full(&base, "pk-remember", "pk-remember@example.test").await;
+    rg_db::ops::user_ops::stage_pending_totp_secret(&db, user_id, "fixture-encrypted-factor")
+        .await
+        .unwrap();
+    rg_db::ops::user_ops::enable_mfa_with_backup_codes(&db, user_id, &[])
+        .await
+        .unwrap();
     let key = authenticator();
     rg_db::ops::passkey_credential_ops::create(
         &db,
@@ -337,6 +343,13 @@ async fn remembered_passkey_choice_is_bound_to_the_verified_ceremony() {
             .to_owned();
         assert_eq!(cookie.contains("Max-Age="), choice);
         let body: serde_json::Value = finish.json().await.unwrap();
+        let claims =
+            rg_core::auth::jwt::validate_token(body["token"].as_str().unwrap(), "test-secret-key")
+                .unwrap();
+        assert!(
+            claims.sudo_covers_mfa(Some("fixture-encrypted-factor"), "test-secret-key"),
+            "a user-verified passkey is complete MFA proof"
+        );
         assert_eq!(
             rg_core::auth::jwt::validate_token(body["token"].as_str().unwrap(), "test-secret-key")
                 .unwrap()

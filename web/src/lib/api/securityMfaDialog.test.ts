@@ -131,10 +131,10 @@ describe('MFA enrollment dialogs', () => {
 		mfa.regenerateBackup.mockResolvedValue({ backup_codes: backupCodes });
 		rendered = await renderComponent(SecurityPage);
 		const form = button(rendered.container, 'Regenerate backup codes').closest('form')!;
-		await input(element(form, 'input[type="password"]'), 'Test-password-1!');
+		expect(form.querySelector('input[type="password"]')).toBeNull();
 		await submit(form);
 		await answerConfirm();
-		expect(mfa.regenerateBackup).toHaveBeenCalledWith('Test-password-1!');
+		expect(mfa.regenerateBackup).toHaveBeenCalledWith();
 		for (const code of backupCodes) expect(dialog().textContent).toContain(code);
 	});
 });

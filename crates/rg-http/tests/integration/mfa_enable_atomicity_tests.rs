@@ -191,6 +191,7 @@ async fn a_failed_re_enrolment_keeps_the_codes_the_owner_already_has() {
 
     // Step 1 of the replacement, which by itself must change nothing the
     // account is using.
+    let token = crate::common::fresh_mfa_session(&db, user_id).await;
     let replacement = setup_and_current_code(&base, &token).await;
 
     let fault = fail_db_writes(&db, "mfa_backup_codes", DbWrite::Insert).await;

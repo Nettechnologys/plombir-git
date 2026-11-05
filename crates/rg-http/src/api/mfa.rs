@@ -30,7 +30,7 @@ use tracing;
 use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_credential};
-use crate::api::auth::{require_sudo, AuthUser, LoginSession};
+use crate::api::auth::{require_sudo_for_user, AuthUser, LoginSession};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -200,13 +200,21 @@ pub(crate) async fn confirm_second_factor(
 async fn finalize_mfa_login(
     state: &AppState,
     headers: &HeaderMap,
-    user_id: i64,
+    proved_user: &rg_db::entities::user::Model,
     auth_provider: &str,
 ) -> Result<rg_db::entities::user::Model, AppError> {
     let user = crate::api::users::finalized_login_user(
-        user_id,
-        rg_db::ops::user_ops::record_successful_login(&state.db, user_id).await,
+        proved_user.id,
+        rg_db::ops::user_ops::record_successful_login(&state.db, proved_user.id).await,
     )?;
+    if user.session_version != proved_user.session_version
+        || user.totp_secret != proved_user.totp_secret
+        || !user.mfa_enabled
+    {
+        return Err(AppError::unauthorized(
+            "authentication changed; sign in again",
+        ));
+    }
     let (ip_address, user_agent) = crate::api::audit::extract_ip_and_ua(headers);
     if let Err(error) = rg_db::ops::login_log_ops::log_attempt(
         &state.db,
@@ -250,7 +258,7 @@ const PENDING_ENROLMENT_TTL: chrono::Duration = chrono::Duration::minutes(30);
     responses(
         (status = 200, description = "TOTP secret and QR code generated", body = SetupMfaResponse),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "A personal access token, or, for an account with no password here, a session outside its sudo window (`reason: sudo_required`)"),
+        (status = 403, description = "A personal access token, or missing fresh proof of the existing factor (`reason: sudo_required`)"),
         (status = 404, description = "User not found"),
         (status = 500, description = "Internal server error"),
     ),
@@ -332,7 +340,7 @@ pub struct EnableMfaResponse {
         (status = 200, description = "MFA enabled successfully with backup codes", body = EnableMfaResponse),
         (status = 400, description = "Invalid TOTP code, no setup in flight, or a replacement without the account password"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "A personal access token, or, for an account with no password here, a session outside its sudo window (`reason: sudo_required`)"),
+        (status = 403, description = "A personal access token, or missing fresh proof of the existing factor (`reason: sudo_required`)"),
         (status = 404, description = "User not found"),
         (status = 500, description = "Internal server error"),
     ),
@@ -418,10 +426,18 @@ pub async fn enable_mfa(
     // was enabled. The promotion belongs in the same commit for the same
     // reason: a live secret replaced without the recovery set that goes with it
     // is the lockout this endpoint exists to avoid.
-    rg_db::ops::user_ops::enable_mfa_with_backup_codes(&state.db, user_id, &backup_codes)
+    if !rg_db::ops::user_ops::complete_mfa_enrolment(&state.db, &user, &backup_codes)
         .await
         .map_err(AppError::from)?
-        .ok_or_else(|| AppError::not_found("user not found"))?;
+    {
+        if rg_db::ops::user_ops::find_by_id(&state.db, user_id)
+            .await?
+            .is_none()
+        {
+            return Err(AppError::not_found("user not found"));
+        }
+        return Err(AppError::conflict("MFA setup changed; start it again"));
+    }
 
     // The method and how many codes were issued, and nothing else. The TOTP
     // secret is the factor and every backup code is a single-use password for
@@ -529,14 +545,15 @@ pub async fn verify_mfa(
     )
     .await?;
 
-    let user = finalize_mfa_login(&state, &headers, user.id, &challenge.auth_provider).await?;
+    let user = finalize_mfa_login(&state, &headers, &user, &challenge.auth_provider).await?;
     crate::metrics::recorder::auth_event("mfa", "success");
 
     // Issue JWT
-    let token = rg_core::auth::jwt::generate_authenticated_token(
+    let token = rg_core::auth::jwt::generate_authenticated_token_with_mfa(
         user.id,
         &user.username,
         user.session_version,
+        user.totp_secret.as_deref(),
         &state.jwt_secret,
         7,
     )
@@ -607,8 +624,8 @@ pub async fn get_backup_codes(
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct DisableMfaRequest {
-    /// The account password; an account without one here sends none and must
-    /// be in sudo mode instead.
+    /// Optional compatibility confirmation for older clients. Current-factor
+    /// sudo proof is required regardless; the SPA uses the shared sudo dialog.
     #[serde(default)]
     password: Option<String>,
 }
@@ -628,16 +645,11 @@ pub struct DisableMfaRequest {
 /// Authorise a change to the account's second factor, from a login session
 /// (never a PAT — the extractor already refused one).
 ///
-/// An account with a password of its own re-proves it, through the
-/// lockout-aware door. One whose password lives with its SSO provider or its
-/// directory has nothing to send here, so it must be in sudo mode instead —
-/// fresh from a provider sign-in, a directory bind or a passkey (decision #5,
-/// on top of #10). Without either, a stolen session could enrol an
-/// authenticator the owner never held and lock them out.
-///
-/// `password` is `None` on a step that asks for no password of a local
-/// account (`setup` stages a secret nothing reads yet; `enable` is where the
-/// password is asked).
+/// An enrolled account must prove its existing factor through sudo, including
+/// before staging a replacement. Password-only proof cannot remove MFA. First
+/// enrolment still proves the local password plus the new authenticator; a
+/// passwordless account uses its existing passkey/provider sudo proof instead.
+/// `password == None` is the preparatory step of a first enrolment only.
 async fn authorize_mfa_change(
     state: &AppState,
     headers: &HeaderMap,
@@ -646,8 +658,16 @@ async fn authorize_mfa_change(
     password: Option<Option<&str>>,
     channel: &'static str,
 ) -> Result<(), AppError> {
-    if !has_local_password(user) {
-        return require_sudo(claims);
+    if user.mfa_enabled || !has_local_password(user) {
+        require_sudo_for_user(claims, user, &state.jwt_secret)?;
+        // Older API clients may still explicitly confirm a local password.
+        // Honour it if present; the SPA uses the shared sudo dialog instead.
+        return match password.flatten().filter(|_| has_local_password(user)) {
+            Some(password) => {
+                confirm_account_password(state, user, password, channel, headers).await
+            }
+            None => Ok(()),
+        };
     }
     match password {
         None => Ok(()),
@@ -746,7 +766,7 @@ pub struct RegenerateBackupCodesResponse {
 }
 
 /// POST /users/mfa/backup/regenerate
-/// Replace the unused backup codes with a fresh set (requires current password).
+/// Replace the unused backup codes with a fresh set (requires current-factor sudo).
 ///
 /// Without this the only way to refresh a spent or leaked printout was to turn
 /// MFA off and on again — i.e. to drop the second factor in order to renew the
@@ -760,7 +780,7 @@ pub struct RegenerateBackupCodesResponse {
         (status = 200, description = "New backup codes, shown once", body = RegenerateBackupCodesResponse),
         (status = 400, description = "MFA is not enabled for this account"),
         (status = 401, description = "Unauthorized, invalid password, or account temporarily locked"),
-        (status = 403, description = "A personal access token, or, for an account with no password here, a session outside its sudo window (`reason: sudo_required`)"),
+        (status = 403, description = "A personal access token, or missing fresh proof of the existing factor (`reason: sudo_required`)"),
         (status = 404, description = "User not found"),
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Password verification is at capacity — retry shortly"),
@@ -824,7 +844,7 @@ pub async fn regenerate_backup_codes(
 }
 
 /// POST /users/mfa/disable
-/// Disable MFA (requires current password for security).
+/// Disable MFA (requires current-factor sudo).
 #[utoipa::path(
     post,
     path = "/users/mfa/disable",
@@ -833,7 +853,7 @@ pub async fn regenerate_backup_codes(
     responses(
         (status = 200, description = "MFA disabled successfully"),
         (status = 401, description = "Unauthorized, invalid password, or account temporarily locked"),
-        (status = 403, description = "A personal access token, or, for an account with no password here, a session outside its sudo window (`reason: sudo_required`)"),
+        (status = 403, description = "A personal access token, or missing fresh proof of the existing factor (`reason: sudo_required`)"),
         (status = 404, description = "User not found"),
         (status = 500, description = "Internal server error"),
         (status = 503, description = "Password verification is at capacity — retry shortly"),

@@ -233,7 +233,10 @@ async fn remembered_session_refresh_refuses_other_credentials_and_cross_site_req
 async fn remembered_mfa_choice_cannot_be_changed_in_the_second_factor_body() {
     let (base, db) = spawn_test_app_with_db().await;
     let (_, user_id) = register_full(&base, "remember-mfa", "remember-mfa@example.test").await;
-    rg_db::ops::user_ops::enable_mfa(&db, user_id)
+    rg_db::ops::user_ops::stage_pending_totp_secret(&db, user_id, "fixture-encrypted-factor")
+        .await
+        .unwrap();
+    rg_db::ops::user_ops::enable_mfa_with_backup_codes(&db, user_id, &[])
         .await
         .unwrap();
     let client = reqwest::Client::new();
@@ -259,6 +262,8 @@ async fn remembered_mfa_choice_cannot_be_changed_in_the_second_factor_body() {
             .json(&serde_json::json!({"username":"remember-mfa","code":code,"backup":true,"remember_me":!choice})).send().await.unwrap();
         assert_eq!(response.status(), 200);
         let body: serde_json::Value = response.json().await.unwrap();
+        let claims = jwt::validate_token(body["token"].as_str().unwrap(), SECRET).unwrap();
+        assert!(claims.sudo_covers_mfa(Some("fixture-encrypted-factor"), SECRET));
         assert_eq!(
             jwt::validate_token(body["token"].as_str().unwrap(), SECRET)
                 .unwrap()
