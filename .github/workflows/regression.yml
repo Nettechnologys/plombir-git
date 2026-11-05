@@ -85,7 +85,7 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       # --all-targets so tests, examples and benches are linted too: the deny
       # lints are about code that runs, and test code holding a guard across an
@@ -123,7 +123,7 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Build the workspace documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps -j 6
@@ -158,7 +158,7 @@ jobs:
         run: rustup toolchain install "${MSRV}" --profile minimal --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: msrv
 
@@ -186,11 +186,11 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       # Prebuilt binary — no from-source compile, keeps the gate fast.
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: cargo-nextest
 
@@ -299,7 +299,7 @@ jobs:
 
       # Prebuilt binaries — no from-source compile, keeps the gate fast.
       - name: Install cargo-audit and cargo-deny
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: cargo-audit,cargo-deny
 
@@ -326,7 +326,7 @@ jobs:
       # scripts/advisory-ignore-list-contract-check.mjs keeps equal to
       # .cargo/audit.toml and deny.toml; everything else is red.
       - name: Install osv-scanner
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
         with:
           tool: osv-scanner
 
@@ -373,7 +373,7 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Build Plombir Git
         run: cargo build -p rg-cli
@@ -407,7 +407,7 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -465,7 +465,7 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       # First, deliberately: this reproduces the original failure only while the
       # database is still empty, because that is when concurrent migrators race
@@ -588,7 +588,7 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Allow the migration account to create triggers with binary logging
         run: >-
