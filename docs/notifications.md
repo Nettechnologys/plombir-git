@@ -12,7 +12,7 @@ Save the page to store the current interface language (`en`, `ru`, `zh-CN`). Ord
 
 ## New-device policy and rollout
 
-Only a completely successful login can create a new-device alert. A signed, random browser witness cookie identifies a browser separately for each account; IP addresses and user-agent strings are descriptive context, not device identity. The cookie is HttpOnly, SameSite=Lax, path `/`, Secure on HTTPS, and has an absolute 180-day lifetime. Refresh does not extend it. The signature uses a domain-separated key derived from the JWT signing secret.
+Only a completely successful login can create a new-device alert. A signed, random browser witness cookie identifies a browser separately for each account; IP addresses and user-agent strings are descriptive context, not device identity. The cookie is HttpOnly, SameSite=Lax, path `/`, Secure on HTTPS, and has an absolute 180-day lifetime. Only authentication endpoints issue it; ordinary API traffic and session refresh do not create or renew it. The signature uses a domain-separated key derived from the JWT signing secret.
 
 After upgrade, the first completed login of **each browser for each account** generates an alert. No known browsers are seeded from existing sessions, login logs, IP addresses or user agents. Cookie deletion, private browsing, expiry or rotation of the JWT signing key also makes a browser new.
 

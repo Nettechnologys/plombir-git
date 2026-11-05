@@ -195,3 +195,11 @@ pub fn current_metadata() -> Metadata {
 pub fn current_actor_id() -> Option<i64> {
     CONTEXT.try_with(|context| context.0).ok().flatten()
 }
+
+/// Internal error adapter, not a database operation. Preserve DB error identity
+/// for transaction retries without rendering arbitrary error data into a string.
+pub(crate) fn db_error(error: anyhow::Error) -> sea_orm::DbErr {
+    error
+        .downcast::<sea_orm::DbErr>()
+        .unwrap_or_else(|_| sea_orm::DbErr::Custom("notification enqueue failed".into()))
+}

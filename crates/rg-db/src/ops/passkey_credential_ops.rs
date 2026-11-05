@@ -34,7 +34,7 @@ pub async fn create(
         None,
     )
     .await
-    .map_err(|error| super::notification_delivery_ops::db_error(error))?;
+    .map_err(crate::notification::db_error)?;
     txn.commit().await?;
     Ok(key)
 }
@@ -92,14 +92,14 @@ pub async fn delete(db: &DatabaseConnection, user_id: i64, id: i64) -> Result<bo
                     None,
                 )
                 .await
-                .map_err(|error| super::notification_delivery_ops::db_error(error))?;
+                .map_err(crate::notification::db_error)?;
             }
         }
         txn.commit().await?;
         Ok(res.rows_affected > 0)
     })
     .await
-    .map_err(|error| super::notification_delivery_ops::db_error(error))
+    .map_err(crate::notification::db_error)
 }
 
 /// Delete every passkey of an account, answering how many went.
@@ -120,7 +120,7 @@ pub async fn delete_all_for_user(db: &DatabaseConnection, user_id: i64) -> Resul
         None,
     )
     .await
-    .map_err(|error| super::notification_delivery_ops::db_error(error))?;
+    .map_err(crate::notification::db_error)?;
     txn.commit().await?;
     Ok(res.rows_affected)
 }

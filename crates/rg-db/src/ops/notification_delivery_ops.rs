@@ -280,14 +280,6 @@ pub async fn account_event(
     enqueue(db, &event).await
 }
 
-/// Retain database error identity for retryable transactions, without rendering
-/// an arbitrary error (which could include data) into another error string.
-pub fn db_error(error: anyhow::Error) -> DbErr {
-    error
-        .downcast::<DbErr>()
-        .unwrap_or_else(|_| DbErr::Custom("notification enqueue failed".into()))
-}
-
 pub async fn event_rows(
     db: &impl ConnectionTrait,
     user_id: i64,

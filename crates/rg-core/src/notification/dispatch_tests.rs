@@ -120,11 +120,12 @@ async fn smtp_disabled_does_not_prevent_telegram_and_latest_saved_language_wins(
     queue::put_profile(&db, profile).await.unwrap();
     let out = Recorder::default();
     pass(&db, &config(false), &out).await.unwrap();
-    let sent = out.sent.lock().unwrap();
-    assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].0, "telegram:-1001234:Some(42)");
-    assert!(sent[0].1.contains("新设备登录") && sent[0].1.contains("Alice <literal>"));
-    drop(sent);
+    {
+        let sent = out.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "telegram:-1001234:Some(42)");
+        assert!(sent[0].1.contains("新设备登录") && sent[0].1.contains("Alice <literal>"));
+    }
     for row in rows {
         let row = notification_delivery::Entity::find_by_id(row.id)
             .one(&db)
@@ -216,23 +217,24 @@ async fn old_confirmed_destination_survives_mute_locale_change_and_logout_but_is
     logout.update(&db).await.unwrap();
     let out = Recorder::default();
     pass(&db, &config(false), &out).await.unwrap();
-    let sent = out.sent.lock().unwrap();
-    assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].0, "telegram:-1001234:Some(42)");
-    assert!(sent[0].1.contains("Настройки уведомлений изменены"));
-    for excluded in [
-        TOKEN,
-        "Private actor",
-        "198.51.100.99",
-        "Private UA",
-        "-1001234",
-    ] {
-        assert!(!sent[0].1.contains(excluded));
+    {
+        let sent = out.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "telegram:-1001234:Some(42)");
+        assert!(sent[0].1.contains("Настройки уведомлений изменены"));
+        for excluded in [
+            TOKEN,
+            "Private actor",
+            "198.51.100.99",
+            "Private UA",
+            "-1001234",
+        ] {
+            assert!(!sent[0].1.contains(excluded));
+        }
+        assert!(sent[0]
+            .1
+            .contains("https://forge.invalid/settings/notifications"));
     }
-    assert!(sent[0]
-        .1
-        .contains("https://forge.invalid/settings/notifications"));
-    drop(sent);
     let rows = notification_delivery::Entity::find()
         .all(&db)
         .await
@@ -424,18 +426,20 @@ async fn real_thread_fanout_captures_both_channels_and_cancels_removed_or_folded
     .unwrap();
     let out = Recorder::default();
     pass(&db, &config(true), &out).await.unwrap();
-    let sent = out.sent.lock().unwrap();
-    assert_eq!(sent.len(), 8);
-    assert!(!sent
-        .iter()
-        .any(|(_, text)| text.contains("literal fixture 0") || text.contains("literal fixture 1")));
-    assert_eq!(
-        sent.iter()
-            .filter(|(target, _)| target.starts_with("telegram:"))
-            .count(),
-        4
-    );
-    drop(sent);
+    {
+        let sent = out.sent.lock().unwrap();
+        assert_eq!(sent.len(), 8);
+        assert!(!sent
+            .iter()
+            .any(|(_, text)| text.contains("literal fixture 0")
+                || text.contains("literal fixture 1")));
+        assert_eq!(
+            sent.iter()
+                .filter(|(target, _)| target.starts_with("telegram:"))
+                .count(),
+            4
+        );
+    }
     let cancelled = notification_delivery::Entity::find()
         .filter(notification_delivery::Column::LastError.eq("thread_removed_or_superseded"))
         .all(&db)
