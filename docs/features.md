@@ -106,6 +106,13 @@ initial enrolment or rotation, confirm with the new factor when next asked.
 Losing both the authenticator and all recovery methods requires administrator
 recovery; knowing the password alone is deliberately insufficient.
 
+The security page reads the explicit MFA-enabled flag, independently of backup
+code history. Disabling MFA revokes unused codes; used rows remain as history
+and do not mean the factor is still enabled. The backup status API returns
+`mfa_enabled` and `replacement_count` alongside the existing counts; `total`
+includes historical used rows. The page shows unused codes and used-code
+history separately, and uses the configured replacement count for re-issuance.
+
 Repository/org permission grants, CI secrets, webhooks, and administrator
 maintenance/deletion endpoints keep their existing role and PAT scope policies.
 These automation-capable APIs are distinct from credential issuance; this change

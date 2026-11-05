@@ -16,6 +16,9 @@ export interface MfaRegenerateBackupResponse {
 }
 
 export interface MfaBackupStatus {
+  mfa_enabled: boolean;
+  replacement_count: number;
+  /** Includes used codes retained as history, even after MFA is disabled. */
   total: number;
   unused: number;
   codes: { used: boolean; used_at?: string | null; created_at: string }[];

@@ -7,6 +7,7 @@ import {
 	button,
 	click,
 	renderComponent,
+	settle,
 	type RenderedComponent,
 } from '../test/render';
 
@@ -25,7 +26,7 @@ beforeEach(async () => {
 		display_name: 'Alice',
 	});
 	auth.listSsoLinks.mockResolvedValue([]);
-	mfa.backup.mockResolvedValue({ total: 0, unused: 0 });
+	mfa.backup.mockResolvedValue({ mfa_enabled: false, replacement_count: 10, total: 0, unused: 0 });
 	passkeys.list.mockResolvedValue([]);
 	await fetchUser();
 });
@@ -77,8 +78,8 @@ describe('Security page MFA state availability', () => {
 		expect(mfa.setup).not.toHaveBeenCalled();
 	});
 
-	it('still states an honest "no codes" as MFA being off, and offers setup', async () => {
-		mfa.backup.mockResolvedValue({ total: 0, unused: 0 });
+	it('uses the explicit disabled state and offers setup', async () => {
+		mfa.backup.mockResolvedValue({ mfa_enabled: false, replacement_count: 10, total: 0, unused: 0 });
 
 		rendered = await renderComponent(SecurityPage);
 
@@ -89,10 +90,48 @@ describe('Security page MFA state availability', () => {
 		expect(mfa.setup).toHaveBeenCalledOnce();
 	});
 
+	it.each([0, 3])('keeps an enabled factor enabled with %i historical codes and no unused codes', async (total) => {
+		mfa.backup.mockResolvedValue({ mfa_enabled: true, replacement_count: 10, total, unused: 0, codes: [] });
+		rendered = await renderComponent(SecurityPage);
+		expect(statusBadge(0)).toBe('Enabled');
+		expect(hasButton('Set up MFA')).toBe(false);
+		expect(hasButton('Disable MFA')).toBe(true);
+		expect(rendered.container.textContent).toContain('Issues a fresh set of 10 codes');
+	});
+
+	it('does not mistake retained used codes for an enabled factor on a fresh page load', async () => {
+		mfa.backup.mockResolvedValue({ mfa_enabled: false, replacement_count: 10, total: 3, unused: 0, codes: [] });
+		rendered = await renderComponent(SecurityPage);
+		expect(statusBadge(0)).toBe('Disabled');
+		expect(hasButton('Set up MFA')).toBe(true);
+		expect(hasButton('Disable MFA')).toBe(false);
+		expect(hasButton('Regenerate backup codes')).toBe(false);
+		expect(rendered.container.querySelector('.summary-grid')).toBeNull();
+	});
+
+	it('distinguishes used-code history from the size of a replacement set', async () => {
+		mfa.backup.mockResolvedValue({ mfa_enabled: true, replacement_count: 10, total: 13, unused: 10, codes: [] });
+		rendered = await renderComponent(SecurityPage);
+		const summary = rendered.container.querySelector('.summary-grid')!;
+		expect(Array.from(summary.querySelectorAll('strong'), (item) => item.textContent)).toEqual(['10', '3']);
+		expect(summary.textContent).toContain('used backup codes (history)');
+		expect(rendered.container.textContent).toContain('Issues a fresh set of 10 codes');
+		expect(rendered.container.textContent).not.toContain('Issues a fresh set of 13 codes');
+	});
+
+	it.each([0, 3])('does not infer MFA from a legacy response with %i codes', async (total) => {
+		mfa.backup.mockResolvedValue({ total, unused: 0, codes: [] });
+		rendered = await renderComponent(SecurityPage);
+		expect(statusBadge(0)).toBe('Unknown');
+		expect(hasButton('Set up MFA')).toBe(false);
+		expect(hasButton('Disable MFA')).toBe(false);
+		expect(hasButton('Retry reading MFA state')).toBe(true);
+	});
+
 	it('re-reads the MFA state instead of guessing it', async () => {
 		mfa.backup
 			.mockRejectedValueOnce(new Error('HTTP 500'))
-			.mockResolvedValueOnce({ total: 8, unused: 7 });
+			.mockResolvedValueOnce({ mfa_enabled: true, replacement_count: 10, total: 8, unused: 7 });
 
 		rendered = await renderComponent(SecurityPage);
 		await click(button(rendered.container, 'Retry reading MFA state'));
@@ -100,6 +139,21 @@ describe('Security page MFA state availability', () => {
 		expect(mfa.backup).toHaveBeenCalledTimes(2);
 		expect(statusBadge(0)).toBe('Enabled');
 		expect(rendered.container.textContent).toContain('unused backup codes');
+	});
+
+	it('shows loading rather than a failed read while retrying the MFA state', async () => {
+		mfa.backup.mockRejectedValueOnce(new Error('HTTP 500'));
+		rendered = await renderComponent(SecurityPage);
+		let complete!: (value: unknown) => void;
+		mfa.backup.mockImplementationOnce(() => new Promise((resolve) => { complete = resolve; }));
+		await click(button(rendered.container, 'Retry reading MFA state'));
+		expect(statusBadge(0)).toBe('Unknown');
+		expect(rendered.container.querySelector('.section')?.textContent).toContain('Loading');
+		expect(hasButton('Retry reading MFA state')).toBe(false);
+		expect(rendered.container.querySelector('.state-unknown')).toBeNull();
+		complete({ mfa_enabled: false, replacement_count: 10, total: 3, unused: 0, codes: [] });
+		await settle();
+		expect(statusBadge(0)).toBe('Disabled');
 	});
 });
 

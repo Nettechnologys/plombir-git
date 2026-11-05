@@ -213,7 +213,7 @@ describe('account and admin collection state ownership', () => {
 	});
 
 	it('does not let an older security load overwrite a confirmed passkey registration', async () => {
-		const initialBackup = deferred<{ total: number; unused: number }>();
+		const initialBackup = deferred<{ mfa_enabled: boolean; replacement_count: number; total: number; unused: number }>();
 		const initialPasskeys = deferred<ReturnType<typeof passkey>[]>();
 		const initialLinks = deferred<ReturnType<typeof ssoLink>[]>();
 		const mutation = deferred<unknown>();
@@ -233,7 +233,7 @@ describe('account and admin collection state ownership', () => {
 		await settle();
 		expect(rendered.container.textContent).toContain('1 active');
 
-		initialBackup.resolve({ total: 8, unused: 7 });
+		initialBackup.resolve({ mfa_enabled: true, replacement_count: 10, total: 8, unused: 7 });
 		initialPasskeys.resolve([passkey(1, 'stale-passkey')]);
 		initialLinks.resolve([ssoLink('current-sso', 'Current SSO')]);
 		await settle();

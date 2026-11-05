@@ -41,7 +41,7 @@ beforeEach(async () => {
 		display_name: 'Alice',
 	});
 	routeAuth.listSsoLinks.mockResolvedValue([]);
-	mfa.backup.mockResolvedValue({ total: 0, unused: 0 });
+	mfa.backup.mockResolvedValue({ mfa_enabled: false, replacement_count: 10, total: 0, unused: 0 });
 	passkeys.list.mockResolvedValue([]);
 	await fetchUser();
 });

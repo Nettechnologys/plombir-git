@@ -585,14 +585,16 @@ pub async fn verify_mfa(
 }
 
 /// GET /users/mfa/backup
-/// Get existing backup codes status (does not reveal unused codes).
+/// Read the live MFA flag and backup-code status without revealing codes.
+/// `total` includes used history; `replacement_count` is the size of a new set.
 #[utoipa::path(
     get,
     path = "/users/mfa/backup",
     tag = "MFA",
     responses(
-        (status = 200, description = "Backup codes status summary", body = serde_json::Value),
+        (status = 200, description = "MFA flag, replacement set size and backup code history summary", body = serde_json::Value),
         (status = 401, description = "Unauthorized"),
+        (status = 404, description = "User not found"),
         (status = 500, description = "Internal server error"),
     ),
 )]
@@ -600,6 +602,10 @@ pub async fn get_backup_codes(
     State(state): State<AppState>,
     AuthUser(user_id): AuthUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let user = rg_db::ops::user_ops::find_by_id(&state.db, user_id)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::not_found("user not found"))?;
     let codes = rg_db::ops::mfa_backup_code_ops::list_codes(&state.db, user_id)
         .await
         .map_err(AppError::from)?;
@@ -616,6 +622,11 @@ pub async fn get_backup_codes(
         .collect();
 
     Ok(Json(serde_json::json!({
+        // Used codes survive disabling or replacing the factor as history.
+        // Neither their presence nor their count describes the live factor
+        // or the size of the next set issued by regeneration.
+        "mfa_enabled": user.mfa_enabled,
+        "replacement_count": rg_db::ops::mfa_backup_code_ops::BACKUP_CODE_COUNT,
         "total": codes.len(),
         "unused": codes.iter().filter(|c| !c.used).count(),
         "codes": summary,

@@ -77,6 +77,93 @@ fn sudo_refusal(answer: &(u16, serde_json::Value)) -> bool {
     answer.0 == 403 && answer.1["error"]["reason"] == "sudo_required"
 }
 
+/// Used-code rows are retained history, not evidence that MFA is enabled and
+/// not the size of the next replacement set. Exercise the actual disable and
+/// re-enrolment endpoints with the three used rows from the reported UI bug.
+#[tokio::test]
+async fn backup_status_separates_the_live_factor_from_used_code_history() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, user_id) = register_full(&base, "mfa_history", "mfa_history@example.com").await;
+    let client = reqwest::Client::new();
+    let read_status = || async {
+        let response = client
+            .get(format!("{base}/api/v1/users/mfa/backup"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        response.json::<serde_json::Value>().await.unwrap()
+    };
+    let initial = read_status().await;
+    assert_eq!(initial["mfa_enabled"], false);
+    assert_eq!(initial["total"], 0);
+    assert_eq!(initial["replacement_count"], 10);
+
+    let secret = setup_secret(&base, &token).await;
+    let (status, enrolled) = post(
+        &base,
+        "/users/mfa/enable",
+        &token,
+        serde_json::json!({"code": current_code(&secret), "password": PASSWORD}),
+    )
+    .await;
+    assert_eq!(status, 200, "{enrolled}");
+    for code in enrolled["backup_codes"].as_array().unwrap().iter().take(3) {
+        assert!(rg_db::ops::mfa_backup_code_ops::verify_and_consume(
+            &db,
+            user_id,
+            code.as_str().unwrap()
+        )
+        .await
+        .unwrap());
+    }
+    let active = read_status().await;
+    assert_eq!(active["mfa_enabled"], true);
+    assert_eq!(active["total"], 10);
+    assert_eq!(active["unused"], 7);
+
+    let proof = session(&db, user_id, true).await;
+    let answer = post(&base, "/users/mfa/disable", &proof, serde_json::json!({})).await;
+    assert_eq!(answer.0, 200, "{answer:?}");
+    let disabled = read_status().await;
+    assert_eq!(disabled["mfa_enabled"], false);
+    assert_eq!(disabled["total"], 3, "used history remains available");
+    assert_eq!(disabled["unused"], 0);
+    assert_eq!(disabled["replacement_count"], 10);
+    assert!(disabled["codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|code| code["used"] == true && code.get("code_hash").is_none()));
+    let me: serde_json::Value = client
+        .get(format!("{base}/api/v1/users/me"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["mfa_enabled"], false);
+
+    let secret = setup_secret(&base, &token).await;
+    let answer = post(
+        &base,
+        "/users/mfa/enable",
+        &token,
+        serde_json::json!({"code": current_code(&secret), "password": PASSWORD}),
+    )
+    .await;
+    assert_eq!(answer.0, 200, "{answer:?}");
+    let reenabled = read_status().await;
+    assert_eq!(reenabled["mfa_enabled"], true);
+    assert_eq!(reenabled["total"], 13);
+    assert_eq!(reenabled["unused"], 10);
+    assert_eq!(reenabled["replacement_count"], 10);
+    assert_eq!(answer.1["backup_codes"].as_array().unwrap().len(), 10);
+}
+
 /// First enrolment proves the password and new code; subsequent changes
 /// require current-factor proof. A PAT may not touch the factor at all.
 #[tokio::test]

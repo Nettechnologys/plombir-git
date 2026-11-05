@@ -2228,7 +2228,7 @@
       "state_unknown": "The second factor of this account could not be read, so this page cannot say whether MFA is on. Starting a new setup from here would replace an authenticator that may still be live, so the read is offered again instead.",
       "retry": "Retry reading MFA state",
       "unused_codes": "unused backup codes",
-      "total_codes": "total backup codes",
+      "used_codes": "used backup codes (history)",
       "current_password": "Current password",
       "working": "Working...",
       "regenerate": "Regenerate backup codes",

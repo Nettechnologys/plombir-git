@@ -22,7 +22,7 @@ beforeEach(async () => {
 	auth.me.mockResolvedValue({ id: 1, username: 'alice', has_password: true });
 	auth.listSsoLinks.mockResolvedValue([]);
 	auth.listSsoProviders.mockResolvedValue([]);
-	mfa.backup.mockResolvedValue({ total: 0, unused: 0, codes: [] });
+	mfa.backup.mockResolvedValue({ mfa_enabled: false, replacement_count: 10, total: 0, unused: 0, codes: [] });
 	mfa.setup.mockResolvedValue(setupResponse);
 	mfa.enable.mockResolvedValue({ enabled: true, backup_codes: backupCodes });
 	passkeys.list.mockResolvedValue([]);
@@ -97,7 +97,7 @@ describe('MFA enrollment dialogs', () => {
 	it('shows newly issued backup codes in a modal after a successful confirmation', async () => {
 		await openSetup();
 		await fillSetup();
-		mfa.backup.mockResolvedValue({ total: 2, unused: 2, codes: [] });
+		mfa.backup.mockResolvedValue({ mfa_enabled: true, replacement_count: 10, total: 2, unused: 2, codes: [] });
 		await submit(element(dialog(), 'form'));
 		expect(mfa.enable).toHaveBeenCalledWith('123456', 'Test-password-1!');
 		expect(dialog().textContent).toContain('Backup Codes');
@@ -127,7 +127,7 @@ describe('MFA enrollment dialogs', () => {
 
 	it('also shows replacement backup codes in a modal after regeneration', async () => {
 		await rendered.destroy();
-		mfa.backup.mockResolvedValue({ total: 2, unused: 1, codes: [] });
+		mfa.backup.mockResolvedValue({ mfa_enabled: true, replacement_count: 10, total: 2, unused: 1, codes: [] });
 		mfa.regenerateBackup.mockResolvedValue({ backup_codes: backupCodes });
 		rendered = await renderComponent(SecurityPage);
 		const form = button(rendered.container, 'Regenerate backup codes').closest('form')!;
@@ -136,5 +136,26 @@ describe('MFA enrollment dialogs', () => {
 		await answerConfirm();
 		expect(mfa.regenerateBackup).toHaveBeenCalledWith();
 		for (const code of backupCodes) expect(dialog().textContent).toContain(code);
+	});
+
+	it('shows MFA as disabled after removal even when used backup codes remain', async () => {
+		await rendered.destroy();
+		mfa.backup.mockResolvedValueOnce({ mfa_enabled: true, replacement_count: 10, total: 10, unused: 7, codes: [] });
+		rendered = await renderComponent(SecurityPage);
+		mfa.disable.mockResolvedValue({ disabled: true });
+		let complete!: (value: unknown) => void;
+		mfa.backup.mockImplementationOnce(() => new Promise((resolve) => { complete = resolve; }));
+		await submit(button(rendered.container, 'Disable MFA').closest('form')!);
+		await answerConfirm();
+		expect(mfa.disable).toHaveBeenCalledOnce();
+		expect(rendered.container.querySelector('.success-box')?.textContent).toContain('MFA disabled');
+		// While refreshing, do not contradict the confirmed mutation with the old badge.
+		expect(rendered.container.querySelector('.status')?.textContent?.trim()).toBe('Unknown');
+		complete({ mfa_enabled: false, replacement_count: 10, total: 3, unused: 0, codes: [] });
+		await settle();
+		expect(rendered.container.querySelector('.status')?.textContent?.trim()).toBe('Disabled');
+		expect(button(rendered.container, 'Set up MFA').disabled).toBe(false);
+		expect(rendered.container.querySelector('.summary-grid')).toBeNull();
+		expect(rendered.container.textContent).not.toContain('Regenerate backup codes');
 	});
 });

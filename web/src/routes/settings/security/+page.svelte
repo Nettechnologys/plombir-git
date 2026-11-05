@@ -44,7 +44,8 @@
   const UNKNOWN = 'unknown';
   type Unknown = typeof UNKNOWN;
 
-  let backupStatus = $state<MfaBackupStatus | Unknown | null>(null);
+  let backupStatus = $state<MfaBackupStatus | Unknown>(UNKNOWN);
+  let backupStatusLoading = $state(true);
   // An account whose password lives with its SSO provider or its directory
   // has no password field to fill here: the server asks for sudo mode
   // instead, and the confirmation prompt handles that (decision #5). Until
@@ -81,7 +82,7 @@
 
   const mfaStateUnknown = $derived(backupStatus === UNKNOWN);
   const backupCodes = $derived(backupStatus === UNKNOWN ? null : backupStatus);
-  const mfaEnabled = $derived((backupCodes?.total ?? 0) > 0);
+  const mfaEnabled = $derived(backupCodes?.mfa_enabled === true);
   const passkeyListUnknown = $derived(passkeyList === UNKNOWN);
   const knownPasskeys = $derived(passkeyList === UNKNOWN ? [] : passkeyList);
   const ssoLinksUnknown = $derived(ssoLinks === UNKNOWN);
@@ -137,14 +138,21 @@
 
   async function loadBackupStatus() {
     const claim = backupStatusRequests.begin('backup-status');
+    backupStatus = UNKNOWN;
+    backupStatusLoading = true;
     const result = await optionalSection(
       mfa.backup(),
       'the multi-factor state of this account',
     );
 
-    if (isUnavailable(result)) {
-      if (backupStatusRequests.owns(claim, 'backup-status')) backupStatus = UNKNOWN;
-    } else if (backupStatusRequests.owns(claim, 'backup-status')) {
+    if (!backupStatusRequests.owns(claim, 'backup-status')) return;
+    backupStatusLoading = false;
+    // An older or incomplete response cannot establish the factor's state.
+    // In particular, retained used codes must never be treated as proof of MFA.
+    if (isUnavailable(result) || typeof result?.mfa_enabled !== 'boolean'
+      || !Number.isInteger(result.replacement_count) || result.replacement_count <= 0) {
+      backupStatus = UNKNOWN;
+    } else {
       backupStatus = result;
     }
   }
@@ -423,7 +431,7 @@
       </span>
     </div>
 
-    {#if loading}
+    {#if loading || backupStatusLoading}
       <p class="muted">{t('common.loading')}</p>
     {:else if mfaStateUnknown}
       <p class="muted state-unknown">{t('account_security.mfa.state_unknown')}</p>
@@ -437,8 +445,8 @@
           <span>{t('account_security.mfa.unused_codes')}</span>
         </div>
         <div>
-          <strong>{backupCodes?.total ?? 0}</strong>
-          <span>{t('account_security.mfa.total_codes')}</span>
+          <strong>{(backupCodes?.total ?? 0) - (backupCodes?.unused ?? 0)}</strong>
+          <span>{t('account_security.mfa.used_codes')}</span>
         </div>
       </div>
 
@@ -449,7 +457,7 @@
         </button>
       </form>
       <p class="muted">
-        {t('account_security.mfa.regenerate_hint', { count: backupCodes?.total ?? 0 })}
+        {t('account_security.mfa.regenerate_hint', { count: backupCodes?.replacement_count ?? 0 })}
       </p>
 
       <form class="disable-form" onsubmit={disableMfa}>

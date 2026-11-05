@@ -43,7 +43,7 @@ beforeEach(async () => {
 			provider_enabled: false,
 		},
 	]);
-	mfa.backup.mockResolvedValue({ total: 0, unused: 0 });
+	mfa.backup.mockResolvedValue({ mfa_enabled: false, replacement_count: 10, total: 0, unused: 0 });
 	passkeys.list.mockResolvedValue([]);
 	await fetchUser();
 });

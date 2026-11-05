@@ -2228,7 +2228,7 @@
       "state_unknown": "无法读取此账号的第二因素，因此本页无法判断 MFA 是否已开启。在这里重新设置可能会替换一个仍在使用的身份验证器，所以这里提供的是重新读取，而不是设置。",
       "retry": "重新读取 MFA 状态",
       "unused_codes": "个未使用的备用码",
-      "total_codes": "个备用码（总计）",
+      "used_codes": "个已使用的备用码（历史记录）",
       "current_password": "当前密码",
       "working": "处理中...",
       "regenerate": "重新生成备用码",
