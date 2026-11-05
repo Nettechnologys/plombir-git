@@ -11,6 +11,10 @@ or a Personal Access Token. These examples continue the
 value generated there. Save that password securely before
 closing its shell.
 
+Personal notification settings and delivery tests require a login session;
+PATs cannot access the saved Telegram destination. See the
+[notification API and fresh-proof policy](notifications.md#api-contract).
+
 ```bash
 # Login → returns a JWT
 TOKEN="$(curl -fsS -X POST "$BASE_URL/api/v1/users/login" \

@@ -2503,12 +2503,22 @@ pub(crate) fn build_all_routes(
         .get(
             User,
             "/users/me/notification-settings",
-            api::notifications::get_notification_settings,
+            api::notifications::delivery_settings::get_notification_settings,
         )
         .put(
             User,
             "/users/me/notification-settings",
-            api::notifications::update_notification_settings,
+            api::notifications::delivery_settings::update_notification_settings,
+        )
+        .post(
+            User,
+            "/users/me/notification-settings/test",
+            api::notifications::delivery_settings::test_notification,
+        )
+        .get(
+            User,
+            "/users/me/notification-settings/test",
+            api::notifications::delivery_settings::notification_test_result,
         )
         .get(
             RepoAuthRead,

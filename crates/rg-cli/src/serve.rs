@@ -2150,6 +2150,14 @@ fn build_transports(
             Some(shutdown_rx.clone()),
         )
     });
+    // Telegram/security delivery must run even when SMTP is disabled.
+    let notification_channels = rg_core::notification::dispatch::spawn_dispatcher(
+        storage.db_write.clone(),
+        settings.auth_secrets.encryption_key.clone(),
+        smtp_config.clone(),
+        settings.external_url.clone(),
+        shutdown_rx.clone(),
+    )?;
     let mirror_sync = spawn_mirror_sync(&settings, storage, &post_push_context, shutdown_rx)?;
     // `on: schedule`. Always on: a workflow that declares a schedule asks for
     // it, and the floor below is the operator's only knob over how often.
@@ -2272,6 +2280,7 @@ fn build_transports(
         ssh,
         workers: notification_mail
             .into_iter()
+            .chain(Some(notification_channels))
             .chain(mirror_sync)
             .chain(Some(push_mirrors))
             .chain(Some(ci_schedule))

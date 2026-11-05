@@ -34,6 +34,7 @@ mod common;
 mod compare_and_fork_head_tests;
 mod link_preview_tests;
 mod notification_routing_tests;
+mod notification_delivery_settings_tests;
 mod pull_request_deletion_tests;
 mod push_mirror_tests;
 mod repo_redirect_tests;
