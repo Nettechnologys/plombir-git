@@ -46,6 +46,37 @@ pub async fn upsert(
         .one(&transaction)
         .await
         .context("db: read agent profile before write")?;
+    let mut before_repos = if let Some(old) = &existing {
+        agent_profile_repository::Entity::find()
+            .filter(agent_profile_repository::Column::ProfileId.eq(old.id))
+            .all(&transaction)
+            .await?
+            .into_iter()
+            .map(|row| row.repository_id)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    before_repos.sort_unstable();
+    let mut new_repos = repository_ids.to_vec();
+    new_repos.sort_unstable();
+    new_repos.dedup();
+    let mut changed = Vec::new();
+    macro_rules! changed_field { ($($field:ident),+)=>{$(if existing.as_ref().is_none_or(|old|old.$field!=model.$field) { changed.push(stringify!($field).to_owned()); })+}; }
+    changed_field!(
+        enabled,
+        preset,
+        image,
+        command,
+        runner_tags,
+        model_key_encrypted,
+        timeout_secs,
+        max_runs_per_day,
+        max_iterations
+    );
+    if before_repos != new_repos {
+        changed.push("repositories".into());
+    }
     let active = active_for_write(model, existing.as_ref());
     let profile = if existing.is_some() {
         active
@@ -77,6 +108,22 @@ pub async fn upsert(
         .await
         .context("db: record agent profile repositories")?;
     }
+    if !changed.is_empty() {
+        if let Some(bot) = crate::entities::user::Entity::find_by_id(profile.bot_id)
+            .one(&transaction)
+            .await?
+        {
+            if let Some(owner) = bot.bot_owner_id {
+                let mut event = super::notification_delivery_ops::QueueEvent::security(
+                    owner,
+                    crate::notification::Event::AgentProfileChanged,
+                    Some(bot.username),
+                );
+                event.metadata.changed = changed;
+                super::notification_delivery_ops::enqueue(&transaction, &event).await?;
+            }
+        }
+    }
     transaction
         .commit()
         .await
@@ -101,10 +148,28 @@ fn active_for_write(
 /// Delete bot `bot_id`'s profile and, through the cascade, its repository list.
 /// `false` when there was none.
 pub async fn delete_by_bot(db: &DatabaseConnection, bot_id: i64) -> Result<bool> {
+    let txn = db.begin().await?;
     let result = ProfileEntity::delete_many()
         .filter(agent_profile::Column::BotId.eq(bot_id))
-        .exec(db)
+        .exec(&txn)
         .await
         .context("db: delete agent profile")?;
+    if result.rows_affected > 0 {
+        if let Some(bot) = crate::entities::user::Entity::find_by_id(bot_id)
+            .one(&txn)
+            .await?
+        {
+            if let Some(owner) = bot.bot_owner_id {
+                let mut event = super::notification_delivery_ops::QueueEvent::security(
+                    owner,
+                    crate::notification::Event::AgentProfileChanged,
+                    Some(bot.username),
+                );
+                event.metadata.changed = vec!["profile_removed".into()];
+                super::notification_delivery_ops::enqueue(&txn, &event).await?;
+            }
+        }
+    }
+    txn.commit().await?;
     Ok(result.rows_affected > 0)
 }

@@ -14,6 +14,31 @@ pub struct RequestId(pub String);
 
 static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
+/// Safe description for transaction-local producers. This is not an auth
+/// decision: existing route/session guards still authorize every mutation.
+pub async fn notification_context(
+    State(state): State<crate::AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let claims = crate::api::auth::session_claims(request.headers(), &state.jwt_secret);
+    let actor_id = claims
+        .as_ref()
+        .and_then(|claims| claims.sub.parse::<i64>().ok());
+    let (ip, device) = crate::api::audit::extract_ip_and_ua(request.headers());
+    rg_db::notification::scope(
+        actor_id,
+        rg_db::notification::Metadata {
+            actor: claims.map(|claims| claims.username),
+            ip,
+            device,
+            ..Default::default()
+        },
+        next.run(request),
+    )
+    .await
+}
+
 /// HTTP metrics middleware - records request count, duration, and in-flight count.
 ///
 /// Uses `MatchedPath` to normalize route templates like `/users/{id}` instead of

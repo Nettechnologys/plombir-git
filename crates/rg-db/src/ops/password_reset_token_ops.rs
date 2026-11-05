@@ -164,6 +164,15 @@ pub async fn complete_password_reset(
 
         match result {
             Ok(Some(user)) => {
+                super::notification_delivery_ops::account_event(
+                    &transaction,
+                    user_id,
+                    crate::notification::Event::PasswordReset,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
                 transaction
                     .commit()
                     .await

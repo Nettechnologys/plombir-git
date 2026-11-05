@@ -3186,6 +3186,10 @@ pub(crate) fn build_all_routes(
     // Bearer JWT before the (JWT-only) handlers run.
     let api_v1 = api_v1.layer(axum::middleware::from_fn_with_state(
         state.clone(),
+        crate::middleware::notification_context,
+    ));
+    let api_v1 = api_v1.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
         pat_auth::pat_auth_middleware,
     ));
 

@@ -145,9 +145,19 @@ pub async fn reissue_codes(
     codes: &[String],
 ) -> anyhow::Result<()> {
     crate::contention::retry_transaction("re-issue MFA backup codes", || async {
-        set_codes(db, user_id, codes)
-            .await
-            .map_err(anyhow::Error::from)
+        let txn = db.begin().await?;
+        set_codes(&txn, user_id, codes).await?;
+        super::notification_delivery_ops::account_event(
+            &txn,
+            user_id,
+            crate::notification::Event::BackupCodesRegenerated,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(())
     })
     .await
 }

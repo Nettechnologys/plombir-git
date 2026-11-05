@@ -76,9 +76,24 @@ pub async fn link(
         created_at: Set(now),
         updated_at: Set(now),
     };
-    match am.insert(db).await {
-        Ok(inserted) => Ok(Some(inserted)),
+    let txn = db.begin().await?;
+    match am.insert(&txn).await {
+        Ok(inserted) => {
+            super::notification_delivery_ops::account_event(
+                &txn,
+                user_id,
+                crate::notification::Event::ExternalLoginLinked,
+                None,
+                Some(provider.into()),
+                None,
+            )
+            .await
+            .map_err(super::notification_delivery_ops::db_error)?;
+            txn.commit().await?;
+            Ok(Some(inserted))
+        }
         Err(error) if crate::is_unique_violation(&error) => {
+            txn.rollback().await?;
             // Lost the race for the first row. Whoever won holds this exact
             // identity, so treat it the way the existing-row branch would.
             match find_by_provider_and_uid(db, provider, provider_user_id).await? {
@@ -89,7 +104,10 @@ pub async fn link(
                 None => Err(error),
             }
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            txn.rollback().await?;
+            Err(error)
+        }
     }
 }
 
@@ -135,6 +153,16 @@ pub async fn link_with_new_user(
         }
         .insert(&transaction)
         .await?;
+        super::notification_delivery_ops::account_event(
+            &transaction,
+            user.id,
+            crate::notification::Event::ExternalLoginLinked,
+            None,
+            Some(provider.into()),
+            None,
+        )
+        .await
+        .map_err(super::notification_delivery_ops::db_error)?;
         Ok((user, link))
     }
     .await;
@@ -196,10 +224,34 @@ pub async fn touch_existing(
 /// A `user_id` that does not own `id` is likewise `false` — indistinguishable
 /// from "no such link", which is what the caller answers either way.
 pub async fn delete_by_id(db: &DatabaseConnection, id: i64, user_id: i64) -> Result<bool, DbErr> {
-    let res = Entity::delete_many()
-        .filter(oauth_account::Column::Id.eq(id))
-        .filter(oauth_account::Column::UserId.eq(user_id))
-        .exec(db)
-        .await?;
-    Ok(res.rows_affected > 0)
+    crate::contention::retry_transaction("notification oauth_account_ops delete", || async {
+        let txn = db.begin().await?;
+        let before = Entity::find_by_id(id)
+            .filter(oauth_account::Column::UserId.eq(user_id))
+            .one(&txn)
+            .await?;
+        let res = Entity::delete_many()
+            .filter(oauth_account::Column::Id.eq(id))
+            .filter(oauth_account::Column::UserId.eq(user_id))
+            .exec(&txn)
+            .await?;
+        if res.rows_affected > 0 {
+            if let Some(link) = before {
+                super::notification_delivery_ops::account_event(
+                    &txn,
+                    user_id,
+                    crate::notification::Event::ExternalLoginUnlinked,
+                    None,
+                    Some(link.provider),
+                    None,
+                )
+                .await
+                .map_err(super::notification_delivery_ops::db_error)?;
+            }
+        }
+        txn.commit().await?;
+        Ok(res.rows_affected > 0)
+    })
+    .await
+    .map_err(super::notification_delivery_ops::db_error)
 }

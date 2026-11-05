@@ -14,6 +14,9 @@ pub mod telegram;
 pub mod template;
 pub mod thread;
 
+#[cfg(test)]
+mod producer_tests;
+
 /// Paginated list of notifications. Returns (data, total).
 pub async fn list_notifications_paginated(
     db: &DatabaseConnection,

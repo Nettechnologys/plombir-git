@@ -36,7 +36,17 @@ pub async fn list_by_repo(db: &DatabaseConnection, repo_id: i64) -> Result<Vec<D
 }
 
 pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<DeployKey> {
-    model.insert(db).await.context("db: create deploy key")
+    let txn = db.begin().await?;
+    let key = model.insert(&txn).await.context("db: create deploy key")?;
+    record(
+        &txn,
+        &key,
+        crate::notification::Event::DeployKeyAdded,
+        key.created_by_id,
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(key)
 }
 
 /// Record that a deploy key was used, at most once per
@@ -69,9 +79,46 @@ pub async fn touch_last_used(
 /// revocation can win in between; reporting `rows_affected` is what lets the
 /// route answer 404 instead of confirming a revocation it did not perform.
 pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
-    let result = DeployKeyEntity::delete_by_id(id)
-        .exec(db)
-        .await
-        .context("db: delete deploy key")?;
-    Ok(result.rows_affected > 0)
+    crate::contention::retry_transaction("notification deploy_key_ops delete", || async {
+        let txn = db.begin().await?;
+        let before = DeployKeyEntity::find_by_id(id).one(&txn).await?;
+        let result = DeployKeyEntity::delete_by_id(id)
+            .exec(&txn)
+            .await
+            .context("db: delete deploy key")?;
+        if result.rows_affected > 0 {
+            if let Some(key) = before {
+                record(
+                    &txn,
+                    &key,
+                    crate::notification::Event::DeployKeyRemoved,
+                    crate::notification::current_actor_id(),
+                )
+                .await?;
+            }
+        }
+        txn.commit().await?;
+        Ok(result.rows_affected > 0)
+    })
+    .await
+}
+
+async fn record(
+    db: &impl ConnectionTrait,
+    key: &DeployKey,
+    event: crate::notification::Event,
+    actor: Option<i64>,
+) -> Result<()> {
+    if let Some(actor) = actor {
+        let mut event = super::notification_delivery_ops::QueueEvent::security(
+            actor,
+            event,
+            Some(key.title.clone()),
+        );
+        event.metadata.fingerprint = Some(key.fingerprint.clone());
+        event.repo_id = Some(key.repo_id);
+        event.admin_only = true;
+        super::notification_delivery_ops::enqueue(db, &event).await?;
+    }
+    Ok(())
 }

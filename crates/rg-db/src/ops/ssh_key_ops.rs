@@ -38,7 +38,19 @@ pub async fn list_by_user(db: &DatabaseConnection, user_id: i64) -> Result<Vec<S
 
 /// Create a new SSH key.
 pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<SshKey> {
-    model.insert(db).await.context("db: create ssh key")
+    let txn = db.begin().await?;
+    let key = model.insert(&txn).await.context("db: create ssh key")?;
+    super::notification_delivery_ops::account_event(
+        &txn,
+        key.user_id,
+        crate::notification::Event::SshKeyAdded,
+        None,
+        Some(key.title.clone()),
+        Some(key.fingerprint.clone()),
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(key)
 }
 
 /// Record that an SSH key was used, at most once per
@@ -71,9 +83,28 @@ pub async fn touch_last_used(
 /// revocation can win in between; reporting `rows_affected` is what lets the
 /// route answer 404 instead of confirming a revocation it did not perform.
 pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
-    let result = SshKeyEntity::delete_by_id(id)
-        .exec(db)
-        .await
-        .context("db: delete ssh key")?;
-    Ok(result.rows_affected > 0)
+    crate::contention::retry_transaction("notification ssh_key_ops delete", || async {
+        let txn = db.begin().await?;
+        let before = SshKeyEntity::find_by_id(id).one(&txn).await?;
+        let result = SshKeyEntity::delete_by_id(id)
+            .exec(&txn)
+            .await
+            .context("db: delete ssh key")?;
+        if result.rows_affected > 0 {
+            if let Some(key) = before {
+                super::notification_delivery_ops::account_event(
+                    &txn,
+                    key.user_id,
+                    crate::notification::Event::SshKeyRemoved,
+                    None,
+                    Some(key.title),
+                    Some(key.fingerprint),
+                )
+                .await?;
+            }
+        }
+        txn.commit().await?;
+        Ok(result.rows_affected > 0)
+    })
+    .await
 }

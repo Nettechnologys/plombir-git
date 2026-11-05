@@ -61,15 +61,20 @@ pub async fn find_active_by_username(
 /// so this caller does not own the deletion and must not start retiring storage
 /// a concurrent deleter is also retiring.
 pub async fn begin_user_retirement(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let txn = db.begin().await?;
     let now = chrono::Utc::now();
     let result = UserEntity::update_many()
         .col_expr(user::Column::DeletedAt, Expr::value(Some(now)))
         .col_expr(user::Column::UpdatedAt, Expr::value(now))
         .filter(user::Column::Id.eq(id))
         .filter(user::Column::DeletedAt.is_null())
-        .exec(db)
+        .exec(&txn)
         .await
         .context("db: begin user retirement")?;
+    if result.rows_affected > 0 {
+        super::notification_delivery_ops::cancel_account(&txn, id).await?;
+    }
+    txn.commit().await?;
     Ok(result.rows_affected > 0)
 }
 
@@ -263,7 +268,21 @@ pub async fn list_users(
 
 /// Create a new user and return the persisted model.
 pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<User> {
-    model.insert(db).await.context("db: create user")
+    let txn = db.begin().await?;
+    let user = model.insert(&txn).await.context("db: create user")?;
+    if user.is_bot() {
+        super::notification_delivery_ops::account_event(
+            &txn,
+            user.id,
+            crate::notification::Event::BotCreated,
+            None,
+            Some(user.username.clone()),
+            None,
+        )
+        .await?;
+    }
+    txn.commit().await?;
+    Ok(user)
 }
 
 ///
@@ -801,6 +820,19 @@ pub async fn complete_mfa_enrolment(
             return Ok(false);
         }
         crate::ops::mfa_backup_code_ops::set_codes(&transaction, expected.id, codes).await?;
+        super::notification_delivery_ops::account_event(
+            &transaction,
+            expected.id,
+            if expected.mfa_enabled {
+                crate::notification::Event::MfaReplaced
+            } else {
+                crate::notification::Event::MfaEnabled
+            },
+            None,
+            None,
+            None,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(true)
     })
@@ -1036,6 +1068,17 @@ where
             crate::ops::mfa_backup_code_ops::set_codes(&transaction, user_id, &[])
                 .await
                 .context("db: revoke MFA backup codes")?;
+            if model.as_ref().is_some_and(|old| old.mfa_enabled) {
+                super::notification_delivery_ops::account_event(
+                    &transaction,
+                    user_id,
+                    crate::notification::Event::MfaDisabled,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            }
             Ok(Some(user))
         }
         .await;
@@ -1333,10 +1376,20 @@ where
         after_read().await?;
 
         crate::serialized_user_grants::remove_user(&transaction, id).await?;
+        let bot_owner = model.is_bot().then_some(model.bot_owner_id).flatten();
+        let bot_name = model.username.clone();
         model
             .delete(&transaction)
             .await
             .context("db: delete user")?;
+        if let Some(owner) = bot_owner {
+            let event = super::notification_delivery_ops::QueueEvent::security(
+                owner,
+                crate::notification::Event::BotDeleted,
+                Some(bot_name),
+            );
+            super::notification_delivery_ops::enqueue(&transaction, &event).await?;
+        }
         crate::ops::repo_ops::refresh_stars_counts(&transaction, &starred).await?;
         transaction
             .commit()
@@ -1455,6 +1508,19 @@ async fn write_password(
         .await;
         match result {
             Ok(Some(user)) => {
+                super::notification_delivery_ops::account_event(
+                    &transaction,
+                    user_id,
+                    if change_required {
+                        crate::notification::Event::AdminPasswordReset
+                    } else {
+                        crate::notification::Event::PasswordChanged
+                    },
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
                 transaction
                     .commit()
                     .await
@@ -1489,21 +1555,48 @@ pub async fn update_email(
     user_id: i64,
     email: &str,
 ) -> Result<Option<User>> {
-    let now = chrono::Utc::now();
-    let updated = UserEntity::update_many()
-        .col_expr(user::Column::Email, Expr::value(email.to_string()))
-        .col_expr(user::Column::EmailVerifiedAt, Expr::value(now))
-        .col_expr(user::Column::UpdatedAt, Expr::value(now))
-        .filter(user::Column::Id.eq(user_id))
-        .filter(user::Column::IsActive.eq(true))
-        .filter(user::Column::DeletedAt.is_null())
-        .exec(db)
-        .await
-        .context("db: change a user's email")?;
-    if updated.rows_affected == 0 {
-        return Ok(None);
-    }
-    find_by_id(db, user_id).await
+    crate::contention::retry_transaction("change account email", || async {
+        let txn = db.begin().await?;
+        UserEntity::update_many()
+            .col_expr(
+                user::Column::SessionVersion,
+                Expr::col(user::Column::SessionVersion).into(),
+            )
+            .filter(user::Column::Id.eq(user_id))
+            .exec(&txn)
+            .await?;
+        let before = UserEntity::find_by_id(user_id).one(&txn).await?;
+        let now = chrono::Utc::now();
+        UserEntity::update_many()
+            .col_expr(user::Column::Email, Expr::value(email.to_string()))
+            .col_expr(user::Column::EmailVerifiedAt, Expr::value(now))
+            .col_expr(user::Column::UpdatedAt, Expr::value(now))
+            .filter(user::Column::Id.eq(user_id))
+            .filter(user::Column::IsActive.eq(true))
+            .filter(user::Column::DeletedAt.is_null())
+            .exec(&txn)
+            .await
+            .context("db: change a user's email")?;
+        let current = UserEntity::find_by_id(user_id)
+            .filter(user::Column::IsActive.eq(true))
+            .filter(user::Column::DeletedAt.is_null())
+            .one(&txn)
+            .await?;
+        if current.is_some() && before.as_ref().is_some_and(|old| old.email != email) {
+            super::notification_delivery_ops::account_event(
+                &txn,
+                user_id,
+                crate::notification::Event::EmailChanged,
+                None,
+                None,
+                None,
+            )
+            .await?;
+        }
+        txn.commit().await?;
+        Ok(current)
+    })
+    .await
 }
 
 /// Record that `user_id` proved it receives mail at `email`.

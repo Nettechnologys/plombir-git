@@ -23,7 +23,20 @@ pub async fn create(
         created_at: Set(chrono::Utc::now()),
         last_used_at: Set(None),
     };
-    am.insert(db).await
+    let txn = db.begin().await?;
+    let key = am.insert(&txn).await?;
+    super::notification_delivery_ops::account_event(
+        &txn,
+        user_id,
+        crate::notification::Event::PasskeyAdded,
+        None,
+        Some(name.into()),
+        None,
+    )
+    .await
+    .map_err(super::notification_delivery_ops::db_error)?;
+    txn.commit().await?;
+    Ok(key)
 }
 
 /// Count credentials created before the relying-party id was persisted.
@@ -57,20 +70,58 @@ pub async fn list_by_user(
 
 /// Delete a passkey by id, scoped to its owner. Returns true if a row was removed.
 pub async fn delete(db: &DatabaseConnection, user_id: i64, id: i64) -> Result<bool, DbErr> {
-    let res = Entity::delete_many()
-        .filter(passkey_credential::Column::Id.eq(id))
-        .filter(passkey_credential::Column::UserId.eq(user_id))
-        .exec(db)
-        .await?;
-    Ok(res.rows_affected > 0)
+    crate::contention::retry_transaction("notification passkey_credential_ops delete", || async {
+        let txn = db.begin().await?;
+        let before = Entity::find_by_id(id)
+            .filter(passkey_credential::Column::UserId.eq(user_id))
+            .one(&txn)
+            .await?;
+        let res = Entity::delete_many()
+            .filter(passkey_credential::Column::Id.eq(id))
+            .filter(passkey_credential::Column::UserId.eq(user_id))
+            .exec(&txn)
+            .await?;
+        if res.rows_affected > 0 {
+            if let Some(key) = before {
+                super::notification_delivery_ops::account_event(
+                    &txn,
+                    user_id,
+                    crate::notification::Event::PasskeyRemoved,
+                    None,
+                    Some(key.name),
+                    None,
+                )
+                .await
+                .map_err(super::notification_delivery_ops::db_error)?;
+            }
+        }
+        txn.commit().await?;
+        Ok(res.rows_affected > 0)
+    })
+    .await
+    .map_err(super::notification_delivery_ops::db_error)
 }
 
 /// Delete every passkey of an account, answering how many went.
 pub async fn delete_all_for_user(db: &DatabaseConnection, user_id: i64) -> Result<u64, DbErr> {
+    let txn = db.begin().await?;
     let res = Entity::delete_many()
         .filter(passkey_credential::Column::UserId.eq(user_id))
-        .exec(db)
+        .exec(&txn)
         .await?;
+    // Final durable stage of the shared operator reset, including a TOTP-only
+    // reset with zero passkeys. Its earlier session revocation remains staged.
+    super::notification_delivery_ops::account_event(
+        &txn,
+        user_id,
+        crate::notification::Event::AdminFactorsReset,
+        None,
+        None,
+        None,
+    )
+    .await
+    .map_err(super::notification_delivery_ops::db_error)?;
+    txn.commit().await?;
     Ok(res.rows_affected)
 }
 

@@ -51,20 +51,54 @@ pub async fn create(
     db: &DatabaseConnection,
     model: commit_signing_key::ActiveModel,
 ) -> Result<commit_signing_key::Model> {
-    model
-        .insert(db)
+    let txn = db.begin().await?;
+    let key = model
+        .insert(&txn)
         .await
-        .context("db: create commit signing key")
+        .context("db: create commit signing key")?;
+    super::notification_delivery_ops::account_event(
+        &txn,
+        key.user_id,
+        crate::notification::Event::SigningKeyAdded,
+        None,
+        Some(key.title.clone()),
+        Some(key.fingerprint.clone()),
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(key)
 }
 
 /// Ownership is part of the DELETE, so a concurrent change cannot turn a
 /// checked row into a different account's successful deletion.
 pub async fn delete_by_user(db: &DatabaseConnection, id: i64, user_id: i64) -> Result<bool> {
-    let deleted = commit_signing_key::Entity::delete_many()
-        .filter(commit_signing_key::Column::Id.eq(id))
-        .filter(commit_signing_key::Column::UserId.eq(user_id))
-        .exec(db)
-        .await
-        .context("db: delete account commit signing key")?;
-    Ok(deleted.rows_affected == 1)
+    crate::contention::retry_transaction("notification commit_signing_key_ops delete", || async {
+        let txn = db.begin().await?;
+        let before = commit_signing_key::Entity::find_by_id(id)
+            .filter(commit_signing_key::Column::UserId.eq(user_id))
+            .one(&txn)
+            .await?;
+        let deleted = commit_signing_key::Entity::delete_many()
+            .filter(commit_signing_key::Column::Id.eq(id))
+            .filter(commit_signing_key::Column::UserId.eq(user_id))
+            .exec(&txn)
+            .await
+            .context("db: delete account commit signing key")?;
+        if deleted.rows_affected == 1 {
+            if let Some(key) = before {
+                super::notification_delivery_ops::account_event(
+                    &txn,
+                    key.user_id,
+                    crate::notification::Event::SigningKeyRemoved,
+                    None,
+                    Some(key.title),
+                    Some(key.fingerprint),
+                )
+                .await?;
+            }
+        }
+        txn.commit().await?;
+        Ok(deleted.rows_affected == 1)
+    })
+    .await
 }

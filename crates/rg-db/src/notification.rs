@@ -176,12 +176,22 @@ impl Metadata {
 
 // Request context is safe metadata only; transport tokens/passwords never
 // enter it. Database producers also work without HTTP (CLI/system actions).
-tokio::task_local! { static CONTEXT: Metadata; }
+tokio::task_local! { static CONTEXT: (Option<i64>, Metadata); }
 
-pub async fn scope<F: std::future::Future>(metadata: Metadata, future: F) -> F::Output {
-    CONTEXT.scope(metadata.bounded(), future).await
+pub async fn scope<F: std::future::Future>(
+    actor_id: Option<i64>,
+    metadata: Metadata,
+    future: F,
+) -> F::Output {
+    CONTEXT.scope((actor_id, metadata.bounded()), future).await
 }
 
 pub fn current_metadata() -> Metadata {
-    CONTEXT.try_with(Clone::clone).unwrap_or_default()
+    CONTEXT
+        .try_with(|context| context.1.clone())
+        .unwrap_or_default()
+}
+
+pub fn current_actor_id() -> Option<i64> {
+    CONTEXT.try_with(|context| context.0).ok().flatten()
 }

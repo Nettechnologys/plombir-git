@@ -69,6 +69,15 @@ pub async fn create(
         .await
         .context("db: record access token repositories")?;
     }
+    super::notification_delivery_ops::account_event(
+        &transaction,
+        token.user_id,
+        crate::notification::Event::TokenCreated,
+        Some(crate::notification::Event::AgentTokenCreated),
+        Some(token.name.clone()),
+        None,
+    )
+    .await?;
     transaction
         .commit()
         .await
@@ -133,11 +142,30 @@ pub async fn touch_last_used(
 /// revocation can win in between; reporting `rows_affected` is what lets the
 /// route answer 404 instead of confirming a revocation it did not perform.
 pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
-    let result = TokenEntity::delete_by_id(id)
-        .exec(db)
-        .await
-        .context("db: delete access token")?;
-    Ok(result.rows_affected > 0)
+    crate::contention::retry_transaction("notification token_ops delete", || async {
+        let txn = db.begin().await?;
+        let before = TokenEntity::find_by_id(id).one(&txn).await?;
+        let result = TokenEntity::delete_by_id(id)
+            .exec(&txn)
+            .await
+            .context("db: delete access token")?;
+        if result.rows_affected > 0 {
+            if let Some(token) = before {
+                super::notification_delivery_ops::account_event(
+                    &txn,
+                    token.user_id,
+                    crate::notification::Event::TokenRevoked,
+                    Some(crate::notification::Event::AgentTokenRevoked),
+                    Some(token.name),
+                    None,
+                )
+                .await?;
+            }
+        }
+        txn.commit().await?;
+        Ok(result.rows_affected > 0)
+    })
+    .await
 }
 
 #[cfg(test)]

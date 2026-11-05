@@ -61,6 +61,12 @@ pub async fn register_runner(
         .insert(&txn)
         .await
         .context("db: register runner")?;
+    record_credential(
+        &txn,
+        crate::notification::Event::RunnerTokenCreated,
+        &runner.name,
+    )
+    .await?;
 
     txn.commit()
         .await
@@ -260,6 +266,7 @@ pub async fn deregister_runner(db: &DatabaseConnection, runner_id: i64) -> Resul
     let txn = db.begin().await.context("db: begin transaction")?;
 
     crate::ops::pipeline_ops::reset_runner_jobs(&txn, runner_id).await?;
+    let before = RunnerEntity::find_by_id(runner_id).one(&txn).await?;
 
     let deleted = RunnerEntity::delete_by_id(runner_id)
         .exec(&txn)
@@ -272,9 +279,33 @@ pub async fn deregister_runner(db: &DatabaseConnection, runner_id: i64) -> Resul
         txn.rollback().await.context("db: rollback transaction")?;
         return Ok(false);
     }
+    if let Some(before) = before {
+        record_credential(
+            &txn,
+            crate::notification::Event::RunnerTokenRevoked,
+            &before.name,
+        )
+        .await?;
+    }
 
     txn.commit().await.context("db: commit transaction")?;
     Ok(true)
+}
+
+async fn record_credential(
+    db: &impl ConnectionTrait,
+    event: crate::notification::Event,
+    name: &str,
+) -> Result<()> {
+    if let Some(actor) = crate::notification::current_actor_id() {
+        let mut event =
+            super::notification_delivery_ops::QueueEvent::security(actor, event, Some(name.into()));
+        // Instance-level issuance: do not include a private repository title
+        // or fan out to its owner. Dispatcher rechecks administrator status.
+        event.admin_only = true;
+        super::notification_delivery_ops::enqueue(db, &event).await?;
+    }
+    Ok(())
 }
 
 /// Generate a unique token for runner authentication.

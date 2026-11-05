@@ -176,6 +176,40 @@ pub async fn enqueue(db: &impl ConnectionTrait, event: &QueueEvent) -> Result<()
     Ok(())
 }
 
+/// Credential-owner routing is resolved inside the mutation transaction.
+/// Bots never receive personal security mail: their human owner does.
+pub async fn account_event(
+    db: &impl ConnectionTrait,
+    owner_id: i64,
+    event: Event,
+    bot_event: Option<Event>,
+    name: Option<String>,
+    fingerprint: Option<String>,
+) -> Result<()> {
+    let Some(owner) = user::Entity::find_by_id(owner_id).one(db).await? else {
+        return Ok(());
+    };
+    let (recipient, event) = if owner.is_bot() {
+        let Some(recipient) = owner.bot_owner_id else {
+            return Ok(());
+        };
+        (recipient, bot_event.unwrap_or(event))
+    } else {
+        (owner.id, event)
+    };
+    let mut event = QueueEvent::security(recipient, event, name);
+    event.metadata.fingerprint = fingerprint;
+    enqueue(db, &event).await
+}
+
+/// Retain database error identity for retryable transactions, without rendering
+/// an arbitrary error (which could include data) into another error string.
+pub fn db_error(error: anyhow::Error) -> DbErr {
+    error
+        .downcast::<DbErr>()
+        .unwrap_or_else(|_| DbErr::Custom("notification enqueue failed".into()))
+}
+
 pub async fn event_rows(
     db: &impl ConnectionTrait,
     user_id: i64,
