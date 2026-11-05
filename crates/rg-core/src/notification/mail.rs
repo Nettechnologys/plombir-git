@@ -1,19 +1,10 @@
-//! Mailing notifications, batched per person (card_349c2b6a0d7c).
+//! Legacy digest compatibility and pending-bit drain.
 //!
-//! [`super::thread::deliver`] never sends mail itself. It marks a notification
-//! row `email_pending` when its recipient asked to be mailed about that kind of
-//! thing, and wakes the dispatcher. The dispatcher waits [`BATCH_WINDOW`] —
-//! the review request, the comment and the CI failure of one push land in that
-//! window together — and then sends each recipient one mail with everything
-//! that piled up for them.
-//!
-//! The recipient's settings are read again at send time: turning a category
-//! off stops the mail that is still waiting, not only the next one.
-//!
-//! A row is cleared whether or not its mail went out. A failed SMTP round trip
-//! is logged; retrying it every pass would turn an outage into a storm of the
-//! same mails once the server comes back, and the notification itself is still
-//! in the inbox.
+//! New thread notifications capture channel jobs in their publication commit.
+//! Production uses only `drain_pending` here; all network delivery goes through
+//! the durable channel dispatcher. Historical pending rows lack a captured
+//! recipient, so they are retired with a safe outcome instead of redirected to
+//! a potentially changed address. Their in-app notifications remain intact.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -60,15 +51,17 @@ pub struct DigestEntry {
 }
 
 /// One mail to one person.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Digest {
     pub subject: String,
     pub entries: Vec<DigestEntry>,
     /// Where the recipient turns these mails off.
     pub settings_url: Option<String>,
+    // Internal source versions for the durable adapter; never rendered as mail.
+    sources: Vec<Notification>,
 }
 
-/// Where mails go — SMTP in production, a recorder in tests.
+/// Compatibility digest sink; production uses the non-network durable adapter.
 pub trait Outbox: Send + Sync {
     fn send<'a>(
         &'a self,
@@ -112,6 +105,7 @@ pub fn compose(rows: &[Notification], base_url: Option<&str>) -> Digest {
         subject,
         entries,
         settings_url: absolute(base_url, "/settings/notifications"),
+        sources: rows.to_vec(),
     }
 }
 
@@ -134,7 +128,6 @@ pub async fn deliver_pending(
             .map_or(rows.len(), |offset| start + offset);
         let batch = &rows[start..end];
         start = end;
-        let ids: Vec<i64> = batch.iter().map(|row| row.id).collect();
 
         let settings = notification_setting_ops::get(db, user_id).await?;
         let wanted: Vec<Notification> = batch
@@ -156,25 +149,98 @@ pub async fn deliver_pending(
             let digest = compose(&wanted, base_url);
             match outbox.send(&address, &digest).await {
                 Ok(()) => sent += 1,
-                Err(error) => tracing::warn!(
-                    user_id,
-                    notifications = wanted.len(),
-                    error = %format!("{error:#}"),
-                    "notification mail was not delivered"
-                ),
+                Err(_) => {
+                    tracing::warn!(
+                        user_id,
+                        notifications = wanted.len(),
+                        "notification mail was not delivered"
+                    );
+                    continue;
+                }
             }
         }
-        notification_ops::clear_email_pending(pools.write(), &ids).await?;
+        notification_ops::clear_email_pending(pools.write(), batch).await?;
     }
     Ok(sent)
+}
+
+/// Drain the old pending marker without sending or recreating unknown targets.
+/// The conditional clear cannot consume a concurrently folded thread version.
+pub async fn drain_pending(db: &sea_orm::DatabaseConnection) -> Result<usize> {
+    deliver_pending(db, &DurableOutbox(db), None).await
+}
+
+struct DurableOutbox<'a>(&'a sea_orm::DatabaseConnection);
+impl Outbox for DurableOutbox<'_> {
+    fn send<'a>(
+        &'a self,
+        _to: &'a str,
+        mail: &'a Digest,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move { retire_sources(self.0, &mail.sources).await })
+    }
+}
+
+async fn retire_sources(db: &sea_orm::DatabaseConnection, notes: &[Notification]) -> Result<()> {
+    use rg_db::entities::notification_delivery as delivery;
+    use rg_db::ops::notification_delivery_ops as queue;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
+    let ids: Vec<_> = notes.iter().map(queue::thread_event_id).collect();
+    let existing: std::collections::HashSet<_> = delivery::Entity::find()
+        .filter(delivery::Column::EventId.is_in(ids))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| row.event_id)
+        .collect();
+    let tx = db.begin().await?;
+    let now = chrono::Utc::now();
+    for note in notes {
+        let event_id = queue::thread_event_id(note);
+        if !existing.contains(&event_id) {
+            queue::insert(
+                &tx,
+                delivery::ActiveModel {
+                    id: sea_orm::NotSet,
+                    event_id: Set(event_id),
+                    user_id: Set(note.user_id),
+                    event_key: Set(note
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "participating".into())),
+                    channel: Set("email".into()),
+                    metadata: Set("{}".into()),
+                    repo_id: Set(note.repo_id),
+                    admin_only: Set(false),
+                    generation: Set(0),
+                    destination_hash: Set(String::new()),
+                    previous_destination_encrypted: Set(None),
+                    previous_token_encrypted: Set(None),
+                    prior_locale: Set(None),
+                    is_test: Set(false),
+                    status: Set("cancelled".into()),
+                    attempts: Set(0),
+                    next_attempt_at: Set(now),
+                    lease_token: Set(None),
+                    lease_until: Set(None),
+                    last_error: Set(Some("legacy_destination_unknown".into())),
+                    created_at: Set(now),
+                    expires_at: Set(now),
+                    completed_at: Set(Some(now)),
+                },
+            )
+            .await?;
+        }
+    }
+    notification_ops::clear_email_pending(&tx, notes).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Run the dispatcher until `shutdown` fires: a pass [`BATCH_WINDOW`] after a
 /// wake-up, and one every [`IDLE_PASS`] regardless.
 pub fn spawn_dispatcher(
     db: crate::db::Db,
-    smtp: crate::email::SmtpConfig,
-    base_url: Option<String>,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -193,15 +259,15 @@ pub fn spawn_dispatcher(
             }
             // One last pass on shutdown too: what is pending now would wait for
             // the next start otherwise.
-            match deliver_pending(&db, &smtp, base_url.as_deref()).await {
+            match drain_pending(db.write()).await {
                 Ok(0) => {}
-                Ok(mails) => tracing::debug!(mails, "notification mails sent"),
-                Err(error) => tracing::warn!(
-                    error = %format!("{error:#}"),
-                    "notification mail pass failed"
-                ),
+                Ok(rows) => tracing::debug!(rows, "legacy notification pending flags drained"),
+                Err(_) => tracing::warn!("notification pending drain failed"),
             }
-            if shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
+            if shutdown_rx
+                .as_ref()
+                .is_some_and(|rx| *rx.borrow() || rx.has_changed().is_err())
+            {
                 tracing::info!("notification mail dispatcher received shutdown, stopping");
                 break;
             }

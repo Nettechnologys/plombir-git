@@ -22,7 +22,11 @@ pub async fn notification_context(
     next: Next,
 ) -> Response {
     let witness_cookie =
-        crate::api::browser_notifications::bootstrap(&state, request.headers_mut());
+        if crate::api::browser_notifications::is_ceremony(request.method(), request.uri().path()) {
+            crate::api::browser_notifications::bootstrap(&state, request.headers_mut())
+        } else {
+            None
+        };
     let claims = crate::api::auth::session_claims(request.headers(), &state.jwt_secret);
     let actor_id = claims
         .as_ref()

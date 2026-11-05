@@ -376,18 +376,38 @@ pub async fn list_email_pending(
         .context("db: list notifications owed a mail")
 }
 
-/// The dispatcher has dealt with these rows.
-pub async fn clear_email_pending(db: &DatabaseConnection, ids: &[i64]) -> Result<u64> {
-    if ids.is_empty() {
-        return Ok(0);
+/// Clear only the source versions the dispatcher dealt with. A concurrent fold
+/// must retain its pending marker, including on second-precision SQL backends.
+pub async fn clear_email_pending(
+    db: &impl ConnectionTrait,
+    notes: &[notification::Model],
+) -> Result<u64> {
+    let mut cleared = 0;
+    for note in notes {
+        let version = match note.updated_at {
+            Some(at) => notification::Column::UpdatedAt.eq(at),
+            None => notification::Column::UpdatedAt.is_null(),
+        };
+        let mut update = notification::Entity::update_many()
+            .col_expr(notification::Column::EmailPending, Expr::value(false))
+            .filter(notification::Column::Id.eq(note.id))
+            .filter(version)
+            .filter(notification::Column::Title.eq(note.title.clone()));
+        update = update.filter(match &note.reason {
+            Some(reason) => notification::Column::Reason.eq(reason.clone()),
+            None => notification::Column::Reason.is_null(),
+        });
+        update = update.filter(match &note.body {
+            Some(body) => notification::Column::Body.eq(body.clone()),
+            None => notification::Column::Body.is_null(),
+        });
+        cleared += update
+            .exec(db)
+            .await
+            .context("db: clear pending notification source")?
+            .rows_affected;
     }
-    let result = notification::Entity::update_many()
-        .col_expr(notification::Column::EmailPending, Expr::value(false))
-        .filter(notification::Column::Id.is_in(ids.iter().copied()))
-        .exec(db)
-        .await
-        .context("db: clear pending notification mail")?;
-    Ok(result.rows_affected)
+    Ok(cleared)
 }
 
 /// Remove every notification about a subject — the issue is gone.

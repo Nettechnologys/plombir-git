@@ -183,7 +183,7 @@ mod tests {
         crate::run_migrations(&db).await.expect("run migrations");
         db.execute(Statement::from_string(
             sea_orm::DatabaseBackend::Sqlite,
-            "INSERT INTO users(id, username, email, password_hash, is_admin, is_active, created_at, updated_at) VALUES(1, 'test', 'test@test.com', 'x', 0, 1, '2024-01-01', '2024-01-01')",
+            "INSERT INTO users(id, username, email, password_hash, is_admin, is_active, created_at, updated_at) VALUES(1, 'test', 'test@test.com', 'x', 0, 1, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
         )).await.expect("insert test user");
         db
     }

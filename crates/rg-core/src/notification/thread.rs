@@ -562,6 +562,34 @@ async fn deliver_page(
         }
     }
     notification_ops::create_for_subjects(&transaction, &inserts).await?;
+    let persisted = notification_ops::find_unread_for_subject_among(
+        &transaction,
+        &recipient_ids,
+        subject_type,
+        subject.id,
+    )
+    .await?;
+    let queued: Vec<_> = persisted
+        .values()
+        .filter_map(|note| {
+            let event = rg_db::notification::Event::parse(note.reason.as_deref()?)?;
+            Some(rg_db::ops::notification_delivery_ops::QueueEvent {
+                id: rg_db::ops::notification_delivery_ops::thread_event_id(note),
+                user_id: note.user_id,
+                event,
+                metadata: rg_db::notification::Metadata {
+                    actor: text.actor.map(str::to_owned),
+                    subject: Some(note.title.clone()),
+                    link: note.link.clone(),
+                    ..Default::default()
+                },
+                repo_id: note.repo_id,
+                admin_only: false,
+                is_test: false,
+            })
+        })
+        .collect();
+    rg_db::ops::notification_delivery_ops::enqueue_many(&transaction, &queued).await?;
     transaction.commit().await?;
 
     for (user_id, reason, email) in outcome {

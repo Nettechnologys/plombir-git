@@ -112,7 +112,10 @@ pub fn row(
     profile: &profile::Model,
     channel: &str,
 ) -> Result<delivery::ActiveModel> {
-    let now = chrono::Utc::now();
+    // Supported MySQL temporal columns have second precision. Avoid rounding
+    // an immediately queued event into the future or extending its 24h expiry.
+    let now = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0)
+        .expect("current UTC timestamp");
     Ok(delivery::ActiveModel {
         id: NotSet,
         event_id: Set(event.id.clone()),
@@ -148,7 +151,7 @@ pub async fn insert(db: &impl ConnectionTrait, row: delivery::ActiveModel) -> Re
                 delivery::Column::UserId,
                 delivery::Column::Channel,
             ])
-            .do_nothing()
+            .do_nothing_on([delivery::Column::Id])
             .to_owned(),
         )
         .exec_without_returning(db)
@@ -174,6 +177,81 @@ pub async fn enqueue(db: &impl ConnectionTrait, event: &QueueEvent) -> Result<()
         insert(db, row(event, &user, &profile, "telegram")?).await?;
     }
     Ok(())
+}
+
+/// One bounded fanout page, without a per-recipient query/transaction. Capture
+/// recipients and destination generations in the thread's publication commit.
+pub async fn enqueue_many(db: &impl ConnectionTrait, events: &[QueueEvent]) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<i64> = events.iter().map(|event| event.user_id).collect();
+    let users: std::collections::HashMap<_, _> = user::Entity::find()
+        .filter(user::Column::Id.is_in(ids.iter().copied()))
+        .all(db)
+        .await?
+        .into_iter()
+        .filter(|user| user.is_usable() && !user.is_bot())
+        .map(|user| (user.id, user))
+        .collect();
+    let profiles: std::collections::HashMap<_, _> = profile::Entity::find()
+        .filter(profile::Column::UserId.is_in(ids.iter().copied()))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|profile| (profile.user_id, profile))
+        .collect();
+    let legacy = super::notification_setting_ops::get_many(db, &ids).await?;
+    let mut rows = Vec::new();
+    for event in events {
+        let Some(user) = users.get(&event.user_id) else {
+            continue;
+        };
+        let default = profile::Model::defaults(user.id);
+        let profile = profiles.get(&user.id).unwrap_or(&default);
+        let channels = choices(profile, &legacy[&user.id])?[&event.event];
+        if channels.email && !user.email.trim().is_empty() {
+            rows.push(row(event, user, profile, "email")?);
+        }
+        if channels.telegram && profile.telegram_configured() {
+            rows.push(row(event, user, profile, "telegram")?);
+        }
+    }
+    for page in rows.chunks(500) {
+        delivery::Entity::insert_many(page.to_vec())
+            .on_conflict(
+                OnConflict::columns([
+                    delivery::Column::EventId,
+                    delivery::Column::UserId,
+                    delivery::Column::Channel,
+                ])
+                .do_nothing_on([delivery::Column::Id])
+                .to_owned(),
+            )
+            .exec_without_returning(db)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Fingerprint the persisted source version, including its text/reason. Some
+/// MySQL schemas store second precision, so timestamps alone would swallow a
+/// stronger reason or renamed subject folded within the same second.
+pub fn thread_event_id(note: &crate::entities::notification::Model) -> String {
+    let version = serde_json::to_string(&(
+        note.created_at,
+        note.updated_at,
+        &note.title,
+        &note.body,
+        &note.reason,
+        &note.link,
+    ))
+    .expect("notification source strings serialize");
+    format!(
+        "thread:{}:{}",
+        note.id,
+        &crate::token_digest(&version)[..40]
+    )
 }
 
 /// Credential-owner routing is resolved inside the mutation transaction.

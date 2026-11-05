@@ -1179,6 +1179,31 @@ impl PipelineGraph<'_> {
         }
 
         self.create_jobs(tx, &stage_id_map).await?;
+        if self.trigger_type == "push" {
+            use sea_orm::EntityTrait;
+            if let Some(repo) = rg_db::entities::repository::Entity::find_by_id(self.repo_id)
+                .one(tx)
+                .await?
+                .filter(|repo| repo.org_id.is_none())
+            {
+                let mut event = rg_db::ops::notification_delivery_ops::QueueEvent::security(
+                    repo.owner_id,
+                    rg_db::notification::Event::CiTriggered,
+                    None,
+                );
+                event.id = format!("pipeline:{pipeline_id}:triggered");
+                event.repo_id = Some(repo.id);
+                event.metadata.subject = Some(format!(
+                    "{}/{} · {}",
+                    self.repository.owner, self.repository.name, self.ref_name
+                ));
+                event.metadata.link = Some(format!(
+                    "/{}/{}/pipelines",
+                    self.repository.owner, self.repository.name
+                ));
+                rg_db::ops::notification_delivery_ops::enqueue(tx, &event).await?;
+            }
+        }
         Ok(pipeline_id)
     }
 
@@ -4517,6 +4542,33 @@ mod matrix_tests {
         )
         .await
         .unwrap();
+        rg_core::notification::settings::save(
+            &db,
+            user.id,
+            &rg_core::notification::settings::Patch {
+                events: std::collections::BTreeMap::from([(
+                    rg_db::notification::Event::CiTriggered,
+                    rg_core::notification::settings::ChannelPatch {
+                        email: Some(false),
+                        telegram: Some(true),
+                    },
+                )]),
+                telegram: Some(rg_core::notification::settings::TelegramChange::Set {
+                    token: Some("123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghi".into()),
+                    chat_id: -1001234,
+                    message_thread_id: Some(42),
+                }),
+                ..Default::default()
+            },
+            &rg_core::notification::settings::SaveContext {
+                encryption_secret: "fixture",
+                smtp_available: false,
+                metadata: Default::default(),
+            },
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
         let pipeline_id = trigger_pipeline(
             TriggerPipelineParams {
                 db: &db,
@@ -4543,6 +4595,17 @@ mod matrix_tests {
         )
         .await
         .unwrap();
+        let notices = rg_db::ops::notification_delivery_ops::event_rows(
+            &db,
+            user.id,
+            &format!("pipeline:{pipeline_id}:triggered"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(notices.len(), 1, "Telegram-only CI works without SMTP");
+        assert_eq!(notices[0].event_key, "ci_triggered");
+        assert_eq!(notices[0].channel, "telegram");
+        assert_eq!(notices[0].repo_id, Some(repo.id));
         let jobs = rg_db::ops::pipeline_ops::list_jobs_by_pipeline(&db, pipeline_id)
             .await
             .unwrap();
@@ -4762,6 +4825,13 @@ mod matrix_tests {
         .await
         .unwrap();
 
+        let mut preferences = rg_db::ops::notification_setting_ops::get(&db, user.id)
+            .await
+            .unwrap();
+        preferences.email_ci_triggered = true;
+        rg_db::ops::notification_setting_ops::put(&db, preferences)
+            .await
+            .unwrap();
         let error = trigger_pipeline(
             TriggerPipelineParams {
                 db: &db,
@@ -4788,6 +4858,16 @@ mod matrix_tests {
         )
         .await
         .unwrap_err();
+        use sea_orm::{ColumnTrait, QueryFilter};
+        assert_eq!(
+            rg_db::entities::notification_delivery::Entity::find()
+                .filter(rg_db::entities::notification_delivery::Column::EventKey.eq("ci_triggered"))
+                .count(&db)
+                .await
+                .unwrap(),
+            0,
+            "failed graph does not publish a successful trigger notice"
+        );
         // The original failure reaches the caller — the rollback does not
         // rewrite it into a generic database error.
         let reported = format!("{error:#}");

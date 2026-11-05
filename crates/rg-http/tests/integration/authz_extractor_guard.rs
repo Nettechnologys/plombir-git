@@ -359,6 +359,12 @@ const WORKSPACE_SIGNED_OFF: &[(&str, &str)] = &[
 /// mutation boundary must therefore re-read current write access itself.
 const WORKSPACE_FUNCTION_SIGNED_OFF: &[(&str, &str, &str)] = &[
     (
+        "rg-core/src/notification/dispatch.rs",
+        "prepare",
+        "background delivery has no HTTP caller/extractor; rechecks the recorded recipient's \
+         current repository-admin permission before sending a queued credential notice",
+    ),
+    (
         "rg-core/src/repo/refs.rs",
         "delete_merged_head_branch",
         "deletes the head branch of a pull request a merge just consumed — in the head repository, \

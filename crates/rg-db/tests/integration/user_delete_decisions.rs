@@ -82,6 +82,24 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
         "card_dd3f86fde48e: an inbox row is meaningless without its recipient",
     ),
     (
+        "known_browsers",
+        "user_id",
+        "CASCADE",
+        "the account's own browser evidence must disappear on deletion",
+    ),
+    (
+        "notification_profiles",
+        "user_id",
+        "CASCADE",
+        "personal delivery preferences and encrypted bot credential belong to the account",
+    ),
+    (
+        "notification_deliveries",
+        "user_id",
+        "CASCADE",
+        "recipient-owned jobs and encrypted previous destinations must not survive deletion",
+    ),
+    (
         "notification_settings",
         "user_id",
         "CASCADE",

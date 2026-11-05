@@ -6,6 +6,32 @@ use axum::http::{
 };
 use rg_core::notification::browser::{self, Witness, COOKIE_NAME};
 
+/// Only authentication ceremonies bootstrap evidence. Ordinary API traffic,
+/// session refresh and revoked-cookie recovery keep their existing cookie
+/// contract and cannot renew or create browser evidence as a side effect.
+pub(crate) fn is_ceremony(method: &axum::http::Method, path: &str) -> bool {
+    let path = path.strip_prefix("/api/v1").unwrap_or(path);
+    if *method == axum::http::Method::POST {
+        matches!(
+            path,
+            "/users/register"
+                | "/users/login"
+                | "/users/password/initial"
+                | "/users/verify-email"
+                | "/users/reset-password"
+                | "/users/mfa/verify"
+                | "/users/passkeys/login/start"
+                | "/users/passkeys/login/finish"
+        )
+    } else if *method == axum::http::Method::GET {
+        path.strip_prefix("/auth/sso/").is_some_and(|suffix| {
+            suffix != "providers" && (!suffix.contains('/') || suffix.ends_with("/callback"))
+        })
+    } else {
+        false
+    }
+}
+
 /// Make freshly issued evidence available to this authentication request and
 /// return the one Set-Cookie header the outer middleware must publish. Existing
 /// valid cookies are not renewed. Only this non-authorizing cookie is replaced.

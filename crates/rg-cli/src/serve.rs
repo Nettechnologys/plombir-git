@@ -2139,17 +2139,12 @@ fn build_transports(
         storage_limits: settings.storage_limits,
     };
 
-    // Notification mail, batched per person (card_349c2b6a0d7c). Without SMTP
-    // the rows are still written — the inbox is the notification — and nothing
-    // waits to mail them.
-    let notification_mail = smtp_config.clone().map(|smtp| {
-        rg_core::notification::mail::spawn_dispatcher(
-            rg_core::db::Db::new(storage.db.clone(), storage.db_write.clone()),
-            smtp,
-            settings.external_url.clone(),
-            Some(shutdown_rx.clone()),
-        )
-    });
+    // Old pending bits are drained even without SMTP. Only the durable
+    // channel dispatcher below performs network delivery.
+    let notification_mail = Some(rg_core::notification::mail::spawn_dispatcher(
+        rg_core::db::Db::new(storage.db.clone(), storage.db_write.clone()),
+        Some(shutdown_rx.clone()),
+    ));
     // Telegram/security delivery must run even when SMTP is disabled.
     let notification_channels = rg_core::notification::dispatch::spawn_dispatcher(
         storage.db_write.clone(),

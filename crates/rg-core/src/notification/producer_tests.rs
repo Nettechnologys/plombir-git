@@ -8,7 +8,14 @@ use sea_orm::*;
 use std::collections::BTreeMap;
 
 async fn fixture() -> (DatabaseConnection, user::Model) {
-    let db = rg_db::connect("sqlite::memory:").await.unwrap();
+    let db = rg_db::connect_with_pool(
+        "sqlite::memory:",
+        rg_db::TEST_CONNECT_TIMEOUT_SECS,
+        rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+        rg_db::DEFAULT_MAX_CONNECTIONS,
+    )
+    .await
+    .unwrap();
     rg_db::run_migrations(&db).await.unwrap();
     let user = user_ops::create_user(
         &db,

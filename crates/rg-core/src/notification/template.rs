@@ -183,6 +183,33 @@ fn field_label(field: &str, locale: Locale) -> String {
             "Telegram 已停用",
         ),
         "locale" => translated(locale, "Language", "Язык", "语言"),
+        "enabled" => translated(locale, "Agent enabled", "Агент включён", "代理启用状态"),
+        "preset" => translated(locale, "Agent preset", "Профиль агента", "代理预设"),
+        "image" => translated(locale, "Container image", "Образ контейнера", "容器镜像"),
+        "command" => translated(locale, "Agent command", "Команда агента", "代理命令"),
+        "runner_tags" => translated(locale, "Runner tags", "Метки раннера", "运行器标签"),
+        "model_key_encrypted" => translated(locale, "Model credential", "Ключ модели", "模型凭据"),
+        "timeout_secs" => translated(locale, "Run timeout", "Таймаут запуска", "运行超时"),
+        "max_runs_per_day" => translated(
+            locale,
+            "Daily run limit",
+            "Лимит запусков в день",
+            "每日运行上限",
+        ),
+        "max_iterations" => translated(locale, "Iteration limit", "Лимит итераций", "迭代上限"),
+        "repositories" => translated(
+            locale,
+            "Allowed repositories",
+            "Разрешённые репозитории",
+            "允许的仓库",
+        ),
+        "profile_removed" => translated(
+            locale,
+            "Agent profile removed",
+            "Профиль агента удалён",
+            "代理配置已删除",
+        ),
+
         _ => field,
     }
     .to_owned()
@@ -223,18 +250,26 @@ pub fn render(
         translated(locale, "Time", "Время", "时间"),
         at.format("%Y-%m-%d %H:%M:%S")
     );
+    let method = metadata.method.as_deref().map(|value| {
+        match value {
+            "local" | "password" => translated(locale, "Password", "Пароль", "密码"),
+            "password_reset" => translated(locale, "Password reset", "Сброс пароля", "密码重置"),
+            "initial_password" => {
+                translated(locale, "Initial password", "Начальный пароль", "初始密码")
+            }
+            "registration" => translated(locale, "Registration", "Регистрация", "注册"),
+            "passkey" => translated(locale, "Passkey", "Ключ доступа", "通行密钥"),
+            _ => value,
+        }
+        .to_owned()
+    });
     for (value, en, ru, zh) in [
         (&metadata.actor, "Actor", "Кто", "操作者"),
         (&metadata.name, "Name", "Имя", "名称"),
         (&metadata.fingerprint, "Fingerprint", "Отпечаток", "指纹"),
         (&metadata.ip, "IP address", "IP-адрес", "IP 地址"),
         (&metadata.device, "Device", "Устройство", "设备"),
-        (
-            &metadata.method,
-            "Sign-in method",
-            "Способ входа",
-            "登录方式",
-        ),
+        (&method, "Sign-in method", "Способ входа", "登录方式"),
         (&metadata.subject, "Subject", "Тема", "主题"),
     ] {
         if let Some(value) = value {

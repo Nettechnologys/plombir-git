@@ -1,5 +1,4 @@
 mod fts_safety;
-pub mod m20261105_000001_notification_channels;
 pub(crate) mod ghost_author;
 pub mod m20260424_000001_create_users;
 pub mod m20260424_000002_create_repositories;
@@ -177,6 +176,7 @@ pub mod m20261022_000001_imported_original_author;
 pub mod m20261022_000002_pipeline_run_name;
 pub mod m20261022_000003_imported_assignments;
 pub mod m20261026_000001_agent_profiles;
+pub mod m20261105_000001_notification_channels;
 
 use sea_orm_migration::prelude::*;
 

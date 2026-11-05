@@ -36,9 +36,8 @@ use sea_orm::{
 };
 
 use rg_db::entities::{
-    notification_profile, notification_delivery,
-    agent_profile, ci_secret, instance_signing_key, mirror, pipeline_job, sso_provider, user,
-    webhook,
+    agent_profile, ci_secret, instance_signing_key, mirror, notification_delivery,
+    notification_profile, pipeline_job, sso_provider, user, webhook,
 };
 
 use crate::auth::encrypted_columns::with_encrypted_columns;

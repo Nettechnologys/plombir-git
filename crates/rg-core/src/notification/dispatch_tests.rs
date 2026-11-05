@@ -42,7 +42,14 @@ fn config(smtp: bool) -> Config<'static> {
     }
 }
 async fn fixture() -> (DatabaseConnection, user::Model) {
-    let db = rg_db::connect("sqlite::memory:").await.unwrap();
+    let db = rg_db::connect_with_pool(
+        "sqlite::memory:",
+        rg_db::TEST_CONNECT_TIMEOUT_SECS,
+        rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+        rg_db::DEFAULT_MAX_CONNECTIONS,
+    )
+    .await
+    .unwrap();
     rg_db::run_migrations(&db).await.unwrap();
     let user = rg_db::ops::user_ops::create_user(
         &db,
@@ -328,4 +335,244 @@ async fn removed_accounts_and_missing_private_repositories_never_send() {
         .await
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test]
+async fn real_thread_fanout_captures_both_channels_and_cancels_removed_or_folded_sources() {
+    use super::super::thread::{self, Reason, Subject, SubjectKind, ThreadEvent};
+    let (db, user) = fixture().await;
+    let now = chrono::Utc::now();
+    let repo = rg_db::ops::repo_ops::create(
+        &db,
+        rg_db::entities::repository::ActiveModel {
+            owner_id: Set(user.id),
+            name: Set("notices".into()),
+            is_private: Set(true),
+            default_branch: Set("main".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let reasons = [
+        Reason::ReviewRequested,
+        Reason::Mention,
+        Reason::Assigned,
+        Reason::CiFailed,
+        Reason::Participating,
+    ];
+    for (i, reason) in reasons.into_iter().enumerate() {
+        let subject = Subject {
+            kind: SubjectKind::Issue,
+            id: i as i64 + 100,
+            number: i as i64 + 1,
+            repo_id: repo.id,
+            title: format!("literal fixture {i}"),
+        };
+        thread::deliver(
+            &db,
+            &ThreadEvent::new(subject, None, "fixture action").to(user.id, reason),
+        )
+        .await
+        .unwrap();
+    }
+    let original = notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::EventId.starts_with("thread:"))
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(original.len(), 10);
+    for reason in reasons {
+        assert_eq!(
+            original
+                .iter()
+                .filter(|row| row.event_key == reason.as_str())
+                .count(),
+            2
+        );
+    }
+    let removed = rg_db::entities::notification::Entity::find()
+        .filter(rg_db::entities::notification::Column::SubjectId.eq(100))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    rg_db::entities::notification::Entity::delete_by_id(removed.id)
+        .exec(&db)
+        .await
+        .unwrap();
+    // A folded thread replaces its pending text/version. Its earlier queued
+    // payload cannot survive deletion or race the stronger latest reason.
+    thread::deliver(
+        &db,
+        &ThreadEvent::new(
+            Subject {
+                kind: SubjectKind::Issue,
+                id: 101,
+                number: 2,
+                repo_id: repo.id,
+                title: "updated literal".into(),
+            },
+            None,
+            "fixture action",
+        )
+        .to(user.id, Reason::Mention),
+    )
+    .await
+    .unwrap();
+    let out = Recorder::default();
+    pass(&db, &config(true), &out).await.unwrap();
+    let sent = out.sent.lock().unwrap();
+    assert_eq!(sent.len(), 8);
+    assert!(!sent
+        .iter()
+        .any(|(_, text)| text.contains("literal fixture 0") || text.contains("literal fixture 1")));
+    assert_eq!(
+        sent.iter()
+            .filter(|(target, _)| target.starts_with("telegram:"))
+            .count(),
+        4
+    );
+    drop(sent);
+    let cancelled = notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::LastError.eq("thread_removed_or_superseded"))
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(cancelled.len(), 4);
+    assert!(cancelled.iter().all(|row| row.metadata == "{}"));
+}
+
+#[tokio::test]
+async fn legacy_pending_drain_never_redirects_unknown_payload_or_duplicates_durable_jobs() {
+    use rg_db::{entities::notification, ops::notification_ops};
+    let (db, user) = fixture().await;
+    let note = notification_ops::ThreadNotification {
+        user_id: user.id,
+        repo_id: 0,
+        subject_type: "issue",
+        subject_id: 55,
+        reason: "mention",
+        title: "legacy private title",
+        body: None,
+        link: "/old/private/issues/1",
+        email: true,
+    };
+    notification_ops::create_for_subjects(&db, &[note])
+        .await
+        .unwrap();
+    let note = notification::Entity::find()
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(super::super::mail::drain_pending(&db).await.unwrap(), 1);
+    assert_eq!(super::super::mail::drain_pending(&db).await.unwrap(), 0);
+    let jobs = queue::event_rows(&db, user.id, &queue::thread_event_id(&note))
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        jobs[0].last_error.as_deref(),
+        Some("legacy_destination_unknown")
+    );
+    assert_eq!(jobs[0].metadata, "{}");
+    assert!(jobs[0].previous_destination_encrypted.is_none());
+    assert_eq!(
+        notification::Entity::find_by_id(note.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .title,
+        "legacy private title"
+    );
+    let out = Recorder::default();
+    pass(&db, &config(true), &out).await.unwrap();
+    assert!(out.sent.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn revoked_repository_and_instance_grants_cancel_pending_delivery() {
+    use rg_db::{
+        entities::{repo_collaborator, repository},
+        ops::{repo_collaborator_ops, repo_ops, user_ops},
+    };
+    let (db, user) = fixture().await;
+    let owner = user_ops::create_user(&db, "other-owner", "owner@example.invalid", "fixture", "")
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    let repo = repo_ops::create(
+        &db,
+        repository::ActiveModel {
+            owner_id: Set(owner.id),
+            name: Set("private-grants".into()),
+            is_private: Set(true),
+            default_branch: Set("main".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let grant = repo_collaborator_ops::create(
+        &db,
+        repo_collaborator::ActiveModel {
+            repo_id: Set(repo.id),
+            user_id: Set(user.id),
+            permission: Set("admin".into()),
+            created_at: Set(now),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut admin =
+        queue::QueueEvent::security(user.id, Event::DeployKeyAdded, Some("fixture".into()));
+    admin.repo_id = Some(repo.id);
+    admin.admin_only = true;
+    queue::enqueue(&db, &admin).await.unwrap();
+    repo_collaborator_ops::update_permission(&db, grant.id, "read".into())
+        .await
+        .unwrap()
+        .unwrap();
+    let out = Recorder::default();
+    pass(&db, &config(true), &out).await.unwrap();
+    let rows = queue::event_rows(&db, user.id, &admin.id).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.status == "cancelled"
+        && row.last_error.as_deref() == Some("repository_access_removed")));
+    let mut reader =
+        queue::QueueEvent::security(user.id, Event::Mention, Some("private title".into()));
+    reader.repo_id = Some(repo.id);
+    queue::enqueue(&db, &reader).await.unwrap();
+    repo_collaborator_ops::delete_by_repo_and_user(&db, repo.id, user.id)
+        .await
+        .unwrap();
+    pass(&db, &config(true), &out).await.unwrap();
+    let rows = queue::event_rows(&db, user.id, &reader.id).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|row| row.status == "cancelled" && row.metadata == "{}"));
+    let mut instance: user::ActiveModel = user.clone().into();
+    instance.is_admin = Set(true);
+    instance.update(&db).await.unwrap();
+    let mut runner =
+        queue::QueueEvent::security(user.id, Event::RunnerTokenCreated, Some("runner".into()));
+    runner.admin_only = true;
+    queue::enqueue(&db, &runner).await.unwrap();
+    let mut instance: user::ActiveModel = user.clone().into();
+    instance.is_admin = Set(false);
+    instance.update(&db).await.unwrap();
+    pass(&db, &config(true), &out).await.unwrap();
+    let rows = queue::event_rows(&db, user.id, &runner.id).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.status == "cancelled"
+        && row.last_error.as_deref() == Some("administrator_access_removed")));
+    assert!(out.sent.lock().unwrap().is_empty());
 }

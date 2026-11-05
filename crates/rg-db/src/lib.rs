@@ -17,8 +17,8 @@ pub mod entities;
 mod entity_schema_guard;
 #[cfg(test)]
 mod fts_rebuild_tests;
-pub mod ops;
 pub mod notification;
+pub mod ops;
 #[cfg(test)]
 mod query_plan_tests;
 pub mod sqlite_process_guard;

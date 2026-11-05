@@ -6,7 +6,14 @@ const TOKEN: &str = "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghi";
 const KEY: &str = "notification-fixture-key";
 
 async fn fixture() -> (DatabaseConnection, user::Model) {
-    let db = rg_db::connect("sqlite::memory:").await.unwrap();
+    let db = rg_db::connect_with_pool(
+        "sqlite::memory:",
+        rg_db::TEST_CONNECT_TIMEOUT_SECS,
+        rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+        rg_db::DEFAULT_MAX_CONNECTIONS,
+    )
+    .await
+    .unwrap();
     rg_db::run_migrations(&db).await.unwrap();
     let user = rg_db::ops::user_ops::create_user(
         &db,
@@ -425,6 +432,7 @@ async fn waiting_writer_classifies_committed_settings_and_current_account() {
     legacy::put(&txn, prefs).await.unwrap();
     let mut rotated: user::ActiveModel = current.into();
     rotated.session_version = Set(user.session_version + 1);
+    rotated.totp_secret = Set(Some("rotated-factor-fixture".into()));
     rotated.update(&txn).await.unwrap();
     // A writer which started before this commit must block before reading,
     // then classify true→false and see the new session generation.
@@ -432,18 +440,70 @@ async fn waiting_writer_classifies_committed_settings_and_current_account() {
     let waiting = save(&db, user.id, &off, &ctx, |fresh, sensitive| {
         assert!(sensitive);
         assert_eq!(fresh.session_version, user.session_version + 1);
+        assert_eq!(fresh.totp_secret.as_deref(), Some("rotated-factor-fixture"));
         anyhow::bail!("fixture session_revoked")
     });
     tokio::pin!(waiting);
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(25), &mut waiting)
-            .await
-            .is_err()
-    );
+    match tokio::time::timeout(std::time::Duration::from_millis(25), &mut waiting).await {
+        Err(_) => {}
+        Ok(Ok(_)) => panic!("waiting writer unexpectedly completed before commit"),
+        Ok(Err(error)) => panic!("waiting writer failed before commit: {error:#}"),
+    }
     txn.commit().await.unwrap();
     assert_eq!(
         waiting.await.err().unwrap().to_string(),
         "fixture session_revoked"
     );
     assert!(get(&db, user.id).await.unwrap().events[&Event::Mention].email);
+}
+
+#[tokio::test]
+async fn durable_warning_insert_failure_rolls_back_the_entire_authorized_patch() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    let (db, user) = fixture().await;
+    save(&db, user.id, &configure(), &context(), |_, _| Ok(()))
+        .await
+        .unwrap();
+    queue::confirm_telegram(&db, user.id, 1).await.unwrap();
+    let before = get(&db, user.id).await.unwrap();
+    let jobs = delivery::Entity::find().count(&db).await.unwrap();
+    let patch = Patch {
+        telegram: Some(TelegramChange::Remove),
+        email: [(Event::Mention, false)].into(),
+        locale: Some(Locale::ZhCn),
+        ..Default::default()
+    };
+    // First fail the warning itself, then fail the profile write AFTER the
+    // warning insert. Neither ordering may leave half the transaction behind.
+    for (operation, table) in [
+        ("INSERT", "notification_deliveries"),
+        ("UPDATE", "notification_profiles"),
+    ] {
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            format!(
+                "CREATE TRIGGER reject_notice BEFORE {operation} ON {table} \
+                     BEGIN SELECT RAISE(ABORT, 'fixture write unavailable'); END"
+            ),
+        ))
+        .await
+        .unwrap();
+        assert!(save(&db, user.id, &patch, &context(), |_, sensitive| {
+            assert!(sensitive);
+            Ok(())
+        })
+        .await
+        .is_err());
+        let after = get(&db, user.id).await.unwrap();
+        assert_eq!(after.profile, before.profile);
+        assert_eq!(after.legacy, before.legacy);
+        assert_eq!(after.events, before.events);
+        assert_eq!(delivery::Entity::find().count(&db).await.unwrap(), jobs);
+        db.execute(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "DROP TRIGGER reject_notice".to_owned(),
+        ))
+        .await
+        .unwrap();
+    }
 }

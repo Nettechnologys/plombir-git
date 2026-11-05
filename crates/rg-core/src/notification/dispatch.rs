@@ -134,6 +134,40 @@ async fn prepare(
     {
         return Ok(Prepared::Stop("failed", "invalid_prior_notice"));
     }
+    if let Some(source) = held.event_id.strip_prefix("thread:") {
+        let id = source
+            .split(':')
+            .next()
+            .and_then(|id| id.parse::<i64>().ok());
+        let note = if let Some(id) = id {
+            rg_db::entities::notification::Entity::find_by_id(id)
+                .one(db)
+                .await?
+        } else {
+            None
+        };
+        if !note.is_some_and(|note| {
+            note.user_id == held.user_id && queue::thread_event_id(&note) == held.event_id
+        }) {
+            return Ok(Prepared::Stop("cancelled", "thread_removed_or_superseded"));
+        }
+    }
+    if let Some(source) = held.event_id.strip_prefix("pipeline:") {
+        let id = source
+            .split(':')
+            .next()
+            .and_then(|id| id.parse::<i64>().ok());
+        let pipeline = if let Some(id) = id {
+            rg_db::ops::pipeline_ops::get_pipeline(db, id).await?
+        } else {
+            None
+        };
+        if !pipeline.is_some_and(|pipeline| {
+            Some(pipeline.repo_id) == held.repo_id && pipeline.status != "cancelled"
+        }) {
+            return Ok(Prepared::Stop("cancelled", "pipeline_unavailable"));
+        }
+    }
     if let Some(repo_id) = held.repo_id {
         let Some(repo) = rg_db::ops::repo_ops::find_by_id(db, repo_id).await? else {
             return Ok(Prepared::Stop("cancelled", "repository_unavailable"));
@@ -270,7 +304,14 @@ fn retry_at(
     if delay >= remaining {
         return None;
     }
-    now.checked_add_signed(chrono::Duration::from_std(delay).ok()?)
+    let next = now.checked_add_signed(chrono::Duration::from_std(delay).ok()?)?;
+    // Round upward for second-precision SQL backends: never retry earlier than
+    // Telegram asked, and never push a retry beyond the fixed expiry.
+    let seconds = next
+        .timestamp()
+        .checked_add(i64::from(next.timestamp_subsec_nanos() != 0))?;
+    let next = chrono::DateTime::from_timestamp(seconds, 0)?;
+    (next < held.expires_at).then_some(next)
 }
 
 pub async fn deliver_one(

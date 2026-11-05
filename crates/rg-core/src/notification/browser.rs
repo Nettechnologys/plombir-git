@@ -174,7 +174,14 @@ mod tests {
     }
     #[tokio::test]
     async fn admission_is_atomic_account_scoped_and_every_fresh_witness_alerts() {
-        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
         let a =
             rg_db::ops::user_ops::create_user(&db, "browser-a", "a@example.invalid", "fixture", "")
@@ -239,7 +246,14 @@ mod tests {
     }
     #[tokio::test]
     async fn failed_outbox_does_not_mark_browser_known() {
-        let db = rg_db::connect("sqlite::memory:").await.unwrap();
+        let db = rg_db::connect_with_pool(
+            "sqlite::memory:",
+            rg_db::TEST_CONNECT_TIMEOUT_SECS,
+            rg_db::DEFAULT_IDLE_TIMEOUT_SECS,
+            rg_db::DEFAULT_MAX_CONNECTIONS,
+        )
+        .await
+        .unwrap();
         rg_db::run_migrations(&db).await.unwrap();
         let user = rg_db::ops::user_ops::create_user(
             &db,

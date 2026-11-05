@@ -88,7 +88,7 @@ pub async fn link(
                 None,
             )
             .await
-            .map_err(super::notification_delivery_ops::db_error)?;
+            .map_err(|error| super::notification_delivery_ops::db_error(error))?;
             txn.commit().await?;
             Ok(Some(inserted))
         }
@@ -162,7 +162,7 @@ pub async fn link_with_new_user(
             None,
         )
         .await
-        .map_err(super::notification_delivery_ops::db_error)?;
+        .map_err(|error| super::notification_delivery_ops::db_error(error))?;
         Ok((user, link))
     }
     .await;
@@ -246,12 +246,12 @@ pub async fn delete_by_id(db: &DatabaseConnection, id: i64, user_id: i64) -> Res
                     None,
                 )
                 .await
-                .map_err(super::notification_delivery_ops::db_error)?;
+                .map_err(|error| super::notification_delivery_ops::db_error(error))?;
             }
         }
         txn.commit().await?;
         Ok(res.rows_affected > 0)
     })
     .await
-    .map_err(super::notification_delivery_ops::db_error)
+    .map_err(|error| super::notification_delivery_ops::db_error(error))
 }

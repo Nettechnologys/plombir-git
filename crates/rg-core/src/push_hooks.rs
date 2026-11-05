@@ -1290,51 +1290,7 @@ async fn trigger_ci_for_push(params: &PostPushParams<'_>, target: &HookTarget, u
         }),
     );
 
-    // Send email notification if SMTP is configured
-    if let Some(smtp) = params.smtp_config {
-        if let Some(owner_user) = crate::notification::best_effort_user_by_id(
-            params.db,
-            owner_id,
-            target.repo_id,
-            "ci_triggered",
-            "recipient",
-        )
-        .await
-        // A bot's address is a placeholder under `.invalid`: no mailbox to
-        // reach, only a failed SMTP round trip per push (card_60a80311d512).
-        .filter(|owner_user| !owner_user.is_bot())
-        {
-            // Every CI-triggering push used to mail the owner, unasked and with
-            // no way to stop it. It is a notification setting now, off unless
-            // chosen (card_349c2b6a0d7c).
-            match rg_db::ops::notification_setting_ops::get(params.db, owner_user.id).await {
-                Ok(settings) if settings.email_ci_triggered => {}
-                Ok(_) => return,
-                Err(error) => {
-                    tracing::warn!(
-                        user_id = owner_user.id,
-                        error = %format!("{error:#}"),
-                        "CI notification mail skipped: notification settings could not be read"
-                    );
-                    return;
-                }
-            }
-            let subject = format!(
-                "[Plombir Git] CI pipeline #{} triggered for {}/{}",
-                pipeline_id, target.owner, target.name
-            );
-            let body = format!(
-                "A CI pipeline has been triggered for repository {}/{} on branch {}.\n\nCommit: {}\nPipeline ID: {}",
-                target.owner, target.name, update.refname, update.new_sha, pipeline_id
-            );
-            if let Err(e) =
-                crate::email::send_html_notification(smtp, &owner_user.email, &subject, &body, None)
-                    .await
-            {
-                tracing::warn!(error = %format!("{e:#}"), "Failed to send CI notification email");
-            }
-        }
-    }
+    // Durable channel jobs were inserted with the successful pipeline graph.
 }
 
 fn ref_kind(ref_name: &str) -> Option<&'static str> {

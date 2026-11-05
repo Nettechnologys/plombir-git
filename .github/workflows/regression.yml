@@ -489,6 +489,9 @@ jobs:
       - name: Prove integer SUM aggregates decode on PostgreSQL
         run: "cargo test -p rg-db -j 6 --test integration aggregate_sums_decode:: -- --nocapture"
 
+      - name: Prove notification channels and queue state on PostgreSQL
+        run: "cargo test -p rg-db -j 6 --test integration notification_channels_schema:: -- --nocapture"
+
       - name: Prove single-use credentials hold on PostgreSQL
         run: >-
           cargo test -p rg-db -j 6 --test integration -- --nocapture
@@ -612,6 +615,9 @@ jobs:
       # and only a non-NULL total exposes the difference.
       - name: Prove integer SUM aggregates decode on MySQL
         run: "cargo test -p rg-db -j 6 --test integration aggregate_sums_decode:: -- --nocapture"
+
+      - name: Prove notification channels and queue state on MySQL
+        run: "cargo test -p rg-db -j 6 --test integration notification_channels_schema:: -- --nocapture"
 
       - name: Prove single-use credentials hold on MySQL
         run: >-
