@@ -19,6 +19,10 @@ pub struct Destination {
 }
 
 impl Destination {
+    #[cfg(test)]
+    pub(crate) fn fixture_parts(&self) -> (&str, i64, Option<i32>) {
+        (&self.token, self.chat_id, self.message_thread_id)
+    }
     pub fn new(token: String, chat_id: i64, message_thread_id: Option<i32>) -> Result<Self, Error> {
         validate_token(&token)?;
         validate_recipient(chat_id, message_thread_id)?;
@@ -413,6 +417,7 @@ mod tests {
         for (status, code, expected) in [
             (200, 400, Error::InvalidDestination),
             (401, 401, Error::Unauthorized),
+            (404, 404, Error::Unauthorized),
             (403, 403, Error::Forbidden),
             (503, 503, Error::Unavailable),
         ] {
@@ -504,17 +509,28 @@ mod tests {
                 Err(Error::InvalidText)
             );
         }
+        // A live HTTP listener distinguishes HTTPS rejection from an ordinary
+        // connection-refused error. No request may even connect to it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
         let production = Client::new().unwrap();
         assert_eq!(
-            production
-                .send_to("http://127.0.0.1:1/", &destination(None), "test")
-                .await,
+            production.send_to(&url, &destination(None), "test").await,
             Err(Error::Network)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
         );
     }
 
     #[test]
     fn malformed_or_false_success_is_not_acknowledged() {
+        assert_eq!(
+            response_result(reqwest::StatusCode::NO_CONTENT, b""),
+            Err(Error::Protocol)
+        );
         for body in [
             b"not json".as_slice(),
             br#"{"ok":false}"#,
@@ -530,6 +546,9 @@ mod tests {
 
     #[tokio::test]
     async fn trace_output_and_formatted_error_do_not_disclose_the_secret() {
+        // Scoped tracing events only: set_default does NOT exercise the global
+        // log→tracing bridge used by reqwest/hyper/h2. Review of pinned reqwest
+        // 0.12.28 found no path/token in its connection log; recheck on upgrades.
         let logs = Logs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(logs.clone())
