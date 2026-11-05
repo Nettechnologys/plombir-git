@@ -80,6 +80,12 @@ export { buildLabelPayload, type LabelFormState } from './labelForm';
 export {
   notifications,
   EMAIL_NOTIFICATION_KEYS,
+  NOTIFICATION_EVENTS,
+  type DeliverySettings,
+  type DeliverySettingsPatch,
+  type NotificationEvent,
+  type NotificationChannel,
+  type NotificationTestResult,
   type EmailNotificationKey,
   type EmailNotificationSettings,
   type NotificationReason,

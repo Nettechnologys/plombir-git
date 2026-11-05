@@ -476,6 +476,7 @@
       "handler": "api::sudo::step_up",
       "testedIn": [
         "rust",
+        "web",
         "smoke"
       ],
       "reachedFromUi": false
@@ -4112,7 +4113,7 @@
       "method": "GET",
       "url": "/api/v1/users/me/notification-settings",
       "access": "User",
-      "handler": "api::notifications::get_notification_settings",
+      "handler": "api::notifications::delivery_settings::get_notification_settings",
       "testedIn": [
         "web"
       ],
@@ -4122,9 +4123,29 @@
       "method": "PUT",
       "url": "/api/v1/users/me/notification-settings",
       "access": "User",
-      "handler": "api::notifications::update_notification_settings",
+      "handler": "api::notifications::delivery_settings::update_notification_settings",
       "testedIn": [
         "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "POST",
+      "url": "/api/v1/users/me/notification-settings/test",
+      "access": "User",
+      "handler": "api::notifications::delivery_settings::test_notification",
+      "testedIn": [
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/users/me/notification-settings/test",
+      "access": "User",
+      "handler": "api::notifications::delivery_settings::notification_test_result",
+      "testedIn": [
         "web"
       ],
       "reachedFromUi": true
@@ -28329,21 +28350,45 @@
       "admin": false,
       "controls": [
         {
-          "tag": "input",
-          "label": "",
-          "line": 95,
+          "tag": "button",
+          "label": "i18n:notification_settings.retry",
+          "line": 158,
           "via": null,
           "href": null,
-          "handler": "(event) => toggle(key, event)",
+          "handler": "() => load()",
           "calls": [
             {
-              "symbol": "notifications.updateSettings",
+              "symbol": "notifications.settings",
+              "method": "GET",
+              "url": "/api/v1/users/me/notification-settings",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/me/notification-settings",
+              "access": "User",
+              "handler": "api::notifications::delivery_settings::get_notification_settings",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "form",
+          "label": "}>",
+          "line": 167,
+          "via": null,
+          "href": null,
+          "handler": "(event) => { event.preventDefault(); void save(); }",
+          "calls": [
+            {
+              "symbol": "notifications.updateDelivery",
               "method": "PUT",
               "url": "/api/v1/users/me/notification-settings",
               "opaque": false,
               "routeUrl": "/api/v1/users/me/notification-settings",
               "access": "User",
-              "handler": "api::notifications::update_notification_settings",
+              "handler": "api::notifications::delivery_settings::update_notification_settings",
               "matched": true,
               "testedIn": [
                 "rust",
@@ -28352,23 +28397,128 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "select",
+          "label": "i18n:notification_settings.keep",
+          "line": 173,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:notification_settings.save_language",
+          "line": 193,
+          "via": null,
+          "href": null,
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:notification_settings.discard",
+          "line": 194,
+          "via": null,
+          "href": null,
+          "handler": "() => { if (settings) apply(settings); saveError = ''; }",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "input",
+          "label": "",
+          "line": 211,
+          "via": null,
+          "href": null,
+          "handler": "(event) => toggle(key, channel as NotificationChannel, event)",
+          "calls": [
+            {
+              "symbol": "notifications.updateDelivery",
+              "method": "PUT",
+              "url": "/api/v1/users/me/notification-settings",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/me/notification-settings",
+              "access": "User",
+              "handler": "api::notifications::delivery_settings::update_notification_settings",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "notifications.updateSettings",
+              "method": "PUT",
+              "url": "/api/v1/users/me/notification-settings",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/me/notification-settings",
+              "access": "User",
+              "handler": "api::notifications::delivery_settings::update_notification_settings",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:notification_settings.testing",
+          "line": 213,
+          "via": null,
+          "href": null,
+          "handler": "() => test(key)",
+          "calls": [
+            {
+              "symbol": "notifications.testResult",
+              "method": "GET",
+              "url": "/api/v1/users/me/notification-settings/test",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/me/notification-settings/test",
+              "access": "User",
+              "handler": "api::notifications::delivery_settings::notification_test_result",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            },
+            {
+              "symbol": "notifications.testDelivery",
+              "method": "POST",
+              "url": "/api/v1/users/me/notification-settings/test",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/me/notification-settings/test",
+              "access": "User",
+              "handler": "api::notifications::delivery_settings::test_notification",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            },
+            {
+              "symbol": "notifications.settings",
+              "method": "GET",
+              "url": "/api/v1/users/me/notification-settings",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/me/notification-settings",
+              "access": "User",
+              "handler": "api::notifications::delivery_settings::get_notification_settings",
+              "matched": true,
+              "testedIn": [
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
         }
       ],
-      "passive": [
-        {
-          "symbol": "notifications.settings",
-          "method": "GET",
-          "url": "/api/v1/users/me/notification-settings",
-          "opaque": false,
-          "routeUrl": "/api/v1/users/me/notification-settings",
-          "access": "User",
-          "handler": "api::notifications::get_notification_settings",
-          "matched": true,
-          "testedIn": [
-            "web"
-          ]
-        }
-      ]
+      "passive": []
     },
     {
       "route": "/settings/profile",
@@ -29721,7 +29871,7 @@
       "outsider"
     ],
     "scenarios": 52,
-    "inventoryEntries": 836,
+    "inventoryEntries": 841,
     "coveredEntries": 197,
     "coveredRoutes": 187,
     "maxUiRoutesWithoutFrontendTest": 22

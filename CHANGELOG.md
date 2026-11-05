@@ -6,6 +6,26 @@ This project records user-facing changes here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Personal Telegram and email channels for 36 activity/security events, saved
+  English/Russian/Simplified Chinese delivery language and per-event test sends.
+  Telegram credentials are encrypted and included in normal key-check/rekey.
+- New-device alerts after completed authentication, and alerts for credential,
+  MFA and account security changes. The first login of every browser/account
+  after upgrade alerts; existing sessions are not used to seed trusted browsers.
+
+### Changed
+
+- Telegram changes and every reduction of notification delivery require fresh
+  current-factor authentication. Confirmed previous destinations receive a
+  minimal warning after a successful protected change.
+- Notification delivery uses a durable queue with bounded retries. Old pending
+  email rows without a captured destination remain in-app but are not mailed
+  after upgrade. Personal notification settings now require a login session,
+  including the legacy email-only API. See [notification rollout and operator
+  requirements](docs/notifications.md).
+
 ## [0.3.0] - 2026-10-23
 
 This release changes how Actions workflows run, and a v0.2.0

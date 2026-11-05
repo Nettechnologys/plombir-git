@@ -1,133 +1,260 @@
 <script lang="ts">
-  // Which notifications are also mailed (card_349c2b6a0d7c). Every mail footer
-  // links here. A toggle saves on its own — `PUT` carries only the key that
-  // changed, so a second tab's choice for another category is not overwritten —
-  // and the switches then show what the server stored, not what was clicked.
   import { goto } from '$app/navigation';
+  import { onDestroy } from 'svelte';
   import {
-    EMAIL_NOTIFICATION_KEYS,
-    notifications,
-    type EmailNotificationKey,
-    type EmailNotificationSettings,
+    EMAIL_NOTIFICATION_KEYS, NOTIFICATION_EVENTS, notifications,
+    type EmailNotificationKey, type NotificationSettings, type NotificationEvent,
+    type NotificationChannel, type DeliverySettingsPatch, type NotificationTestResult,
   } from '$lib/api/client.svelte';
-  import { formatTranslationFallback, t } from '$lib/i18n';
-  import { isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
+  import { activeLocale, formatTranslationFallback, t } from '$lib/i18n';
+  import { getUser, isAuthReady, isLoggedIn } from '$lib/stores/auth.svelte';
 
-  let settings = $state<EmailNotificationSettings | null>(null);
+  let settings = $state<NotificationSettings | null>(null);
   let loading = $state(true);
   let loadError = $state('');
-  let savingKey = $state<EmailNotificationKey | null>(null);
+  let savingKey = $state<string | null>(null);
   let saveError = $state('');
   let saved = $state(false);
-  let loadGeneration = 0;
+  let mode = $state<'keep' | 'replace' | 'remove'>('keep');
+  let token = $state('');
+  let chat = $state('');
+  let topic = $state('');
+  let tests = $state<Partial<Record<NotificationEvent, NotificationTestResult>>>({});
+  let testErrors = $state<Partial<Record<NotificationEvent, string>>>({});
+  let pending = $state<Partial<Record<NotificationEvent, boolean>>>({});
+  let generation = 0;
+  let alive = true;
+  const timers = new Map<ReturnType<typeof setTimeout>, () => void>();
+  const modern = $derived(!!settings?.events);
+  const dirty = $derived(mode !== 'keep' || token !== ''
+    || chat !== String(settings?.telegram?.chat_id ?? '')
+    || topic !== String(settings?.telegram?.message_thread_id ?? ''));
+  const testDirty = $derived(dirty || !!settings?.locale && activeLocale() !== settings.locale);
+  const busy = $derived(savingKey !== null);
+  const keys = $derived(modern ? NOTIFICATION_EVENTS : EMAIL_NOTIFICATION_KEYS);
+  const groups = $derived(modern ? ['activity', 'security'] : ['activity']);
 
+  function clearTimers() {
+    for (const [timer, resolve] of timers) { clearTimeout(timer); resolve(); }
+    timers.clear();
+  }
+  onDestroy(() => { alive = false; ++generation; token = ''; clearTimers(); });
   $effect(() => {
     if (!isAuthReady()) return;
-    if (!isLoggedIn()) {
-      goto('/login');
-      return;
-    }
-    void load();
+    const id = getUser()?.id;
+    ++generation;
+    clearTimers();
+    settings = null; token = ''; tests = {}; testErrors = {}; pending = {};
+    if (!isLoggedIn() || !id) { goto('/login'); return; }
+    void load(id);
   });
-
-  async function load() {
-    const generation = ++loadGeneration;
-    loading = true;
-    loadError = '';
+  const owns = (stamp: number, id: number | undefined) => alive && generation === stamp && getUser()?.id === id;
+  function apply(response: NotificationSettings) {
+    settings = response;
+    chat = String(response.telegram?.chat_id ?? '');
+    topic = String(response.telegram?.message_thread_id ?? '');
+    token = ''; mode = 'keep';
+  }
+  async function load(id = getUser()?.id) {
+    const stamp = ++generation;
+    loading = true; loadError = ''; saveError = ''; saved = false; savingKey = null;
     try {
       const response = await notifications.settings();
-      if (generation === loadGeneration) settings = response.email;
+      if (owns(stamp, id)) apply(response);
     } catch (err: any) {
-      if (generation === loadGeneration) loadError = err?.message || t('notification_settings.load_failed');
-    } finally {
-      if (generation === loadGeneration) loading = false;
-    }
+      if (owns(stamp, id)) loadError = err?.message || t('notification_settings.load_failed');
+    } finally { if (owns(stamp, id)) loading = false; }
   }
-
-  async function toggle(key: EmailNotificationKey, event: Event) {
+  function selected(key: NotificationEvent, channel: NotificationChannel) {
+    return settings?.events?.[key]?.[channel] ?? (channel === 'email' ? settings?.email[key as EmailNotificationKey] ?? false : false);
+  }
+  async function toggle(key: NotificationEvent, channel: NotificationChannel, event: Event) {
     const input = event.currentTarget as HTMLInputElement;
-    const value = input.checked;
-    if (!settings || savingKey !== null) {
-      input.checked = settings?.[key] ?? !value;
-      return;
-    }
-    savingKey = key;
-    saveError = '';
-    saved = false;
+    const previous = selected(key, channel);
+    if (!settings || busy || dirty) { input.checked = previous; return; }
+    const stamp = generation, id = getUser()?.id;
+    savingKey = `${key}:${channel}`; saveError = ''; saved = false;
     try {
-      const response = await notifications.updateSettings({ [key]: value });
-      settings = response.email;
-      saved = true;
+      const response = modern
+        ? await notifications.updateDelivery({ events: { [key]: { [channel]: input.checked } }, locale: activeLocale() })
+        : await notifications.updateSettings({ [key]: input.checked });
+      if (owns(stamp, id)) { apply(response); saved = true; }
     } catch (err: any) {
-      saveError = err?.message || t('notification_settings.save_failed');
-      // The switch goes back to what the server still holds.
-      input.checked = settings[key];
-    } finally {
-      savingKey = null;
+      if (owns(stamp, id)) { input.checked = previous; saveError = err?.message || t('notification_settings.save_failed'); }
+    } finally { if (owns(stamp, id)) savingKey = null; }
+  }
+  async function save() {
+    if (!settings || busy) return;
+    const patch: DeliverySettingsPatch = { locale: activeLocale() };
+    if (mode === 'remove') patch.telegram = { action: 'remove' };
+    else if (dirty) {
+      const chatId = Number(chat), topicId = topic.trim() ? Number(topic) : null;
+      if (!chat.trim() || !Number.isSafeInteger(chatId) || !chatId || Math.abs(chatId) > 2 ** 52 - 1
+        || topicId !== null && (!Number.isSafeInteger(topicId) || topicId <= 0 || topicId > 2147483647)
+        || (mode === 'replace' || !settings.telegram?.token_configured) && !token.trim()) {
+        saveError = t('notification_settings.invalid_destination'); return;
+      }
+      patch.telegram = { action: 'set', chat_id: chatId, message_thread_id: topicId,
+        ...(mode === 'replace' || !settings.telegram?.token_configured ? { token: token.trim() } : {}) };
     }
+    const stamp = generation, id = getUser()?.id;
+    savingKey = 'configuration'; saveError = ''; saved = false;
+    try {
+      const response = await notifications.updateDelivery(patch);
+      if (owns(stamp, id)) { apply(response); saved = true; }
+    } catch (err: any) {
+      if (owns(stamp, id)) saveError = err?.message || t('notification_settings.save_failed');
+    } finally { if (owns(stamp, id)) savingKey = null; }
+  }
+  const isWaiting = (result: NotificationTestResult | undefined) => result && Object.values(result.channels).some(c => c.status === 'queued' || c.status === 'inflight');
+  function pause() { return new Promise<void>(resolve => { const timer = setTimeout(() => { timers.delete(timer); resolve(); }, 1000); timers.set(timer, resolve); }); }
+  async function test(key: NotificationEvent) {
+    if (testDirty || busy || pending[key]) return;
+    const stamp = generation, id = getUser()?.id;
+    const revision = settings?.revision;
+    pending[key] = true; testErrors[key] = '';
+    try {
+      let result = isWaiting(tests[key]) ? await notifications.testResult(tests[key]!.event_id) : await notifications.testDelivery(key);
+      for (let attempt = 0; owns(stamp, id); attempt++) {
+        tests[key] = result;
+        if (!isWaiting(result) || attempt >= 30) break;
+        await pause();
+        if (!owns(stamp, id)) return;
+        result = await notifications.testResult(result.event_id);
+      }
+      if (owns(stamp, id) && result.channels.telegram.status === 'sent') {
+        // Confirm only the same saved revision. A late send must not make a
+        // changed destination look verified, or overwrite an edited form.
+        try {
+          const fresh = await notifications.settings();
+          if (owns(stamp, id) && settings && settings.revision === revision && fresh.revision === revision && settings.telegram && fresh.telegram) {
+            settings = { ...settings, telegram: { ...settings.telegram, confirmed: fresh.telegram.confirmed } };
+          }
+        } catch { /* The delivery result remains valid if the status refresh fails. */ }
+      }
+    } catch (err: any) {
+      if (owns(stamp, id)) testErrors[key] = err?.message || t('notification_settings.test_failed');
+    } finally { if (owns(stamp, id)) pending[key] = false; }
+  }
+  function reason(code: string | null) {
+    if (!code) return '';
+    // Finite server codes only; unknown details use a localized safe fallback.
+    if (['telegram_timeout', 'telegram_network'].includes(code)) code = 'telegram_transport';
+    if (['telegram_invalid_response', 'telegram_redirect_refused', 'telegram_response_too_large'].includes(code)) code = 'telegram_protocol';
+    if (['telegram_invalid_chat', 'telegram_invalid_topic'].includes(code)) code = 'telegram_invalid_destination';
+    if (code === 'telegram_invalid_token') code = 'telegram_unauthorized';
+    const known = ['smtp_unavailable','email_unavailable','telegram_not_configured','channel_disabled','telegram_unauthorized','telegram_forbidden','telegram_invalid_destination','telegram_rate_limited','telegram_unavailable','telegram_protocol','telegram_transport','smtp_delivery_failed','destination_changed','encryption_unavailable'];
+    return t(`notification_settings.reason.${known.includes(code) ? code : 'other'}`, undefined, t('notification_settings.reason.other'));
   }
 </script>
 
-<svelte:head>
-  <title>{t('notification_settings.title')} · Plombir Git</title>
-</svelte:head>
-
-<div class="page-container notification-settings-page">
-  <header class="page-header">
-    <h1>{t('notification_settings.title')}</h1>
-    <p>{t('notification_settings.description')}</p>
-  </header>
-
+<svelte:head><title>{t('notification_settings.title')} · Plombir Git</title></svelte:head>
+<div class="page-container-narrow notification-settings-page">
+  <header class="page-header"><h1>{t('notification_settings.title')}</h1><p>{t('notification_settings.description')}</p></header>
   {#if loading}
     <p class="muted">{t('common.loading')}</p>
   {:else if loadError}
     <div class="message error-box" role="alert">{loadError}</div>
+    <button type="button" class="btn btn-secondary" onclick={() => load()}>{t('notification_settings.retry')}</button>
   {:else if settings}
     {#if saveError}<div class="message error-box save-error" role="alert">{saveError}</div>{/if}
     {#if saved}<div class="message success-box" role="status">{t('notification_settings.saved')}</div>{/if}
-
-    <section class="section">
-      <h2>{t('notification_settings.email_title')}</h2>
-      <ul class="category-list">
-        {#each EMAIL_NOTIFICATION_KEYS as key (key)}
-          <li class="category" data-category={key}>
-            <label>
-              <input
-                type="checkbox"
-                checked={settings[key]}
-                disabled={savingKey !== null}
-                onchange={(event) => toggle(key, event)}
-              />
-              <span class="category-text">
-                <span class="category-name">{t(`notification_settings.category.${key}.name`, undefined, formatTranslationFallback(key))}</span>
-                <span class="category-hint">{t(`notification_settings.category.${key}.hint`, undefined, formatTranslationFallback(key))}</span>
-              </span>
-            </label>
-          </li>
-        {/each}
-      </ul>
-      <p class="muted footnote">{t('notification_settings.in_app_note')}</p>
-    </section>
+    {#if modern}
+      <section class="section destination" aria-labelledby="destination-heading">
+        <h2 id="destination-heading">{t('notification_settings.delivery')}</h2>
+        <p class="muted">{t('notification_settings.saved_language', { language: settings.locale === 'ru' ? 'Русский' : settings.locale === 'zh-CN' ? '简体中文' : 'English' })}</p>
+        {#if !settings.capabilities?.email}<p class="message unavailable">{t('notification_settings.reason.smtp_unavailable')}</p>{/if}
+        <form onsubmit={(event) => { event.preventDefault(); void save(); }}>
+          <fieldset disabled={busy}>
+            <legend>{t('notification_settings.telegram')}</legend>
+            <p class="muted">{settings.telegram?.token_configured ? t('notification_settings.token_saved') : t('notification_settings.token_missing')}</p>
+            {#if settings.telegram?.token_configured}<p class="muted">{settings.telegram.confirmed ? t('notification_settings.confirmed') : t('notification_settings.unconfirmed')}</p>{/if}
+            <label for="telegram-action">{t('notification_settings.token_action')}</label>
+            <select id="telegram-action" bind:value={mode}>
+              <option value="keep">{t('notification_settings.keep')}</option>
+              <option value="replace">{settings.telegram?.token_configured ? t('notification_settings.replace') : t('notification_settings.add')}</option>
+              {#if settings.telegram?.token_configured}<option value="remove">{t('notification_settings.remove')}</option>{/if}
+            </select>
+            {#if mode === 'replace'}
+              <label for="telegram-token">{t('notification_settings.bot_token')}</label>
+              <input id="telegram-token" type="password" autocomplete="new-password" spellcheck="false" bind:value={token} maxlength="149" />
+              <p class="hint">{t('notification_settings.botfather')}</p>
+            {/if}
+            {#if mode !== 'remove'}
+              <div class="destination-fields">
+                <div><label for="telegram-chat">{t('notification_settings.chat')}</label><input id="telegram-chat" inputmode="text" autocomplete="off" bind:value={chat} /></div>
+                <div><label for="telegram-topic">{t('notification_settings.topic')}</label><input id="telegram-topic" inputmode="numeric" autocomplete="off" bind:value={topic} /></div>
+              </div>
+              <p class="hint">{t('notification_settings.destination_hint')}</p>
+            {/if}
+          </fieldset>
+          <p class="warning">{t('notification_settings.protection')}</p>
+          <p class="hint">{t('notification_settings.old_warning')}</p>
+          <div class="form-actions"><button type="submit" class="btn btn-primary" disabled={busy} aria-busy={savingKey === 'configuration'}>{t('notification_settings.save_language')}</button>
+            {#if dirty}<button type="button" class="btn btn-secondary" disabled={busy} onclick={() => { if (settings) apply(settings); saveError = ''; }}>{t('notification_settings.discard')}</button>{/if}
+          </div>
+        </form>
+      </section>
+      {#if testDirty}<p class="message unavailable" role="status">{t('notification_settings.save_before_test')}</p>{/if}
+    {/if}
+    {#each groups as group}
+      <section class="section" aria-labelledby={`group-${group}`}>
+        <h2 id={`group-${group}`}>{modern ? t(`notification_settings.${group}`, undefined, formatTranslationFallback(group)) : t('notification_settings.email_title')}</h2>
+        <ul class="category-list">
+          {#each keys.filter(key => group === 'security' ? !EMAIL_NOTIFICATION_KEYS.includes(key as EmailNotificationKey) : EMAIL_NOTIFICATION_KEYS.includes(key as EmailNotificationKey)) as key (key)}
+            <li class="category" data-category={key}>
+              <div class="category-text"><span class="category-name" id={`event-${key}`}>{t(modern ? `notification_settings.events.${key}` : `notification_settings.category.${key}.name`, undefined, formatTranslationFallback(key))}</span>
+                {#if EMAIL_NOTIFICATION_KEYS.includes(key as EmailNotificationKey)}<span class="category-hint">{t(`notification_settings.category.${key}.hint`, undefined, formatTranslationFallback(key))}</span>{/if}
+              </div>
+              <div class="channel-actions">
+                {#each (modern ? ['email', 'telegram'] : ['email']) as channel}
+                  <label class="channel"><input type="checkbox" aria-labelledby={`event-${key} channel-${key}-${channel}`} checked={selected(key, channel as NotificationChannel)} disabled={busy || dirty || modern && (channel === 'email' ? !settings.capabilities?.email : !settings.telegram?.token_configured)} onchange={(event) => toggle(key, channel as NotificationChannel, event)} /><span id={`channel-${key}-${channel}`}>{channel === 'email' ? t('notification_settings.email_title') : t('notification_settings.telegram')}</span></label>
+                {/each}
+                {#if modern}<button type="button" class="btn btn-secondary test-button" disabled={testDirty || busy || pending[key]} aria-busy={pending[key] ?? false} aria-label={`${t('notification_settings.test')} — ${t(`notification_settings.events.${key}`, undefined, formatTranslationFallback(key))}`} onclick={() => test(key)}>{pending[key] ? t('notification_settings.testing') : isWaiting(tests[key]) ? t('notification_settings.check_result') : t('notification_settings.test')}</button>{/if}
+              </div>
+              {#if tests[key]}<div class="test-results" role="status" aria-live="polite">{#each ['email', 'telegram'] as channel}{@const result = tests[key]!.channels[channel as NotificationChannel]}<p class:sent={result.status === 'sent'}>{channel === 'email' ? t('notification_settings.email_title') : t('notification_settings.telegram')}: {t(`notification_settings.status.${result.status}`, undefined, formatTranslationFallback(result.status))}{result.reason ? ` — ${reason(result.reason)}` : ''}</p>{/each}</div>{/if}
+              {#if testErrors[key]}<p class="error-box test-error" role="alert">{testErrors[key]}</p>{/if}
+            </li>
+          {/each}
+        </ul>
+      </section>
+    {/each}
+    <p class="muted footnote">{t('notification_settings.in_app_note')}</p>
   {/if}
 </div>
 
 <style>
-  .notification-settings-page { max-width: 760px; }
+  .notification-settings-page { max-width: 860px; }
   .page-header { margin-bottom: 24px; }
-  .page-header p { color: var(--text-secondary); margin-top: 6px; }
+  .page-header p, .muted, .hint, .category-hint { color: var(--text-secondary); }
+  .page-header p { margin-top: 6px; }
   h2 { font-size: 18px; margin: 0 0 12px; }
-  .section { margin-bottom: 32px; }
+  .section { margin-bottom: 28px; }
+  .destination { border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }
+  fieldset { border: 0; padding: 0; min-width: 0; margin: 16px 0; }
+  legend { font-weight: 600; margin-bottom: 8px; }
+  form label { display: block; margin: 12px 0 6px; }
+  form input, form select { width: 100%; box-sizing: border-box; min-width: 0; }
+  .destination-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .hint, .category-hint, .footnote, .test-results { font-size: 13px; }
+  .hint { margin: 8px 0; }
+  .warning { margin-top: 16px; }
+  .form-actions, .channel-actions { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  button { white-space: normal; overflow-wrap: anywhere; }
+  .form-actions { margin-top: 16px; }
   .message { margin-bottom: 20px; padding: 14px 16px; border: 1px solid var(--border); border-radius: var(--radius); }
-  .error-box { color: var(--red); background: color-mix(in srgb, var(--red) 10%, transparent); }
-  .success-box { color: var(--green); background: color-mix(in srgb, var(--green) 10%, transparent); }
+  .error-box { color: var(--red); }
+  .success-box, .sent { color: var(--green); }
+  .unavailable { color: var(--text-secondary); }
   .category-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); border-radius: var(--radius); }
-  .category { padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .category { padding: 16px; border-bottom: 1px solid var(--border); }
   .category:last-child { border-bottom: none; }
-  .category label { display: flex; align-items: flex-start; gap: 12px; cursor: pointer; }
-  .category input { margin-top: 3px; }
-  .category-text { display: flex; flex-direction: column; gap: 2px; }
+  .category-text { display: flex; flex-direction: column; gap: 3px; margin-bottom: 12px; overflow-wrap: anywhere; }
   .category-name { font-weight: 600; }
-  .category-hint { color: var(--text-secondary); font-size: 13px; }
-  .muted { color: var(--text-secondary); }
-  .footnote { margin-top: 12px; font-size: 13px; }
+  .channel { display: flex; align-items: center; gap: 6px; cursor: pointer; min-height: 32px; }
+  .channel input { margin: 0; }
+  .test-button { margin-left: auto; }
+  .test-results { margin-top: 10px; overflow-wrap: anywhere; }
+  .test-results p { margin: 4px 0; }
+  @media (max-width: 480px) { .destination { padding: 14px; } .destination-fields { grid-template-columns: 1fr; gap: 0; } .test-button { margin-left: 0; } }
 </style>

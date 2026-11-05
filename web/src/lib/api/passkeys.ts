@@ -124,7 +124,7 @@ export const passkeys = {
 
     const options = await request<{ publicKey: any }>('/users/passkeys/login/start', {
       method: 'POST',
-      body: JSON.stringify({ username, remember_me: rememberMe, reauthenticate }),
+      body: JSON.stringify({ username, remember_me: rememberMe, ...(reauthenticate ? { reauthenticate: true } : {}) }),
     });
     const publicKey = options.publicKey;
     publicKey.challenge = b64urlToBuf(publicKey.challenge);

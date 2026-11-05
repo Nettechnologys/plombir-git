@@ -26,7 +26,7 @@ export {
 } from '../api/milestoneForm';
 export { buildMirrorPayload } from '../api/mirrorForm';
 export { buildRepoSettingsPatch, repoSettingsFormState } from '../api/repoSettingsForm';
-export { EMAIL_NOTIFICATION_KEYS } from '../api/notifications';
+export { EMAIL_NOTIFICATION_KEYS, NOTIFICATION_EVENTS } from '../api/notifications';
 export { buildOrganizationUpdatePayload } from '../api/orgManagement';
 export { buildReleaseUpdatePayload } from '../api/releaseForm';
 export { buildTagProtectionPayload } from '../api/tagProtectionForm';

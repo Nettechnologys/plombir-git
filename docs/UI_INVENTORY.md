@@ -19,12 +19,12 @@
 
 | | |
 |---|---|
-| Router routes (with declared `Access`) | 456 |
-| Reachable from the browser | 316 (69%) |
+| Router routes (with declared `Access`) | 458 |
+| Reachable from the browser | 318 (69%) |
 | Layout modules | 2 |
 | Pages | 75 |
-| Interactive controls | 1060 |
-| Controls calling an API | 378 |
+| Interactive controls | 1066 |
+| Controls calling an API | 381 |
 | Controls from shared components | 425 |
 | Browser sweep: scenarios / inventory entries / routes | 52 / 197 / 187 |
 | **UI routes without a web/smoke/browser test** | **22** |
@@ -36,7 +36,7 @@
 |---|---:|---:|---:|---:|
 | `RepoRead` | 111 | 72 | 4 | 0 |
 | `RepoWrite` | 81 | 62 | 12 | 2 |
-| `User` | 61 | 50 | 3 | 0 |
+| `User` | 63 | 52 | 3 | 0 |
 | `RepoAdmin` | 54 | 49 | 0 | 4 |
 | `InstanceAdmin` | 33 | 28 | 0 | 1 |
 | `Public` | 25 | 10 | 2 | 0 |
@@ -113,6 +113,7 @@
 | `/[owner]/[repo]/settings/lfs-storage` | 7 | 4 | 2 |
 | `/[owner]/[repo]/settings/mirror` | 7 | 3 | 2 |
 | `/[owner]/[repo]/settings/tags` | 7 | 2 | 2 |
+| `/settings/notifications` | 7 | 4 | 0 |
 | `/settings/signing-keys` | 7 | 2 | 2 |
 | `/[owner]/[repo]/settings/ci-secrets` | 6 | 2 | 2 |
 | `/admin` 🔒 | 6 | 0 | 0 |
@@ -131,7 +132,6 @@
 | `/register` | 3 | 0 | 0 |
 | `/verify-email` | 3 | 1 | 0 |
 | `/[owner]/[repo]/settings/runners` | 1 | 0 | 0 |
-| `/settings/notifications` | 1 | 1 | 0 |
 
 ## Test plan: control → route → access level
 
@@ -1246,8 +1246,13 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| (event) => toggle(key, event) | :95 | `PUT /api/v1/users/me/notification-settings` | `User` | rust+web |
-| _(page load)_ | — | `GET /api/v1/users/me/notification-settings` | `User` | web |
+| i18n:notification_settings.retry | :158 | `GET /api/v1/users/me/notification-settings` | `User` | web |
+| }> | :167 | `PUT /api/v1/users/me/notification-settings` | `User` | rust+web |
+| (event) => toggle(key, channel as Notifi | :211 | `PUT /api/v1/users/me/notification-settings` | `User` | rust+web |
+| (event) => toggle(key, channel as Notifi | :211 | `PUT /api/v1/users/me/notification-settings` | `User` | rust+web |
+| i18n:notification_settings.testing | :213 | `GET /api/v1/users/me/notification-settings/test` | `User` | web |
+| i18n:notification_settings.testing | :213 | `POST /api/v1/users/me/notification-settings/test` | `User` | web |
+| i18n:notification_settings.testing | :213 | `GET /api/v1/users/me/notification-settings` | `User` | web |
 
 ### `/settings/profile`
 
@@ -1371,7 +1376,7 @@ CI runners, and webhooks. A browser test cannot cover these routes.
 | POST | `/api/v1/users/login` | `Public` | rust+web+smoke |
 | POST | `/api/v1/users/logout` | `User` | rust+web |
 | POST | `/api/v1/users/me/session/refresh` | `User` | rust+web |
-| POST | `/api/v1/users/me/sudo` | `User` | rust+smoke |
+| POST | `/api/v1/users/me/sudo` | `User` | rust+web+smoke |
 | POST | `/api/v1/users/password/initial` | `Public` | rust+web |
 | GET | `/api/v1/avatars/{username}` | `Public` | rust |
 | POST | `/api/v1/users/mfa/verify` | `Public` | rust |

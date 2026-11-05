@@ -32,8 +32,64 @@ export const EMAIL_NOTIFICATION_KEYS = [
 export type EmailNotificationKey = (typeof EMAIL_NOTIFICATION_KEYS)[number];
 export type EmailNotificationSettings = Record<EmailNotificationKey, boolean>;
 
-export interface NotificationSettings {
+export const NOTIFICATION_EVENTS = [
+  'review_requested',
+  'mention',
+  'assigned',
+  'ci_failed',
+  'participating',
+  'ci_triggered',
+  'new_device',
+  'token_created',
+  'token_revoked',
+  'agent_token_created',
+  'agent_token_revoked',
+  'ssh_key_added',
+  'ssh_key_removed',
+  'signing_key_added',
+  'signing_key_removed',
+  'deploy_key_added',
+  'deploy_key_removed',
+  'passkey_added',
+  'passkey_removed',
+  'mfa_enabled',
+  'mfa_replaced',
+  'mfa_disabled',
+  'backup_codes_regenerated',
+  'password_changed',
+  'password_reset',
+  'email_changed',
+  'external_login_linked',
+  'external_login_unlinked',
+  'admin_password_reset',
+  'admin_factors_reset',
+  'runner_token_created',
+  'runner_token_revoked',
+  'notification_settings_changed',
+  'agent_profile_changed',
+  'bot_created',
+  'bot_deleted',
+] as const;
+export type NotificationEvent = (typeof NOTIFICATION_EVENTS)[number];
+export type NotificationChannel = 'email' | 'telegram';
+export interface DeliverySettings {
   email: EmailNotificationSettings;
+  events: Record<NotificationEvent, Record<NotificationChannel, boolean>>;
+  locale: 'en' | 'ru' | 'zh-CN';
+  revision: number;
+  telegram: { token_configured: boolean; chat_id: number | null; message_thread_id: number | null; confirmed: boolean };
+  capabilities: { email: boolean; email_reason: string | null };
+}
+/** Accept the old read shape during a rolling frontend/backend upgrade. */
+export type NotificationSettings = { email: EmailNotificationSettings } & Partial<Omit<DeliverySettings, 'email'>>;
+export interface DeliverySettingsPatch {
+  locale?: DeliverySettings['locale'];
+  events?: Partial<Record<NotificationEvent, Partial<Record<NotificationChannel, boolean>>>>;
+  telegram?: { action: 'keep' | 'remove' } | { action: 'set'; token?: string; chat_id: number; message_thread_id: number | null };
+}
+export interface NotificationTestResult {
+  event_id: string;
+  channels: Record<NotificationChannel, { status: 'queued' | 'inflight' | 'sent' | 'failed' | 'unavailable' | 'cancelled'; reason: string | null }>;
 }
 
 /** Why the caller follows an issue or a pull request. */
@@ -66,6 +122,13 @@ export const notifications = {
       method: 'PUT',
       body: JSON.stringify({ email }),
     }),
+  updateDelivery: (patch: DeliverySettingsPatch) => request<DeliverySettings>('/users/me/notification-settings', {
+    method: 'PUT', body: JSON.stringify(patch),
+  }),
+  testDelivery: (event: NotificationEvent) => request<NotificationTestResult>('/users/me/notification-settings/test', {
+    method: 'POST', body: JSON.stringify({ event }),
+  }),
+  testResult: (eventId: string) => request<NotificationTestResult>(`/users/me/notification-settings/test${qs({ event_id: eventId })}`),
   // The two thread kinds are spelled out rather than built by a helper, so
   // every route stays statically visible to the API alignment checks.
   subscription: (owner: string, repo: string, kind: ThreadKind, number: number) =>
