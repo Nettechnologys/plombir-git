@@ -68,6 +68,12 @@ const failures = [];
  */
 const CIPHERTEXT_PRODUCERS = [
   {
+    file: 'crates/rg-core/src/notification/settings.rs',
+    sites: 2,
+    writes: ['notification_profiles.telegram_token_encrypted', 'notification_deliveries.previous_token_encrypted', 'notification_deliveries.previous_destination_encrypted'],
+    why: 'personal Telegram token is sealed at replacement; its ciphertext is also retained for the mandatory previous-destination warning, whose recipient snapshot is separately encrypted; both retained columns must rekey before retry',
+  },
+  {
     file: 'crates/rg-http/src/api/mfa.rs',
     sites: 1,
     writes: ['users.totp_secret', 'users.pending_totp_secret'],

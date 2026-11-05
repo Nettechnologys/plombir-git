@@ -31,6 +31,7 @@ pub mod milestone_ops;
 pub mod mirror_ops;
 pub mod notification_ops;
 pub mod notification_setting_ops;
+pub mod notification_delivery_ops;
 pub mod npm_dist_tag_ops;
 pub mod oauth_account_ops;
 pub mod oci_ops;

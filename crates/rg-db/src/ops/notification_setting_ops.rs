@@ -7,7 +7,7 @@ use sea_orm::*;
 use crate::entities::notification_setting;
 
 /// The account's mail choices — the defaults when it never changed any.
-pub async fn get(db: &DatabaseConnection, user_id: i64) -> Result<notification_setting::Model> {
+pub async fn get(db: &impl ConnectionTrait, user_id: i64) -> Result<notification_setting::Model> {
     Ok(notification_setting::Entity::find_by_id(user_id)
         .one(db)
         .await
@@ -18,7 +18,7 @@ pub async fn get(db: &DatabaseConnection, user_id: i64) -> Result<notification_s
 /// The mail choices of every account in `user_ids`, in one query — the
 /// defaults for an account that never changed any.
 pub async fn get_many(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     user_ids: &[i64],
 ) -> Result<std::collections::HashMap<i64, notification_setting::Model>> {
     let mut settings: std::collections::HashMap<i64, notification_setting::Model> = user_ids
@@ -41,7 +41,7 @@ pub async fn get_many(
 
 /// Store the account's mail choices, whole.
 pub async fn put(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     settings: notification_setting::Model,
 ) -> Result<notification_setting::Model> {
     use notification_setting::Column;

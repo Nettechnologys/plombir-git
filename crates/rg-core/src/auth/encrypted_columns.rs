@@ -27,6 +27,12 @@
 macro_rules! with_encrypted_columns {
     ($callback:ident) => {
         $callback! {
+            notification_profile, TelegramTokenEncrypted, telegram_token_encrypted,
+                "notification_profiles.telegram_token_encrypted", optional;
+            notification_delivery, PreviousDestinationEncrypted, previous_destination_encrypted,
+                "notification_deliveries.previous_destination_encrypted", optional;
+            notification_delivery, PreviousTokenEncrypted, previous_token_encrypted,
+                "notification_deliveries.previous_token_encrypted", optional;
             user, TotpSecret, totp_secret,
                 "users.totp_secret", optional;
             // The same secret one step earlier: `POST /users/mfa/setup` seals

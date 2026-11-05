@@ -9,6 +9,7 @@ use crate::repo::service::WatchState;
 
 pub mod mail;
 pub mod telegram;
+pub mod settings;
 pub mod thread;
 
 /// Paginated list of notifications. Returns (data, total).

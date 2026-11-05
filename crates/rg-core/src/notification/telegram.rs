@@ -21,18 +21,25 @@ pub struct Destination {
 impl Destination {
     pub fn new(token: String, chat_id: i64, message_thread_id: Option<i32>) -> Result<Self, Error> {
         validate_token(&token)?;
-        if chat_id == 0 || !(-MAX_CHAT_ID..=MAX_CHAT_ID).contains(&chat_id) {
-            return Err(Error::InvalidChat);
-        }
-        if message_thread_id.is_some_and(|id| id <= 0) {
-            return Err(Error::InvalidTopic);
-        }
+        validate_recipient(chat_id, message_thread_id)?;
         Ok(Self {
             token,
             chat_id,
             message_thread_id,
         })
     }
+}
+
+/// The settings writer validates a kept secret's recipient without decrypting
+/// the secret. Same validation as delivery, with no transport policy change.
+pub fn validate_recipient(chat_id: i64, message_thread_id: Option<i32>) -> Result<(), Error> {
+    if chat_id == 0 || !(-MAX_CHAT_ID..=MAX_CHAT_ID).contains(&chat_id) {
+        return Err(Error::InvalidChat);
+    }
+    if message_thread_id.is_some_and(|id| id <= 0) {
+        return Err(Error::InvalidTopic);
+    }
+    Ok(())
 }
 
 /// Validate without putting the input into any diagnostic. Restricting the
