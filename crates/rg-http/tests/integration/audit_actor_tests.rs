@@ -1401,6 +1401,25 @@ async fn second_factor_events_are_journalled_and_the_factor_itself_is_not() {
         .collect();
     assert!(!first_codes.is_empty());
 
+    // Enrolment retires password-only sudo. Prove the enrolled factor before
+    // issuing recovery material or removing a sign-in method.
+    let elevated = client
+        .post(format!("{base}/api/v1/users/me/sudo"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "password": "Qz7$wRtm",
+            "totp_code": current_totp_code(&totp_secret),
+        }))
+        .send()
+        .await
+        .expect("confirm the enrolled factor");
+    assert_eq!(elevated.status(), 200, "{}", elevated.text().await.unwrap());
+    let elevated: serde_json::Value = elevated.json().await.expect("sudo response");
+    let token = elevated["token"]
+        .as_str()
+        .expect("a fully confirmed session")
+        .to_owned();
+
     // 2. Re-issue. What makes this an event is that every code from step 1
     //    stopped working, which no row in `mfa_backup_codes` records.
     let reissued = client
