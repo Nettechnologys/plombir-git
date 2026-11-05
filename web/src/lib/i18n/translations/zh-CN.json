@@ -64,6 +64,7 @@
     "signing_out": "正在退出...",
     "sign_out_failed": "退出失败；您的会话仍处于活动状态。",
     "sign_out_failed_detail": "服务器未确认该请求。",
+    "sign_out_account_changed": "此浏览器现在以 {username} 的身份登录。请再次选择退出，以结束该账户的会话。",
     "admin_panel": "管理后台",
     "search_placeholder": "搜索或跳转到...",
     "checking_session": "正在检查会话...",

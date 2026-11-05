@@ -85,6 +85,10 @@ pub enum AppError {
     /// An explicitly presented session was revoked, rather than a bad password.
     #[error("{0}")]
     SessionRevoked(String),
+    /// Ambient and explicit credentials name different accounts. Never retry
+    /// the action under whichever account happens to own the browser cookie.
+    #[error("{0}")]
+    IdentityConflict(String),
     #[error("{0}")]
     Forbidden(String),
     /// 403 with `reason: "sudo_required"` — a login session that has not
@@ -127,7 +131,9 @@ impl AppError {
         match self {
             Self::NotFound(_) => "NOT_FOUND",
             Self::BadRequest(_) => "BAD_REQUEST",
-            Self::Unauthorized(_) | Self::SessionRevoked(_) => "UNAUTHORIZED",
+            Self::Unauthorized(_) | Self::SessionRevoked(_) | Self::IdentityConflict(_) => {
+                "UNAUTHORIZED"
+            }
             Self::Forbidden(_) | Self::SudoRequired(_) => "FORBIDDEN",
             Self::Conflict(_) => "CONFLICT",
             Self::Gone(_) => "GONE",
@@ -145,7 +151,9 @@ impl AppError {
         match self {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
-            Self::Unauthorized(_) | Self::SessionRevoked(_) => StatusCode::UNAUTHORIZED,
+            Self::Unauthorized(_) | Self::SessionRevoked(_) | Self::IdentityConflict(_) => {
+                StatusCode::UNAUTHORIZED
+            }
             Self::Forbidden(_) | Self::SudoRequired(_) => StatusCode::FORBIDDEN,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Gone(_) => StatusCode::GONE,
@@ -196,6 +204,7 @@ impl IntoResponse for AppError {
                 reason: match self {
                     Self::SudoRequired(_) => Some(SUDO_REQUIRED_REASON),
                     Self::SessionRevoked(_) => Some("session_revoked"),
+                    Self::IdentityConflict(_) => Some("identity_conflict"),
                     _ => None,
                 },
             },

@@ -5,6 +5,7 @@ export {
   isSudoRequired,
   requestSudo,
   setSudoPrompt,
+  setIdentityConflictHandler,
   setToken,
   type PaginationMeta,
   type PaginatedResponse,

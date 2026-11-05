@@ -187,6 +187,25 @@ function forgetRevokedBearer(error: ApiError, token: string | null) {
   }
 }
 
+let identityConflictHandler: (() => Promise<void>) | null = null;
+let pendingIdentityCheck: Promise<void> | null = null;
+
+export function setIdentityConflictHandler(handler: (() => Promise<void>) | null): void {
+  identityConflictHandler = handler;
+}
+
+async function reconcileIdentity(error: ApiError, token: string | null): Promise<void> {
+  if (error.status !== 401 || error.reason !== 'identity_conflict' || !token
+      || getToken() !== token || !identityConflictHandler) return;
+  // Keep the conflicting bearer until the store has replaced the old UI:
+  // other requests must keep failing closed while the cookie-only probe runs.
+  // This is a read-only reconciliation, never a retry of the refused action.
+  if (!pendingIdentityCheck) {
+    pendingIdentityCheck = identityConflictHandler().finally(() => { pendingIdentityCheck = null; });
+  }
+  await pendingIdentityCheck;
+}
+
 /** `RequestInit` plus the knobs `request` reads itself. */
 type RequestOptions = RequestInit & {
   timeoutMs?: number;
@@ -221,6 +240,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     // Stop replaying a rejected bearer on login and public requests. A late
     // response from an older request must not erase a newly adopted session.
     forgetRevokedBearer(error, token);
+    await reconcileIdentity(error, token);
     // A sudo refusal is a question, not an answer: ask once, then send the
     // same request again on the re-issued session. Once — a second refusal
     // means something other than the window and reaches the caller.
@@ -262,6 +282,7 @@ export async function requestBytes(path: string, options: { timeoutMs?: number }
   if (!res.ok) {
     const error = await responseError(res);
     forgetRevokedBearer(error, token);
+    await reconcileIdentity(error, token);
     throw error;
   }
   return res.arrayBuffer();
@@ -303,6 +324,7 @@ export async function downloadApiFile(path: string, fallbackFilename: string): P
   if (!res.ok) {
     const error = await responseError(res);
     forgetRevokedBearer(error, token);
+    await reconcileIdentity(error, token);
     throw error;
   }
 

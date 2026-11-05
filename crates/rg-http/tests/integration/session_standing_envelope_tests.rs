@@ -299,6 +299,7 @@ async fn revoked_browser_cookie_recovers_public_pages_but_not_private_access() {
 
 /// Reproduce the stale-tab logout: a gate refusal has not ended the newer
 /// cookie session. Only the subsequent cookie-only logout revokes it.
+/// Both credentials name the same account: this is not an identity conflict.
 #[tokio::test]
 async fn logout_with_a_stale_bearer_must_complete_against_the_current_cookie() {
     let (base, db) = spawn_test_app_with_db().await;
@@ -379,4 +380,148 @@ async fn logout_with_a_stale_bearer_must_complete_against_the_current_cookie() {
         .to_str()
         .unwrap()
         .contains("Max-Age=0"));
+}
+
+#[tokio::test]
+async fn mixed_accounts_cannot_read_mutate_or_logout_as_the_cookie_owner() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (bearer_a, a_id) = register_full(&base, "identity-a", "identity-a@example.test").await;
+    let (cookie_b, b_id) = register_full(&base, "identity-b", "identity-b@example.test").await;
+    let client = reqwest::Client::new();
+    let cookie = format!("plombir_git_token={cookie_b}");
+
+    // A revoked bearer from A still must not invite a retry that logs B out.
+    for revoked_a in [false, true] {
+        if revoked_a {
+            rg_db::ops::user_ops::invalidate_sessions(&db, a_id)
+                .await
+                .unwrap();
+        }
+        for request in [
+            client.get(format!("{base}/api/v1/users/me")),
+            client.get(format!("{base}/api/v1/instance")),
+            client
+                .post(format!("{base}/api/v1/repos"))
+                .json(&serde_json::json!({ "name": "must-not-exist" })),
+            client.post(format!("{base}/api/v1/users/logout")),
+        ] {
+            let response = request
+                .header(header::COOKIE, &cookie)
+                .header(header::ORIGIN, &base)
+                .bearer_auth(&bearer_a)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 401);
+            assert!(!response.headers().contains_key(header::SET_COOKIE));
+            assert!(!response.headers().contains_key(header::WWW_AUTHENTICATE));
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(body["error"]["code"], "UNAUTHORIZED");
+            assert_eq!(body["error"]["reason"], "identity_conflict");
+        }
+        for (id, version) in [(a_id, i64::from(revoked_a)), (b_id, 0)] {
+            assert_eq!(
+                rg_db::ops::user_ops::find_by_id(&db, id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .session_version,
+                version
+            );
+        }
+    }
+    assert_eq!(
+        client
+            .get(format!("{base}/api/v1/repos/identity-b/must-not-exist"))
+            .bearer_auth(&cookie_b)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    // The refused requests did not damage B's session; matching credentials
+    // and a deliberate cookie-only profile probe remain usable.
+    for token in [None, Some(&cookie_b)] {
+        let mut request = client
+            .get(format!("{base}/api/v1/users/me"))
+            .header(header::COOKIE, &cookie);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["id"],
+            b_id
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_revoked_cookie_does_not_conflict_with_another_accounts_valid_bearer() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (cookie_a, a_id) = register_full(&base, "revoked-a", "revoked-a@example.test").await;
+    let (bearer_b, b_id) = register_full(&base, "valid-b", "valid-b@example.test").await;
+    rg_db::ops::user_ops::invalidate_sessions(&db, a_id)
+        .await
+        .unwrap();
+    let response = reqwest::Client::new()
+        .get(format!("{base}/api/v1/users/me"))
+        .header(header::COOKIE, format!("plombir_git_token={cookie_a}"))
+        .bearer_auth(&bearer_b)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .contains("Max-Age=0"));
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["id"],
+        b_id
+    );
+}
+
+#[tokio::test]
+async fn mixed_accounts_are_rejected_on_git_websocket_and_public_page_requests() {
+    let (base, _) = spawn_test_app_with_db().await;
+    let (token_a, _) = register_full(&base, "transport-a", "transport-a@example.test").await;
+    let (token_b, _) = register_full(&base, "transport-b", "transport-b@example.test").await;
+    let client = reqwest::Client::new();
+    for (request, basic_challenge) in [
+        (
+            client
+                .get(format!(
+                    "{base}/git/transport-b/repo/info/refs?service=git-upload-pack"
+                ))
+                .basic_auth("transport-a", Some(&token_a)),
+            true,
+        ),
+        (
+            client
+                .get(format!("{base}/api/v1/ws/notifications"))
+                .header(header::SEC_WEBSOCKET_PROTOCOL, format!("bearer.{token_a}")),
+            false,
+        ),
+        (client.get(format!("{base}/")).bearer_auth(&token_a), false),
+    ] {
+        let response = request
+            .header(header::COOKIE, format!("plombir_git_token={token_b}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+        assert_eq!(
+            response.headers().contains_key(header::WWW_AUTHENTICATE),
+            basic_challenge
+        );
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        assert!(response
+            .text()
+            .await
+            .unwrap()
+            .contains("different accounts"));
+    }
 }

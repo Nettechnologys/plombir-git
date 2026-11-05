@@ -7,6 +7,7 @@
   import ThemeToggle from './ThemeToggle.svelte';
   import { getRegistrationOpen } from '$lib/stores/instance.svelte';
   import { getUnreadCount, watchUnreadNotifications } from '$lib/stores/unreadNotifications.svelte';
+  import { ApiError } from '$lib/api/error';
 
   // Below 900px the links, the search and the account menu fold behind one
   // button instead of stacking into three rows (card_c30077df5603).
@@ -39,9 +40,10 @@
       await logout();
       await goto('/login');
     } catch (cause: unknown) {
-      logoutError = cause instanceof Error && cause.message
-        ? cause.message
-        : t('nav.sign_out_failed_detail');
+      const user = getUser();
+      logoutError = cause instanceof ApiError && cause.reason === 'identity_conflict' && user
+        ? t('nav.sign_out_account_changed', { username: user.username })
+        : cause instanceof Error && cause.message ? cause.message : t('nav.sign_out_failed_detail');
     } finally {
       logoutPending = false;
     }

@@ -90,4 +90,31 @@ describe('logout with mixed browser credentials', () => {
     await expect(logout()).rejects.toThrow('did not confirm');
     expect(isLoggedIn()).toBe(true);
   });
+
+  it.each([null, 'valid'])('does not treat an HTML 401 as logout with bearer %s', async (token) => {
+    setToken(token);
+    fetchMock.mockResolvedValueOnce(new Response('<h1>Unauthorized</h1>', {
+      status: 401, headers: { 'content-type': 'text/html', server: 'nginx' },
+    }));
+    await expect(logout()).rejects.toMatchObject({ status: 401, code: null });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(isLoggedIn()).toBe(true);
+    expect(getToken()).toBe(token);
+  });
+
+  it('does not confirm logout when an HTML 401 interrupts cookie-only recovery', async () => {
+    setToken('stale');
+    fetchMock.mockResolvedValueOnce(refused(401, 'session_revoked'))
+      .mockResolvedValueOnce(new Response('Proxy login required', { status: 401 }));
+    await expect(logout()).rejects.toMatchObject({ status: 401, code: null });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(isLoggedIn()).toBe(true);
+  });
+
+  it('does not interpret an unknown API refusal as an ended session', async () => {
+    fetchMock.mockResolvedValueOnce(refused(401, 'unexpected_reason'));
+    await expect(logout()).rejects.toMatchObject({ reason: 'unexpected_reason' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(isLoggedIn()).toBe(true);
+  });
 });

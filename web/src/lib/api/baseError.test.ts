@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { ApiError, downloadApiFile, request, requestBytes, getToken, setToken } from './_base.svelte';
+import { ApiError, downloadApiFile, request, requestBytes, getToken, setToken, setIdentityConflictHandler } from './_base.svelte';
 
 const fetchMock = vi.fn();
 
@@ -26,6 +26,7 @@ afterEach(() => {
 	vi.unstubAllGlobals();
 	vi.clearAllMocks();
 	setToken(null);
+	setIdentityConflictHandler(null);
 });
 
 describe('API response errors', () => {
@@ -94,6 +95,35 @@ describe('API response errors', () => {
 
 
 describe('rejected session recovery', () => {
+  it.each([
+    ['JSON', () => request('/users/me')],
+    ['bytes', () => requestBytes('/repos/owner/repo/raw/main/file')],
+    ['download', () => downloadApiFile('/instance', 'instance.json')],
+  ])('reconciles a %s identity conflict without retrying or prematurely clearing its bearer', async (_name, operation) => {
+    setToken('alice');
+    const reconcile = vi.fn(async () => { expect(getToken()).toBe('alice'); });
+    setIdentityConflictHandler(reconcile);
+    fetchMock.mockResolvedValueOnce(failedResponse(401, 'identity_conflict'));
+    await expect(operation()).rejects.toMatchObject({ reason: 'identity_conflict' });
+    expect(reconcile).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(getToken()).toBe('alice');
+  });
+
+  it('ignores a late identity conflict from a previous login', async () => {
+    const reconcile = vi.fn(async () => {});
+    setIdentityConflictHandler(reconcile);
+    let resolve!: (response: Response) => void;
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((done) => { resolve = done; }));
+    setToken('old');
+    const pending = request('/users/me');
+    setToken('new');
+    resolve(failedResponse(401, 'identity_conflict'));
+    await expect(pending).rejects.toMatchObject({ reason: 'identity_conflict' });
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(getToken()).toBe('new');
+  });
+
   it.each([
     ['JSON', () => request('/users/me')],
     ['bytes', () => requestBytes('/repos/owner/repo/raw/main/file')],

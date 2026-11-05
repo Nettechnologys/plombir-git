@@ -102,6 +102,7 @@ export const isPasskeySupported = vi.fn(() => true);
 export const setToken = vi.fn();
 // The root layout mounts the sudo prompt, which registers itself here.
 export const setSudoPrompt = vi.fn();
+export const setIdentityConflictHandler = vi.fn();
 export const requestSudo = vi.fn(async () => false);
 export const isSudoRequired = vi.fn(() => false);
 export const API_BASE = '/api/v1';

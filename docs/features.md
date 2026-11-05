@@ -61,6 +61,17 @@ the browser UI and API on the same origin: a cross-site UI configured through
 `PLOMBIR_GIT_CORS_ORIGINS` cannot renew a `SameSite=Strict` cookie that its browser
 withholds. No weaker cookie setting or bearer refresh fallback is introduced.
 
+A live browser cookie and an explicit signed session credential must name the
+same account. Conflicting credentials are refused before the requested action
+runs (`401`, API reason `identity_conflict`). The UI rechecks the browser's
+account and discards the old account's forms; it does not repeat the action or
+sign out the newly selected account automatically. A proxy's HTML `401` is not
+treated as confirmation of sign-out.
+
+This check applies to mixed session credentials. A tab sending only its cookie
+uses the account currently selected in that browser. Use separate browser
+profiles to keep simultaneous accounts independent.
+
 ## Tech stack
 
 | Layer | Choice | Version |

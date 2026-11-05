@@ -64,6 +64,7 @@
     "signing_out": "Signing out...",
     "sign_out_failed": "Sign out failed; your session is still active.",
     "sign_out_failed_detail": "The server did not confirm the request.",
+    "sign_out_account_changed": "This browser is now signed in as {username}. Choose Sign out again to end that account's session.",
     "admin_panel": "Admin Panel",
     "search_placeholder": "Search or jump to...",
     "checking_session": "Checking session...",

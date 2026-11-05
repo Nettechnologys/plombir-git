@@ -482,9 +482,28 @@ pub(crate) async fn session_standing_middleware(
         remove_auth_cookie(req.headers_mut());
     }
     let presented = presented_session_versions(req.headers(), &state.jwt_secret);
+    // `presented_session_versions` puts the cookie first and deduplicates
+    // (user, version) pairs. Keep those invariants when adding credential forms.
+    let mut live_cookie_user = None;
     for (user_id, session_version) in presented {
+        // The cookie is the first candidate and has already passed the DB
+        // check before any explicit credential reaches this branch. Even a
+        // revoked bearer of another account must not trigger a cookie-only
+        // logout retry that would revoke this account instead.
+        if let Some(cookie_user) = live_cookie_user.filter(|cookie_user| *cookie_user != user_id) {
+            tracing::warn!(
+                cookie_user,
+                explicit_user = user_id,
+                "refusing mixed-account credentials"
+            );
+            return session_refusal(req.uri().path(), SessionRefusal::IdentityConflict);
+        }
         match rg_db::ops::user_ops::find_by_id(&state.db, user_id).await {
-            Ok(Some(user)) if user.is_usable() && user.session_version == session_version => {}
+            Ok(Some(user)) if user.is_usable() && user.session_version == session_version => {
+                if cookie_session == Some((user_id, session_version)) {
+                    live_cookie_user = Some(user_id);
+                }
+            }
             Ok(_) => {
                 // A browser attaches its cookie to public pages and to a new
                 // login too. Drop a revoked cookie before routing, so those
@@ -571,16 +590,19 @@ fn clear_revoked_cookie(mut response: Response, clear: bool, is_https: bool) -> 
     response
 }
 
-/// Which of the two answers `session_standing_middleware` is giving back.
+/// Why `session_standing_middleware` refused the request.
 ///
 /// `Revoked` is a 401 the client should not retry — the session has been
 /// invalidated on purpose and the caller has to reauthenticate. `Unavailable`
 /// is a 503 the client is right to retry — the middleware could not ask the
 /// database whether the account still stood, so failing closed is a claim about
 /// this middleware's own state, not about the session.
+/// `IdentityConflict` rejects mixed accounts without revoking either session
+/// or inviting a mutation to be retried under the cookie's account.
 #[derive(Clone, Copy)]
 enum SessionRefusal {
     Revoked,
+    IdentityConflict,
     Unavailable,
 }
 
@@ -605,6 +627,16 @@ fn session_refusal(path: &str, kind: SessionRefusal) -> Response {
     use crate::error::AppError;
 
     match kind {
+        SessionRefusal::IdentityConflict => {
+            let message = "the browser session and explicit credentials name different accounts";
+            crate::refusal::pre_router_refusal_response(
+                path,
+                StatusCode::UNAUTHORIZED,
+                || AppError::IdentityConflict(message.to_string()).into_response(),
+                rg_core::package_registry::oci::types::error_codes::UNAUTHORIZED,
+                message,
+            )
+        }
         SessionRefusal::Revoked => {
             let message = "session is no longer valid";
             crate::refusal::pre_router_refusal_response(

@@ -113,6 +113,20 @@ describe('session probe failure semantics', () => {
 });
 
 describe('logout failure semantics', () => {
+	it('names the reconciled account before asking the user to sign out again', async () => {
+		auth.logout.mockImplementationOnce(async () => {
+			auth.me.mockResolvedValueOnce({ ...user, id: 2, username: 'bob' });
+			await fetchUser();
+			throw new ApiError('Different accounts', 401, 'UNAUTHORIZED', null, 'identity_conflict');
+		});
+		rendered = await renderLoggedInNavbar();
+		await click(button(rendered.container, 'Sign out'));
+		expect(rendered.container.querySelector('[role="alert"]')?.textContent)
+			.toContain('This browser is now signed in as bob. Choose Sign out again');
+		expect(auth.logout).toHaveBeenCalledOnce();
+		expect(navigation.goto).not.toHaveBeenCalled();
+	});
+
 	it('waits for server confirmation before clearing the session and navigating', async () => {
 		let confirmLogout!: (value: { logged_out: boolean }) => void;
 		auth.logout.mockImplementationOnce(

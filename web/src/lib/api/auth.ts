@@ -113,6 +113,14 @@ export interface SudoConfirmation {
   backup_code?: string;
 }
 
+function isEndedSession(cause: unknown): cause is ApiError {
+  // A proxy's HTML 401 does not prove that the application ended its session.
+  // Identity conflicts also need reconciliation, never a logout as the other
+  // account on a cookie-only retry.
+  return cause instanceof ApiError && cause.status === 401 && cause.code === 'UNAUTHORIZED'
+    && (cause.reason === null || cause.reason === 'session_revoked');
+}
+
 export const auth = {
   // `setupToken` is the one-time secret the first account on an empty
   // instance has to present (`GET /instance` says when: `setup_required`).
@@ -135,7 +143,7 @@ export const auth = {
       method: 'POST',
       body: JSON.stringify({ username, code, backup }),
     }),
-  me: () => request<Me>('/users/me'),
+  me: (options?: { omitBearer?: boolean }) => request<Me>('/users/me', options),
   refreshSession: () => request<{ user_id: number; remember_me: boolean; refreshed: boolean }>(
     '/users/me/session/refresh', { method: 'POST', omitBearer: true },
   ),
@@ -221,7 +229,7 @@ export const auth = {
     try {
       return await request<{ logged_out: boolean }>('/users/logout', { method: 'POST' });
     } catch (cause) {
-      if (!(cause instanceof ApiError && cause.status === 401)) throw cause;
+      if (!isEndedSession(cause)) throw cause;
       if (!hadBearer) return { logged_out: true };
     }
     // A rejected bearer says nothing about a newer HttpOnly cookie. Revoke
@@ -232,7 +240,7 @@ export const auth = {
         omitBearer: true,
       });
     } catch (cause) {
-      if (cause instanceof ApiError && cause.status === 401) return { logged_out: true };
+      if (isEndedSession(cause)) return { logged_out: true };
       throw cause;
     }
   },

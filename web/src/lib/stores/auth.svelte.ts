@@ -1,9 +1,10 @@
 // Auth state store using Svelte 5 runes
 
-import { setToken, getToken, auth, passkeys } from '$lib/api/client.svelte';
+import { setToken, getToken, auth, passkeys, setIdentityConflictHandler } from '$lib/api/client.svelte';
 import type { PasskeyDevice } from '$lib/api/passkeys';
 import { ApiError } from '$lib/api/error';
 import { t } from '$lib/i18n';
+import { tick } from 'svelte';
 
 interface User {
   remember_me?: boolean;
@@ -27,6 +28,40 @@ let sessionGeneration = 0;
 let lastRefreshAttempt = -Infinity;
 let refreshInFlight: Promise<void> | null = null;
 const SESSION_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+
+setIdentityConflictHandler(async () => {
+  const generation = ++sessionGeneration;
+  // Unmount account-specific forms while the browser identity is unknown.
+  // Keep the old bearer in the request layer until this read completes, so
+  // pending clicks cannot silently execute with the other account's cookie.
+  currentUser = null;
+  authReady = false;
+  pendingMfaUsername = null;
+  pendingPasswordChangeLogin = null;
+  await tick();
+  if (generation !== sessionGeneration) return;
+  try {
+    const me = await auth.me({ omitBearer: true });
+    if (generation !== sessionGeneration) return;
+    currentUser = sessionUser(me);
+    setToken(null);
+    authReady = true;
+    sessionCheckError = null;
+    lastRefreshAttempt = -Infinity;
+  } catch (cause) {
+    if (generation !== sessionGeneration) return;
+    if (cause instanceof ApiError && cause.status === 401 && cause.code === 'UNAUTHORIZED'
+        && (cause.reason === null || cause.reason === 'session_revoked')) {
+      // The browser session ended during reconciliation. Follow that explicit
+      // result rather than silently returning to the previous tab's account.
+      setToken(null);
+      authReady = true;
+      sessionCheckError = null;
+      return;
+    }
+    sessionCheckError = cause instanceof Error ? cause.message : 'Session check failed';
+  }
+});
 
 function sessionUser(me: Awaited<ReturnType<typeof auth.me>>): User {
   return {
@@ -262,6 +297,13 @@ export async function logout() {
   try {
     const result = await auth.logout();
     if (!result?.logged_out) throw new Error(t('nav.sign_out_failed_detail'));
+  } catch (cause) {
+    // Logout can invalidate a pending identity probe. If it also fails, leave
+    // a retryable check error instead of an indefinitely hidden account UI.
+    if (!authReady) {
+      sessionCheckError = cause instanceof Error ? cause.message : t('nav.sign_out_failed_detail');
+    }
+    throw cause;
   } finally {
     sessionGeneration++;
   }
