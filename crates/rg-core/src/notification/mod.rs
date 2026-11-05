@@ -8,6 +8,7 @@ use rg_db::ops::notification_ops;
 use crate::repo::service::WatchState;
 
 pub mod mail;
+pub mod telegram;
 pub mod thread;
 
 /// Paginated list of notifications. Returns (data, total).
