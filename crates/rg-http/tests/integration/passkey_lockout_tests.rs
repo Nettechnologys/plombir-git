@@ -358,3 +358,96 @@ async fn remembered_passkey_choice_is_bound_to_the_verified_ceremony() {
         );
     }
 }
+
+#[tokio::test]
+async fn new_device_passkey_completion_and_bound_step_up_are_distinct() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (session, id) = register_full(&base, "pk_notice", "pk_notice@example.invalid").await;
+    let key = authenticator();
+    rg_db::ops::passkey_credential_ops::create(
+        &db,
+        id,
+        &b64(CREDENTIAL_ID),
+        &stored_passkey(&key),
+        "fixture key",
+        RP_ID,
+    )
+    .await
+    .unwrap();
+    let before = crate::notification_browser_tests::count(&db, id).await;
+    let (challenge, cookie) = start(&base, "pk_notice").await;
+    assert_eq!(
+        crate::notification_browser_tests::count(&db, id).await,
+        before
+    );
+    assert_eq!(
+        finish(&base, &cookie, &assertion(&key, &challenge, 1, true))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        crate::notification_browser_tests::count(&db, id).await,
+        before + 1
+    );
+    let client = reqwest::Client::new();
+    let path = format!("{base}/api/v1/users/passkeys/login/start");
+    let body = serde_json::json!({"username":"pk_notice","reauthenticate":true});
+    assert_eq!(
+        client
+            .post(&path)
+            .header(reqwest::header::HOST, RP_ID)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401,
+        "client flag cannot suppress a new-login alert without a session"
+    );
+    let response = client
+        .post(&path)
+        .header(reqwest::header::HOST, RP_ID)
+        .bearer_auth(&session)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let cookie = response
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let body: serde_json::Value = response.json().await.unwrap();
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(body["publicKey"]["challenge"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        finish(&base, &cookie, &assertion(&key, &challenge, 2, true))
+            .await
+            .0,
+        401,
+        "finish also requires the bound session"
+    );
+    let response = client
+        .post(format!("{base}/api/v1/users/passkeys/login/finish"))
+        .header(reqwest::header::HOST, RP_ID)
+        .header(reqwest::header::COOKIE, cookie)
+        .bearer_auth(&session)
+        .json(&assertion(&key, &challenge, 2, true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    assert_eq!(
+        crate::notification_browser_tests::count(&db, id).await,
+        before + 1,
+        "sudo passkey does not create a new-device event"
+    );
+}

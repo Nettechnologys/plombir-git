@@ -71,6 +71,9 @@ pub struct MfaChallengeClaims {
     pub auth_provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remember_me: Option<bool>,
+    /// Server-signed ceremony purpose. A provider step-up is not a new login.
+    #[serde(default)]
+    pub reauthentication: bool,
     pub iat: i64,
     pub exp: i64,
 }
@@ -358,12 +361,36 @@ pub fn generate_mfa_challenge_with_remember(
     secret: &str,
     remember_me: Option<bool>,
 ) -> Result<String> {
+    mfa_challenge_with_purpose(user_id, username, auth_provider, secret, remember_me, false)
+}
+
+/// Same second-factor challenge/proof policy, with an explicit step-up purpose
+/// chosen only after the HTTP layer verifies the existing provider session.
+pub fn generate_mfa_reauthentication_challenge(
+    user_id: i64,
+    username: &str,
+    auth_provider: &str,
+    secret: &str,
+    remember_me: Option<bool>,
+) -> Result<String> {
+    mfa_challenge_with_purpose(user_id, username, auth_provider, secret, remember_me, true)
+}
+
+fn mfa_challenge_with_purpose(
+    user_id: i64,
+    username: &str,
+    auth_provider: &str,
+    secret: &str,
+    remember_me: Option<bool>,
+    reauthentication: bool,
+) -> Result<String> {
     let now = Utc::now();
     let claims = MfaChallengeClaims {
         sub: user_id.to_string(),
         username: username.to_string(),
         auth_provider: auth_provider.to_string(),
         remember_me,
+        reauthentication,
         iat: now.timestamp(),
         exp: (now + Duration::minutes(5)).timestamp(),
     };

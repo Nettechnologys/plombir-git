@@ -195,6 +195,8 @@ struct AuthState {
     auth: wa::PasskeyAuthentication,
     #[serde(default)]
     remember_me: Option<bool>,
+    #[serde(default)]
+    reauthentication_version: Option<i64>,
 }
 
 /// Spend the challenge of the ceremony that just verified, answering whether
@@ -811,6 +813,9 @@ pub struct LoginStartRequest {
     pub username: String,
     #[serde(default)]
     pub remember_me: Option<bool>,
+    /// Existing-session step-up only; server validates and seals its identity.
+    #[serde(default)]
+    pub reauthenticate: bool,
 }
 
 /// POST /users/passkeys/login/start
@@ -826,6 +831,7 @@ pub struct LoginStartRequest {
 )]
 pub async fn login_start(
     State(state): State<AppState>,
+    grant: Option<axum::Extension<crate::agent_scope::TokenGrant>>,
     headers: HeaderMap,
     Json(req): Json<LoginStartRequest>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -837,6 +843,22 @@ pub async fn login_start(
         .map_err(AppError::from)?
         .filter(|u| u.is_usable())
         .ok_or_else(no_passkey)?;
+
+    let reauthentication_version = if req.reauthenticate {
+        let claims = crate::api::auth::session_claims(&headers, &state.jwt_secret)
+            .filter(|claims| {
+                claims.pat_id.is_none()
+                    && claims.sub == user.id.to_string()
+                    && claims.session_version == user.session_version
+            })
+            .filter(|_| grant.is_none())
+            .ok_or_else(|| {
+                AppError::unauthorized("passkey step-up requires the current login session")
+            })?;
+        Some(claims.session_version)
+    } else {
+        None
+    };
 
     let rp = resolve_rp(&state, &headers)?;
     let selected = load_passkeys_for_rp(&state, user.id, &rp.rp_id).await?;
@@ -863,6 +885,7 @@ pub async fn login_start(
             ceremony_id: wa::new_ceremony_id(),
             rp,
             auth,
+            reauthentication_version,
             // Passkey step-up is a new proof and opens a new session lifetime,
             // unlike password sudo, which reissues the existing session.
             remember_me: req.remember_me.or_else(|| {
@@ -915,6 +938,7 @@ pub struct PasskeyLoginResponse {
 )]
 pub async fn login_finish(
     State(state): State<AppState>,
+    grant: Option<axum::Extension<crate::agent_scope::TokenGrant>>,
     headers: HeaderMap,
     Json(credential): Json<wa::PublicKeyCredential>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -928,6 +952,19 @@ pub async fn login_finish(
         .ok_or_else(|| AppError::unauthorized("invalid credentials"))?;
     if user.username != sealed.username || !user.is_usable() {
         return Err(AppError::unauthorized("invalid credentials"));
+    }
+    if let Some(version) = sealed.reauthentication_version {
+        let current =
+            crate::api::auth::session_claims(&headers, &state.jwt_secret).is_some_and(|claims| {
+                claims.pat_id.is_none()
+                    && claims.sub == user.id.to_string()
+                    && claims.session_version == version
+            });
+        if !current || grant.is_some() || user.session_version != version {
+            return Err(AppError::unauthorized(
+                "passkey step-up requires the current login session",
+            ));
+        }
     }
     // The brute-force lock is read only after the assertion verifies, below.
     // Read here, it answered "account is temporarily locked" to anyone holding
@@ -1065,6 +1102,14 @@ pub async fn login_finish(
         user.id,
         rg_db::ops::user_ops::record_successful_login(&state.db, user.id).await,
     )?;
+    if sealed
+        .reauthentication_version
+        .is_some_and(|version| version != user.session_version)
+    {
+        return Err(AppError::SessionRevoked(
+            "account changed during passkey step-up".into(),
+        ));
+    }
     let (ip_address, user_agent) = crate::api::audit::extract_ip_and_ua(&headers);
     if let Err(error) = rg_db::ops::login_log_ops::log_attempt(
         &state.db,
@@ -1094,6 +1139,10 @@ pub async fn login_finish(
     })
     .map_err(AppError::from)?;
 
+    if sealed.reauthentication_version.is_none() {
+        crate::api::browser_notifications::completed_token(&state, &headers, &token, "passkey")
+            .await?;
+    }
     let is_https = crate::public_url::request_is_https(&state, &headers);
     let mut response = (
         StatusCode::OK,

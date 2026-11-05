@@ -113,9 +113,8 @@
     busy = true;
     error = '';
     try {
-      // A passkey sign-in is a fresh login, and a fresh login starts in sudo
-      // mode.
-      const session = await passkeys.login(me.username);
+      // Bind step-up to this existing session; it is not a new-device login.
+      const session = await passkeys.login(me.username, 'auto', undefined, true);
       setToken(session.token);
       finish(true);
     } catch (err: any) {

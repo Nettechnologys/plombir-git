@@ -338,6 +338,17 @@ pub async fn set_initial_password(
             if updated.mfa_enabled {
                 second_factor_response(&state, &headers, &updated, body.remember_me)
             } else {
+                if let Err(error) = super::browser_notifications::completed(
+                    &state,
+                    &headers,
+                    updated.id,
+                    updated.session_version,
+                    "initial_password",
+                )
+                .await
+                {
+                    return error.into_response();
+                }
                 session_response(&state, &headers, StatusCode::OK, &updated, body.remember_me)
             }
         }
@@ -553,6 +564,17 @@ pub async fn confirm_email(
     match rg_core::user::account::confirm(&state.db, directories(&state), permit, &body.token).await
     {
         Ok(Confirmed::Registered(user)) => {
+            if let Err(error) = super::browser_notifications::completed(
+                &state,
+                &headers,
+                user.id,
+                user.session_version,
+                "registration",
+            )
+            .await
+            {
+                return error.into_response();
+            }
             let actor =
                 rg_core::audit::AuditActor::resolve_after_the_fact(&state.db, user.id).await;
             rg_core::audit::record(

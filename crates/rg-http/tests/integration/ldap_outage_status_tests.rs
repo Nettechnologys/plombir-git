@@ -600,6 +600,14 @@ async fn a_healthy_directory_still_signs_in() {
     let harness = Harness::start(Behaviour::Healthy).await;
 
     let (status, body) = harness.sign_in().await;
+    assert_eq!(
+        crate::notification_browser_tests::count(
+            &harness.db,
+            harness.user_id.expect("fixture account")
+        )
+        .await,
+        1
+    );
 
     assert_eq!(
         status,

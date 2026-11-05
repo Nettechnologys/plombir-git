@@ -7,6 +7,7 @@ use rg_db::ops::notification_ops;
 
 use crate::repo::service::WatchState;
 
+pub mod browser;
 pub mod dispatch;
 pub mod mail;
 pub mod settings;

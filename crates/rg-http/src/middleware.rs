@@ -18,15 +18,17 @@ static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 /// decision: existing route/session guards still authorize every mutation.
 pub async fn notification_context(
     State(state): State<crate::AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
+    let witness_cookie =
+        crate::api::browser_notifications::bootstrap(&state, request.headers_mut());
     let claims = crate::api::auth::session_claims(request.headers(), &state.jwt_secret);
     let actor_id = claims
         .as_ref()
         .and_then(|claims| claims.sub.parse::<i64>().ok());
     let (ip, device) = crate::api::audit::extract_ip_and_ua(request.headers());
-    rg_db::notification::scope(
+    let mut response = rg_db::notification::scope(
         actor_id,
         rg_db::notification::Metadata {
             actor: claims.map(|claims| claims.username),
@@ -36,7 +38,9 @@ pub async fn notification_context(
         },
         next.run(request),
     )
-    .await
+    .await;
+    crate::api::browser_notifications::append_cookie(&mut response, witness_cookie);
+    response
 }
 
 /// HTTP metrics middleware - records request count, duration, and in-flight count.

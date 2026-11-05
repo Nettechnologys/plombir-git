@@ -1019,7 +1019,7 @@ async fn complete_reauthentication(
     // An account with a second factor proves it too, through the login's own
     // second step, which answers a session in sudo mode.
     if user.mfa_enabled {
-        let challenge = rg_core::auth::jwt::generate_mfa_challenge_with_remember(
+        let challenge = rg_core::auth::jwt::generate_mfa_reauthentication_challenge(
             user.id,
             &user.username,
             &provider.slug,
@@ -1657,6 +1657,8 @@ async fn callback_inner(
         rg_core::auth::jwt::with_browser_session(&token, remember_me, &state.jwt_secret)
     })
     .map_err(AppError::from)?;
+
+    super::browser_notifications::completed_token(&state, &headers, &token, &provider.slug).await?;
 
     let mut redirect = Redirect::temporary("/dashboard").into_response();
     append_set_cookie(

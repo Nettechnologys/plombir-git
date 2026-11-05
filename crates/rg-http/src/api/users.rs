@@ -254,6 +254,16 @@ pub async fn register(
 
     match outcome {
         Ok(resp) => {
+            if let Err(error) = super::browser_notifications::completed_token(
+                &state,
+                &headers,
+                &resp.token,
+                "registration",
+            )
+            .await
+            {
+                return error.into_response();
+            }
             // Record audit log
             let details = serde_json::json!({
                 "email": body.email,
@@ -531,6 +541,16 @@ pub async fn login(
                 response
             } else {
                 // M-4: Set HttpOnly cookie with JWT for browser-based auth
+                if let Err(error) = super::browser_notifications::completed_token(
+                    &state,
+                    &headers,
+                    &resp.token,
+                    login_method,
+                )
+                .await
+                {
+                    return error.into_response();
+                }
                 let is_https = crate::public_url::request_is_https(&state, &headers);
                 let cookie = build_auth_cookie(&resp.token, is_https, &state.jwt_secret);
                 (
@@ -1279,6 +1299,16 @@ pub async fn reset_password(
     .await
     {
         Ok(PasswordResetOutcome::Session(resp)) => {
+            if let Err(error) = super::browser_notifications::completed_token(
+                &state,
+                &headers,
+                &resp.token,
+                "password_reset",
+            )
+            .await
+            {
+                return error.into_response();
+            }
             tracing::info!(user_id = resp.user_id, "password reset successful");
             journal_password_reset(&state, &headers, resp.user_id, &resp.username, false).await;
             // M-4: Set HttpOnly cookie so the user stays logged in after reset

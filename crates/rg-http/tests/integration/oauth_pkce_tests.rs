@@ -410,6 +410,10 @@ async fn oidc_callback_uses_discovery_and_pkce_and_rejects_missing_verifier() {
         .unwrap()
         .unwrap();
     assert_eq!(user.email, "oidc-user@example.com");
+    assert_eq!(
+        crate::notification_browser_tests::count(&db, user.id).await,
+        1
+    );
     assert!(
         rg_db::ops::oauth_account_ops::find_by_provider_and_uid(&db, "oidc-test", "subject-1")
             .await
@@ -1055,6 +1059,16 @@ async fn an_sso_account_steps_up_by_signing_in_again_through_its_provider() {
         .to_string();
     let (status, body) = ssh_key(elevated).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let notice_user = rg_db::ops::user_ops::find_by_username(&db, "oidc-user")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        crate::notification_browser_tests::count(&db, notice_user.id).await,
+        1,
+        "provider reauthentication must not add an event after the original login"
+    );
 
     // A return path off this site is replaced.
     let started = start("https://evil.example/").await;

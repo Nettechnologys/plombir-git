@@ -12,6 +12,7 @@ pub(crate) mod author_names;
 pub mod boards;
 pub mod bots;
 pub mod branch_protection;
+pub(crate) mod browser_notifications;
 pub mod ci;
 pub mod ci_environments;
 pub mod ci_oidc;

@@ -119,12 +119,12 @@ export const passkeys = {
   },
 
   /** Full authentication ceremony: begin → browser prompt → finish. */
-  async login(username: string, device: PasskeyDevice = 'auto', rememberMe?: boolean): Promise<PasskeyLoginResponse> {
+  async login(username: string, device: PasskeyDevice = 'auto', rememberMe?: boolean, reauthenticate = false): Promise<PasskeyLoginResponse> {
     if (!isPasskeySupported()) throw new Error(t('account_security.passkeys.unsupported'));
 
     const options = await request<{ publicKey: any }>('/users/passkeys/login/start', {
       method: 'POST',
-      body: JSON.stringify({ username, remember_me: rememberMe }),
+      body: JSON.stringify({ username, remember_me: rememberMe, reauthenticate }),
     });
     const publicKey = options.publicKey;
     publicKey.challenge = b64urlToBuf(publicKey.challenge);

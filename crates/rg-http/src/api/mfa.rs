@@ -563,6 +563,15 @@ pub async fn verify_mfa(
     .map_err(AppError::from)?;
 
     // M-4: Set HttpOnly cookie for browser-based auth
+    if !challenge.reauthentication {
+        super::browser_notifications::completed_token(
+            &state,
+            &headers,
+            &token,
+            &challenge.auth_provider,
+        )
+        .await?;
+    }
     let is_https = crate::public_url::request_is_https(&state, &headers);
     let cookie_value = crate::api::users::build_auth_cookie(&token, is_https, &state.jwt_secret);
 
