@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { SvelteMap } from 'svelte/reactivity';
 import Page from '../../routes/settings/notifications/+page.svelte';
 import SudoPrompt from '../components/SudoPrompt.svelte';
 import { NOTIFICATION_EVENTS, type DeliverySettings, type DeliverySettingsPatch, type NotificationTestResult } from './notifications';
 import { locale } from '../i18n';
 import { fetchUser, logout } from '../stores/auth.svelte';
-import { auth, notifications, resetTestClient, setSudoPrompt } from '../test/client';
+import { auth, notifications, resetTestClient, setSudoPrompt, setToken } from '../test/client';
 import { check, change, click, element, input, renderComponent, settle, submit, type RenderedComponent } from '../test/render';
 
 let page: RenderedComponent | undefined;
@@ -29,6 +30,13 @@ beforeEach(async () => {
   notifications.updateDelivery.mockImplementation(async (patch: DeliverySettingsPatch) => {
     stored.locale = patch.locale ?? stored.locale;
     for (const [key, channels] of Object.entries(patch.events ?? {})) Object.assign(stored.events[key as keyof typeof stored.events], channels);
+    if (patch.telegram?.action === 'set') stored.telegram = {
+      token_configured: !!patch.telegram.token || stored.telegram.token_configured,
+      chat_id: patch.telegram.chat_id, message_thread_id: patch.telegram.message_thread_id, confirmed: false,
+    };
+    if (patch.telegram?.action === 'remove') stored.telegram = {
+      token_configured: false, chat_id: null, message_thread_id: null, confirmed: false,
+    };
     stored.revision++;
     return structuredClone(stored);
   });
@@ -120,12 +128,165 @@ describe('saved notification delivery', () => {
     expect(page.container.querySelector('.test-results')).toBeNull();
     expect(element<HTMLInputElement>(page.container,'#telegram-chat').value).toBe('777');
   });
+  it.each(['sent', 'error'])('clears a completed %s result when another destination is saved and can test it', async outcome => {
+    if (outcome === 'error') notifications.testDelivery.mockRejectedValueOnce(new Error('Old destination failed'));
+    page = await renderComponent(Page);
+    await click(element(row('mention'), '.test-button'));
+    expect(row('mention').querySelector(outcome === 'sent' ? '.test-results' : '.test-error')).not.toBeNull();
+
+    await input(element(page.container, '#telegram-chat'), '-1009999');
+    await submit(element(page.container, 'form'));
+    expect(row('mention').querySelector('.test-results')).toBeNull();
+    expect(row('mention').querySelector('.test-error')).toBeNull();
+    expect(element<HTMLButtonElement>(page.container, 'button[type=submit]').disabled).toBe(false);
+    expect(element<HTMLButtonElement>(row('mention'), '.test-button').disabled).toBe(false);
+    expect(notifications.testDelivery).toHaveBeenCalledTimes(1);
+
+    await click(element(row('mention'), '.test-button'));
+    expect(notifications.testDelivery).toHaveBeenCalledTimes(2);
+    expect(row('mention').textContent).toContain('Telegram: Sent');
+  });
+  it.each(['sent', 'error'])('ignores a late %s poll from the previous revision without clearing the new pending test', async outcome => {
+    vi.useFakeTimers();
+    try {
+      const oldPoll = deferred<NotificationTestResult>();
+      const newTest = deferred<NotificationTestResult>();
+      notifications.testDelivery.mockResolvedValueOnce(result('old', 'queued', 'queued')).mockReturnValueOnce(newTest.promise);
+      notifications.testResult.mockReturnValueOnce(oldPoll.promise);
+      page = await renderComponent(Page);
+      await click(element(row('mention'), '.test-button'));
+      await vi.advanceTimersByTimeAsync(1000); await settle();
+      expect(notifications.testResult).toHaveBeenCalledExactlyOnceWith('old');
+
+      await input(element(page.container, '#telegram-chat'), '-1009999');
+      await submit(element(page.container, 'form'));
+      expect(row('mention').querySelector('.test-results')).toBeNull();
+      expect(element<HTMLButtonElement>(page.container, 'button[type=submit]').disabled).toBe(false);
+      await click(element(row('mention'), '.test-button'));
+      if (outcome === 'sent') oldPoll.resolve(result('old'));
+      else oldPoll.reject(new Error('Old poll failed'));
+      await settle();
+      await vi.advanceTimersByTimeAsync(35_000); await settle();
+      expect(row('mention').querySelector('.test-results')).toBeNull();
+      expect(row('mention').querySelector('.test-error')).toBeNull();
+      expect(element<HTMLButtonElement>(row('mention'), '.test-button').disabled).toBe(true);
+      expect(notifications.testResult).toHaveBeenCalledTimes(1);
+      expect(notifications.testDelivery).toHaveBeenCalledTimes(2);
+
+      newTest.resolve(result('new')); await settle();
+      expect(row('mention').textContent).toContain('Telegram: Sent');
+      expect(element<HTMLButtonElement>(row('mention'), '.test-button').disabled).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+  it.each(['locale', 'channel'])('stops a queued poll when the saved %s changes without leaving save busy', async kind => {
+    vi.useFakeTimers();
+    try {
+      notifications.testDelivery.mockResolvedValue(result('old', 'queued', 'queued'));
+      page = await renderComponent(Page);
+      await click(element(row('mention'), '.test-button'));
+      if (kind === 'locale') {
+        locale.set('ru'); await settle();
+        await submit(element(page.container, 'form'));
+      } else {
+        await check(row('mention').querySelectorAll('input')[1], false);
+      }
+      await vi.advanceTimersByTimeAsync(35_000); await settle();
+      expect(notifications.testResult).not.toHaveBeenCalled();
+      expect(notifications.testDelivery).toHaveBeenCalledTimes(1);
+      expect(row('mention').querySelector('.test-results')).toBeNull();
+      expect(element<HTMLButtonElement>(row('mention'), '.test-button').disabled).toBe(false);
+      expect(element<HTMLButtonElement>(page.container, 'button[type=submit]').disabled).toBe(false);
+      expect(row('mention').querySelector('input')?.getAttribute('aria-disabled')).toBe('false');
+    } finally { vi.useRealTimers(); }
+  });
+  it('keeps an existing result after a no-op save with the same revision', async () => {
+    notifications.updateDelivery.mockImplementation(async () => structuredClone(stored));
+    page = await renderComponent(Page);
+    await click(element(row('mention'), '.test-button'));
+    await submit(element(page.container, 'form'));
+    expect(row('mention').textContent).toContain('Telegram: Sent');
+    expect(notifications.testDelivery).toHaveBeenCalledTimes(1);
+  });
+  it.each(['identity', 'unmount'])('stops queued polling on %s', async lifecycle => {
+    vi.useFakeTimers();
+    try {
+      notifications.testDelivery.mockResolvedValue(result('old', 'queued', 'queued'));
+      page = await renderComponent(Page);
+      await click(element(row('mention'), '.test-button'));
+      if (lifecycle === 'identity') {
+        auth.me.mockResolvedValue({ id: 2, username: 'bob' });
+        await fetchUser(); await settle();
+        expect(row('mention').querySelector('.test-results')).toBeNull();
+      } else {
+        await page.destroy(); page = undefined;
+      }
+      await vi.advanceTimersByTimeAsync(35_000); await settle();
+      expect(notifications.testResult).not.toHaveBeenCalled();
+      expect(notifications.testDelivery).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+  });
+  it.each(['success', 'failure'])('keeps the pending toggle focusable and respects a later focus choice on %s', async outcome => {
+    const saving = deferred<DeliverySettings>();
+    notifications.updateDelivery.mockReturnValueOnce(saving.promise);
+    page = await renderComponent(Page);
+    const opener = row('mention').querySelectorAll('input')[0];
+    opener.focus();
+    await check(opener, false);
+    expect(document.activeElement).toBe(opener);
+    expect(opener.disabled).toBe(false);
+    expect(opener.getAttribute('aria-disabled')).toBe('true');
+    const other = row('mention').querySelectorAll('input')[1];
+    await check(other, false);
+    expect(other.checked).toBe(true);
+    expect(notifications.updateDelivery).toHaveBeenCalledTimes(1);
+    other.focus();
+    if (outcome === 'success') {
+      stored.events.mention.email = false;
+      stored.revision++;
+      saving.resolve(structuredClone(stored));
+    } else saving.reject(new Error('Save failed'));
+    await settle();
+    expect(document.activeElement).toBe(other);
+    expect(opener.getAttribute('aria-disabled')).toBe('false');
+    expect(opener.checked).toBe(outcome !== 'success');
+  });
+  it('returns focus to the initiating channel after successful sudo', async () => {
+    // The real request reads a reactive bearer before its first await.
+    const credential = new SvelteMap([['token', 'original-session']]);
+    notifications.settings.mockImplementation(async () => {
+      credential.get('token');
+      return structuredClone(stored);
+    });
+    setToken.mockImplementation(value => { credential.set('token', value); });
+    prompt = await renderComponent(SudoPrompt);
+    const ask = setSudoPrompt.mock.calls.find(([handler]) => typeof handler === 'function')![0] as () => Promise<boolean>;
+    notifications.updateDelivery.mockImplementation(async () => {
+      if (!await ask()) throw new Error('Authentication cancelled');
+      stored.events.mention.email = false; stored.revision++;
+      return structuredClone(stored);
+    });
+    auth.sudo.mockResolvedValue({ token: 'fixture-session' });
+    page = await renderComponent(Page);
+    const opener = row('mention').querySelectorAll('input')[0];
+    opener.focus(); await check(opener, false);
+    const dialog = element(document.body, '[role=dialog]');
+    await input(element(dialog, '#sudo-password'), 'fixture-password');
+    await input(element(dialog, '#sudo-code'), '123456');
+    await submit(element(dialog, 'form'));
+    expect(document.body.querySelector('[role=dialog]')).toBeNull();
+    expect(document.activeElement).toBe(opener);
+    expect(opener.checked).toBe(false);
+    expect(opener.getAttribute('aria-disabled')).toBe('false');
+    expect(notifications.settings).toHaveBeenCalledTimes(1);
+    expect(opener.isConnected).toBe(true);
+  });
   it.each(['cancel','wrong factor'])('uses the existing SudoPrompt and preserves saved channels on %s', async (kind) => {
     prompt=await renderComponent(SudoPrompt);
     const ask=setSudoPrompt.mock.calls.find(([handler]) => typeof handler === 'function')![0] as () => Promise<boolean>;
     notifications.updateDelivery.mockImplementation(async () => { if (!await ask()) throw new Error('Authentication cancelled'); return structuredClone(stored); });
     page=await renderComponent(Page);
-    await check(row('mention').querySelectorAll('input')[0],false);
+    const opener = row('mention').querySelectorAll('input')[0];
+    opener.focus(); await check(opener,false);
     await settle();
     const dialog=element(document.body,'[role="dialog"]');
     expect(dialog.querySelector('#sudo-code')).not.toBeNull();
@@ -138,6 +299,7 @@ describe('saved notification delivery', () => {
       expect(stored.events.mention.email).toBe(true);
     }
     await click(element(dialog,'.actions button')); await settle();
+    expect(document.activeElement).toBe(opener);
     expect(row('mention').querySelectorAll('input')[0].checked).toBe(true);
     expect(stored.events.mention.email).toBe(true);
     expect(notifications.updateDelivery).toHaveBeenCalledTimes(1);

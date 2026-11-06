@@ -1,6 +1,6 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
-  import { onDestroy } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import {
     EMAIL_NOTIFICATION_KEYS, NOTIFICATION_EVENTS, notifications,
     type EmailNotificationKey, type NotificationSettings, type NotificationEvent,
@@ -23,6 +23,7 @@
   let testErrors = $state<Partial<Record<NotificationEvent, string>>>({});
   let pending = $state<Partial<Record<NotificationEvent, boolean>>>({});
   let generation = 0;
+  let testGeneration = 0;
   let alive = true;
   const timers = new Map<ReturnType<typeof setTimeout>, () => void>();
   const modern = $derived(!!settings?.events);
@@ -38,18 +39,26 @@
     for (const [timer, resolve] of timers) { clearTimeout(timer); resolve(); }
     timers.clear();
   }
+  function resetTests() {
+    ++testGeneration;
+    clearTimers();
+    tests = {}; testErrors = {}; pending = {};
+  }
   onDestroy(() => { alive = false; ++generation; token = ''; clearTimers(); });
   $effect(() => {
     if (!isAuthReady()) return;
     const id = getUser()?.id;
     ++generation;
-    clearTimers();
-    settings = null; token = ''; tests = {}; testErrors = {}; pending = {};
+    resetTests();
+    settings = null; token = '';
     if (!isLoggedIn() || !id) { goto('/login'); return; }
-    void load(id);
+    // A sudo bearer refresh must not reload this account's form mid-save.
+    untrack(() => { void load(id); });
   });
   const owns = (stamp: number, id: number | undefined) => alive && generation === stamp && getUser()?.id === id;
   function apply(response: NotificationSettings) {
+    // Test results belong to the saved revision, independently of save ownership.
+    if (settings?.revision !== response.revision) resetTests();
     settings = response;
     chat = String(response.telegram?.chat_id ?? '');
     topic = String(response.telegram?.message_thread_id ?? '');
@@ -109,32 +118,33 @@
   const isWaiting = (result: NotificationTestResult | undefined) => result && Object.values(result.channels).some(c => c.status === 'queued' || c.status === 'inflight');
   function pause() { return new Promise<void>(resolve => { const timer = setTimeout(() => { timers.delete(timer); resolve(); }, 1000); timers.set(timer, resolve); }); }
   async function test(key: NotificationEvent) {
-    if (testDirty || busy || pending[key]) return;
+    if (!settings || testDirty || busy || pending[key]) return;
     const stamp = generation, id = getUser()?.id;
-    const revision = settings?.revision;
+    const revision = settings.revision, testStamp = testGeneration;
+    const ownsTest = () => owns(stamp, id) && testGeneration === testStamp && settings?.revision === revision;
     pending[key] = true; testErrors[key] = '';
     try {
       let result = isWaiting(tests[key]) ? await notifications.testResult(tests[key]!.event_id) : await notifications.testDelivery(key);
-      for (let attempt = 0; owns(stamp, id); attempt++) {
+      for (let attempt = 0; ownsTest(); attempt++) {
         tests[key] = result;
         if (!isWaiting(result) || attempt >= 30) break;
         await pause();
-        if (!owns(stamp, id)) return;
+        if (!ownsTest()) return;
         result = await notifications.testResult(result.event_id);
       }
-      if (owns(stamp, id) && result.channels.telegram.status === 'sent') {
+      if (ownsTest() && result.channels.telegram.status === 'sent') {
         // Confirm only the same saved revision. A late send must not make a
         // changed destination look verified, or overwrite an edited form.
         try {
           const fresh = await notifications.settings();
-          if (owns(stamp, id) && settings && settings.revision === revision && fresh.revision === revision && settings.telegram && fresh.telegram) {
+          if (ownsTest() && settings && fresh.revision === revision && settings.telegram && fresh.telegram) {
             settings = { ...settings, telegram: { ...settings.telegram, confirmed: fresh.telegram.confirmed } };
           }
         } catch { /* The delivery result remains valid if the status refresh fails. */ }
       }
     } catch (err: any) {
-      if (owns(stamp, id)) testErrors[key] = err?.message || t('notification_settings.test_failed');
-    } finally { if (owns(stamp, id)) pending[key] = false; }
+      if (ownsTest()) testErrors[key] = err?.message || t('notification_settings.test_failed');
+    } finally { if (ownsTest()) pending[key] = false; }
   }
   function reason(code: string | null) {
     if (!code) return '';
@@ -208,7 +218,8 @@
               </div>
               <div class="channel-actions">
                 {#each (modern ? ['email', 'telegram'] : ['email']) as channel}
-                  <label class="channel"><input type="checkbox" aria-labelledby={`event-${key} channel-${key}-${channel}`} checked={selected(key, channel as NotificationChannel)} disabled={busy || dirty || modern && (channel === 'email' ? !settings.capabilities?.email : !settings.telegram?.token_configured)} onchange={(event) => toggle(key, channel as NotificationChannel, event)} /><span id={`channel-${key}-${channel}`}>{channel === 'email' ? t('notification_settings.email_title') : t('notification_settings.telegram')}</span></label>
+                  <!-- Keep the opener focusable during async sudo; toggle guards busy changes. -->
+                  <label class="channel"><input type="checkbox" aria-labelledby={`event-${key} channel-${key}-${channel}`} checked={selected(key, channel as NotificationChannel)} aria-disabled={busy} disabled={dirty || modern && (channel === 'email' ? !settings.capabilities?.email : !settings.telegram?.token_configured)} onchange={(event) => toggle(key, channel as NotificationChannel, event)} /><span id={`channel-${key}-${channel}`}>{channel === 'email' ? t('notification_settings.email_title') : t('notification_settings.telegram')}</span></label>
                 {/each}
                 {#if modern}<button type="button" class="btn btn-secondary test-button" disabled={testDirty || busy || pending[key]} aria-busy={pending[key] ?? false} aria-label={`${t('notification_settings.test')} — ${t(`notification_settings.events.${key}`, undefined, formatTranslationFallback(key))}`} onclick={() => test(key)}>{pending[key] ? t('notification_settings.testing') : isWaiting(tests[key]) ? t('notification_settings.check_result') : t('notification_settings.test')}</button>{/if}
               </div>
@@ -253,6 +264,7 @@
   .category-name { font-weight: 600; }
   .channel { display: flex; align-items: center; gap: 6px; cursor: pointer; min-height: 32px; }
   .channel input { margin: 0; }
+  .channel input[aria-disabled="true"] { opacity: 0.6; cursor: wait; }
   .test-button { margin-left: auto; }
   .test-results { margin-top: 10px; overflow-wrap: anywhere; }
   .test-results p { margin: 4px 0; }
