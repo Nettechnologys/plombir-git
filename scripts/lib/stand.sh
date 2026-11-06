@@ -90,49 +90,39 @@ stand_trap() {
   exit "${status}"
 }
 
-# Start a background child, remembering enough about it to kill whatever it
-# spawns. `vite preview` is one node process today, but a wrapper around it
-# (npm, a shell) leaves the real server behind when only the wrapper is
-# signalled — the orphan then holds its port until somebody notices. `setsid`
-# puts the child in its own process group so teardown can signal the group.
+# Every child owns a session/process group whose ID is its recorded PID.
+# Python is already required by stand_open; os.setsid also works on macOS,
+# where the setsid executable is absent. Exec preserves that PID/group identity.
 stand_spawn() {
   local log=$1
   local cwd=$2
   shift 2
 
-  if command -v setsid >/dev/null 2>&1; then
-    (cd "${cwd}" && exec setsid "$@" >"${log}" 2>&1) &
-  else
-    (cd "${cwd}" && exec "$@" >"${log}" 2>&1) &
-  fi
+  (cd "${cwd}" && exec python3 -c '
+import os, sys
+os.setsid()
+os.execvp(sys.argv[1], sys.argv[1:])
+' "$@" >"${log}" 2>&1) &
   STAND_LAST_PID=$!
   STAND_PIDS+=("${STAND_LAST_PID}")
 }
 
-# Signal the child's whole process group when it has one of its own, and the
-# child alone when it does not — a stand without `setsid` shares its group with
-# this script, and `kill -- -$$` would take the test down with the server.
+# The leader can exit while a helper still owns a listener. Keep targeting the
+# recorded group even after its leader disappeared; testing only the PID loses
+# those helpers. Fall back to the PID only if interrupted before setsid ran.
 stand_stop_process() {
   local pid=$1
-  kill -0 "${pid}" 2>/dev/null || return 0
+  local target="-${pid}"
 
-  local own_pgid child_pgid target
-  own_pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
-  child_pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d ' ')"
-  target="${pid}"
-  if [[ -n "${child_pgid}" && -n "${own_pgid}" && "${child_pgid}" != "${own_pgid}" ]]; then
-    target="-${child_pgid}"
-  fi
-
-  kill -s TERM -- "${target}" 2>/dev/null || true
+  kill -s TERM -- "${target}" 2>/dev/null || kill -s TERM -- "${pid}" 2>/dev/null || true
   local _
   for _ in $(seq 1 50); do
-    kill -0 "${pid}" 2>/dev/null || break
+    if ! kill -0 -- "${target}" 2>/dev/null && ! kill -0 "${pid}" 2>/dev/null; then
+      break
+    fi
     sleep 0.1
   done
-  if kill -0 "${pid}" 2>/dev/null; then
-    kill -s KILL -- "${target}" 2>/dev/null || true
-  fi
+  kill -s KILL -- "${target}" 2>/dev/null || kill -s KILL -- "${pid}" 2>/dev/null || true
   wait "${pid}" 2>/dev/null || true
 }
 
