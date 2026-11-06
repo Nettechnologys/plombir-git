@@ -28352,7 +28352,7 @@
         {
           "tag": "button",
           "label": "i18n:notification_settings.retry",
-          "line": 158,
+          "line": 168,
           "via": null,
           "href": null,
           "handler": "() => load()",
@@ -28376,7 +28376,7 @@
         {
           "tag": "form",
           "label": "}>",
-          "line": 167,
+          "line": 177,
           "via": null,
           "href": null,
           "handler": "(event) => { event.preventDefault(); void save(); }",
@@ -28401,7 +28401,7 @@
         {
           "tag": "select",
           "label": "i18n:notification_settings.keep",
-          "line": 173,
+          "line": 183,
           "via": null,
           "href": null,
           "handler": null,
@@ -28411,7 +28411,7 @@
         {
           "tag": "button",
           "label": "i18n:notification_settings.save_language",
-          "line": 193,
+          "line": 203,
           "via": null,
           "href": null,
           "handler": null,
@@ -28421,7 +28421,7 @@
         {
           "tag": "button",
           "label": "i18n:notification_settings.discard",
-          "line": 194,
+          "line": 204,
           "via": null,
           "href": null,
           "handler": "() => { if (settings) apply(settings); saveError = ''; }",
@@ -28431,7 +28431,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 211,
+          "line": 222,
           "via": null,
           "href": null,
           "handler": "(event) => toggle(key, channel as NotificationChannel, event)",
@@ -28470,7 +28470,7 @@
         {
           "tag": "button",
           "label": "i18n:notification_settings.testing",
-          "line": 213,
+          "line": 224,
           "via": null,
           "href": null,
           "handler": "() => test(key)",

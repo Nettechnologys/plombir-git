@@ -1246,13 +1246,13 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:notification_settings.retry | :158 | `GET /api/v1/users/me/notification-settings` | `User` | web |
-| }> | :167 | `PUT /api/v1/users/me/notification-settings` | `User` | rust+web |
-| (event) => toggle(key, channel as Notifi | :211 | `PUT /api/v1/users/me/notification-settings` | `User` | rust+web |
-| (event) => toggle(key, channel as Notifi | :211 | `PUT /api/v1/users/me/notification-settings` | `User` | rust+web |
-| i18n:notification_settings.testing | :213 | `GET /api/v1/users/me/notification-settings/test` | `User` | web |
-| i18n:notification_settings.testing | :213 | `POST /api/v1/users/me/notification-settings/test` | `User` | web |
-| i18n:notification_settings.testing | :213 | `GET /api/v1/users/me/notification-settings` | `User` | web |
+| i18n:notification_settings.retry | :168 | `GET /api/v1/users/me/notification-settings` | `User` | web |
+| }> | :177 | `PUT /api/v1/users/me/notification-settings` | `User` | rust+web |
+| (event) => toggle(key, channel as Notifi | :222 | `PUT /api/v1/users/me/notification-settings` | `User` | rust+web |
+| (event) => toggle(key, channel as Notifi | :222 | `PUT /api/v1/users/me/notification-settings` | `User` | rust+web |
+| i18n:notification_settings.testing | :224 | `GET /api/v1/users/me/notification-settings/test` | `User` | web |
+| i18n:notification_settings.testing | :224 | `POST /api/v1/users/me/notification-settings/test` | `User` | web |
+| i18n:notification_settings.testing | :224 | `GET /api/v1/users/me/notification-settings` | `User` | web |
 
 ### `/settings/profile`
 
