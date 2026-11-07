@@ -6,7 +6,15 @@ This project records user-facing changes here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-07
+
+Read the [v0.4.0 upgrade notes](docs/releases/v0.4.0.md) before deploying.
+
 ### Added
+
+- Russian interface localization, remembered browser sessions with bounded
+  activity renewal, and optional bot agent profiles with encrypted model keys.
+- Configurable advertised SSH clone port for instances behind a port-mapping proxy.
 
 - Personal Telegram and email channels for 36 activity/security events, saved
   English/Russian/Simplified Chinese delivery language and per-event test sends.
@@ -29,6 +37,21 @@ This project records user-facing changes here. The format follows
   after upgrade. Personal notification settings now require a login session,
   including the legacy email-only API. See [notification rollout and operator
   requirements](docs/notifications.md).
+
+### Fixed
+
+- MFA changes and sensitive account actions require fresh proof of the current
+  factor; password-only sudo issued before enrolment cannot mint credentials.
+  Enrolment atomically promotes the exact verified pending secret.
+- Mixed-account cookie/session credentials are refused before mutations;
+  browser recovery does not replay the action. Logout no longer treats an
+  intermediary's HTML 401 as confirmation that the session ended.
+- MFA status is independent of backup-code history. Security setup uses dialogs,
+  and token forms have compact copy controls with clear success/error feedback.
+- Repository tabs overflow into an accessible menu; search and branch controls,
+  translated labels, warning colors and mobile settings layouts are consistent.
+- SQLite restore tolerates an already removed sidecar. CI and release images,
+  workflows and dependencies include the updates merged since v0.3.0.
 
 ## [0.3.0] - 2026-10-23
 
