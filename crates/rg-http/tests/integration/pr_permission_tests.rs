@@ -357,7 +357,7 @@ async fn private_prs_require_repo_read_access_and_updates_require_ownership() {
     let pr_url = format!("{base}/api/v1/repos/pr-owner/private-prs/pulls/1");
 
     let anonymous = client.get(&pr_url).send().await.unwrap();
-    assert_eq!(anonymous.status(), 401);
+    assert_eq!(anonymous.status(), 404);
 
     let outsider = client
         .get(&pr_url)
@@ -365,7 +365,7 @@ async fn private_prs_require_repo_read_access_and_updates_require_ownership() {
         .send()
         .await
         .unwrap();
-    assert_eq!(outsider.status(), 403);
+    assert_eq!(outsider.status(), 404);
 
     let update = client
         .patch(&pr_url)
@@ -374,7 +374,7 @@ async fn private_prs_require_repo_read_access_and_updates_require_ownership() {
         .send()
         .await
         .unwrap();
-    assert_eq!(update.status(), 403);
+    assert_eq!(update.status(), 404);
 
     let merge = client
         .post(format!("{pr_url}/merge"))
@@ -383,7 +383,7 @@ async fn private_prs_require_repo_read_access_and_updates_require_ownership() {
         .send()
         .await
         .unwrap();
-    assert_eq!(merge.status(), 403);
+    assert_eq!(merge.status(), 404);
 
     let owner_update = client
         .patch(&pr_url)

@@ -8,7 +8,7 @@
 //! the neighbouring endpoint let them in.
 //!
 //! These tests pin the three answers the shared gate owes a private repo —
-//! `401` anonymous, `403` outsider, "not a denial" for the owner — across the
+//! `404` anonymous, `404` outsider, "not a denial" for the owner — across the
 //! endpoints that used to hold their own copy, and they pin them for a
 //! cookie-authenticated session specifically.
 
@@ -87,13 +87,13 @@ async fn private_repo_reads_reject_anonymous_and_outsiders_everywhere() {
     for url in read_endpoints(&base, owner, repo) {
         assert_eq!(
             status(&url, None).await,
-            401,
-            "anonymous read of a private repo must be 401 at {url}"
+            404,
+            "anonymous read of a private repo must be 404 at {url}"
         );
         assert_eq!(
             status(&url, Some((&outsider_token, false))).await,
-            403,
-            "outsider read of a private repo must be 403 at {url}"
+            404,
+            "outsider read of a private repo must be 404 at {url}"
         );
     }
 }

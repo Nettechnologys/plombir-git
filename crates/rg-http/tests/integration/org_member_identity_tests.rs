@@ -61,7 +61,7 @@ async fn an_owner_can_add_a_member_by_username_and_see_them_named() {
         .expect("request");
     assert_eq!(
         hidden.status(),
-        403,
+        404,
         "baseline: the guest cannot see the private repo before joining"
     );
 

@@ -5633,6 +5633,26 @@
       ]
     },
     {
+      "scope": "/[owner]/[repo]",
+      "file": "web/src/routes/[owner]/[repo]/+layout.svelte",
+      "passive": [
+        {
+          "symbol": "repos.get",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{name}",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}",
+          "access": "RepoRead",
+          "handler": "api::repos::get_repo",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        }
+      ]
+    },
+    {
       "scope": "/[owner]/[repo]/settings",
       "file": "web/src/routes/[owner]/[repo]/settings/+layout.svelte",
       "passive": []

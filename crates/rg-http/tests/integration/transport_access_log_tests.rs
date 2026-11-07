@@ -98,7 +98,7 @@ async fn a_refused_and_an_accepted_lfs_batch_both_leave_a_line_at_the_default_le
             .send()
     };
     let refused = batch(password.to_string()).await.unwrap();
-    assert_eq!(refused.status(), 401, "a password is not an LFS credential");
+    assert_eq!(refused.status(), 404, "a password is not an LFS credential");
     let accepted = batch(pat.clone()).await.unwrap();
     assert_eq!(accepted.status(), 200, "a token is");
     let anonymous = client
@@ -118,7 +118,7 @@ async fn a_refused_and_an_accepted_lfs_batch_both_leave_a_line_at_the_default_le
     assert!(
         batch_lines
             .iter()
-            .any(|line| line.contains(" WARN ") && line.contains("status=401")),
+            .any(|line| line.contains(" WARN ") && line.contains("status=404")),
         "the refused batch left no warning: {lines:#?}"
     );
     assert!(

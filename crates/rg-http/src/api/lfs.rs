@@ -219,7 +219,7 @@ async fn signer_still_stands(
 /// the argument that "a public repository's read gate would admit this caller
 /// with no credentials at all". True when the URL was minted; not true an hour
 /// later, after the repository was made private. `check_read_for(…, None)`
-/// answers `401` for exactly that case and keeps admitting the anonymous caller
+/// answers `404` for exactly that case and keeps admitting the anonymous caller
 /// while the repository really is public.
 ///
 /// The cost is one permission read per object, which is what the unsigned
@@ -253,11 +253,11 @@ async fn authorize_signed_action(
                     Err(AppError::gone("LFS action URL has expired"))
                 }
                 Err(rg_core::lfs::service::LfsActionSignatureError::Invalid) => {
-                    Err(AppError::forbidden("invalid LFS action URL signature"))
+                    Err(AppError::not_found("repository not found"))
                 }
             }
         }
-        _ => Err(AppError::forbidden("incomplete LFS action URL signature")),
+        _ => Err(AppError::not_found("repository not found")),
     }
 }
 
@@ -333,32 +333,16 @@ pub(crate) async fn ssh_grant(
     repo_model: &rg_db::entities::repository::Model,
     accepts: impl Fn(rg_core::lfs::service::LfsActionKind) -> bool,
 ) -> Option<Result<rg_core::lfs::service::LfsActor, AppError>> {
-    use rg_core::lfs::service::{verify_ssh_grant, LfsActionSignatureError, SSH_GRANT_AUTH_SCHEME};
-
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix(SSH_GRANT_AUTH_SCHEME)?
-        .strip_prefix(' ')?;
-    let grant = match verify_ssh_grant(
-        state.jwt_secret.as_bytes(),
-        token,
-        chrono::Utc::now().timestamp(),
-    ) {
+    let grant = match presented_ssh_grant(state, headers)? {
         Ok(grant) => grant,
-        Err(LfsActionSignatureError::Expired) => {
-            return Some(Err(AppError::unauthorized(
-                "the SSH LFS credential has expired; git-lfs fetches a new one over SSH",
-            )))
-        }
-        Err(LfsActionSignatureError::Invalid) => {
-            return Some(Err(AppError::unauthorized("invalid SSH LFS credential")))
-        }
+        Err(error) => return Some(Err(error)),
     };
-    if grant.repo_id != repo_model.id || !accepts(grant.action) {
+    if grant.repo_id != repo_model.id {
+        return Some(Err(AppError::not_found("repository not found")));
+    }
+    if !accepts(grant.action) {
         return Some(Err(AppError::forbidden(
-            "the SSH LFS credential was issued for another repository or operation",
+            "the SSH LFS credential was issued for another operation",
         )));
     }
     Some(
@@ -366,6 +350,98 @@ pub(crate) async fn ssh_grant(
             .await
             .map(|()| grant.actor),
     )
+}
+
+/// Validate the credential independently of the guessed repository. An invalid
+/// or expired SSH grant must have the same answer at a hidden and a missing name.
+fn presented_ssh_grant(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<Result<rg_core::lfs::service::SshLfsGrant, AppError>> {
+    use rg_core::lfs::service::{verify_ssh_grant, LfsActionSignatureError, SSH_GRANT_AUTH_SCHEME};
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix(SSH_GRANT_AUTH_SCHEME)?
+        .strip_prefix(' ')?;
+    Some(
+        verify_ssh_grant(
+            state.jwt_secret.as_bytes(),
+            token,
+            chrono::Utc::now().timestamp(),
+        )
+        .map_err(|error| match error {
+            LfsActionSignatureError::Expired => AppError::unauthorized(
+                "the SSH LFS credential has expired; git-lfs fetches a new one over SSH",
+            ),
+            LfsActionSignatureError::Invalid => {
+                AppError::unauthorized("invalid SSH LFS credential")
+            }
+        }),
+    )
+}
+
+/// LFS needs a credential challenge before git-lfs will ask its credential
+/// helper. Challenge *both* hidden and absent names; authenticated outsiders
+/// receive the ordinary repository 404. Signed URLs take their own proof path.
+pub(crate) fn repository_refusal(
+    state: &AppState,
+    headers: &HeaderMap,
+    error: AppError,
+) -> AppError {
+    if matches!(&error, AppError::NotFound(_))
+        && actor_id(headers, state).is_none()
+        && !headers.contains_key(axum::http::header::AUTHORIZATION)
+    {
+        AppError::unauthorized("authentication required")
+    } else {
+        error
+    }
+}
+
+pub(crate) async fn resolve_repository(
+    state: &AppState,
+    headers: &HeaderMap,
+    owner: &str,
+    name: &str,
+    signed_url: bool,
+) -> Result<rg_db::entities::repository::Model, AppError> {
+    let grant = presented_ssh_grant(state, headers).transpose()?;
+    if let Some(grant) = grant {
+        use rg_core::lfs::service::LfsActor;
+        match grant.actor {
+            LfsActor::User {
+                user_id,
+                credential,
+            } => {
+                signer_still_stands(&state.db, user_id, credential).await?;
+            }
+            LfsActor::DeployKey { key_id } => {
+                let key = rg_db::ops::deploy_key_ops::find_by_id(&state.db, key_id)
+                    .await
+                    .map_err(AppError::from)?;
+                if key.is_none_or(|key| key.repo_id != grant.repo_id) {
+                    return Err(AppError::unauthorized("the deploy key has been removed"));
+                }
+            }
+        }
+    }
+    let repo = rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, name)
+        .await
+        .map_err(AppError::from)?;
+    let Some(repo) = repo else {
+        let error = AppError::not_found("repository not found");
+        return Err(if signed_url {
+            error
+        } else {
+            repository_refusal(state, headers, error)
+        });
+    };
+    if grant.is_some_and(|grant| grant.repo_id != repo.id) {
+        return Err(AppError::not_found("repository not found"));
+    }
+    Ok(repo)
 }
 
 /// The user behind this request's credentials, if any.
@@ -431,7 +507,7 @@ fn signed_actor(
         // Two credentials at once is not a shape this server mints either, and
         // it is the one a caller would try in order to pick which question gets
         // asked about their URL.
-        _ => Err(AppError::forbidden("incomplete LFS action URL signature")),
+        _ => Err(AppError::not_found("repository not found")),
     }
 }
 
@@ -473,12 +549,10 @@ pub async fn batch(
     }
 
     // LFS client sends Accept: application/vnd.git-lfs+json
-    let repo_model =
-        match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &repo).await {
-            Ok(Some(r)) => r,
-            Ok(None) => return AppError::not_found("repository not found").into_response(),
-            Err(e) => return AppError::from(e).into_response(),
-        };
+    let repo_model = match resolve_repository(&state, &headers, &owner, &repo, false).await {
+        Ok(repo) => repo,
+        Err(error) => return error.into_response(),
+    };
 
     // Upload actions always require repository write access, including for
     // public repositories; a download requires whatever reading the repository
@@ -502,7 +576,7 @@ pub async fn batch(
                 repo_access::check_read_for(&state, &repo_model, actor_id).await
             };
             if let Err(error) = decision {
-                return error.into_response();
+                return repository_refusal(&state, &headers, error).into_response();
             }
             actor
         }
@@ -569,12 +643,18 @@ pub async fn upload_object(
     if !rg_core::lfs::service::is_valid_oid(&oid) {
         return AppError::bad_request("invalid LFS object identifier").into_response();
     }
-    let repo_model =
-        match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &repo).await {
-            Ok(Some(r)) => r,
-            Ok(None) => return AppError::not_found("repository not found").into_response(),
-            Err(e) => return AppError::from(e).into_response(),
-        };
+    let repo_model = match resolve_repository(
+        &state,
+        &headers,
+        &owner,
+        &repo,
+        query.signature.is_some() || query.expires.is_some(),
+    )
+    .await
+    {
+        Ok(repo) => repo,
+        Err(error) => return error.into_response(),
+    };
 
     let signed = match authorize_signed_action(
         &state,
@@ -591,7 +671,7 @@ pub async fn upload_object(
     if !signed {
         let actor_id = actor_id(&headers, &state);
         if let Err(error) = repo_access::check_write_for(&state, &repo_model, actor_id).await {
-            return error.into_response();
+            return repository_refusal(&state, &headers, error).into_response();
         }
     }
 
@@ -673,12 +753,18 @@ pub async fn download_object(
         return AppError::bad_request("invalid LFS object identifier").into_response();
     }
     // H-01: Auth check for private repos
-    let repo_model =
-        match rg_core::repo::service::find_repo_by_owner_name(&state.db, &owner, &repo).await {
-            Ok(Some(r)) => r,
-            Ok(None) => return AppError::not_found("repository not found").into_response(),
-            Err(e) => return AppError::from(e).into_response(),
-        };
+    let repo_model = match resolve_repository(
+        &state,
+        &headers,
+        &owner,
+        &repo,
+        query.signature.is_some() || query.expires.is_some(),
+    )
+    .await
+    {
+        Ok(repo) => repo,
+        Err(error) => return error.into_response(),
+    };
 
     if let Err(response) = authorize_lfs_download(&state, &repo_model, &oid, &query, &headers).await
     {
@@ -779,7 +865,7 @@ async fn authorize_lfs_download(
     if !signed {
         let actor_id = actor_id(headers, state);
         if let Err(error) = repo_access::check_read_for(state, repo_model, actor_id).await {
-            return Err(error.into_response());
+            return Err(repository_refusal(state, headers, error).into_response());
         }
     }
     Ok(())

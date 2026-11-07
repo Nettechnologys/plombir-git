@@ -501,13 +501,9 @@ pub async fn ws_job_log_handler(
     // that user may read is the shared repository gate's decision, exactly as
     // it would be on the REST route serving the same logs.
     //
-    // What the caller is *told* is not that decision, though, and this is where
-    // it parts company with the REST route: there the path named the repository,
-    // so a `403` teaches nothing the caller did not already supply, while here
-    // the caller supplied an opaque integer and any answer other than the one an
-    // absent id gets confirms the integer hit a row. So the refusal is folded
-    // into [`job_not_found`] — the same collapse `masked_denial` performs for
-    // `/artifacts/{id}`, and for the same reason.
+    // A guessed job id, like a guessed repository name in the REST API,
+    // reveals no existence information. Use the same job-shaped 404 for a
+    // missing row and an inaccessible one, as `masked_denial` does for artifacts.
     //
     // Only a *denial* is folded. A check that could not run stays what it was,
     // or a database outage would answer `404` and send the caller off looking

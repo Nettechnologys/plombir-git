@@ -203,7 +203,7 @@ async fn private_repository_templates_require_read_access() {
         .send()
         .await
         .unwrap();
-    assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(anonymous.status(), reqwest::StatusCode::NOT_FOUND);
 
     let forbidden = client
         .get(format!(
@@ -213,7 +213,7 @@ async fn private_repository_templates_require_read_access() {
         .send()
         .await
         .unwrap();
-    assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(forbidden.status(), reqwest::StatusCode::NOT_FOUND);
 
     let owner_response = client
         .get(format!(

@@ -111,12 +111,12 @@ async fn private_repo_issue_metadata_is_closed_to_anonymous_and_outsiders() {
     for path in &paths {
         assert_eq!(
             get_status(&base, path, None).await,
-            401,
+            404,
             "anonymous reached {path} on a private repo"
         );
         assert_eq!(
             get_status(&base, path, Some(&outsider_token)).await,
-            403,
+            404,
             "an outsider reached {path} on a private repo"
         );
 

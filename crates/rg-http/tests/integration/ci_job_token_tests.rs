@@ -165,7 +165,7 @@ async fn ci_job_token_can_read_scoped_private_packages() {
         .send()
         .await
         .unwrap();
-    assert_eq!(wrong_repo_resp.status(), 401);
+    assert_eq!(wrong_repo_resp.status(), 404);
 }
 
 /// A token outlives the job it was minted for — the gate must not.
@@ -210,7 +210,7 @@ async fn a_cancelled_job_stops_opening_the_repository_with_its_token() {
         .unwrap();
     assert_eq!(
         after_cancel.status(),
-        401,
+        404,
         "a cancelled job kept its key to the repository until the token expired"
     );
 }
@@ -245,7 +245,7 @@ async fn a_token_naming_rows_that_were_never_written_opens_nothing() {
         .unwrap();
     assert_eq!(
         resp.status(),
-        401,
+        404,
         "a signature naming no persisted job opened a private repository"
     );
 }
@@ -380,5 +380,5 @@ async fn ci_job_token_can_read_scoped_private_repo_content() {
         .send()
         .await
         .unwrap();
-    assert_eq!(wrong_repo_resp.status(), 401);
+    assert_eq!(wrong_repo_resp.status(), 404);
 }

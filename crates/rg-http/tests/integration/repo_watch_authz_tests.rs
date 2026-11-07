@@ -228,14 +228,14 @@ async fn private_repo_star_and_watch_reject_anonymous_and_outsiders() {
 
     for status in star_watch_statuses(&base, owner, repo, None).await {
         assert_eq!(
-            status, 401,
-            "anonymous star/watch of a private repo must be 401"
+            status, 404,
+            "anonymous star/watch of a private repo must be 404"
         );
     }
     for status in star_watch_statuses(&base, owner, repo, Some(&outsider_token)).await {
         assert_eq!(
-            status, 403,
-            "outsider star/watch of a private repo must be 403"
+            status, 404,
+            "outsider star/watch of a private repo must be 404"
         );
     }
 }

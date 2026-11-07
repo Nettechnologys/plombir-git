@@ -60,7 +60,7 @@ async fn private_package_list_requires_read_access() {
         .send()
         .await
         .unwrap();
-    assert_eq!(anon_resp.status(), 401);
+    assert_eq!(anon_resp.status(), 404);
 
     let other_resp = client
         .get(format!(
@@ -71,7 +71,7 @@ async fn private_package_list_requires_read_access() {
         .send()
         .await
         .unwrap();
-    assert_eq!(other_resp.status(), 403);
+    assert_eq!(other_resp.status(), 404);
 
     let owner_resp = client
         .get(format!(
@@ -111,7 +111,7 @@ async fn private_package_publish_requires_write_access() {
         .send()
         .await
         .unwrap();
-    assert_eq!(other_resp.status(), 403);
+    assert_eq!(other_resp.status(), 404);
 
     let owner_resp = client
         .post(format!(
@@ -173,7 +173,7 @@ async fn private_package_versions_require_read_access() {
         .send()
         .await
         .unwrap();
-    assert_eq!(anon_resp.status(), 401);
+    assert_eq!(anon_resp.status(), 404);
 
     let other_resp = client
         .get(format!(
@@ -184,7 +184,7 @@ async fn private_package_versions_require_read_access() {
         .send()
         .await
         .unwrap();
-    assert_eq!(other_resp.status(), 403);
+    assert_eq!(other_resp.status(), 404);
 
     let owner_resp = client
         .get(format!(

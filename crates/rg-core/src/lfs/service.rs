@@ -348,15 +348,18 @@ pub fn verify_action_url(
     signature: &str,
     now: i64,
 ) -> std::result::Result<(), LfsActionSignatureError> {
-    if expires_at <= now {
-        return Err(LfsActionSignatureError::Expired);
-    }
     let signature = hex::decode(signature).map_err(|_| LfsActionSignatureError::Invalid)?;
     let mut mac =
         HmacSha256::new_from_slice(secret).map_err(|_| LfsActionSignatureError::Invalid)?;
     mac.update(action_signature_payload(action, repo_id, oid, expires_at, actor).as_bytes());
     mac.verify_slice(&signature)
-        .map_err(|_| LfsActionSignatureError::Invalid)
+        .map_err(|_| LfsActionSignatureError::Invalid)?;
+    // Only a genuine capability may disclose that it expired. A forged
+    // timestamp must not distinguish an existing private repository.
+    if expires_at <= now {
+        return Err(LfsActionSignatureError::Expired);
+    }
+    Ok(())
 }
 
 // ── LFS over an SSH remote ────────────────────────────────────────────────
@@ -3044,6 +3047,40 @@ mod ssh_grant_tests {
                 "{malformed:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_expired_action_url_must_prove_its_signature_before_reporting_expiry() {
+        let oid = "a".repeat(64);
+        let signature =
+            super::sign_action_url(SECRET, LfsActionKind::Download, 7, &oid, EXPIRES, None)
+                .unwrap();
+        assert_eq!(
+            super::verify_action_url(
+                SECRET,
+                LfsActionKind::Download,
+                7,
+                &oid,
+                EXPIRES,
+                None,
+                &signature,
+                EXPIRES
+            ),
+            Err(LfsActionSignatureError::Expired),
+        );
+        assert_eq!(
+            super::verify_action_url(
+                SECRET,
+                LfsActionKind::Download,
+                8,
+                &oid,
+                EXPIRES,
+                None,
+                &signature,
+                EXPIRES
+            ),
+            Err(LfsActionSignatureError::Invalid),
+        );
     }
 
     #[test]

@@ -113,6 +113,11 @@ const GATES: &[&str] = &[
 /// rules, so their gate is a separate mechanism on purpose.
 const SIGNED_OFF: &[(&str, &str)] = &[
     (
+        "handlers.rs",
+        "SPA HTML fallback has no repo route extractor; uses require_read for the document status \
+         before adding public metadata, with the same visibility rule as the REST API",
+    ),
+    (
         "api/repo_access.rs",
         "the gate itself: the require_* implementations and the extractors over them",
     ),

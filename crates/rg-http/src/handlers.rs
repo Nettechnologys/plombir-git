@@ -46,12 +46,19 @@ pub(crate) async fn spa_index_handler(
         Ok(html_bytes) => {
             let html = String::from_utf8_lossy(&html_bytes).into_owned();
             let mut modified = security::inject_csp_nonce(&html, &nonce.0);
-            if let Some(preview) = public_repo_preview(&state, &headers, uri.path()).await {
-                modified = preview.apply(&modified);
+            let status = repository_page_status(&state, &headers, uri.path()).await;
+            if status == StatusCode::OK {
+                if let Some(preview) = public_repo_preview(&state, &headers, uri.path()).await {
+                    modified = preview.apply(&modified);
+                }
             }
             (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                status,
+                [
+                    (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                    (header::CACHE_CONTROL, "private, no-store"),
+                    (header::VARY, "Cookie, Authorization"),
+                ],
                 modified,
             )
                 .into_response()
@@ -64,6 +71,37 @@ pub(crate) async fn spa_index_handler(
 /// because `ServeDir::fallback` takes a stateless service.
 #[derive(Clone)]
 pub(crate) struct SpaAppState(pub AppState);
+
+/// The shell contains no private data, but its HTTP status must not confirm
+/// whether a repository exists. The client renders the same full-page error
+/// after its own access probe, including during SPA navigation.
+async fn repository_page_status(state: &AppState, headers: &HeaderMap, path: &str) -> StatusCode {
+    let mut segments = path.trim_start_matches('/').split('/');
+    let Some(owner) = segments.next().filter(|s| !s.is_empty()) else {
+        return StatusCode::OK;
+    };
+    let Some(name) = segments.next().filter(|s| !s.is_empty()) else {
+        return StatusCode::OK;
+    };
+    let (Ok(owner), Ok(name)) = (urlencoding::decode(owner), urlencoding::decode(name)) else {
+        return StatusCode::NOT_FOUND;
+    };
+    // Static application pages (settings/profile, admin/users, …) have their
+    // own gates. "git" also remains a possible legacy owner on SPA paths;
+    // the actual Git protocol endpoints are mounted before this fallback.
+    if rg_core::namespace::is_reserved_segment(&owner) && owner != "git" {
+        return StatusCode::OK;
+    }
+    if rg_core::platform::validate_repo_path(&owner).is_err()
+        || rg_core::platform::validate_repo_path(&name).is_err()
+    {
+        return StatusCode::NOT_FOUND;
+    }
+    match crate::api::repo_access::require_read(state, headers, &owner, &name).await {
+        Ok(_) => StatusCode::OK,
+        Err(error) => error.status(),
+    }
+}
 
 /// The `description` and Open Graph tags of one public repository's pages.
 ///

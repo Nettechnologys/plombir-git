@@ -234,7 +234,7 @@ async fn a_grant_opens_only_its_own_repository_and_operation_and_runs_out() {
         content.len(),
     )
     .await;
-    assert_eq!(other_repo.status(), 403);
+    assert_eq!(other_repo.status(), 404);
     let upload_with_download_grant = batch(
         &base,
         "ssh_lfs_bound",
@@ -327,7 +327,7 @@ async fn a_grant_is_re_gated_at_the_batch_against_current_repository_access() {
         content.len(),
     )
     .await;
-    assert_eq!(refused.status(), 403);
+    assert_eq!(refused.status(), 404);
 }
 
 #[tokio::test]
@@ -399,7 +399,9 @@ async fn a_deploy_key_grant_reads_its_repository_and_writes_only_when_not_read_o
         content.len(),
     )
     .await;
-    assert_eq!(foreign_pull.status(), 403);
+    // This manufactured grant names a key that never belonged to its signed
+    // repository. Reject the credential before resolving any requested name.
+    assert_eq!(foreign_pull.status(), 401);
 
     let push = batch(
         &base,

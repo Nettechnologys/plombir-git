@@ -204,7 +204,7 @@ async fn pipeline_poll_omits_logs_and_job_log_ranges_are_bounded() {
         .send()
         .await
         .unwrap();
-    assert_eq!(denied.status(), 401);
+    assert_eq!(denied.status(), 404);
 }
 
 #[tokio::test]
@@ -234,7 +234,7 @@ async fn private_pipeline_list_requires_read_access() {
         .send()
         .await
         .unwrap();
-    assert_eq!(anon_resp.status(), 401);
+    assert_eq!(anon_resp.status(), 404);
 
     let other_resp = client
         .get(format!(
@@ -245,7 +245,7 @@ async fn private_pipeline_list_requires_read_access() {
         .send()
         .await
         .unwrap();
-    assert_eq!(other_resp.status(), 403);
+    assert_eq!(other_resp.status(), 404);
 
     let owner_resp = client
         .get(format!(
@@ -291,7 +291,7 @@ async fn cancel_pipeline_requires_write_access() {
         .send()
         .await
         .unwrap();
-    assert_eq!(other_resp.status(), 403);
+    assert_eq!(other_resp.status(), 404);
 
     let owner_resp = client
         .post(format!(
@@ -578,7 +578,7 @@ async fn manual_job_play_requires_write_access_and_is_atomic() {
             .await
             .unwrap()
             .status(),
-        403
+        404
     );
     db.execute_unprepared(&format!(
         "CREATE TRIGGER break_manual_stage_resume BEFORE UPDATE OF status ON pipeline_stages\n\
@@ -869,7 +869,7 @@ async fn protected_environment_requires_authorized_approval_before_release() {
             .await
             .unwrap()
             .status(),
-        403
+        404
     );
     db.execute_unprepared(&format!(
         "CREATE TRIGGER break_approval_stage_resume BEFORE UPDATE OF status ON pipeline_stages\n\

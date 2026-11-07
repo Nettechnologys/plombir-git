@@ -6,6 +6,14 @@ This project records user-facing changes here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Hidden and missing repositories now return the same REST/API 404. Repository
+  pages show a full-page 404 without repository controls or clone links, and
+  their HTML responses are private and not cached. Token confinement and SSH
+  key refusals also conceal repository existence. Git/LFS retain the same
+  credential challenge for both hidden and missing names before authentication.
+
 ## [0.4.0] - 2026-11-07
 
 Read the [v0.4.0 upgrade notes](docs/releases/v0.4.0.md) before deploying.

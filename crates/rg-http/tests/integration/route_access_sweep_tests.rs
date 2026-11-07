@@ -675,11 +675,9 @@ enum Expect {
 
 /// The heart of the sweep: what each declared level owes each persona.
 ///
-/// `Denied` is checked as a family (`401` *or* `403`) rather than as an exact
-/// code. Which of the two is right is a separate question — a private repo owes
-/// `401` to an anonymous caller and `403` to an authenticated outsider, and
-/// `repo_read_gate_tests` pins exactly that. Here the question is only whether
-/// the gate answered at all.
+/// Hidden repositories are paired with absent names, including their response
+/// bodies. A 401 is only admissible when the same credential-first refusal
+/// occurs before both lookups; a visible repository's write denial remains 403.
 ///
 /// `anchored` is the third axis, and it is not derivable from the other two.
 /// An anchored route declares the same `RepoRead` a path-based one declares —
@@ -715,6 +713,9 @@ fn expectation(access: Access, persona: Persona, scope: Scope, anchored: bool) -
             Owner => Expect::Allowed,
             _ => Expect::Hidden,
         },
+        access if access.is_repo_scoped() && scope == Scope::PrivateRepo && persona != Owner => {
+            Expect::Hidden
+        }
         // Neither public level can be failed here — see the module note and
         // `the_self_filtering_routes_show_public_and_hide_private`, which is
         // where `PublicFiltered` is actually held to something.
@@ -2934,6 +2935,15 @@ async fn every_route_answers_its_declared_access_level() {
                 // has no name in its path to vary, so it varies the id its
                 // repository is resolved from.
                 let (url, twin) = match anchor {
+                    None if is_repo_path(&fact.path) => {
+                        let url = fill(fact, repo, &globals, ORG);
+                        let twin = url.replacen(
+                            &format!("/{OWNER}/{}", repo.name),
+                            &format!("/{OWNER}/sweepabsentrepo"),
+                            1,
+                        );
+                        (url, Some(twin))
+                    }
                     None => (
                         fill(fact, repo, &globals, ORG),
                         Some(fill(fact, repo, &globals, ABSENT_ORG)),

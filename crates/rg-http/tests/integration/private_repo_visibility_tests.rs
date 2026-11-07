@@ -79,8 +79,8 @@ async fn private_repo_is_hidden_from_anonymous_and_outsiders() {
     ] {
         // 1. The repository card itself.
         let (status, _) = get(&base, "/api/v1/repos/vis-owner/secret-repo", token).await;
-        assert!(
-            status == 401 || status == 403,
+        assert_eq!(
+            status, 404,
             "{label} read the private repo card: got {status}"
         );
 
@@ -253,13 +253,13 @@ async fn private_repo_side_endpoints_are_closed_to_outsiders() {
     for path in &paths {
         let (anon_status, _) = get(&base, path, None).await;
         assert_eq!(
-            anon_status, 401,
+            anon_status, 404,
             "anonymous reached {path} on a private repo"
         );
 
         let (outsider_status, _) = get(&base, path, Some(&outsider_token)).await;
         assert_eq!(
-            outsider_status, 403,
+            outsider_status, 404,
             "an outsider reached {path} on a private repo"
         );
 

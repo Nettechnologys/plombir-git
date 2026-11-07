@@ -37,9 +37,9 @@ async fn spawn_with_shell() -> String {
     format!("http://{addr}")
 }
 
-async fn shell(base: &str, path: &str) -> String {
+async fn shell(base: &str, path: &str, status: u16) -> String {
     let response = reqwest::get(format!("{base}{path}")).await.unwrap();
-    assert_eq!(response.status(), 200, "{path}: the SPA shell is served");
+    assert_eq!(response.status(), status, "{path}: the SPA shell is served");
     response.text().await.unwrap()
 }
 
@@ -70,7 +70,7 @@ async fn a_public_repository_page_carries_its_own_preview_and_a_private_one_does
     // generic description gone rather than doubled — on the repository's root
     // and on any page under it.
     for path in ["/preview_owner/shown", "/preview_owner/shown/issues/1"] {
-        let page = shell(&base, path).await;
+        let page = shell(&base, path, 200).await;
         assert!(
             page.contains("<meta property=\"og:title\" content=\"preview_owner/shown\" />"),
             "{path}: {page}"
@@ -104,7 +104,7 @@ async fn a_public_repository_page_carries_its_own_preview_and_a_private_one_does
         let end = start + 7 + page[start + 7..].find('"').unwrap();
         format!("{}{}", &page[..start], &page[end + 1..])
     };
-    let generic = normalise(shell(&base, "/dashboard").await);
+    let generic = normalise(shell(&base, "/dashboard", 200).await);
     assert!(generic.contains("Generic instance text."));
     assert!(!generic.contains("og:"));
     for path in [
@@ -112,7 +112,7 @@ async fn a_public_repository_page_carries_its_own_preview_and_a_private_one_does
         "/preview_owner/missing",
         "/nobody_here/shown",
     ] {
-        let page = normalise(shell(&base, path).await);
+        let page = normalise(shell(&base, path, 404).await);
         assert_eq!(
             page, generic,
             "{path} must not be told apart from a missing repository"

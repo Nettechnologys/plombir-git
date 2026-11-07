@@ -529,11 +529,8 @@ async fn a_private_artifact_is_refused_to_an_outsider_and_kept_for_its_owner() {
         404
     );
 
-    // The listing route is deliberately *not* in that table. Its path carries
-    // `{owner}/{name}`, so the caller brought the repository name themselves and
-    // a `403` confirms nothing they did not type — the declared decision for
-    // repository-level routes, pinned by `repo_read_gate_tests`. The anchored
-    // routes differ because the caller brings an opaque integer instead.
+    // A guessed repository name, like a guessed row id, reveals nothing.
+    // The list route must also conceal the private repository.
     assert_eq!(
         client
             .get(&listing)
@@ -542,7 +539,7 @@ async fn a_private_artifact_is_refused_to_an_outsider_and_kept_for_its_owner() {
             .await
             .unwrap()
             .status(),
-        403,
+        404,
         "the listing route was served to an outsider"
     );
 

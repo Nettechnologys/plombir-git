@@ -213,7 +213,7 @@ async fn fixture() -> Fixture {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ssh_git_failures_distinguish_outage_not_found_and_denial() {
+async fn ssh_git_failures_hide_denial_as_not_found_but_preserve_outages() {
     let Fixture {
         _dir,
         db,
@@ -243,8 +243,8 @@ async fn ssh_git_failures_distinguish_outage_not_found_and_denial() {
         "git-upload-pack '/ssh-failure-owner/private-repo.git'",
     )
     .await;
-    assert_failure(&denied, "repository access denied");
-    assert!(!denied.stderr.contains("repository not found"));
+    assert_failure(&denied, "repository not found");
+    assert_eq!(denied.stderr, missing.stderr);
     assert!(!denied.stderr.contains("temporarily unavailable"));
 
     // The authorization query succeeds, then receive-pack's policy lookup

@@ -295,8 +295,8 @@ async fn an_agent_opens_an_issue_and_a_pr_through_mcp_and_is_refused_outside_its
         )
         .await;
     assert!(failed, "an out-of-scope tool call succeeded: {refused}");
-    assert!(refused.contains("403"), "{refused}");
-    assert_eq!(f.get(&token, "/repos/alice/other").await, 403);
+    assert!(refused.contains("404"), "{refused}");
+    assert_eq!(f.get(&token, "/repos/alice/other").await, 404);
     assert_eq!(f.get(&token, "/repos/alice/app").await, 200);
     // A route that is not about one repository answers from everything the
     // account can see — which is what the confinement cuts.
@@ -778,7 +778,7 @@ async fn repository_confinement_holds_over_git_and_for_a_persons_own_token() {
             .send()
     };
     assert_eq!(info_refs("app").await.unwrap().status(), 200);
-    assert_eq!(info_refs("other").await.unwrap().status(), 403);
+    assert_eq!(info_refs("other").await.unwrap().status(), 404);
 
     // LFS is declared by its credential mechanism, not by a repository level,
     // and is still about the repository its path names.
@@ -799,7 +799,7 @@ async fn repository_confinement_holds_over_git_and_for_a_persons_own_token() {
     };
     let allowed = lfs_batch("app").await.unwrap();
     assert_eq!(allowed.status(), 200, "{}", allowed.text().await.unwrap());
-    assert_eq!(lfs_batch("other").await.unwrap().status(), 403);
+    assert_eq!(lfs_batch("other").await.unwrap().status(), 404);
 
     // The registry's own token names repositories by scope string, not by this
     // allow-list, so a confined token is refused `docker login` outright — while
@@ -838,7 +838,7 @@ async fn repository_confinement_holds_over_git_and_for_a_persons_own_token() {
     assert_eq!(own["deny_protected_merge"], false);
     let own = own["token"].as_str().unwrap();
     assert_eq!(f.get(own, "/repos/alice/app").await, 200);
-    assert_eq!(f.get(own, "/repos/alice/other").await, 403);
+    assert_eq!(f.get(own, "/repos/alice/other").await, 404);
     assert_eq!(
         f.get(own, "/users/me").await,
         403,
@@ -886,7 +886,7 @@ async fn the_bot_stops_with_its_owner_and_holds_the_owner_back_from_deletion() {
     rg_db::ops::user_ops::update_by_id(&f.db, f.alice_id, None, None, None, Some(false))
         .await
         .unwrap();
-    assert_eq!(f.get(&token, "/repos/alice/app").await, 401);
+    assert_eq!(f.get(&token, "/repos/alice/app").await, 404);
 }
 
 /// Every token of one bot spends one budget; people are not counted against it.
@@ -1583,7 +1583,7 @@ async fn a_resource_read_is_held_to_the_tokens_tools_and_repositories() {
         body["result"].is_null()
             && body["error"]["message"]
                 .as_str()
-                .is_some_and(|m| m.contains("403")),
+                .is_some_and(|m| m.contains("404")),
         "a repository outside the token's list was read through file://: {body}"
     );
     assert!(f

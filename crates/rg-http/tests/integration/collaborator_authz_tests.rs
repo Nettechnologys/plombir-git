@@ -93,7 +93,7 @@ async fn outsider_cannot_grant_itself_access_to_a_private_repo() {
         .unwrap();
     assert_eq!(
         grant.status(),
-        403,
+        404,
         "an outsider with a valid token granted itself access to a private repo"
     );
 
@@ -108,7 +108,7 @@ async fn outsider_cannot_grant_itself_access_to_a_private_repo() {
         .unwrap();
     assert_eq!(
         read.status(),
-        403,
+        404,
         "the private repo became readable anyway"
     );
 }

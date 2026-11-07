@@ -61,7 +61,16 @@ pub(crate) async fn follow_renamed_repository(
         .unwrap_or_else(|| request.uri().clone());
     let headers = request.headers().clone();
     let response = next.run(request).await;
-    if response.status() != StatusCode::NOT_FOUND {
+    if !matches!(
+        response.status(),
+        StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED
+    ) {
+        return response;
+    }
+    // An invalid explicit credential is refused independently of the target.
+    // Only the anonymous LFS challenge may need an alias lookup before retry.
+    if response.status() == StatusCode::UNAUTHORIZED && headers.contains_key(header::AUTHORIZATION)
+    {
         return response;
     }
     // `git lfs` reaches this table through `…/{repo}.git/info/lfs/…`, which
@@ -101,10 +110,7 @@ pub(crate) async fn follow_renamed_repository(
                 .into_response()
             }
         }
-        RenamedTarget::Refused(refusal) if lfs && refusal.status() == StatusCode::UNAUTHORIZED => {
-            refusal.into_response()
-        }
-        RenamedTarget::Refused(_) | RenamedTarget::Nothing => response,
+        RenamedTarget::Nothing => response,
     }
 }
 
@@ -117,9 +123,6 @@ fn is_lfs_api(rest: &str) -> bool {
 enum RenamedTarget {
     /// The repository moved to this `owner/name`, and the caller may read it.
     Readable(String, String),
-    /// The repository moved, and the read check refused the caller with this.
-    /// Never shown to a REST client: the new name stays undisclosed.
-    Refused(AppError),
     /// Nothing moved out of the address, or the lookup failed.
     Nothing,
 }
@@ -142,7 +145,7 @@ async fn redirect_target(
     let (target, new_owner) = found;
     match crate::api::repo_access::check_read(state, headers, &target).await {
         Ok(()) => RenamedTarget::Readable(new_owner, target.name),
-        Err(refusal) => RenamedTarget::Refused(refusal),
+        Err(_) => RenamedTarget::Nothing,
     }
 }
 

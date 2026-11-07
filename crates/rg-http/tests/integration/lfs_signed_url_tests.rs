@@ -167,7 +167,7 @@ async fn signed_lfs_urls_are_ttl_and_action_bound() {
         .send()
         .await
         .unwrap();
-    assert_eq!(wrong_action.status(), 403);
+    assert_eq!(wrong_action.status(), 404);
 
     // A signed URL authorizes exactly one content-addressed object. It must
     // not turn arbitrary bytes into a live object merely because its path has
@@ -343,7 +343,7 @@ async fn lfs_upload_batch_always_requires_write_access() {
         1,
     )
     .await;
-    assert_eq!(outsider.status(), 403);
+    assert_eq!(outsider.status(), 404);
 
     let anonymous = batch(
         &base,
@@ -390,7 +390,7 @@ async fn lfs_download_batch_answers_with_the_repository_read_gate() {
     .await;
     assert_eq!(anonymous.status(), 401);
 
-    // Authenticated outsider on the same repository: a token does not help → 403.
+    // Authenticated outsider: the same 404 as an absent repository.
     let outsider = batch(
         &base,
         "lfs_read_owner",
@@ -401,7 +401,7 @@ async fn lfs_download_batch_answers_with_the_repository_read_gate() {
         1,
     )
     .await;
-    assert_eq!(outsider.status(), 403);
+    assert_eq!(outsider.status(), 404);
 
     // A public repository stays anonymously readable — with a real object
     // behind the request, so the 200 proves the gate let it through rather than
@@ -526,7 +526,7 @@ async fn deactivating_an_account_revokes_its_outstanding_lfs_urls() {
         .send()
         .await
         .unwrap();
-    assert_eq!(forged.status(), 403);
+    assert_eq!(forged.status(), 404);
 }
 
 /// Mint an upload URL for `owner/repo` as `token`, and hand back the href.

@@ -135,14 +135,13 @@ fn core_refusal(error: anyhow::Error) -> Response {
 
 async fn repository(
     state: &AppState,
+    headers: &HeaderMap,
     owner: &str,
     name: &str,
 ) -> Result<rg_db::entities::repository::Model, Response> {
-    match rg_core::repo::service::find_repo_by_owner_name(&state.db, owner, name).await {
-        Ok(Some(repo)) => Ok(repo),
-        Ok(None) => Err(lfs_refusal(AppError::not_found("repository not found"))),
-        Err(error) => Err(core_refusal(error)),
-    }
+    crate::api::lfs::resolve_repository(state, headers, owner, name, false)
+        .await
+        .map_err(lfs_refusal)
 }
 
 /// The actor behind the credential `git-lfs-authenticate` minted on the SSH
@@ -206,7 +205,7 @@ pub async fn create_lock(
     headers: HeaderMap,
     Json(request): Json<CreateLockRequest>,
 ) -> Response {
-    let repo = match repository(&state, &owner, &name).await {
+    let repo = match repository(&state, &headers, &owner, &name).await {
         Ok(repo) => repo,
         Err(response) => return response,
     };
@@ -217,7 +216,7 @@ pub async fn create_lock(
         Ok(None) => {
             let actor = crate::api::auth::extract_user_id(&headers, &state.jwt_secret);
             if let Err(error) = repo_access::check_write_for(&state, &repo, actor).await {
-                return lfs_refusal(error);
+                return lfs_refusal(crate::api::lfs::repository_refusal(&state, &headers, error));
             }
             match actor {
                 Some(user_id) => user_id,
@@ -264,7 +263,7 @@ pub async fn list_locks(
     Query(query): Query<ListLocksQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let repo = match repository(&state, &owner, &name).await {
+    let repo = match repository(&state, &headers, &owner, &name).await {
         Ok(repo) => repo,
         Err(response) => return response,
     };
@@ -274,7 +273,7 @@ pub async fn list_locks(
         Ok(None) => {
             let actor = crate::api::auth::extract_user_id(&headers, &state.jwt_secret);
             if let Err(error) = repo_access::check_read_for(&state, &repo, actor).await {
-                return lfs_refusal(error);
+                return lfs_refusal(crate::api::lfs::repository_refusal(&state, &headers, error));
             }
         }
     }
@@ -319,7 +318,7 @@ pub async fn verify_locks(
     headers: HeaderMap,
     Json(request): Json<VerifyLocksRequest>,
 ) -> Response {
-    let repo = match repository(&state, &owner, &name).await {
+    let repo = match repository(&state, &headers, &owner, &name).await {
         Ok(repo) => repo,
         Err(response) => return response,
     };
@@ -332,7 +331,7 @@ pub async fn verify_locks(
         Ok(None) => {
             let actor = crate::api::auth::extract_user_id(&headers, &state.jwt_secret);
             if let Err(error) = repo_access::check_write_for(&state, &repo, actor).await {
-                return lfs_refusal(error);
+                return lfs_refusal(crate::api::lfs::repository_refusal(&state, &headers, error));
             }
             match actor {
                 Some(user_id) => Some(user_id),
@@ -385,7 +384,7 @@ pub async fn unlock(
     headers: HeaderMap,
     Json(request): Json<UnlockRequest>,
 ) -> Response {
-    let repo = match repository(&state, &owner, &name).await {
+    let repo = match repository(&state, &headers, &owner, &name).await {
         Ok(repo) => repo,
         Err(response) => return response,
     };
@@ -396,7 +395,7 @@ pub async fn unlock(
         Ok(None) => {
             let actor = crate::api::auth::extract_user_id(&headers, &state.jwt_secret);
             if let Err(error) = repo_access::check_write_for(&state, &repo, actor).await {
-                return lfs_refusal(error);
+                return lfs_refusal(crate::api::lfs::repository_refusal(&state, &headers, error));
             }
             match actor {
                 Some(user_id) => user_id,
@@ -409,7 +408,7 @@ pub async fn unlock(
     // when the lock happens to be their own.
     if request.force {
         if let Err(error) = repo_access::check_admin_for(&state, &repo, Some(user_id)).await {
-            return lfs_refusal(error);
+            return lfs_refusal(crate::api::lfs::repository_refusal(&state, &headers, error));
         }
     }
     let id = match locks::parse_lock_id(&id, "id") {

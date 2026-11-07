@@ -98,7 +98,7 @@ async fn outsider_cannot_write_a_commit_status_to_a_private_repo() {
 
     let status = post_status(&base, "xci_owner", "secret", Some(&outsider_token), None).await;
     assert_eq!(
-        status, 403,
+        status, 404,
         "a logged-in outsider wrote a commit status into a private repository"
     );
     assert_eq!(
@@ -124,14 +124,14 @@ async fn anonymous_cannot_write_a_commit_status() {
     create_private_repo(&base, &owner_token, "secret").await;
 
     let status = post_status(&base, "xcia_owner", "secret", None, None).await;
-    assert_eq!(status, 401, "an anonymous caller reached the handler");
+    assert_eq!(status, 404, "an anonymous caller reached the handler");
     assert_eq!(commit_status_count(&db).await, 0);
 
-    // A repository that does not exist answers the same 401, so the endpoint is
+    // A repository that does not exist answers the same 404, so the endpoint is
     // not an existence oracle for anonymous callers either.
     let status = post_status(&base, "xcia_owner", "nosuchrepo", None, None).await;
     assert_eq!(
-        status, 401,
+        status, 404,
         "an anonymous caller was told whether the repository exists"
     );
 }
@@ -224,7 +224,7 @@ async fn a_valid_signature_does_not_authorize_an_outsider() {
     )
     .await;
     assert_eq!(
-        status, 403,
+        status, 404,
         "the instance-wide webhook secret was accepted as authorization"
     );
     assert_eq!(commit_status_count(&db).await, 0);

@@ -228,12 +228,10 @@ async fn a_repository_admin_reads_its_runners_and_their_liveness() {
         "a stopped runner that comes back is online again"
     );
 
-    // Somebody who may not administer the private repository is refused, and
-    // the refusal carries no runner. 403 rather than 404 is the repository
-    // gate's rule for an authenticated outsider (`check_read_for`), the same
-    // on every route behind it.
+    // The outsider learns neither that the private repository exists nor
+    // which runner serves it.
     let (status, body) = read(stranger_token.clone()).await;
-    assert_eq!(status, 403, "{body}");
+    assert_eq!(status, 404, "{body}");
     assert!(!body.to_string().contains("ci-box"), "{body}");
 
     // The owner's own token, confined to the other repository, does not reach

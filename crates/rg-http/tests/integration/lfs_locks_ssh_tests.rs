@@ -145,7 +145,7 @@ async fn an_ssh_clone_locks_with_its_key_and_a_deploy_key_only_looks() {
     // A grant for another repository opens nothing here.
     let elsewhere = grant(LfsActionKind::Upload, repo_id + 1000, user);
     let (status, _) = call(reqwest::Method::GET, &locks, &elsewhere, None).await;
-    assert_eq!(status, 403);
+    assert_eq!(status, 404);
 
     // A read-only deploy key sees the locks and cannot take one — not even
     // with an upload grant, which the SSH gate would never mint for it.

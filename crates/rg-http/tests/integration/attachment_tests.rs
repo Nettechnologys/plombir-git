@@ -555,7 +555,7 @@ async fn private_pr_and_review_comment_attachments_enforce_access_and_target_sco
         .send()
         .await
         .unwrap();
-    assert_eq!(anonymous_issue.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(anonymous_issue.status(), reqwest::StatusCode::NOT_FOUND);
     let outsider_issue = client
         .get(format!(
             "{base}/api/v1/repos/{owner}/{repo}/issues/{issue_number}/assets"
@@ -564,7 +564,7 @@ async fn private_pr_and_review_comment_attachments_enforce_access_and_target_sco
         .send()
         .await
         .unwrap();
-    assert_eq!(outsider_issue.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(outsider_issue.status(), reqwest::StatusCode::NOT_FOUND);
 
     let pull = rg_db::ops::pull_request_ops::create(
         &db,
@@ -716,7 +716,7 @@ async fn private_pr_and_review_comment_attachments_enforce_access_and_target_sco
         .send()
         .await
         .unwrap();
-    assert_eq!(anonymous_pr.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(anonymous_pr.status(), reqwest::StatusCode::NOT_FOUND);
     let outsider_pr = client
         .get(format!(
             "{base}/api/v1/repos/{owner}/{repo}/pulls/1/assets/{pr_attachment_id}"
@@ -725,7 +725,7 @@ async fn private_pr_and_review_comment_attachments_enforce_access_and_target_sco
         .send()
         .await
         .unwrap();
-    assert_eq!(outsider_pr.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(outsider_pr.status(), reqwest::StatusCode::NOT_FOUND);
 
     let wrong_target = client
         .get(format!(

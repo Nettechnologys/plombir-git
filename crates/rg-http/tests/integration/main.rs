@@ -40,6 +40,7 @@ mod pull_request_deletion_tests;
 mod push_mirror_tests;
 mod repo_redirect_tests;
 mod repo_settings_tests;
+mod repository_visibility_tests;
 
 mod account_deletion_serialized_grant_tests;
 mod account_deletion_storage_tests;

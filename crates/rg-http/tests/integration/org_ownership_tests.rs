@@ -86,7 +86,7 @@ async fn a_creator_removed_from_the_organization_keeps_nothing_and_the_owner_rol
     // both repositories, and buys them nothing.
     let (status, _) = call(Method::GET, api("/repos/own-org/vault"), &creator, None).await;
     assert_eq!(
-        status, 403,
+        status, 404,
         "a removed creator still reads a private repository"
     );
     let (status, listing) = call(Method::GET, api("/repos/own-org"), &creator, None).await;

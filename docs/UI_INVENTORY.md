@@ -21,7 +21,7 @@
 |---|---|
 | Router routes (with declared `Access`) | 458 |
 | Reachable from the browser | 318 (69%) |
-| Layout modules | 2 |
+| Layout modules | 3 |
 | Pages | 75 |
 | Interactive controls | 1067 |
 | Controls calling an API | 382 |
@@ -144,6 +144,7 @@ succeed and which must be denied.
 |---|---|---|---|---|
 | `/` | `instance.get` | `GET /api/v1/instance` | `Public` | rust+web+smoke |
 | `/` | `web/src/routes/+layout.svelte#checkBackendReadiness` | `GET /health` | `Public` | rust+smoke |
+| `/[owner]/[repo]` | `repos.get` | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web |
 
 ### `/`
 

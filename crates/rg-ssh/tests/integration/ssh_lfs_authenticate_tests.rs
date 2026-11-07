@@ -110,6 +110,20 @@ async fn harness(lfs: bool) -> Harness {
             .await
             .unwrap();
 
+    // A second private repository exists, but the deploy key below never
+    // grants it. Its refusal must be identical to an absent name over SSH.
+    rg_core::repo::service::create_repo(
+        &db,
+        owner.id,
+        "other-private",
+        None,
+        true,
+        &repo_root,
+        None,
+    )
+    .await
+    .unwrap();
+
     let deploy_key = random_key();
     let (openssh, fingerprint) = openssh_and_fingerprint(&deploy_key);
     let deploy_key_id = rg_db::ops::deploy_key_ops::create(
@@ -285,7 +299,7 @@ async fn the_grant_is_minted_only_past_the_git_gate() {
     assert_eq!(refused.exit_status, Some(1));
     assert_eq!(refused.stdout, "");
     assert!(
-        refused.stderr.contains("repository access denied"),
+        refused.stderr.contains("repository not found"),
         "{}",
         refused.stderr
     );
@@ -300,6 +314,32 @@ async fn the_grant_is_minted_only_past_the_git_gate() {
         "{}",
         missing.stderr
     );
+
+    assert_eq!(refused.stderr, missing.stderr);
+
+    let deploy_probe = connect_as(&h.server, &h.deploy_key).await;
+    for service in ["git-upload-pack", "git-lfs-authenticate"] {
+        let suffix = if service == "git-lfs-authenticate" {
+            " download"
+        } else {
+            ""
+        };
+        let hidden = exec(
+            &deploy_probe,
+            &format!("{service} /{OWNER}/other-private.git{suffix}"),
+        )
+        .await;
+        let missing = exec(
+            &deploy_probe,
+            &format!("{service} /{OWNER}/no-such-repo.git{suffix}"),
+        )
+        .await;
+        assert_eq!(hidden.exit_status, Some(1));
+        assert_eq!(missing.exit_status, Some(1));
+        assert_eq!(hidden.stdout, "");
+        assert_eq!(hidden.stderr, missing.stderr);
+        assert!(hidden.stderr.contains("repository not found"));
+    }
 
     // A read-only deploy key reads its repository and is refused the upload,
     // exactly as `git-receive-pack` would refuse it.
@@ -325,7 +365,7 @@ async fn the_grant_is_minted_only_past_the_git_gate() {
     assert_eq!(upload.exit_status, Some(1));
     assert_eq!(upload.stdout, "");
     assert!(
-        upload.stderr.contains("repository access denied"),
+        upload.stderr.contains("repository not found"),
         "{}",
         upload.stderr
     );

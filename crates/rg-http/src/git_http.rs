@@ -325,8 +325,9 @@ async fn append_staged(
 ///
 /// When access is denied for an **anonymous** request (no valid credentials),
 /// responds `401 Unauthorized` with a `WWW-Authenticate: Basic` challenge so
-/// that `git` prompts for credentials (a username + PAT). An **authenticated**
-/// actor that simply lacks permission gets `403 Forbidden`.
+/// that `git` prompts for credentials (a username + PAT). A missing repository
+/// gets that same challenge. With credentials, missing and unreadable repos
+/// both get 404; a reader without write permission still gets 403 on push.
 async fn check_git_access(
     db: &DatabaseConnection,
     owner: &str,
@@ -336,18 +337,20 @@ async fn check_git_access(
 ) -> Result<(), (StatusCode, [(header::HeaderName, &'static str); 1], String)> {
     // Hot path: every git clone/fetch/push runs an access check. Metered into
     // the db-query series (see `metrics::time_db` for the sampling boundary).
-    let access = if require_write {
+    let readable = crate::metrics::time_db(
+        "repo.can_read",
+        rg_core::repo::service::can_read(db, owner, repo_name, actor_id),
+    )
+    .await;
+    let can_read = matches!(&readable, Ok(true));
+    let access = if can_read && require_write {
         crate::metrics::time_db(
             "repo.can_write",
             rg_core::repo::service::can_write(db, owner, repo_name, actor_id),
         )
         .await
     } else {
-        crate::metrics::time_db(
-            "repo.can_read",
-            rg_core::repo::service::can_read(db, owner, repo_name, actor_id),
-        )
-        .await
+        readable
     };
 
     match access {
@@ -359,12 +362,24 @@ async fn check_git_access(
             [(header::WWW_AUTHENTICATE, "Basic realm=\"Plombir Git\"")],
             "authentication required".to_string(),
         )),
-        // Authenticated but lacking permission → 403.
-        Ok(false) => Err((
+        // This is a write denial only if visibility was established first.
+        Ok(false) if can_read && require_write => Err((
             StatusCode::FORBIDDEN,
             [(header::CONTENT_TYPE, "text/plain")],
             "access denied".to_string(),
         )),
+        Ok(false) => Err((
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "repository not found".to_string(),
+        )),
+        Err(e) if actor_id.is_none() && e.downcast_ref::<rg_core::error::NotFound>().is_some() => {
+            Err((
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Basic realm=\"Plombir Git\"")],
+                "authentication required".to_string(),
+            ))
+        }
         // The repository genuinely is not there — the only failure of this
         // lookup that belongs to the caller. `can_read` / `can_write` mark it
         // with `rg_core::error::NotFound`, which survives any `.context(…)` on
@@ -454,7 +469,11 @@ async fn git_grant_refusal(
             }),
         )
         .await;
-    Err(refusal(format!("this token may not access {owner}/{repo}")))
+    Err((
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "text/plain")],
+        "repository not found".to_string(),
+    ))
 }
 
 /// The one sentence a git client is allowed to hear about a failure of ours,
@@ -959,7 +978,8 @@ fn strip_git_suffix(repo: &str) -> String {
 /// `GET …/{owner}/{repo}/info/refs` at an address a rename or a transfer left
 /// (card_e83bf21a5e5b): the first request of every clone, fetch and push.
 ///
-/// Answered by [`handle_info_refs`] first; only its `404` is looked at again.
+/// Answered by [`handle_info_refs`] first; a missing-name 404 or anonymous
+/// credential challenge is looked at again.
 /// If the address leads to a repository, the caller is checked against *that*
 /// repository exactly as the live name would check them — so an anonymous
 /// clone of a private one gets the `401` challenge and comes back with
@@ -982,7 +1002,10 @@ pub(crate) async fn handle_info_refs_following_renames(
     )
     .await
     .into_response();
-    if response.status() != StatusCode::NOT_FOUND {
+    if !matches!(
+        response.status(),
+        StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED
+    ) {
         return response;
     }
     let name = strip_git_suffix(&repo);

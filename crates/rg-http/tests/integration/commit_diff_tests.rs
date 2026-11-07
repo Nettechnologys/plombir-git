@@ -192,7 +192,7 @@ async fn a_private_commit_diff_is_not_served_to_an_outsider() {
     assert_eq!(get(url.clone(), Some(&alice)).await.0, 200);
     // The same refusal the commit's signature and statuses give an outsider.
     let (status, body) = get(url.clone(), Some(&mallory)).await;
-    assert_eq!(status, 403, "{body}");
+    assert_eq!(status, 404, "{body}");
     let (status, body) = get(url, None).await;
     assert_ne!(status, 200, "{body}");
 }

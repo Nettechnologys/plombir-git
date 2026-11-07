@@ -160,7 +160,7 @@ async fn outsider_is_rejected_on_every_webhook_endpoint() {
         "whout_owner",
         "secret",
         hook_id,
-        403,
+        404,
     )
     .await;
 

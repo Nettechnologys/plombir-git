@@ -256,7 +256,7 @@ async fn tag_protection_crud_is_repo_scoped_and_admin_only() {
         .send()
         .await
         .unwrap();
-    assert_eq!(denied.status(), 403);
+    assert_eq!(denied.status(), 404);
     for (pattern, metacharacter) in [("v1.?", '?'), ("v[0-9]*", '['), ("release+", '+')] {
         let refused = client
             .post(&endpoint)

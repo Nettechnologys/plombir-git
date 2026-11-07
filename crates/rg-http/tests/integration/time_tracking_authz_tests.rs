@@ -147,7 +147,11 @@ async fn logging_time_requires_write_access_to_the_repository() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 401, "anonymous add_time must be 401");
+    assert_eq!(
+        resp.status(),
+        401,
+        "anonymous add_time must conceal the private repository"
+    );
 
     let resp = client
         .post(&url)
@@ -292,7 +296,11 @@ async fn the_private_write_surface_is_closed_to_outsiders() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 401, "anonymous add_time must be 401");
+    assert_eq!(
+        resp.status(),
+        404,
+        "anonymous add_time must conceal the private repository"
+    );
 
     let resp = client
         .post(&victim_url)
@@ -303,7 +311,7 @@ async fn the_private_write_surface_is_closed_to_outsiders() {
         .unwrap();
     assert_eq!(
         resp.status(),
-        403,
+        404,
         "an outsider must not log time on a private repository's issue"
     );
 

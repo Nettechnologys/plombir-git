@@ -402,9 +402,8 @@ pub(crate) async fn enforce(
         _ => path.clone(),
     };
     grant
-        .deny(
+        .record_denial(
             &parts.headers,
-            &format!("this token may not access {target}"),
             serde_json::json!({
                 "reason": "repository_not_allowed",
                 "method": method,
@@ -412,6 +411,6 @@ pub(crate) async fn enforce(
                 "repository": target,
             }),
         )
-        .await
-        .into_response()
+        .await;
+    AppError::not_found("repository not found").into_response()
 }

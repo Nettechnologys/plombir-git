@@ -154,12 +154,10 @@ async fn a_private_repository_does_not_report_its_checks_to_strangers() {
         format!("{base}/api/v1/repos/signal-owner/signal-repo/commits/{SHA}/status"),
     ] {
         let anonymous = client.get(&url).send().await.unwrap();
-        assert_eq!(anonymous.status(), 401, "anonymous reader of {url}");
+        assert_eq!(anonymous.status(), 404, "anonymous reader of {url}");
 
-        // 403 rather than 404 on purpose: the repository gates answer an
-        // authenticated outsider uniformly with a refusal, and that policy is
-        // pinned next door by `repo_read_gate_tests`. Masking existence is the
-        // organization gates' rule, not this one's (sol_c6cb909ed994).
+        // A guessed private repository name is indistinguishable from an
+        // absent one, even to an authenticated outsider.
         let outsider = client
             .get(&url)
             .bearer_auth(&outsider_token)
@@ -168,7 +166,7 @@ async fn a_private_repository_does_not_report_its_checks_to_strangers() {
             .unwrap();
         assert_eq!(
             outsider.status(),
-            403,
+            404,
             "a private repository reports its checks to nobody else: {url}"
         );
     }

@@ -149,7 +149,7 @@ async fn repository_confinement_holds_at_the_derived_endpoints() {
     for repo in ["allowed", "other"] {
         for endpoint in derived_endpoints(&base, "lfs_conf", repo) {
             let response = batch(&endpoint, "lfs_conf", Some(&pat), "download", b"x").await;
-            let expected = if repo == "allowed" { 200 } else { 403 };
+            let expected = if repo == "allowed" { 200 } else { 404 };
             assert_eq!(response.status(), expected, "{endpoint}");
         }
     }

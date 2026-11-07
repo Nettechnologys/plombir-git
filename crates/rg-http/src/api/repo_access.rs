@@ -61,10 +61,9 @@ pub(crate) async fn resolve_repo(
 
 /// Decide read access for an already-resolved repository.
 ///
-/// Public repos stay anonymously readable; a private repo answers `401` to an
-/// anonymous caller (a token would help) and `403` to an authenticated
-/// outsider (a token would not). A failed check is neither — it propagates as
-/// the underlying error instead of being collapsed into a denial.
+/// Public repos stay anonymously readable. An unreadable repository answers
+/// exactly like a missing one, regardless of whether the caller signed in.
+/// A failed check still propagates; an outage is not evidence of absence.
 pub(crate) async fn check_read(
     state: &AppState,
     headers: &HeaderMap,
@@ -124,21 +123,19 @@ pub(crate) async fn check_read_for(
 ) -> Result<(), AppError> {
     match rg_core::repo::service::can_read_repo(&state.db, repo, actor_id).await {
         Ok(true) => Ok(()),
-        Ok(false) if repo.is_private && actor_id.is_none() => {
-            Err(AppError::unauthorized("authentication required"))
-        }
-        Ok(false) => Err(AppError::forbidden("access denied")),
+        Ok(false) => Err(AppError::not_found("repository not found")),
         Err(e) => Err(AppError::from(e)),
     }
 }
 
-/// [`check_read_for`] for write access: an anonymous caller is `401` whatever
-/// the repository's visibility, because no repository is anonymously writable.
+/// Visibility precedes write permission. Only a reader may learn that the
+/// repository exists but is not writable; an outsider gets the same 404 as GET.
 pub(crate) async fn check_write_for(
     state: &AppState,
     repo: &rg_db::entities::repository::Model,
     actor_id: Option<i64>,
 ) -> Result<(), AppError> {
+    check_read_for(state, repo, actor_id).await?;
     let Some(actor_id) = actor_id else {
         return Err(AppError::unauthorized("authentication required"));
     };
@@ -166,11 +163,8 @@ pub(crate) async fn check_deploy_key_for(
 ) -> Result<(), AppError> {
     match rg_db::ops::deploy_key_ops::find_by_id(&state.db, key_id).await {
         Ok(Some(key)) if rg_core::repo::service::deploy_key_permits(&key, repo.id, write) => Ok(()),
-        Ok(Some(_)) => Err(AppError::forbidden(if write {
-            "write access denied"
-        } else {
-            "access denied"
-        })),
+        Ok(Some(key)) if key.repo_id != repo.id => Err(AppError::not_found("repository not found")),
+        Ok(Some(_)) => Err(AppError::forbidden("write access denied")),
         Ok(None) => Err(AppError::unauthorized("the deploy key has been removed")),
         Err(error) => {
             tracing::error!(
@@ -192,6 +186,7 @@ pub(crate) async fn check_admin_for(
     repo: &rg_db::entities::repository::Model,
     actor_id: Option<i64>,
 ) -> Result<(), AppError> {
+    check_read_for(state, repo, actor_id).await?;
     let Some(actor_id) = actor_id else {
         return Err(AppError::unauthorized("authentication required"));
     };
@@ -210,7 +205,10 @@ pub(crate) async fn check_admin_for(
 /// (the OCI registry mints a scope from one) must fold the *denial* only and
 /// let a failed check stay a failure — see `oci::granted`.
 pub(crate) fn is_access_denial(error: &AppError) -> bool {
-    matches!(error, AppError::Unauthorized(_) | AppError::Forbidden(_))
+    matches!(
+        error,
+        AppError::Unauthorized(_) | AppError::Forbidden(_) | AppError::NotFound(_)
+    )
 }
 
 /// Fold a gate decision into a boolean — the denial only.
@@ -339,11 +337,9 @@ pub(crate) async fn require_authenticated_read(
     owner: &str,
     name: &str,
 ) -> Result<(rg_db::entities::repository::Model, i64), AppError> {
+    let repo = require_read(state, headers, owner, name).await?;
     let actor_id = super::auth::extract_user_id(headers, &state.jwt_secret)
         .ok_or_else(|| AppError::unauthorized("authentication required"))?;
-    let repo = resolve_repo(state, owner, name).await?;
-
-    check_read_for(state, &repo, Some(actor_id)).await?;
     Ok((repo, actor_id))
 }
 
@@ -354,9 +350,9 @@ pub(crate) async fn require_write(
     owner: &str,
     name: &str,
 ) -> Result<(rg_db::entities::repository::Model, i64), AppError> {
+    let repo = require_read(state, headers, owner, name).await?;
     let actor_id = super::auth::extract_user_id(headers, &state.jwt_secret)
         .ok_or_else(|| AppError::unauthorized("authentication required"))?;
-    let repo = resolve_repo(state, owner, name).await?;
 
     check_write_for(state, &repo, Some(actor_id)).await?;
     Ok((repo, actor_id))
@@ -369,9 +365,9 @@ pub(crate) async fn require_admin(
     owner: &str,
     name: &str,
 ) -> Result<(rg_db::entities::repository::Model, i64), AppError> {
+    let repo = require_read(state, headers, owner, name).await?;
     let actor_id = super::auth::extract_user_id(headers, &state.jwt_secret)
         .ok_or_else(|| AppError::unauthorized("authentication required"))?;
-    let repo = resolve_repo(state, owner, name).await?;
     check_admin_for(state, &repo, Some(actor_id)).await?;
     Ok((repo, actor_id))
 }
@@ -421,9 +417,9 @@ pub(crate) async fn require_owner(
     owner: &str,
     name: &str,
 ) -> Result<(rg_db::entities::repository::Model, i64), AppError> {
+    let repo = require_read(state, headers, owner, name).await?;
     let actor_id = super::auth::extract_user_id(headers, &state.jwt_secret)
         .ok_or_else(|| AppError::unauthorized("authentication required"))?;
-    let repo = resolve_repo(state, owner, name).await?;
 
     match rg_core::repo::service::can_own_repo(&state.db, &repo, Some(actor_id)).await {
         Ok(true) => Ok((repo, actor_id)),
@@ -745,9 +741,9 @@ impl<S: CiScope> FromRequestParts<AppState> for CiRead<S> {
 
 /// An authenticated caller who can read the repository.
 ///
-/// Mirrors [`require_authenticated_read`], including its order: a missing token
-/// is a `401` *before* the repository is looked up, so the gate does not double
-/// as an existence oracle for private repositories.
+/// Mirrors [`require_authenticated_read`]: visibility is checked first, so
+/// hidden and missing names share a 404. A visible public repository can still
+/// require authentication for an operation without disclosing private names.
 pub struct RepoAuthRead {
     pub repo: rg_db::entities::repository::Model,
     pub actor_id: i64,
@@ -1112,16 +1108,10 @@ async fn route_id(parts: &mut Parts, state: &AppState, param: &str) -> Result<i6
 ///
 /// Mirrors [`RepoRead`] for the routes whose path names no repository.
 ///
-/// Every refusal is [`RepoAnchor::masked`] — the `401` an anonymous caller draws
-/// on a private repository as much as the `403` an authenticated outsider draws.
-/// The path-based [`RepoRead`] keeps both codes, and the difference is not an
-/// inconsistency: there the caller supplied `{owner}/{name}` and learns nothing
-/// from being refused by name, while here the caller supplied an integer, and
-/// *any* answer other than the one an absent id gets confirms the integer hit a
-/// row. That is also why the `401` cannot be kept for the anonymous case the way
-/// [`AnchoredWrite`] keeps it: this gate has nothing to authenticate before the
-/// row is resolved, so its `401` would arrive strictly after the lookup — an
-/// oracle with no token required at all.
+/// Every access denial uses [`RepoAnchor::masked`], just as a path-based
+/// [`RepoRead`] masks a hidden repository. The response names the resource
+/// kind (job, artifact, etc.), never whether a guessed id exists in a hidden
+/// repository. Backend failures remain failures, not missing resources.
 pub struct AnchoredRead<A: RepoAnchor> {
     pub row: A::Row,
     pub repo: rg_db::entities::repository::Model,

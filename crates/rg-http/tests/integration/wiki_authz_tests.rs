@@ -129,8 +129,8 @@ fn all_endpoints(
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
-/// A private repository's wiki is closed to anonymous callers (401) and to
-/// authenticated outsiders (403) on every endpoint — reads included.
+/// A private repository's wiki is hidden behind 404 from anonymous callers
+/// and authenticated outsiders on every endpoint — reads included.
 #[tokio::test]
 async fn private_wiki_endpoints_reject_anonymous_and_outsiders() {
     let base = spawn_test_app().await;
@@ -148,12 +148,12 @@ async fn private_wiki_endpoints_reject_anonymous_and_outsiders() {
     for (method, url, body) in all_endpoints(&base, owner, repo, "Secret", rev_id) {
         let anonymous = call(method.clone(), &url, None, body.clone()).await;
         assert_eq!(
-            anonymous, 401,
+            anonymous, 404,
             "anonymous {method} {url} answered {anonymous}"
         );
 
         let stranger = call(method.clone(), &url, Some(&outsider_token), body.clone()).await;
-        assert_eq!(stranger, 403, "outsider {method} {url} answered {stranger}");
+        assert_eq!(stranger, 404, "outsider {method} {url} answered {stranger}");
     }
 
     // Nothing above went through: the page still holds the owner's content, and

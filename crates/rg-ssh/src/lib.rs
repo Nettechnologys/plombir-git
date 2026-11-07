@@ -134,7 +134,9 @@ impl GitServiceError {
         match self {
             Self::AuthenticationRequired => "authentication required",
             Self::RepositoryNotFound => "repository not found",
-            Self::AccessDenied(_) => "repository access denied",
+            // Keep the detailed reason in the server log, but do not let an
+            // SSH/deploy key enumerate repositories it cannot open.
+            Self::AccessDenied(_) => "repository not found",
             Self::NotOffered(reason) => reason,
             Self::ServerUnavailable(_) => "server temporarily unavailable; try again later",
             Self::Busy(saturated) => saturated.client_message(),
