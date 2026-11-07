@@ -28352,7 +28352,7 @@
         {
           "tag": "button",
           "label": "i18n:notification_settings.retry",
-          "line": 168,
+          "line": 189,
           "via": null,
           "href": null,
           "handler": "() => load()",
@@ -28376,7 +28376,7 @@
         {
           "tag": "form",
           "label": "}>",
-          "line": 177,
+          "line": 198,
           "via": null,
           "href": null,
           "handler": "(event) => { event.preventDefault(); void save(); }",
@@ -28401,7 +28401,7 @@
         {
           "tag": "select",
           "label": "i18n:notification_settings.keep",
-          "line": 183,
+          "line": 205,
           "via": null,
           "href": null,
           "handler": null,
@@ -28411,7 +28411,7 @@
         {
           "tag": "button",
           "label": "i18n:notification_settings.save_language",
-          "line": 203,
+          "line": 225,
           "via": null,
           "href": null,
           "handler": null,
@@ -28421,7 +28421,7 @@
         {
           "tag": "button",
           "label": "i18n:notification_settings.discard",
-          "line": 204,
+          "line": 226,
           "via": null,
           "href": null,
           "handler": "() => { if (settings) apply(settings); saveError = ''; }",
@@ -28429,9 +28429,48 @@
           "unresolved": true
         },
         {
+          "tag": "button",
+          "label": "i18n:notification_settings.select_all",
+          "line": 240,
+          "via": null,
+          "href": null,
+          "handler": "() => selectGroup(group, channel as NotificationChannel, checked)",
+          "calls": [
+            {
+              "symbol": "notifications.updateDelivery",
+              "method": "PUT",
+              "url": "/api/v1/users/me/notification-settings",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/me/notification-settings",
+              "access": "User",
+              "handler": "api::notifications::delivery_settings::update_notification_settings",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            },
+            {
+              "symbol": "notifications.updateSettings",
+              "method": "PUT",
+              "url": "/api/v1/users/me/notification-settings",
+              "opaque": false,
+              "routeUrl": "/api/v1/users/me/notification-settings",
+              "access": "User",
+              "handler": "api::notifications::delivery_settings::update_notification_settings",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
           "tag": "input",
           "label": "",
-          "line": 222,
+          "line": 254,
           "via": null,
           "href": null,
           "handler": "(event) => toggle(key, channel as NotificationChannel, event)",
@@ -28470,7 +28509,7 @@
         {
           "tag": "button",
           "label": "i18n:notification_settings.testing",
-          "line": 224,
+          "line": 256,
           "via": null,
           "href": null,
           "handler": "() => test(key)",
@@ -29871,7 +29910,7 @@
       "outsider"
     ],
     "scenarios": 52,
-    "inventoryEntries": 841,
+    "inventoryEntries": 843,
     "coveredEntries": 197,
     "coveredRoutes": 187,
     "maxUiRoutesWithoutFrontendTest": 22

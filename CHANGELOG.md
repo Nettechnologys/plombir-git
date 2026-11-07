@@ -17,6 +17,10 @@ This project records user-facing changes here. The format follows
 
 ### Changed
 
+- Connecting Telegram starts with the saved email event selection; replacing
+  an existing token preserves custom choices. Activity and security blocks
+  offer Select all / Deselect all for each channel, with fresh authentication
+  required for disabling delivery.
 - Telegram changes and every reduction of notification delivery require fresh
   current-factor authentication. Confirmed previous destinations receive a
   minimal warning after a successful protected change.

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SvelteMap } from 'svelte/reactivity';
 import Page from '../../routes/settings/notifications/+page.svelte';
 import SudoPrompt from '../components/SudoPrompt.svelte';
-import { NOTIFICATION_EVENTS, type DeliverySettings, type DeliverySettingsPatch, type NotificationTestResult } from './notifications';
+import { EMAIL_NOTIFICATION_KEYS, NOTIFICATION_EVENTS, type DeliverySettings, type DeliverySettingsPatch, type NotificationTestResult, type NotificationChannel } from './notifications';
 import { locale } from '../i18n';
 import { fetchUser, logout } from '../stores/auth.svelte';
 import { auth, notifications, resetTestClient, setSudoPrompt, setToken } from '../test/client';
@@ -21,6 +21,8 @@ const defaults = () => ({
 const result = (event = 'fixture', email = 'sent', telegram = 'sent') => ({event_id: event, channels: { email: { status: email, reason: email === 'unavailable' ? 'smtp_unavailable' : null }, telegram: { status: telegram, reason: telegram === 'failed' ? 'telegram_unauthorized' : null } }} as NotificationTestResult);
 function deferred<T>() { let resolve!: (v: T) => void; let reject!: (e: unknown) => void; const promise = new Promise<T>((a,b) => {resolve = a; reject = b;}); return {promise,resolve,reject}; }
 const row = (key: string) => element(page!.container, `[data-category="${key}"]`);
+const groupEvents = (group: string) => NOTIFICATION_EVENTS.filter(key => EMAIL_NOTIFICATION_KEYS.includes(key as typeof EMAIL_NOTIFICATION_KEYS[number]) === (group === 'activity'));
+const bulk = (group: string, channel: string, checked: boolean) => element<HTMLButtonElement>(page!.container, `[data-bulk="${group}-${channel}"] button:nth-of-type(${checked ? 1 : 2})`);
 
 beforeEach(async () => {
   vi.clearAllMocks(); resetTestClient(); locale.set('en'); stored = defaults();
@@ -45,6 +47,109 @@ beforeEach(async () => {
 afterEach(async () => { await page?.destroy(); await prompt?.destroy(); page = prompt = undefined; await logout(); locale.set('en'); });
 
 describe('saved notification delivery', () => {
+  it('explains initial selection and renders the authoritative choices returned when Telegram is added', async () => {
+    stored.telegram = { token_configured: false, chat_id: null, message_thread_id: null, confirmed: false };
+    stored.events.mention.email = stored.email.mention = false;
+    for (const channels of Object.values(stored.events)) channels.telegram = false;
+    notifications.updateDelivery.mockImplementationOnce(async () => {
+      for (const channels of Object.values(stored.events)) channels.telegram = channels.email;
+      stored.telegram = { token_configured: true, chat_id: -1001234, message_thread_id: null, confirmed: false };
+      stored.revision++;
+      return structuredClone(stored);
+    });
+    page = await renderComponent(Page);
+    expect(page.container.textContent).toContain('same events selected for email');
+    expect(bulk('activity', 'telegram', true).disabled).toBe(true);
+    await change(element(page.container, '#telegram-action'), 'replace');
+    await input(element(page.container, '#telegram-token'), '123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghi');
+    await input(element(page.container, '#telegram-chat'), '-1001234');
+    await submit(element(page.container, 'form'));
+    expect(notifications.updateDelivery).toHaveBeenCalledExactlyOnceWith({ locale: 'en', telegram: { action: 'set', token: '123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghi', chat_id: -1001234, message_thread_id: null } });
+    for (const key of NOTIFICATION_EVENTS) {
+      expect(row(key).querySelectorAll('input')[1].checked).toBe(stored.events[key].email);
+    }
+    expect(page.container.querySelector('#telegram-token')).toBeNull();
+    expect(bulk('activity', 'telegram', true).disabled).toBe(false);
+  });
+  it.each(['activity', 'security'])('selects and clears just the chosen channel in the %s block in one request', async group => {
+    page = await renderComponent(Page);
+    locale.set('ru'); await settle();
+    for (const channel of ['email', 'telegram'] as NotificationChannel[]) {
+      for (const checked of [false, true]) {
+        const before = structuredClone(stored.events);
+        notifications.updateDelivery.mockClear();
+        await click(bulk(group, channel, checked));
+        expect(notifications.updateDelivery).toHaveBeenCalledExactlyOnceWith({
+          events: Object.fromEntries(groupEvents(group).map(key => [key, { [channel]: checked }])), locale: 'ru',
+        });
+        for (const key of NOTIFICATION_EVENTS) {
+          for (const name of ['email', 'telegram'] as NotificationChannel[]) {
+            const expected = groupEvents(group).includes(key) && name === channel ? checked : before[key][name];
+            expect(stored.events[key][name]).toBe(expected);
+            expect(row(key).querySelectorAll('input')[name === 'email' ? 0 : 1].checked).toBe(expected);
+          }
+        }
+        await click(bulk(group, channel, checked));
+        expect(notifications.updateDelivery).toHaveBeenCalledTimes(1);
+      }
+    }
+  });
+  it('does not submit bulk actions for unavailable channels or an unsaved destination', async () => {
+    stored.capabilities.email = false;
+    stored.telegram.token_configured = false;
+    page = await renderComponent(Page);
+    for (const group of ['activity', 'security']) for (const channel of ['email', 'telegram']) {
+      expect(bulk(group, channel, false).disabled).toBe(true);
+      await click(bulk(group, channel, false));
+    }
+    expect(notifications.updateDelivery).not.toHaveBeenCalled();
+    await page.destroy(); stored = defaults(); page = await renderComponent(Page);
+    await input(element(page.container, '#telegram-chat'), '-1009999');
+    await click(bulk('security', 'email', false));
+    expect(notifications.updateDelivery).not.toHaveBeenCalled();
+  });
+  it('guards concurrent bulk requests and keeps selections and focus after a failed save', async () => {
+    const pendingSave = deferred<DeliverySettings>();
+    notifications.updateDelivery.mockReturnValueOnce(pendingSave.promise);
+    page = await renderComponent(Page);
+    const opener = bulk('security', 'telegram', false); opener.focus();
+    await click(opener);
+    await click(bulk('activity', 'email', false));
+    await click(opener);
+    expect(notifications.updateDelivery).toHaveBeenCalledTimes(1);
+    expect(opener.disabled).toBe(false);
+    expect(opener.getAttribute('aria-disabled')).toBe('true');
+    pendingSave.reject(new Error('Fixture save failure')); await settle();
+    expect(document.activeElement).toBe(opener);
+    for (const key of groupEvents('security')) expect(row(key).querySelectorAll('input')[1].checked).toBe(true);
+    expect(page.container.textContent).toContain('Fixture save failure');
+    expect(opener.getAttribute('aria-disabled')).toBe('false');
+  });
+  it.each(['cancel', 'success'])('uses one sudo prompt for bulk deselection and preserves opener focus on %s', async outcome => {
+    prompt = await renderComponent(SudoPrompt);
+    const ask = setSudoPrompt.mock.calls.find(([handler]) => typeof handler === 'function')![0] as () => Promise<boolean>;
+    notifications.updateDelivery.mockImplementation(async (patch: DeliverySettingsPatch) => {
+      if (!await ask()) throw new Error('Authentication cancelled');
+      for (const [key, channels] of Object.entries(patch.events ?? {})) Object.assign(stored.events[key as keyof typeof stored.events], channels);
+      stored.revision++;
+      return structuredClone(stored);
+    });
+    page = await renderComponent(Page);
+    const opener = bulk('security', 'telegram', false); opener.focus(); await click(opener);
+    const dialog = element(document.body, '[role=dialog]');
+    expect(dialog.querySelector('#sudo-code')).not.toBeNull();
+    if (outcome === 'success') {
+      auth.sudo.mockResolvedValue({ token: 'fixture-session' });
+      await input(element(dialog, '#sudo-password'), 'fixture-password');
+      await input(element(dialog, '#sudo-code'), '123456');
+      await submit(element(dialog, 'form'));
+    } else await click(element(dialog, '.actions button'));
+    expect(document.body.querySelector('[role=dialog]')).toBeNull();
+    expect(notifications.updateDelivery).toHaveBeenCalledTimes(1);
+    expect(document.activeElement).toBe(opener);
+    for (const key of groupEvents('security')) expect(row(key).querySelectorAll('input')[1].checked).toBe(outcome === 'cancel');
+    expect(row('mention').querySelectorAll('input')[1].checked).toBe(true);
+  });
   it('renders every event with two independent channels and a test, with no saved token input', async () => {
     page = await renderComponent(Page);
     expect(page.container.querySelectorAll('[data-category]')).toHaveLength(36);

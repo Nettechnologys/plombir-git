@@ -131,6 +131,30 @@ async fn every_channel_and_telegram_field_requires_current_factor_with_atomic_le
     assert!(!saved.to_string().contains(TOKEN));
     assert!(!saved.to_string().contains("encrypted"));
     let before = jobs(&db, id).await;
+    // Bulk controls must use the same atomic fresh-factor guard as one switch.
+    for channel in ["email", "telegram"] {
+        let events: serde_json::Map<String, Value> = Event::ALL
+            .iter()
+            .map(|event| (event.key().into(), json!({channel:false})))
+            .collect();
+        refused(
+            send(
+                &base,
+                "PUT",
+                SETTINGS,
+                &password_only,
+                json!({"events":events,"locale":"ru"}),
+            )
+            .await,
+        );
+        assert_eq!(
+            send(&base, "GET", SETTINGS, &password_only, json!({}))
+                .await
+                .1,
+            saved
+        );
+        assert_eq!(jobs(&db, id).await, before);
+    }
     for event in Event::ALL {
         for channel in ["email", "telegram"] {
             refused(

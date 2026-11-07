@@ -77,6 +77,27 @@
   function selected(key: NotificationEvent, channel: NotificationChannel) {
     return settings?.events?.[key]?.[channel] ?? (channel === 'email' ? settings?.email[key as EmailNotificationKey] ?? false : false);
   }
+  function groupKeys(group: string) {
+    return keys.filter(key => group === 'security' ? !EMAIL_NOTIFICATION_KEYS.includes(key as EmailNotificationKey) : EMAIL_NOTIFICATION_KEYS.includes(key as EmailNotificationKey));
+  }
+  function channelUnavailable(channel: NotificationChannel) {
+    return dirty || modern && (channel === 'email' ? !settings?.capabilities?.email : !settings?.telegram?.token_configured);
+  }
+  async function selectGroup(group: string, channel: NotificationChannel, checked: boolean) {
+    if (!settings || busy || channelUnavailable(channel)) return;
+    const events = groupKeys(group);
+    if (events.every(key => selected(key, channel) === checked)) return;
+    const stamp = generation, id = getUser()?.id;
+    savingKey = `${group}:${channel}`; saveError = ''; saved = false;
+    try {
+      const response = modern
+        ? await notifications.updateDelivery({ events: Object.fromEntries(events.map(key => [key, { [channel]: checked }])), locale: activeLocale() })
+        : await notifications.updateSettings(Object.fromEntries(events.map(key => [key, checked])));
+      if (owns(stamp, id)) { apply(response); saved = true; }
+    } catch (err: any) {
+      if (owns(stamp, id)) saveError = err?.message || t('notification_settings.save_failed');
+    } finally { if (owns(stamp, id)) savingKey = null; }
+  }
   async function toggle(key: NotificationEvent, channel: NotificationChannel, event: Event) {
     const input = event.currentTarget as HTMLInputElement;
     const previous = selected(key, channel);
@@ -178,6 +199,7 @@
           <fieldset disabled={busy}>
             <legend>{t('notification_settings.telegram')}</legend>
             <p class="muted">{settings.telegram?.token_configured ? t('notification_settings.token_saved') : t('notification_settings.token_missing')}</p>
+            {#if !settings.telegram?.token_configured}<p class="hint">{t('notification_settings.initial_selection')}</p>{/if}
             {#if settings.telegram?.token_configured}<p class="muted">{settings.telegram.confirmed ? t('notification_settings.confirmed') : t('notification_settings.unconfirmed')}</p>{/if}
             <label for="telegram-action">{t('notification_settings.token_action')}</label>
             <select id="telegram-action" bind:value={mode}>
@@ -210,8 +232,18 @@
     {#each groups as group}
       <section class="section" aria-labelledby={`group-${group}`}>
         <h2 id={`group-${group}`}>{modern ? t(`notification_settings.${group}`, undefined, formatTranslationFallback(group)) : t('notification_settings.email_title')}</h2>
+        <div class="bulk-actions">
+          {#each (modern ? ['email', 'telegram'] : ['email']) as channel}
+            <div class="bulk-channel" role="group" aria-labelledby={`group-${group} bulk-${group}-${channel}`} data-bulk={`${group}-${channel}`}>
+              <span id={`bulk-${group}-${channel}`} class="bulk-label">{channel === 'email' ? t('notification_settings.email_title') : t('notification_settings.telegram')}</span>
+              {#each [true, false] as checked}
+                <button type="button" class="btn btn-secondary" aria-disabled={busy || groupKeys(group).every(key => selected(key, channel as NotificationChannel) === checked)} disabled={channelUnavailable(channel as NotificationChannel)} onclick={() => selectGroup(group, channel as NotificationChannel, checked)}>{checked ? t('notification_settings.select_all') : t('notification_settings.deselect_all')}</button>
+              {/each}
+            </div>
+          {/each}
+        </div>
         <ul class="category-list">
-          {#each keys.filter(key => group === 'security' ? !EMAIL_NOTIFICATION_KEYS.includes(key as EmailNotificationKey) : EMAIL_NOTIFICATION_KEYS.includes(key as EmailNotificationKey)) as key (key)}
+          {#each groupKeys(group) as key (key)}
             <li class="category" data-category={key}>
               <div class="category-text"><span class="category-name" id={`event-${key}`}>{t(modern ? `notification_settings.events.${key}` : `notification_settings.category.${key}.name`, undefined, formatTranslationFallback(key))}</span>
                 {#if EMAIL_NOTIFICATION_KEYS.includes(key as EmailNotificationKey)}<span class="category-hint">{t(`notification_settings.category.${key}.hint`, undefined, formatTranslationFallback(key))}</span>{/if}
@@ -219,7 +251,7 @@
               <div class="channel-actions">
                 {#each (modern ? ['email', 'telegram'] : ['email']) as channel}
                   <!-- Keep the opener focusable during async sudo; toggle guards busy changes. -->
-                  <label class="channel"><input type="checkbox" aria-labelledby={`event-${key} channel-${key}-${channel}`} checked={selected(key, channel as NotificationChannel)} aria-disabled={busy} disabled={dirty || modern && (channel === 'email' ? !settings.capabilities?.email : !settings.telegram?.token_configured)} onchange={(event) => toggle(key, channel as NotificationChannel, event)} /><span id={`channel-${key}-${channel}`}>{channel === 'email' ? t('notification_settings.email_title') : t('notification_settings.telegram')}</span></label>
+                  <label class="channel"><input type="checkbox" aria-labelledby={`event-${key} channel-${key}-${channel}`} checked={selected(key, channel as NotificationChannel)} aria-disabled={busy} disabled={channelUnavailable(channel as NotificationChannel)} onchange={(event) => toggle(key, channel as NotificationChannel, event)} /><span id={`channel-${key}-${channel}`}>{channel === 'email' ? t('notification_settings.email_title') : t('notification_settings.telegram')}</span></label>
                 {/each}
                 {#if modern}<button type="button" class="btn btn-secondary test-button" disabled={testDirty || busy || pending[key]} aria-busy={pending[key] ?? false} aria-label={`${t('notification_settings.test')} — ${t(`notification_settings.events.${key}`, undefined, formatTranslationFallback(key))}`} onclick={() => test(key)}>{pending[key] ? t('notification_settings.testing') : isWaiting(tests[key]) ? t('notification_settings.check_result') : t('notification_settings.test')}</button>{/if}
               </div>
@@ -265,8 +297,12 @@
   .channel { display: flex; align-items: center; gap: 6px; cursor: pointer; min-height: 32px; }
   .channel input { margin: 0; }
   .channel input[aria-disabled="true"] { opacity: 0.6; cursor: wait; }
+  .bulk-actions { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-bottom: 12px; }
+  .bulk-channel { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; min-width: 0; }
+  .bulk-label { font-weight: 600; }
+  .bulk-channel button[aria-disabled="true"] { opacity: 0.6; cursor: default; }
   .test-button { margin-left: auto; }
   .test-results { margin-top: 10px; overflow-wrap: anywhere; }
   .test-results p { margin: 4px 0; }
-  @media (max-width: 480px) { .destination { padding: 14px; } .destination-fields { grid-template-columns: 1fr; gap: 0; } .test-button { margin-left: 0; } }
+  @media (max-width: 480px) { .destination { padding: 14px; } .destination-fields { grid-template-columns: 1fr; gap: 0; } .test-button { margin-left: 0; } .bulk-label { flex-basis: 100%; } }
 </style>

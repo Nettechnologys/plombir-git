@@ -117,6 +117,26 @@ pub async fn save(
                 events.get_mut(&event).expect("known event").telegram = telegram;
             }
         }
+        // Seed a newly connected destination from the email choices read under
+        // this lock (including this patch). Explicit Telegram choices win;
+        // replacing an existing token/recipient never resets custom choices.
+        if !old.profile.telegram_configured()
+            && matches!(
+                patch.telegram,
+                Some(TelegramChange::Set { token: Some(_), .. })
+            )
+        {
+            for (&event, channels) in &mut events {
+                if patch
+                    .events
+                    .get(&event)
+                    .and_then(|change| change.telegram)
+                    .is_none()
+                {
+                    channels.telegram = channels.email;
+                }
+            }
+        }
         if matches!(patch.telegram, Some(TelegramChange::Remove)) {
             for channels in events.values_mut() {
                 channels.telegram = false;

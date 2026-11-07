@@ -52,6 +52,162 @@ fn configure() -> Patch {
 }
 
 #[tokio::test]
+async fn connecting_mirrors_email_but_replacing_preserves_custom_telegram_choices() {
+    let (db, user) = fixture().await;
+    save(
+        &db,
+        user.id,
+        &Patch {
+            email: [(Event::Mention, false)].into(),
+            events: [(
+                Event::NewDevice,
+                ChannelPatch {
+                    email: Some(false),
+                    telegram: None,
+                },
+            )]
+            .into(),
+            ..Default::default()
+        },
+        &context(),
+        |_, _| Ok(()),
+    )
+    .await
+    .unwrap();
+    let before = get(&db, user.id).await.unwrap();
+    let jobs = delivery::Entity::find().count(&db).await.unwrap();
+    assert!(
+        save(&db, user.id, &configure(), &context(), |_, sensitive| {
+            assert!(sensitive);
+            anyhow::bail!("proof needed")
+        })
+        .await
+        .is_err()
+    );
+    assert_eq!(get(&db, user.id).await.unwrap().profile, before.profile);
+    assert_eq!(get(&db, user.id).await.unwrap().events, before.events);
+    assert_eq!(delivery::Entity::find().count(&db).await.unwrap(), jobs);
+    // SMTP availability does not override the user's saved event selection.
+    let mut ctx = context();
+    ctx.smtp_available = false;
+    let connected = save(&db, user.id, &configure(), &ctx, |_, sensitive| {
+        assert!(sensitive);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    for &event in Event::ALL {
+        assert_eq!(
+            connected.events[&event].telegram,
+            before.events[&event].email,
+            "{}",
+            event.key()
+        );
+    }
+    assert!(!connected.profile.telegram_confirmed);
+    let custom = save(
+        &db,
+        user.id,
+        &Patch {
+            events: [
+                (
+                    Event::Mention,
+                    ChannelPatch {
+                        email: None,
+                        telegram: Some(true),
+                    },
+                ),
+                (
+                    Event::TokenCreated,
+                    ChannelPatch {
+                        email: None,
+                        telegram: Some(false),
+                    },
+                ),
+            ]
+            .into(),
+            ..Default::default()
+        },
+        &ctx,
+        |_, _| Ok(()),
+    )
+    .await
+    .unwrap();
+    let replaced = save(&db, user.id, &configure(), &ctx, |_, _| Ok(()))
+        .await
+        .unwrap();
+    assert_eq!(replaced.events, custom.events);
+    save(
+        &db,
+        user.id,
+        &Patch {
+            telegram: Some(TelegramChange::Remove),
+            ..Default::default()
+        },
+        &ctx,
+        |_, _| Ok(()),
+    )
+    .await
+    .unwrap();
+    let reconnected = save(&db, user.id, &configure(), &ctx, |_, _| Ok(()))
+        .await
+        .unwrap();
+    for channels in reconnected.events.values() {
+        assert_eq!(channels.telegram, channels.email);
+    }
+}
+
+#[tokio::test]
+async fn connecting_uses_patched_email_and_honors_explicit_telegram_choices() {
+    let (db, user) = fixture().await;
+    let mut patch = configure();
+    patch.email = [(Event::Mention, false)].into();
+    patch.events = [
+        (
+            Event::NewDevice,
+            ChannelPatch {
+                email: Some(false),
+                telegram: None,
+            },
+        ),
+        (
+            Event::TokenCreated,
+            ChannelPatch {
+                email: None,
+                telegram: Some(false),
+            },
+        ),
+        (
+            Event::CiTriggered,
+            ChannelPatch {
+                email: Some(false),
+                telegram: Some(true),
+            },
+        ),
+    ]
+    .into();
+    let saved = save(&db, user.id, &patch, &context(), |_, sensitive| {
+        assert!(sensitive);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    for &event in Event::ALL {
+        let channels = saved.events[&event];
+        assert_eq!(
+            channels.telegram,
+            match event {
+                Event::TokenCreated => false,
+                Event::CiTriggered => true,
+                _ => channels.email,
+            }
+        );
+    }
+    assert!(!saved.events[&Event::Mention].email);
+    assert!(!saved.events[&Event::NewDevice].email);
+}
+
+#[tokio::test]
 async fn defaults_and_mixed_patch_are_authorized_before_any_persistent_change() {
     let (db, user) = fixture().await;
     let patch = Patch {

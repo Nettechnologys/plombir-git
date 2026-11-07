@@ -23,8 +23,8 @@
 | Reachable from the browser | 318 (69%) |
 | Layout modules | 2 |
 | Pages | 75 |
-| Interactive controls | 1066 |
-| Controls calling an API | 381 |
+| Interactive controls | 1067 |
+| Controls calling an API | 382 |
 | Controls from shared components | 425 |
 | Browser sweep: scenarios / inventory entries / routes | 52 / 197 / 187 |
 | **UI routes without a web/smoke/browser test** | **22** |
@@ -108,12 +108,12 @@
 | `/[owner]/[repo]/settings/environments` | 8 | 2 | 2 |
 | `/admin/orgs` 🔒 | 8 | 3 | 1 |
 | `/orgs` | 8 | 1 | 0 |
+| `/settings/notifications` | 8 | 5 | 0 |
 | `/` | 7 | 1 | 0 |
 | `/[owner]/[repo]/settings/deploy-keys` | 7 | 2 | 2 |
 | `/[owner]/[repo]/settings/lfs-storage` | 7 | 4 | 2 |
 | `/[owner]/[repo]/settings/mirror` | 7 | 3 | 2 |
 | `/[owner]/[repo]/settings/tags` | 7 | 2 | 2 |
-| `/settings/notifications` | 7 | 4 | 0 |
 | `/settings/signing-keys` | 7 | 2 | 2 |
 | `/[owner]/[repo]/settings/ci-secrets` | 6 | 2 | 2 |
 | `/admin` 🔒 | 6 | 0 | 0 |
@@ -1246,13 +1246,15 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:notification_settings.retry | :168 | `GET /api/v1/users/me/notification-settings` | `User` | web |
-| }> | :177 | `PUT /api/v1/users/me/notification-settings` | `User` | rust+web |
-| (event) => toggle(key, channel as Notifi | :222 | `PUT /api/v1/users/me/notification-settings` | `User` | rust+web |
-| (event) => toggle(key, channel as Notifi | :222 | `PUT /api/v1/users/me/notification-settings` | `User` | rust+web |
-| i18n:notification_settings.testing | :224 | `GET /api/v1/users/me/notification-settings/test` | `User` | web |
-| i18n:notification_settings.testing | :224 | `POST /api/v1/users/me/notification-settings/test` | `User` | web |
-| i18n:notification_settings.testing | :224 | `GET /api/v1/users/me/notification-settings` | `User` | web |
+| i18n:notification_settings.retry | :189 | `GET /api/v1/users/me/notification-settings` | `User` | web |
+| }> | :198 | `PUT /api/v1/users/me/notification-settings` | `User` | rust+web |
+| i18n:notification_settings.select_all | :240 | `PUT /api/v1/users/me/notification-settings` | `User` | rust+web |
+| i18n:notification_settings.select_all | :240 | `PUT /api/v1/users/me/notification-settings` | `User` | rust+web |
+| (event) => toggle(key, channel as Notifi | :254 | `PUT /api/v1/users/me/notification-settings` | `User` | rust+web |
+| (event) => toggle(key, channel as Notifi | :254 | `PUT /api/v1/users/me/notification-settings` | `User` | rust+web |
+| i18n:notification_settings.testing | :256 | `GET /api/v1/users/me/notification-settings/test` | `User` | web |
+| i18n:notification_settings.testing | :256 | `POST /api/v1/users/me/notification-settings/test` | `User` | web |
+| i18n:notification_settings.testing | :256 | `GET /api/v1/users/me/notification-settings` | `User` | web |
 
 ### `/settings/profile`
 

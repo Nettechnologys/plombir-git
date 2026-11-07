@@ -130,6 +130,21 @@ describe('notification settings page', () => {
 		expect(box.checked).toBe(true);
 		expect(element(rendered.container, '.save-error').textContent).toContain('settings are read-only right now');
 	});
+
+	it('selects and clears the whole legacy email block with one patch each', async () => {
+		base.request.mockImplementation(async (_path: string, init?: RequestInit) =>
+			init?.method === 'PUT' ? JSON.parse(init.body as string) : { email: SERVER_DEFAULTS },
+		);
+		rendered = await renderComponent(NotificationSettingsPage);
+		for (const checked of [true, false]) {
+			base.request.mockClear();
+			await click(element(rendered.container, `[data-bulk="activity-email"] button:nth-of-type(${checked ? 1 : 2})`));
+			const puts = callsTo('/users/me/notification-settings', 'PUT');
+			expect(puts).toHaveLength(1);
+			expect(JSON.parse(puts[0][1].body)).toEqual({ email: Object.fromEntries(Object.keys(SERVER_DEFAULTS).map(key => [key, checked])) });
+			for (const box of rendered.container.querySelectorAll<HTMLInputElement>('[data-category] input')) expect(box.checked).toBe(checked);
+		}
+	});
 });
 
 describe('thread subscription button', () => {
