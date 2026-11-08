@@ -256,7 +256,7 @@ async fn runner_register_requires_admin_session_not_pat() {
         .text()
         .await
         .unwrap()
-        .contains("credential creation requires a login session"));
+        .contains("this sensitive action requires a login session"));
 
     let resp = client
         .post(format!("{}/api/v1/runners/register", base))

@@ -14,7 +14,10 @@ use crate::entities::{mirror_sync_lease, repository};
 /// Create a mirror record.
 pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<Model> {
     let transaction = db.begin().await?;
-    let created = model.insert(&transaction).await?;
+    let created = model
+        .insert(&transaction)
+        .await
+        .context("db: create mirror")?;
     super::security_notification_ops::repo_event(
         &transaction,
         created.repo_id,

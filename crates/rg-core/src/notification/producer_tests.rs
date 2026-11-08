@@ -629,6 +629,7 @@ async fn collaborator_changes_notify_owner_and_affected_account_once_without_act
 }
 
 #[tokio::test]
+#[cfg(test)]
 async fn outbox_failure_rolls_back_access_grants_revocations_and_visibility() {
     let (db, owner) = fixture().await;
     let member = user_ops::create_user(&db, "member", "member@example.invalid", "hash", "Member")
@@ -739,6 +740,7 @@ async fn outbox_failure_rolls_back_access_grants_revocations_and_visibility() {
 }
 
 #[tokio::test]
+#[cfg(test)]
 async fn removing_organization_membership_erases_team_authority_and_reinvitation_cannot_restore_it()
 {
     let (db, owner) = fixture().await;

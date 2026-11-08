@@ -308,6 +308,14 @@ const MEMBERSHIP_WRAPPER_HOME: &str = "rg-core/src/org/mod.rs";
 /// its reason, the way `rg-ssh` is carried in [`WORKSPACE_SIGNED_OFF`].
 const ORG_MEMBERSHIP_SIGNED_OFF: &[(&str, &str)] = &[];
 
+/// Background delivery must recheck an organization's current owners at send
+/// time; it has no HTTP caller. Only this function may ask, not its neighbors.
+const ORG_MEMBERSHIP_FUNCTION_SIGNED_OFF: &[(&str, &str, &str)] = &[(
+    "rg-core/src/notification/dispatch.rs",
+    "prepare",
+    "filters queued owner notices against the recipient's current membership and owner role",
+)];
+
 /// The file that *defines* the permission predicates.
 ///
 /// Every guard above stops at the edge of this crate, and that is exactly where
@@ -1113,7 +1121,7 @@ fn the_org_membership_predicate_is_not_decided_in_the_other_crates_either() {
         ORG_MEMBERSHIP,
         &[PREDICATE_HOME, MEMBERSHIP_WRAPPER_HOME],
         ORG_MEMBERSHIP_SIGNED_OFF,
-        &[],
+        ORG_MEMBERSHIP_FUNCTION_SIGNED_OFF,
     );
     offenders.append(&mut elsewhere);
 
@@ -1436,7 +1444,15 @@ fn signed_off_exceptions_are_live() {
         );
         assert!(!reason.is_empty(), "{rel} is signed off without a reason");
     }
-    for (rel, function_name, reason) in WORKSPACE_FUNCTION_SIGNED_OFF {
+    for ((rel, function_name, reason), predicates) in WORKSPACE_FUNCTION_SIGNED_OFF
+        .iter()
+        .map(|entry| (entry, PREDICATES))
+        .chain(
+            ORG_MEMBERSHIP_FUNCTION_SIGNED_OFF
+                .iter()
+                .map(|entry| (entry, ORG_MEMBERSHIP)),
+        )
+    {
         let path = workspace_crates().join(rel);
         assert!(
             path.exists(),
@@ -1462,9 +1478,9 @@ fn signed_off_exceptions_are_live() {
             matching.len()
         );
         assert!(
-            !gate_call_lines(&matching[0].body, PREDICATES).is_empty(),
+            !gate_call_lines(&matching[0].body, predicates).is_empty(),
             "{rel}::{function_name} is signed off to revalidate repository access ({reason}) but \
-             calls none of {PREDICATES:?} any more — drop the stale exception"
+             calls none of {predicates:?} any more — drop the stale exception"
         );
     }
     // Empty today. Listed anyway so the first entry added here is held to the

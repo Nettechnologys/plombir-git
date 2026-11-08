@@ -569,6 +569,12 @@ async fn a_source_confined_token_adds_no_repository_to_any_namespace() {
         .await
         .expect("confined transfer");
     assert_eq!(refused.status(), 403);
+    let refusal: serde_json::Value = refused.json().await.expect("transfer refusal");
+    assert_eq!(refusal["error"]["code"], "FORBIDDEN");
+    assert_eq!(
+        refusal["error"]["message"], "this sensitive action requires a login session",
+        "transfer now rejects every PAT before inspecting the destination"
+    );
     let still_here = rg_db::entities::repository::Entity::find_by_id(movable_id)
         .one(&db)
         .await
@@ -588,7 +594,11 @@ async fn a_source_confined_token_adds_no_repository_to_any_namespace() {
             details["reason"] == "repository_creation_not_allowed"
         })
         .collect();
-    assert_eq!(denials.len(), 3, "every refusal is audited: {denials:?}");
+    assert_eq!(
+        denials.len(),
+        2,
+        "both fork scope refusals are audited: {denials:?}"
+    );
     assert!(denials
         .iter()
         .any(|details| details["namespace"] == "cf-forker-org"

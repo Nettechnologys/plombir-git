@@ -297,6 +297,17 @@ async fn every_team_mutation_leaves_a_row_naming_who_granted_the_access() {
 
     // Baseline: the refusal has to be earned by the writes below, not by a
     // journal that happens to be empty of everything.
+    assert_eq!(
+        client
+            .post(format!("{base}/api/v1/orgs/team-org/members"))
+            .bearer_auth(&owner_token)
+            .json(&serde_json::json!({"user_id": member_id, "role": "member"}))
+            .send()
+            .await
+            .expect("admit the future team member to the organization")
+            .status(),
+        201
+    );
     assert!(
         journal(&base, &owner_token)
             .await

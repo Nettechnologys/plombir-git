@@ -453,6 +453,8 @@ async fn admin_can_unlock_user_and_action_is_audited() {
 
 #[tokio::test]
 async fn admin_unlock_losing_to_retirement_or_delete_is_404_without_audit() {
+    use rg_db::sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+
     let (base, db) = spawn_test_app_with_db().await;
     let client = reqwest::Client::new();
     let (admin_token, admin_id) =
@@ -475,6 +477,13 @@ async fn admin_unlock_losing_to_retirement_or_delete_is_404_without_audit() {
             .await
             .expect("seed a failed login");
     }
+    let queued_before = rg_db::entities::notification_delivery::Entity::find()
+        .filter(
+            rg_db::entities::notification_delivery::Column::EventKey.eq("admin_security_changed"),
+        )
+        .count(&db)
+        .await
+        .expect("count notices before the losing unlocks");
 
     install_retirement_before_user_update(
         &db,
@@ -523,5 +532,17 @@ async fn admin_unlock_losing_to_retirement_or_delete_is_404_without_audit() {
         audit_total(&base, &admin_token, "admin.unlock_user").await,
         0,
         "a losing admin unlock published a success audit event"
+    );
+    assert_eq!(
+        rg_db::entities::notification_delivery::Entity::find()
+            .filter(
+                rg_db::entities::notification_delivery::Column::EventKey
+                    .eq("admin_security_changed")
+            )
+            .count(&db)
+            .await
+            .expect("count notices after the losing unlocks"),
+        queued_before,
+        "a losing admin unlock queued a success notification"
     );
 }

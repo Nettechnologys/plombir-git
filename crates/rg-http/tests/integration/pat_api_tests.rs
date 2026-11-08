@@ -215,7 +215,7 @@ async fn pat_cannot_issue_a_broader_pat_or_ssh_key_but_a_browser_session_can() {
             .text()
             .await
             .unwrap()
-            .contains("credential creation requires a login session"));
+            .contains("this sensitive action requires a login session"));
     }
     assert_eq!(
         rg_db::entities::access_token::Entity::find()
@@ -276,7 +276,7 @@ async fn pat_cannot_issue_a_broader_pat_or_ssh_key_but_a_browser_session_can() {
         .text()
         .await
         .unwrap()
-        .contains("credential creation requires a login session"));
+        .contains("this sensitive action requires a login session"));
 }
 
 #[tokio::test]
@@ -310,7 +310,7 @@ async fn pat_cannot_issue_bot_or_deploy_credentials_or_start_passkey_registratio
         .text()
         .await
         .unwrap()
-        .contains("credential creation requires a login session"));
+        .contains("this sensitive action requires a login session"));
     let created_bot = client
         .post(&bot_url)
         .header("Cookie", &cookie)
@@ -351,7 +351,7 @@ async fn pat_cannot_issue_bot_or_deploy_credentials_or_start_passkey_registratio
         .text()
         .await
         .unwrap()
-        .contains("credential creation requires a login session"));
+        .contains("this sensitive action requires a login session"));
     let created_deploy = client
         .post(&deploy_url)
         .header("Cookie", &cookie)
@@ -378,7 +378,7 @@ async fn pat_cannot_issue_bot_or_deploy_credentials_or_start_passkey_registratio
         .text()
         .await
         .unwrap()
-        .contains("credential creation requires a login session"));
+        .contains("this sensitive action requires a login session"));
     let started_passkey = client
         .post(&passkey_url)
         .header("Cookie", &cookie)

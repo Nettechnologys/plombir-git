@@ -1015,8 +1015,10 @@ async fn removing_a_member_reports_only_real_membership_changes() {
     }
 
     for (family, base_path) in [
-        ("organization", format!("/api/v1/orgs/{ORG}/members")),
+        // Removing the organization membership now also clears team grants.
+        // Exercise the team's actual removal before removing the parent grant.
         ("team", format!("/api/v1/orgs/{ORG}/teams/{team}/members")),
+        ("organization", format!("/api/v1/orgs/{ORG}/members")),
     ] {
         let removed = fx
             .client

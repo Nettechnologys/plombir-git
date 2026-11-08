@@ -1685,16 +1685,23 @@ pub async fn admin_unlock(db: &DatabaseConnection, user_id: i64) -> Result<Optio
         transaction.rollback().await?;
         return Ok(None);
     };
-    UserEntity::update_many()
+    let result = UserEntity::update_many()
+        .col_expr(user::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
         .col_expr(user::Column::LoginAttempts, Expr::value(0))
         .col_expr(
             user::Column::LockedUntil,
             Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
         )
         .filter(user::Column::Id.eq(user_id))
+        .filter(user::Column::DeletedAt.is_null())
         .exec(&transaction)
         .await?;
-    if previous.login_attempts != 0 || previous.locked_until.is_some() {
+    // A competing retirement/delete can suppress the write. Re-read before
+    // recording success, preserving typed absence and never notifying an
+    // unlock that did not happen.
+    let updated =
+        open_user_after_update(&transaction, user_id, result.rows_affected, "admin unlock").await?;
+    if updated.is_some() && (previous.login_attempts != 0 || previous.locked_until.is_some()) {
         super::security_notification_ops::system_event(
             &transaction,
             "account_unlocked",
@@ -1702,7 +1709,6 @@ pub async fn admin_unlock(db: &DatabaseConnection, user_id: i64) -> Result<Optio
         )
         .await?;
     }
-    let updated = UserEntity::find_by_id(user_id).one(&transaction).await?;
     transaction.commit().await?;
     Ok(updated)
 }

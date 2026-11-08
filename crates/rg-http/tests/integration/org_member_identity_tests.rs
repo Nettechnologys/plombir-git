@@ -126,6 +126,14 @@ async fn a_team_member_can_be_added_by_username_and_the_roster_is_named() {
     let client = reqwest::Client::new();
 
     create_org(&base, &owner_token, "tmidcorp", "public").await;
+    let joined = client
+        .post(format!("{base}/api/v1/orgs/tmidcorp/members"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({"username": "tmid-guest", "role": "member"}))
+        .send()
+        .await
+        .expect("join the organization before its team");
+    assert_eq!(joined.status(), 201);
 
     let team = client
         .post(format!("{base}/api/v1/orgs/tmidcorp/teams"))
@@ -150,7 +158,7 @@ async fn a_team_member_can_be_added_by_username_and_the_roster_is_named() {
     assert_eq!(
         added.status(),
         201,
-        "a username must be enough to join a team"
+        "a username must identify an organization member joining a team"
     );
     let body: serde_json::Value = added.json().await.expect("json body");
     assert_eq!(body["user_id"], guest_id);
