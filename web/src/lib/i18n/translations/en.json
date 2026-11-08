@@ -2514,7 +2514,15 @@
       "notification_settings_changed": "Notification settings changed",
       "agent_profile_changed": "Agent profile changed",
       "bot_created": "Bot created",
-      "bot_deleted": "Bot deleted"
+      "bot_deleted": "Bot deleted",
+      "repository_access_changed": "Repository access changed",
+      "organization_access_changed": "Organization access changed",
+      "repository_security_changed": "Repository visibility, ownership or deletion",
+      "organization_security_changed": "Organization visibility or deletion",
+      "webhook_changed": "Webhook configuration changed",
+      "mirror_changed": "Mirror configuration changed",
+      "ci_security_changed": "Repository protection or CI configuration changed",
+      "admin_security_changed": "Administrator security action"
     },
     "status": {
       "queued": "Queued",

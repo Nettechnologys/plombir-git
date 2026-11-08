@@ -20,7 +20,9 @@ use crate::common::{
 };
 
 /// Serve the test router with `ConnectInfo`, trusting `trusted` as proxies.
-async fn spawn_with_peer(trusted: Vec<std::net::IpAddr>) -> (String, rg_db::DatabaseConnection) {
+pub(super) async fn spawn_with_peer(
+    trusted: Vec<std::net::IpAddr>,
+) -> (String, rg_db::DatabaseConnection) {
     let (db, dir) = setup_test_db().await;
     let repo_root = dir.path().join("repos");
     std::fs::create_dir_all(&repo_root).unwrap();

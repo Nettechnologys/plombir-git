@@ -2514,7 +2514,15 @@
       "notification_settings_changed": "通知设置已更改",
       "agent_profile_changed": "代理配置已更改",
       "bot_created": "机器人已创建",
-      "bot_deleted": "机器人已删除"
+      "bot_deleted": "机器人已删除",
+      "repository_access_changed": "仓库访问权限已更改",
+      "organization_access_changed": "组织访问权限已更改",
+      "repository_security_changed": "仓库可见性、所有权或删除",
+      "organization_security_changed": "组织可见性或删除",
+      "webhook_changed": "Webhook 配置已更改",
+      "mirror_changed": "镜像配置已更改",
+      "ci_security_changed": "仓库保护或 CI 配置已更改",
+      "admin_security_changed": "管理员安全操作"
     },
     "status": {
       "queued": "排队中",

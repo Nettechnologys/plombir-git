@@ -2514,7 +2514,15 @@
       "notification_settings_changed": "Настройки уведомлений изменены",
       "agent_profile_changed": "Профиль агента изменён",
       "bot_created": "Бот создан",
-      "bot_deleted": "Бот удалён"
+      "bot_deleted": "Бот удалён",
+      "repository_access_changed": "Доступ к репозиторию изменён",
+      "organization_access_changed": "Доступ к организации изменён",
+      "repository_security_changed": "Приватность, владелец или удаление репозитория",
+      "organization_security_changed": "Приватность или удаление организации",
+      "webhook_changed": "Настройки вебхука изменены",
+      "mirror_changed": "Настройки зеркала изменены",
+      "ci_security_changed": "Защита репозитория или настройки CI изменены",
+      "admin_security_changed": "Действие администратора с безопасностью"
     },
     "status": {
       "queued": "В очереди",

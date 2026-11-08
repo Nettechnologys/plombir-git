@@ -30,6 +30,14 @@ events! {
     AdminPasswordReset => "admin_password_reset", AdminFactorsReset => "admin_factors_reset",
     RunnerTokenCreated => "runner_token_created", RunnerTokenRevoked => "runner_token_revoked",
     NotificationSettingsChanged => "notification_settings_changed",
+    RepositoryAccessChanged => "repository_access_changed",
+    OrganizationAccessChanged => "organization_access_changed",
+    RepositorySecurityChanged => "repository_security_changed",
+    OrganizationSecurityChanged => "organization_security_changed",
+    WebhookChanged => "webhook_changed",
+    MirrorChanged => "mirror_changed",
+    CiSecurityChanged => "ci_security_changed",
+    AdminSecurityChanged => "admin_security_changed",
     AgentProfileChanged => "agent_profile_changed", BotCreated => "bot_created", BotDeleted => "bot_deleted",
 }
 
@@ -122,6 +130,9 @@ pub struct Channels {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Metadata {
+    /// Internal eligibility for an organization-owner copy; never rendered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_owner_id: Option<i64>,
     pub actor: Option<String>,
     pub name: Option<String>,
     pub fingerprint: Option<String>,
@@ -161,7 +172,7 @@ impl Metadata {
         self.changed = self
             .changed
             .into_iter()
-            .take(80)
+            .take(Event::ALL.len() * 2 + 8)
             .map(|value| {
                 value
                     .chars()

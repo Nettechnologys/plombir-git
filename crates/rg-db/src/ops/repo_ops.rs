@@ -516,6 +516,22 @@ pub async fn create(db: &DatabaseConnection, model: RepoActiveModel) -> Result<R
         .insert(&transaction)
         .await
         .context("db: create repo")?;
+    if let Some(source_id) = repo.origin_repo_id {
+        if RepoEntity::find_by_id(source_id)
+            .one(&transaction)
+            .await?
+            .is_some_and(|source| source.is_private)
+        {
+            super::security_notification_ops::repo_event(
+                &transaction,
+                source_id,
+                crate::notification::Event::RepositoryAccessChanged,
+                "private_repository_forked",
+                &[],
+            )
+            .await?;
+        }
+    }
     transaction
         .commit()
         .await
@@ -558,6 +574,19 @@ pub async fn update_settings(
     description: Option<Option<String>>,
     is_private: Option<bool>,
 ) -> Result<bool> {
+    let transaction = db.begin().await?;
+    RepoEntity::update_many()
+        .col_expr(
+            repository::Column::UpdatedAt,
+            Expr::col(repository::Column::UpdatedAt).into(),
+        )
+        .filter(repository::Column::Id.eq(id))
+        .exec(&transaction)
+        .await?;
+    let previous = RepoEntity::find_by_id(id).one(&transaction).await?;
+    let visibility_changed = previous
+        .as_ref()
+        .is_some_and(|row| is_private.is_some_and(|value| row.is_private != value));
     let mut update =
         RepoEntity::update_many().col_expr(repository::Column::UpdatedAt, Expr::value(Utc::now()));
     if let Some(description) = description {
@@ -569,9 +598,24 @@ pub async fn update_settings(
     let updated = update
         .filter(repository::Column::Id.eq(id))
         .filter(repository::Column::DeletedAt.is_null())
-        .exec(db)
+        .exec(&transaction)
         .await
         .context("db: update repository settings")?;
+    if updated.rows_affected == 1 && visibility_changed {
+        super::security_notification_ops::repo_event(
+            &transaction,
+            id,
+            crate::notification::Event::RepositorySecurityChanged,
+            if is_private == Some(true) {
+                "repository_private"
+            } else {
+                "repository_public"
+            },
+            &[],
+        )
+        .await?;
+    }
+    transaction.commit().await?;
     Ok(updated.rows_affected == 1)
 }
 
@@ -717,6 +761,14 @@ pub async fn soft_delete_unless_mirror_syncing(
         .await
         .context("db: retire repository runners")?;
 
+    super::security_notification_ops::repo_event(
+        &transaction,
+        id,
+        crate::notification::Event::RepositorySecurityChanged,
+        "repository_deleted",
+        &[],
+    )
+    .await?;
     transaction
         .commit()
         .await
@@ -1447,6 +1499,30 @@ pub async fn transfer_owner(
         }
     }
 
+    if source_owner_id != owner_id || source_org_id != org_id {
+        let mut affected = if let Some(org) = source_org_id {
+            super::security_notification_ops::org_owners(&transaction, org).await?
+        } else {
+            vec![source_owner_id]
+        };
+        affected.extend(
+            crate::entities::repo_collaborator::Entity::find()
+                .filter(crate::entities::repo_collaborator::Column::RepoId.eq(repo_id))
+                .all(&transaction)
+                .await?
+                .into_iter()
+                .map(|row| row.user_id),
+        );
+        super::security_notification_ops::repo_event_with_history(
+            &transaction,
+            repo_id,
+            crate::notification::Event::RepositorySecurityChanged,
+            "repository_transferred",
+            &affected,
+            Some(&format!("{source_namespace}/{repo_name}")),
+        )
+        .await?;
+    }
     transaction
         .commit()
         .await

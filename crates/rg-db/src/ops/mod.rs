@@ -63,6 +63,7 @@ pub mod repo_star_ops;
 pub mod repo_watch_ops;
 pub mod review_comment_ops;
 pub mod runner_ops;
+pub mod security_notification_ops;
 pub mod ssh_key_ops;
 pub mod sso_provider_ops;
 pub mod thread_subscription_ops;

@@ -187,6 +187,7 @@ pub async fn create_protection(
         repo: repository,
         actor_id,
     }: RepoAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Json(req): Json<CreateProtectionRequest>,
 ) -> impl IntoResponse {
@@ -301,6 +302,7 @@ pub async fn update_protection(
         repo: repository,
         actor_id,
     }: RepoAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Json(req): Json<UpdateProtectionRequest>,
 ) -> impl IntoResponse {
@@ -381,6 +383,7 @@ pub async fn delete_protection(
         repo: repository,
         actor_id,
     }: RepoAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let audit_actor = match grant_actor(&state, actor_id).await {

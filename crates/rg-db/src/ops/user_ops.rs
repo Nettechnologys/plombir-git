@@ -309,6 +309,15 @@ pub async fn update_by_id(
     let is_active = &is_active;
     crate::contention::retry_transaction("admin user update", || async move {
         let transaction = db.begin().await.context("db: begin admin user update")?;
+        UserEntity::update_many()
+            .col_expr(
+                user::Column::SessionVersion,
+                Expr::col(user::Column::SessionVersion).into(),
+            )
+            .filter(user::Column::Id.eq(id))
+            .exec(&transaction)
+            .await?;
+        let previous = UserEntity::find_by_id(id).one(&transaction).await?;
         let result: Result<Option<User>> = async {
             let mut update = UserEntity::update_many();
             let mut has_changes = false;
@@ -346,6 +355,16 @@ pub async fn update_by_id(
         .await;
         match result {
             Ok(updated) => {
+                if let (Some(old), Some(current)) = (&previous, &updated) {
+                    if old.is_admin != current.is_admin || old.is_active != current.is_active {
+                        super::security_notification_ops::system_event(
+                            &transaction,
+                            "account_authority_changed",
+                            Some(id),
+                        )
+                        .await?;
+                    }
+                }
                 transaction
                     .commit()
                     .await
@@ -1390,6 +1409,16 @@ where
             );
             super::notification_delivery_ops::enqueue(&transaction, &event).await?;
         }
+        if bot_owner.is_none()
+            && crate::notification::current_actor_id().is_some_and(|actor| actor != id)
+        {
+            super::security_notification_ops::system_event(
+                &transaction,
+                "account_deleted",
+                Some(id),
+            )
+            .await?;
+        }
         crate::ops::repo_ops::refresh_stars_counts(&transaction, &starred).await?;
         transaction
             .commit()
@@ -2238,4 +2267,45 @@ mod contention_tests {
             .expect("physical deletion is an outcome, not a database error")
             .is_none());
     }
+}
+
+/// Explicit administrator unlock, distinct from successful authentication.
+pub async fn admin_unlock(db: &DatabaseConnection, user_id: i64) -> Result<Option<User>> {
+    let transaction = db.begin().await?;
+    UserEntity::update_many()
+        .col_expr(
+            user::Column::SessionVersion,
+            Expr::col(user::Column::SessionVersion).into(),
+        )
+        .filter(user::Column::Id.eq(user_id))
+        .exec(&transaction)
+        .await?;
+    let previous = UserEntity::find_by_id(user_id)
+        .one(&transaction)
+        .await?
+        .filter(|row| row.deleted_at.is_none());
+    let Some(previous) = previous else {
+        transaction.rollback().await?;
+        return Ok(None);
+    };
+    UserEntity::update_many()
+        .col_expr(user::Column::LoginAttempts, Expr::value(0))
+        .col_expr(
+            user::Column::LockedUntil,
+            Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+        )
+        .filter(user::Column::Id.eq(user_id))
+        .exec(&transaction)
+        .await?;
+    if previous.login_attempts != 0 || previous.locked_until.is_some() {
+        super::security_notification_ops::system_event(
+            &transaction,
+            "account_unlocked",
+            Some(user_id),
+        )
+        .await?;
+    }
+    let updated = UserEntity::find_by_id(user_id).one(&transaction).await?;
+    transaction.commit().await?;
+    Ok(updated)
 }

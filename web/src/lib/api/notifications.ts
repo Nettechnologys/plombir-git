@@ -69,6 +69,14 @@ export const NOTIFICATION_EVENTS = [
   'agent_profile_changed',
   'bot_created',
   'bot_deleted',
+  'repository_access_changed',
+  'organization_access_changed',
+  'repository_security_changed',
+  'organization_security_changed',
+  'webhook_changed',
+  'mirror_changed',
+  'ci_security_changed',
+  'admin_security_changed',
 ] as const;
 export type NotificationEvent = (typeof NOTIFICATION_EVENTS)[number];
 export type NotificationChannel = 'email' | 'telegram';

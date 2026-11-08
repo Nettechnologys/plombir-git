@@ -113,10 +113,38 @@ and do not mean the factor is still enabled. The backup status API returns
 includes historical used rows. The page shows unused codes and used-code
 history separately, and uses the configured replacement count for re-issuance.
 
-Repository/org permission grants, CI secrets, webhooks, and administrator
-maintenance/deletion endpoints keep their existing role and PAT scope policies.
-These automation-capable APIs are distinct from credential issuance; this change
-does not claim that every write operation requires interactive MFA.
+Repository and organization access administration also requires a login session
+with fresh proof: collaborators, membership and teams, visibility changes,
+transfer/deletion, webhooks, pull/push mirror configuration, branch/tag protection,
+CI secrets and deployment environment policy. Administrator unlock/deletion of
+accounts, organizations, SSO providers and runners, and deletion of a bot with its
+repositories have the same guard. The existing resource/role check runs first;
+inaccessible private resources retain their uniform 404 response.
+
+For an MFA account the proof must cover its **current** factor, even if a password
+was entered recently. A completed MFA login/step-up or verified passkey starts the
+ten-minute window; another prompt is unnecessary while that proof remains fresh.
+After it expires, the SPA asks for confirmation and retries the refused action once.
+PATs cannot perform these security-administration writes, even with `repo` or
+`admin` scope. This is an API compatibility change in 0.4.1. Mixed metadata and
+visibility patches are refused as a whole; supplying a visibility field requires
+proof even if its current value happens to match. Ordinary description/default
+branch/name edits, Git/API work, CI runtime operations and CI variable automation
+retain their role/scope checks. Maintenance/banner settings and emergency credential
+revocation retain their existing policies.
+
+Removing an organization member clears that organization's team grants in the same
+transaction. A later invitation cannot restore old team privileges. Adding someone
+to a team requires current organization membership, serialized against removal;
+legacy dormant grants are discarded on re-invitation and excluded from team lists.
+Direct repository collaborator grants remain separate and must be revoked separately.
+
+Repository transfer preserves collaborators, keys, webhooks, mirrors, CI secrets,
+variables, environments and protection rules. Review those integrations when moving
+ownership; old/new owners and collaborators receive security notices according to
+their settings. Revoking repository access cannot retract copies already made,
+including private forks and local clones. A private fork creates a security notice
+for the source owner; it grants no continuing access to new source changes.
 
 ## Tech stack
 

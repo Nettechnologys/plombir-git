@@ -130,7 +130,21 @@ pub async fn get_permission(
 
 /// Create a new collaborator.
 pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<RepoCollaborator> {
-    model.insert(db).await.context("db: create collaborator")
+    let transaction = db.begin().await?;
+    let created = model
+        .insert(&transaction)
+        .await
+        .context("db: create collaborator")?;
+    super::security_notification_ops::repo_event(
+        &transaction,
+        created.repo_id,
+        crate::notification::Event::RepositoryAccessChanged,
+        "collaborator_added",
+        &[created.user_id],
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(created)
 }
 
 /// Result of writing one collaborator permission.
@@ -155,6 +169,7 @@ pub async fn update_permission(
     id: i64,
     permission: String,
 ) -> Result<Option<PermissionUpdate>> {
+    let transaction = db.begin().await?;
     let result = CollabEntity::update_many()
         .col_expr(
             repo_collaborator::Column::Permission,
@@ -162,16 +177,28 @@ pub async fn update_permission(
         )
         .filter(repo_collaborator::Column::Id.eq(id))
         .filter(repo_collaborator::Column::Permission.ne(permission))
-        .exec(db)
+        .exec(&transaction)
         .await
         .context("db: update collaborator")?;
 
-    Ok(find_by_id(db, id)
-        .await?
-        .map(|collaborator| PermissionUpdate {
-            collaborator,
-            changed: result.rows_affected == 1,
-        }))
+    let collaborator = CollabEntity::find_by_id(id).one(&transaction).await?;
+    if result.rows_affected == 1 {
+        if let Some(ref collaborator) = collaborator {
+            super::security_notification_ops::repo_event(
+                &transaction,
+                collaborator.repo_id,
+                crate::notification::Event::RepositoryAccessChanged,
+                "collaborator_permission_changed",
+                &[collaborator.user_id],
+            )
+            .await?;
+        }
+    }
+    transaction.commit().await?;
+    Ok(collaborator.map(|collaborator| PermissionUpdate {
+        collaborator,
+        changed: result.rows_affected == 1,
+    }))
 }
 
 /// Remove a collaborator by repo and user. Returns whether a row was removed.
@@ -193,11 +220,23 @@ pub async fn delete_by_repo_and_user(
     user_id: i64,
 ) -> Result<bool> {
     use sea_orm::QueryFilter;
+    let transaction = db.begin().await?;
     let result = CollabEntity::delete_many()
         .filter(repo_collaborator::Column::RepoId.eq(repo_id))
         .filter(repo_collaborator::Column::UserId.eq(user_id))
-        .exec(db)
+        .exec(&transaction)
         .await
         .context("db: delete collaborator by repo and user")?;
+    if result.rows_affected > 0 {
+        super::security_notification_ops::repo_event(
+            &transaction,
+            repo_id,
+            crate::notification::Event::RepositoryAccessChanged,
+            "collaborator_removed",
+            &[user_id],
+        )
+        .await?;
+    }
+    transaction.commit().await?;
     Ok(result.rows_affected > 0)
 }

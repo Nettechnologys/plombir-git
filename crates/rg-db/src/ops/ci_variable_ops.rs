@@ -73,7 +73,7 @@ pub async fn list(db: &DatabaseConnection, owner: Owner) -> Result<Vec<Variable>
     })
 }
 
-async fn find(db: &DatabaseConnection, owner: Owner, name: &str) -> Result<Option<i64>> {
+async fn find(db: &impl ConnectionTrait, owner: Owner, name: &str) -> Result<Option<i64>> {
     Ok(match owner {
         Owner::Repository(repo_id) => ci_variable::Entity::find()
             .filter(ci_variable::Column::RepoId.eq(repo_id))
@@ -94,7 +94,7 @@ async fn find(db: &DatabaseConnection, owner: Owner, name: &str) -> Result<Optio
 
 /// Write `value` onto the row `id` of `owner`; whether the row was still there.
 async fn update_value(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     owner: Owner,
     id: i64,
     value: &str,
@@ -145,8 +145,8 @@ pub enum Written {
 /// writing this call's value onto the winner's row — last writer wins, as it
 /// would a millisecond apart. A variable deleted between the lookup and the
 /// update is written again rather than reported as stored and missing.
-pub async fn upsert(
-    db: &DatabaseConnection,
+async fn upsert_in(
+    db: &impl ConnectionTrait,
     owner: Owner,
     name: &str,
     value: &str,
@@ -197,12 +197,13 @@ pub async fn upsert(
 
 /// Remove `owner`'s variable `name`; whether there was one.
 pub async fn delete(db: &DatabaseConnection, owner: Owner, name: &str) -> Result<bool> {
+    let transaction = db.begin().await?;
     let rows = match owner {
         Owner::Repository(repo_id) => {
             ci_variable::Entity::delete_many()
                 .filter(ci_variable::Column::RepoId.eq(repo_id))
                 .filter(ci_variable::Column::Name.eq(name))
-                .exec(db)
+                .exec(&transaction)
                 .await
                 .context("db: delete repository CI variable")?
                 .rows_affected
@@ -211,12 +212,16 @@ pub async fn delete(db: &DatabaseConnection, owner: Owner, name: &str) -> Result
             org_ci_variable::Entity::delete_many()
                 .filter(org_ci_variable::Column::OrgId.eq(org_id))
                 .filter(org_ci_variable::Column::Name.eq(name))
-                .exec(db)
+                .exec(&transaction)
                 .await
                 .context("db: delete organization CI variable")?
                 .rows_affected
         }
     };
+    if rows > 0 {
+        notify(&transaction, owner, "ci_variable_deleted").await?;
+    }
+    transaction.commit().await?;
     Ok(rows > 0)
 }
 
@@ -246,4 +251,79 @@ pub async fn for_repo(db: &DatabaseConnection, repo_id: i64) -> Result<BTreeMap<
         values.insert(variable.name, variable.value);
     }
     Ok(values)
+}
+
+/// Serialize configuration changes with the owner's row and publish once.
+pub async fn upsert(
+    db: &DatabaseConnection,
+    owner: Owner,
+    name: &str,
+    value: &str,
+    actor_id: i64,
+) -> Result<Written> {
+    let transaction = db.begin().await?;
+    let previous = match owner {
+        Owner::Repository(id) => {
+            repository::Entity::update_many()
+                .col_expr(
+                    repository::Column::UpdatedAt,
+                    Expr::col(repository::Column::UpdatedAt).into(),
+                )
+                .filter(repository::Column::Id.eq(id))
+                .exec(&transaction)
+                .await?;
+            ci_variable::Entity::find()
+                .filter(ci_variable::Column::RepoId.eq(id))
+                .filter(ci_variable::Column::Name.eq(name))
+                .one(&transaction)
+                .await?
+                .map(|row| row.value)
+        }
+        Owner::Organization(id) => {
+            organization::Entity::update_many()
+                .col_expr(
+                    organization::Column::UpdatedAt,
+                    Expr::col(organization::Column::UpdatedAt).into(),
+                )
+                .filter(organization::Column::Id.eq(id))
+                .exec(&transaction)
+                .await?;
+            org_ci_variable::Entity::find()
+                .filter(org_ci_variable::Column::OrgId.eq(id))
+                .filter(org_ci_variable::Column::Name.eq(name))
+                .one(&transaction)
+                .await?
+                .map(|row| row.value)
+        }
+    };
+    let result = upsert_in(&transaction, owner, name, value, actor_id).await?;
+    if previous.as_deref() != Some(value) {
+        notify(&transaction, owner, "ci_variable_updated").await?;
+    }
+    transaction.commit().await?;
+    Ok(result)
+}
+async fn notify(db: &impl ConnectionTrait, owner: Owner, action: &str) -> Result<()> {
+    match owner {
+        Owner::Repository(id) => {
+            super::security_notification_ops::repo_event(
+                db,
+                id,
+                crate::notification::Event::CiSecurityChanged,
+                action,
+                &[],
+            )
+            .await
+        }
+        Owner::Organization(id) => {
+            super::security_notification_ops::org_event(
+                db,
+                id,
+                crate::notification::Event::CiSecurityChanged,
+                action,
+                &[],
+            )
+            .await
+        }
+    }
 }

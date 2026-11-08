@@ -578,5 +578,78 @@ async fn revoked_repository_and_instance_grants_cancel_pending_delivery() {
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|row| row.status == "cancelled"
         && row.last_error.as_deref() == Some("administrator_access_removed")));
-    assert!(out.sent.lock().unwrap().is_empty());
+    let sent = out.sent.lock().unwrap();
+    // Three access mutations now notify the owner (email) and affected user
+    // (email + Telegram). The revoked content/credential notices still cancel.
+    assert_eq!(sent.len(), 9);
+    assert!(sent
+        .iter()
+        .all(|(_, text)| text.contains("Repository access changed")
+            || text.contains("Доступ к репозиторию изменён")));
+    assert!(sent.iter().all(|(_, text)| !text.contains("private title")
+        && !text.contains("fixture")
+        && !text.contains("runner")));
+}
+
+#[tokio::test]
+async fn organization_owner_copies_recheck_role_but_personal_revocation_notice_survives() {
+    use rg_db::ops::{org_ops, user_ops};
+    let (db, user) = fixture().await;
+    let other = user_ops::create_user(&db, "next-owner", "next@example.invalid", "fixture", "Next")
+        .await
+        .unwrap();
+    let org = org_ops::create_org(&db, "owner-copy", None, None, user.id, "private")
+        .await
+        .unwrap();
+    org_ops::add_org_member(&db, org.id, other.id, "owner")
+        .await
+        .unwrap();
+    org_ops::create_team(&db, org.id, "operators", None, "admin")
+        .await
+        .unwrap();
+    org_ops::remove_org_member(&db, org.id, user.id)
+        .await
+        .unwrap();
+    let pending = notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::UserId.eq(user.id))
+        .all(&db)
+        .await
+        .unwrap();
+    let team: Vec<i64> = pending
+        .iter()
+        .filter(|row| row.metadata.contains("team_created"))
+        .map(|row| row.id)
+        .collect();
+    let removal: Vec<i64> = pending
+        .iter()
+        .filter(|row| row.metadata.contains("org_member_removed"))
+        .map(|row| row.id)
+        .collect();
+    assert_eq!(team.len(), 2);
+    assert_eq!(removal.len(), 2);
+    let out = Recorder::default();
+    pass(&db, &config(true), &out).await.unwrap();
+    for id in team {
+        let row = notification_delivery::Entity::find_by_id(id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "cancelled");
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("organization_access_removed")
+        );
+    }
+    for id in removal {
+        assert_eq!(
+            notification_delivery::Entity::find_by_id(id)
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "sent"
+        );
+    }
 }

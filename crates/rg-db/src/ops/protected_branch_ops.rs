@@ -107,6 +107,14 @@ pub async fn create_with_push_grants(
     .await;
     match result {
         Ok(created) => {
+            super::security_notification_ops::repo_event(
+                &transaction,
+                created.repo_id,
+                crate::notification::Event::CiSecurityChanged,
+                "branch_protection_created",
+                &[],
+            )
+            .await?;
             transaction
                 .commit()
                 .await
@@ -143,6 +151,15 @@ pub async fn update_with_push_grants(
         .begin()
         .await
         .context("db: begin protected branch grant update")?;
+    PbEntity::update_many()
+        .col_expr(
+            protected_branch::Column::UpdatedAt,
+            Expr::col(protected_branch::Column::UpdatedAt).into(),
+        )
+        .filter(protected_branch::Column::Id.eq(id))
+        .exec(&transaction)
+        .await?;
+    let previous = PbEntity::find_by_id(id).one(&transaction).await?;
     let result: Result<Option<ProtectedBranch>> = async {
         let update = PbEntity::update_many()
             .col_expr(
@@ -222,6 +239,24 @@ pub async fn update_with_push_grants(
     .await;
     match result {
         Ok(Some(updated)) => {
+            {
+                let current = &updated;
+                let changed = previous.as_ref().is_none_or(|old| {
+                    let mut current = current.clone();
+                    current.updated_at = old.updated_at;
+                    &current != old
+                });
+                if changed {
+                    super::security_notification_ops::repo_event(
+                        &transaction,
+                        current.repo_id,
+                        crate::notification::Event::CiSecurityChanged,
+                        "branch_protection_updated",
+                        &[],
+                    )
+                    .await?;
+                }
+            }
             transaction
                 .commit()
                 .await
@@ -252,9 +287,27 @@ pub async fn update_with_push_grants(
 /// `rows_affected` is what stops a route from confirming a deletion that a
 /// concurrent request had already performed.
 pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool> {
-    let result = PbEntity::delete_by_id(id)
-        .exec(db)
-        .await
-        .context("db: delete protected branch")?;
+    let transaction = db.begin().await?;
+    PbEntity::update_many()
+        .col_expr(
+            protected_branch::Column::UpdatedAt,
+            Expr::col(protected_branch::Column::UpdatedAt).into(),
+        )
+        .filter(protected_branch::Column::Id.eq(id))
+        .exec(&transaction)
+        .await?;
+    let previous = PbEntity::find_by_id(id).one(&transaction).await?;
+    let result = PbEntity::delete_by_id(id).exec(&transaction).await?;
+    if let Some(previous) = previous.filter(|_| result.rows_affected > 0) {
+        super::security_notification_ops::repo_event(
+            &transaction,
+            previous.repo_id,
+            crate::notification::Event::CiSecurityChanged,
+            "branch_protection_deleted",
+            &[],
+        )
+        .await?;
+    }
+    transaction.commit().await?;
     Ok(result.rows_affected > 0)
 }

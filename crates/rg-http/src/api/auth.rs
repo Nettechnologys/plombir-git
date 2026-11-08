@@ -110,7 +110,7 @@ fn login_session(
             .is_some()
     {
         return Err(crate::error::AppError::forbidden(
-            "credential creation requires a login session",
+            "this sensitive action requires a login session",
         ));
     }
     let user_id = claims

@@ -10,7 +10,7 @@ use chrono::Utc;
 use sea_orm::sea_query::{Expr, Func};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect,
+    QueryOrder, QuerySelect, TransactionTrait,
 };
 
 use super::bounded_sync_error;
@@ -33,7 +33,18 @@ pub fn due_now() -> chrono::DateTime<Utc> {
 }
 
 pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<Model> {
-    model.insert(db).await.context("db: create push mirror")
+    let transaction = db.begin().await?;
+    let created = model.insert(&transaction).await?;
+    super::security_notification_ops::repo_event(
+        &transaction,
+        created.repo_id,
+        crate::notification::Event::MirrorChanged,
+        "push_mirror_created",
+        &[],
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(created)
 }
 
 /// A repository's push mirrors, oldest first.
@@ -69,17 +80,57 @@ pub async fn find_for_repo(
 }
 
 pub async fn update(db: &DatabaseConnection, model: ActiveModel) -> Result<Model> {
-    model.update(db).await.context("db: update push mirror")
+    let transaction = db.begin().await?;
+    let id = *model.id.as_ref();
+    Entity::update_many()
+        .col_expr(Column::UpdatedAt, Expr::col(Column::UpdatedAt).into())
+        .filter(Column::Id.eq(id))
+        .exec(&transaction)
+        .await?;
+    let previous = Entity::find_by_id(id).one(&transaction).await?;
+    let updated = model.update(&transaction).await?;
+    if previous.is_none_or(|old| {
+        old.url != updated.url
+            || old.username != updated.username
+            || old.password_encrypted != updated.password_encrypted
+            || old.force != updated.force
+            || old.enabled != updated.enabled
+            || old.sync_interval_seconds != updated.sync_interval_seconds
+            || old.sync_on_commit != updated.sync_on_commit
+    }) {
+        super::security_notification_ops::repo_event(
+            &transaction,
+            updated.repo_id,
+            crate::notification::Event::MirrorChanged,
+            "push_mirror_updated",
+            &[],
+        )
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(updated)
 }
 
 /// Delete one push mirror of `repo_id`. `false` when there was none.
 pub async fn delete_for_repo(db: &DatabaseConnection, repo_id: i64, id: i64) -> Result<bool> {
+    let transaction = db.begin().await?;
     let deleted = Entity::delete_many()
         .filter(Column::Id.eq(id))
         .filter(Column::RepoId.eq(repo_id))
-        .exec(db)
+        .exec(&transaction)
         .await
         .context("db: delete push mirror")?;
+    if deleted.rows_affected > 0 {
+        super::security_notification_ops::repo_event(
+            &transaction,
+            repo_id,
+            crate::notification::Event::MirrorChanged,
+            "push_mirror_deleted",
+            &[],
+        )
+        .await?;
+    }
+    transaction.commit().await?;
     Ok(deleted.rows_affected > 0)
 }
 

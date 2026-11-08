@@ -2830,6 +2830,7 @@ fn extract_runner_id_from_path(path: &str) -> Option<i64> {
 pub async fn delete_runner_admin(
     State(state): State<AppState>,
     InstanceAdmin(actor_id): InstanceAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     Path(runner_id): Path<i64>,
     headers: HeaderMap,
 ) -> impl IntoResponse {

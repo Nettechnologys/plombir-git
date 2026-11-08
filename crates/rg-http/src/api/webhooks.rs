@@ -140,6 +140,7 @@ pub async fn create_webhook(
     State(state): State<AppState>,
     Path((owner, _)): Path<(String, String)>,
     RepoAdmin { repo, actor_id }: RepoAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Json(body): Json<rg_core::webhook::service::CreateWebhookRequest>,
 ) -> impl IntoResponse {
@@ -233,6 +234,7 @@ pub async fn update_webhook(
     State(state): State<AppState>,
     Path((owner, _, id)): Path<(String, String, i64)>,
     RepoAdmin { repo, actor_id }: RepoAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Json(body): Json<rg_core::webhook::service::UpdateWebhookRequest>,
 ) -> impl IntoResponse {
@@ -301,6 +303,7 @@ pub async fn delete_webhook(
     State(state): State<AppState>,
     Path((owner, _, id)): Path<(String, String, i64)>,
     RepoAdmin { repo, actor_id }: RepoAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let audit_actor = match grant_actor(&state, actor_id).await {
@@ -634,6 +637,7 @@ pub async fn org_list(State(state): State<AppState>, OrgAdmin { org, .. }: OrgAd
 pub async fn org_create(
     State(state): State<AppState>,
     OrgAdmin { org, actor_id }: OrgAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Json(body): Json<rg_core::webhook::service::CreateWebhookRequest>,
 ) -> Response {
@@ -656,6 +660,7 @@ pub async fn org_get(
 pub async fn org_update(
     State(state): State<AppState>,
     OrgAdmin { org, actor_id }: OrgAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     Path((_, hook_id)): Path<(String, i64)>,
     headers: HeaderMap,
     Json(body): Json<rg_core::webhook::service::UpdateWebhookRequest>,
@@ -679,6 +684,7 @@ pub async fn org_update(
 pub async fn org_delete(
     State(state): State<AppState>,
     OrgAdmin { org, actor_id }: OrgAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     Path((_, hook_id)): Path<(String, i64)>,
     headers: HeaderMap,
 ) -> Response {
@@ -715,6 +721,7 @@ pub async fn system_list(State(state): State<AppState>, _: InstanceAdmin) -> Res
 pub async fn system_create(
     State(state): State<AppState>,
     InstanceAdmin(actor_id): InstanceAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Json(body): Json<rg_core::webhook::service::CreateWebhookRequest>,
 ) -> Response {
@@ -737,6 +744,7 @@ pub async fn system_get(
 pub async fn system_update(
     State(state): State<AppState>,
     InstanceAdmin(actor_id): InstanceAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     Path(hook_id): Path<i64>,
     headers: HeaderMap,
     Json(body): Json<rg_core::webhook::service::UpdateWebhookRequest>,
@@ -760,6 +768,7 @@ pub async fn system_update(
 pub async fn system_delete(
     State(state): State<AppState>,
     InstanceAdmin(actor_id): InstanceAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     Path(hook_id): Path<i64>,
     headers: HeaderMap,
 ) -> Response {

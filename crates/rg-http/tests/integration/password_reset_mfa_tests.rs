@@ -283,3 +283,50 @@ async fn logout_revokes_the_bearer_token_it_authenticated() {
         "the bearer token stolen before logout still works"
     );
 }
+
+/// Ambient account A does not become the actor of account B's reset proof.
+#[tokio::test]
+async fn reset_with_another_accounts_cookie_keeps_proof_context_without_false_attribution() {
+    use rg_db::entities::notification_delivery;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    let (base, db) = crate::client_address_tests::spawn_with_peer(Vec::new()).await;
+    let (cookie_a, _) = register_full(&base, "ambient_a", "ambient_a@example.invalid").await;
+    let (_, target_b) =
+        register_full(&base, "reset_target_b", "reset_target_b@example.invalid").await;
+    notification_delivery::Entity::delete_many()
+        .exec(&db)
+        .await
+        .unwrap();
+    let raw = issue_reset_token(&db, target_b, "reset-notice-proof").await;
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/v1/users/reset-password"))
+        .header(
+            reqwest::header::COOKIE,
+            format!("plombir_git_token={cookie_a}"),
+        )
+        .header(reqwest::header::ORIGIN, &base)
+        .header("x-real-ip", "198.51.100.25")
+        .header(reqwest::header::USER_AGENT, "Reset proof browser")
+        .json(&serde_json::json!({"token": raw, "new_password": NEW_PASSWORD}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    let rows = notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::UserId.eq(target_b))
+        .all(&db)
+        .await
+        .unwrap();
+    for event in ["password_reset", "new_device"] {
+        let row = rows.iter().find(|row| row.event_key == event).expect(event);
+        let metadata: rg_db::notification::Metadata = serde_json::from_str(&row.metadata).unwrap();
+        assert_eq!(metadata.actor, None, "{event}");
+        assert_eq!(metadata.ip.as_deref(), Some("127.0.0.1"), "{event}");
+        assert_eq!(
+            metadata.device.as_deref(),
+            Some("Reset proof browser"),
+            "{event}"
+        );
+        assert!(!row.metadata.contains("ambient_a"));
+    }
+}

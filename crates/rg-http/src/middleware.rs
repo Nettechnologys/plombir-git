@@ -21,13 +21,20 @@ pub async fn notification_context(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let witness_cookie =
-        if crate::api::browser_notifications::is_ceremony(request.method(), request.uri().path()) {
-            crate::api::browser_notifications::bootstrap(&state, request.headers_mut())
-        } else {
-            None
-        };
-    let claims = crate::api::auth::session_claims(request.headers(), &state.jwt_secret);
+    let ceremony =
+        crate::api::browser_notifications::is_ceremony(request.method(), request.uri().path());
+    let witness_cookie = if ceremony {
+        crate::api::browser_notifications::bootstrap(&state, request.headers_mut())
+    } else {
+        None
+    };
+    // Login/reset/confirmation prove their target independently of an ambient
+    // session. A cookie for A must never attribute account B's ceremony to A.
+    let claims = if ceremony {
+        None
+    } else {
+        crate::api::auth::session_claims(request.headers(), &state.jwt_secret)
+    };
     let actor_id = claims
         .as_ref()
         .and_then(|claims| claims.sub.parse::<i64>().ok());

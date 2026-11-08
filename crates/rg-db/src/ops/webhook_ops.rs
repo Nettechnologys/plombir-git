@@ -89,7 +89,14 @@ pub async fn create_webhook(db: &DatabaseConnection, model: WebhookActiveModel) 
         ActiveValue::NotSet => None,
     };
     let Some(owner) = owner else {
-        return model.insert(db).await.context("db: create webhook");
+        let transaction = db.begin().await?;
+        let created = model
+            .insert(&transaction)
+            .await
+            .context("db: create webhook")?;
+        notify(&transaction, &created, "webhook_created").await?;
+        transaction.commit().await?;
+        return Ok(created);
     };
     // Serialize a scoped hook insert with retirement of its owner. The HTTP
     // scope check may have completed before retirement took the owner row,
@@ -126,6 +133,7 @@ pub async fn create_webhook(db: &DatabaseConnection, model: WebhookActiveModel) 
         .insert(&transaction)
         .await
         .context("db: create scoped webhook")?;
+    notify(&transaction, &hook, "webhook_created").await?;
     transaction
         .commit()
         .await
@@ -218,6 +226,16 @@ pub async fn update_webhook(
     events: String,
     updated_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<Webhook>> {
+    let transaction = db.begin().await?;
+    WebhookEntity::update_many()
+        .col_expr(
+            webhook::Column::UpdatedAt,
+            Expr::col(webhook::Column::UpdatedAt).into(),
+        )
+        .filter(webhook::Column::Id.eq(id))
+        .exec(&transaction)
+        .await?;
+    let previous = WebhookEntity::find_by_id(id).one(&transaction).await?;
     let result = WebhookEntity::update_many()
         .col_expr(webhook::Column::Url, Expr::value(url))
         .col_expr(webhook::Column::ContentType, Expr::value(content_type))
@@ -229,13 +247,26 @@ pub async fn update_webhook(
         .col_expr(webhook::Column::Events, Expr::value(events))
         .col_expr(webhook::Column::UpdatedAt, Expr::value(updated_at))
         .filter(webhook::Column::Id.eq(id))
-        .exec(db)
+        .exec(&transaction)
         .await
         .context("db: update webhook")?;
-    match result.rows_affected {
-        0 | 1 => find_by_id(db, id).await,
-        rows => anyhow::bail!("db: webhook update affected {rows} rows for id {id}"),
+    if result.rows_affected > 1 {
+        anyhow::bail!("db: webhook update affected multiple rows");
     }
+    let updated = WebhookEntity::find_by_id(id).one(&transaction).await?;
+    if let Some(current) = &updated {
+        if previous.is_none_or(|old| {
+            old.url != current.url
+                || old.content_type != current.content_type
+                || old.secret_encrypted != current.secret_encrypted
+                || old.active != current.active
+                || old.events != current.events
+        }) {
+            notify(&transaction, current, "webhook_updated").await?;
+        }
+    }
+    transaction.commit().await?;
+    Ok(updated)
 }
 
 /// Delete a webhook by id together with its delivery journal, reporting
@@ -267,6 +298,7 @@ pub async fn delete_webhook_by_id(db: &DatabaseConnection, id: i64) -> Result<bo
         .exec(&transaction)
         .await
         .context("db: delete webhook deliveries")?;
+    let previous = WebhookEntity::find_by_id(id).one(&transaction).await?;
     let result = WebhookEntity::delete_by_id(id)
         .exec(&transaction)
         .await
@@ -277,6 +309,9 @@ pub async fn delete_webhook_by_id(db: &DatabaseConnection, id: i64) -> Result<bo
             .await
             .context("db: roll back missing webhook delete")?;
         return Ok(false);
+    }
+    if let Some(previous) = previous {
+        notify(&transaction, &previous, "webhook_deleted").await?;
     }
     transaction
         .commit()
@@ -397,4 +432,30 @@ pub async fn delete_deliveries_before(
         .await
         .context("db: delete expired webhook deliveries")?;
     Ok(result.rows_affected)
+}
+
+async fn notify(db: &impl ConnectionTrait, hook: &Webhook, action: &str) -> Result<()> {
+    match hook.scope_kind.as_str() {
+        "repo" => {
+            super::security_notification_ops::repo_event(
+                db,
+                hook.scope_id,
+                crate::notification::Event::WebhookChanged,
+                action,
+                &[],
+            )
+            .await
+        }
+        "org" => {
+            super::security_notification_ops::org_event(
+                db,
+                hook.scope_id,
+                crate::notification::Event::WebhookChanged,
+                action,
+                &[],
+            )
+            .await
+        }
+        _ => super::security_notification_ops::system_event(db, action, None).await,
+    }
 }

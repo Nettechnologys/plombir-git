@@ -123,6 +123,7 @@ pub async fn put(
     State(state): State<AppState>,
     Path((owner, _, secret_name)): Path<(String, String, String)>,
     RepoAdmin { repo, actor_id }: RepoAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Json(body): Json<PutSecretRequest>,
 ) -> impl IntoResponse {
@@ -193,6 +194,7 @@ pub async fn delete(
     Path((owner, _, secret_name)): Path<(String, String, String)>,
     Query(scope): Query<SecretScopeQuery>,
     RepoAdmin { repo, actor_id }: RepoAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let audit_actor = match grant_actor(&state, actor_id).await {

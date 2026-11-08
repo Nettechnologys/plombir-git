@@ -1201,6 +1201,9 @@ async fn creating_pr_requests_matching_codeowner_user() {
     let team = rg_db::ops::org_ops::create_team(&db, org.id, "reviewers", None, "write")
         .await
         .unwrap();
+    rg_db::ops::org_ops::add_org_member(&db, org.id, reviewer_id, "member")
+        .await
+        .unwrap();
     rg_db::ops::org_ops::add_team_member(&db, team.id, reviewer_id, "member")
         .await
         .unwrap();

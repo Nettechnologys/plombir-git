@@ -753,6 +753,7 @@ pub async fn delete_repo_handler(
         repo,
         actor_id: user_id,
     }: RepoOwner,
+    super::auth::SudoUser(_): super::auth::SudoUser,
 ) -> impl IntoResponse {
     // Only the audit trail's actor name; the ownership decision above it is the
     // extractor's and is not re-litigated here. A missing row is the server's
@@ -1014,6 +1015,7 @@ pub async fn transfer_repo_handler(
     // instead of the route table asserting `RepoOwner` while the only
     // enforcement lives three calls down.
     RepoOwner { .. }: RepoOwner,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     // `NamespaceCreate` gates the *destination*, which is the half nobody was
     // asking about: `new_owner` arrives in the payload, so no path extractor
     // reaches it, and a transfer into a stranger's account went through with a
@@ -1124,8 +1126,17 @@ pub async fn update_repo_handler(
     headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
     RepoAdmin { repo, actor_id }: RepoAdmin,
+    fresh_proof: Result<super::auth::SudoUser, AppError>,
     Json(body): Json<UpdateRepoRequest>,
 ) -> impl IntoResponse {
+    // A supplied visibility field can change access, including in a racing write.
+    // Preserve ordinary metadata edits while requiring proof for every such patch.
+    if body.is_private.is_some() {
+        if let Err(refusal) = fresh_proof {
+            return refusal.into_response();
+        }
+    }
+
     for segment in [&owner, &name] {
         if let Err(e) = rg_core::platform::validate_repo_path(segment) {
             return AppError::bad_request(e.to_string()).into_response();

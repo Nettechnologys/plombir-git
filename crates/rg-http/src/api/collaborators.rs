@@ -265,6 +265,7 @@ pub async fn add_collaborator(
         repo: repository,
         actor_id,
     }: RepoAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Json(req): Json<AddCollaboratorRequest>,
 ) -> impl IntoResponse {
@@ -360,6 +361,7 @@ pub async fn update_permission(
     // row to the repo in the URL. The repo the caller holds admin on is what
     // scopes the update.
     RepoAdmin { repo, actor_id }: RepoAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Json(req): Json<UpdatePermissionRequest>,
 ) -> impl IntoResponse {
@@ -442,6 +444,7 @@ pub async fn remove_collaborator(
     // `update_permission`; re-resolving it from the path would be a second
     // lookup that could disagree with the one the authorization used.
     RepoAdmin { repo, actor_id }: RepoAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let audit_actor = match grant_actor(&state, actor_id).await {

@@ -521,3 +521,731 @@ async fn outbox_failure_rolls_back_credential_creation_and_retirement_erases_sna
         0
     );
 }
+
+async fn access_repo(db: &DatabaseConnection, owner: i64, org: Option<i64>) -> repository::Model {
+    let now = chrono::Utc::now();
+    repo_ops::create(
+        db,
+        repository::ActiveModel {
+            owner_id: Set(owner),
+            org_id: Set(org),
+            name: Set("access-fixture".into()),
+            is_private: Set(true),
+            default_branch: Set("main".into()),
+            stars_count: Set(0),
+            forks_count: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+}
+async fn access_rows(db: &DatabaseConnection, event: Event) -> Vec<notification_delivery::Model> {
+    notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::EventKey.eq(event.key()))
+        .order_by_asc(notification_delivery::Column::Id)
+        .all(db)
+        .await
+        .unwrap()
+}
+#[tokio::test]
+async fn collaborator_changes_notify_owner_and_affected_account_once_without_actor_device_leaks() {
+    let (db, owner) = fixture().await;
+    let member = user_ops::create_user(&db, "member", "member@example.invalid", "hash", "Member")
+        .await
+        .unwrap();
+    let repo = access_repo(&db, owner.id, None).await;
+    rg_db::notification::scope(
+        Some(owner.id),
+        Metadata {
+            actor: Some(owner.username.clone()),
+            ip: Some("198.51.100.9".into()),
+            device: Some("Owner Browser".into()),
+            ..Default::default()
+        },
+        async {
+            let added = repo_collaborator_ops::create(
+                &db,
+                repo_collaborator::ActiveModel {
+                    repo_id: Set(repo.id),
+                    user_id: Set(member.id),
+                    permission: Set("read".into()),
+                    created_at: Set(chrono::Utc::now()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                !repo_collaborator_ops::update_permission(&db, added.id, "read".into())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .changed
+            );
+            assert_eq!(
+                access_rows(&db, Event::RepositoryAccessChanged).await.len(),
+                2
+            );
+            assert!(
+                repo_collaborator_ops::update_permission(&db, added.id, "admin".into())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .changed
+            );
+            assert!(
+                repo_collaborator_ops::delete_by_repo_and_user(&db, repo.id, member.id)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !repo_collaborator_ops::delete_by_repo_and_user(&db, repo.id, member.id)
+                    .await
+                    .unwrap()
+            );
+        },
+    )
+    .await;
+    let rows = access_rows(&db, Event::RepositoryAccessChanged).await;
+    assert_eq!(rows.len(), 6);
+    for row in rows {
+        let metadata: Metadata = serde_json::from_str(&row.metadata).unwrap();
+        assert_eq!(metadata.actor.as_deref(), Some(owner.username.as_str()));
+        if row.user_id == owner.id {
+            assert!(row.admin_only && row.repo_id == Some(repo.id));
+            assert_eq!(metadata.ip.as_deref(), Some("198.51.100.9"));
+        } else {
+            assert_eq!(row.user_id, member.id);
+            assert!(metadata.ip.is_none() && metadata.device.is_none());
+            assert!(
+                row.repo_id.is_none() && !row.admin_only,
+                "revoked account still receives its historical notice"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn outbox_failure_rolls_back_access_grants_revocations_and_visibility() {
+    let (db, owner) = fixture().await;
+    let member = user_ops::create_user(&db, "member", "member@example.invalid", "hash", "Member")
+        .await
+        .unwrap();
+    let repo = access_repo(&db, owner.id, None).await;
+    let model = || repo_collaborator::ActiveModel {
+        repo_id: Set(repo.id),
+        user_id: Set(member.id),
+        permission: Set("read".into()),
+        created_at: Set(chrono::Utc::now()),
+        ..Default::default()
+    };
+    let row = repo_collaborator_ops::create(&db, model()).await.unwrap();
+    let org = org_ops::create_org(&db, "org", None, None, owner.id, "private")
+        .await
+        .unwrap();
+    let team = org_ops::create_team(&db, org.id, "admin-team", None, "admin")
+        .await
+        .unwrap();
+    org_ops::add_org_member(&db, org.id, member.id, "member")
+        .await
+        .unwrap();
+    org_ops::add_team_member(&db, team.id, member.id, "member")
+        .await
+        .unwrap();
+    db.execute(Statement::from_string(DatabaseBackend::Sqlite,
+        "CREATE TRIGGER refuse_notices BEFORE INSERT ON notification_deliveries BEGIN SELECT RAISE(ABORT, 'fixture notification failure'); END".to_owned())).await.unwrap();
+    assert!(
+        repo_collaborator_ops::update_permission(&db, row.id, "admin".into())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        repo_collaborator_ops::find_by_id(&db, row.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .permission,
+        "read"
+    );
+    assert!(
+        repo_collaborator_ops::delete_by_repo_and_user(&db, repo.id, member.id)
+            .await
+            .is_err()
+    );
+    assert!(repo_collaborator_ops::find_by_id(&db, row.id)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(repo_ops::update_settings(&db, repo.id, None, Some(false))
+        .await
+        .is_err());
+    assert!(
+        repo_ops::find_by_id(&db, repo.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_private
+    );
+    assert!(org_ops::remove_org_member(&db, org.id, member.id)
+        .await
+        .is_err());
+    assert!(org_ops::find_org_member(&db, org.id, member.id)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        org_ops::list_team_members(&db, team.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(org_ops::delete_team(&db, team.id).await.is_err());
+    assert!(org_ops::get_team(&db, team.id).await.unwrap().is_some());
+    assert!(ci_secret_ops::upsert(
+        &db,
+        repo.id,
+        None,
+        "SECRET",
+        "encrypted-fixture-secret",
+        owner.id
+    )
+    .await
+    .is_err());
+    assert!(
+        ci_secret_ops::find_by_repo_and_name(&db, repo.id, None, "SECRET")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(ci_variable_ops::upsert(
+        &db,
+        ci_variable_ops::Owner::Repository(repo.id),
+        "CONFIG",
+        "fixture-value",
+        owner.id
+    )
+    .await
+    .is_err());
+    assert!(
+        ci_variable_ops::list(&db, ci_variable_ops::Owner::Repository(repo.id))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn removing_organization_membership_erases_team_authority_and_reinvitation_cannot_restore_it()
+{
+    let (db, owner) = fixture().await;
+    let member = user_ops::create_user(&db, "member", "member@example.invalid", "hash", "Member")
+        .await
+        .unwrap();
+    let org = org_ops::create_org(&db, "org", None, None, owner.id, "private")
+        .await
+        .unwrap();
+    let repo = access_repo(&db, owner.id, Some(org.id)).await;
+    let team = org_ops::create_team(&db, org.id, "admins", None, "admin")
+        .await
+        .unwrap();
+    let refused = crate::org::add_team_member(&db, team.id, member.id, "member")
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("organization before"));
+    org_ops::add_org_member(&db, org.id, member.id, "member")
+        .await
+        .unwrap();
+    crate::org::add_team_member(&db, team.id, member.id, "member")
+        .await
+        .unwrap();
+    assert!(
+        crate::repo::service::can_admin_repo(&db, &repo, Some(member.id))
+            .await
+            .unwrap()
+    );
+    crate::org::remove_org_member(&db, org.id, member.id)
+        .await
+        .unwrap();
+    assert!(
+        !crate::repo::service::can_admin_repo(&db, &repo, Some(member.id))
+            .await
+            .unwrap()
+    );
+    assert!(org_ops::list_team_members(&db, team.id)
+        .await
+        .unwrap()
+        .is_empty());
+    org_ops::add_org_member(&db, org.id, member.id, "member")
+        .await
+        .unwrap();
+    assert!(
+        !crate::repo::service::can_admin_repo(&db, &repo, Some(member.id))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !crate::repo::service::can_write_repo(&db, &repo, Some(member.id))
+            .await
+            .unwrap()
+    );
+    // Old installations can contain dormant rows: invitation discards those too.
+    crate::org::remove_org_member(&db, org.id, member.id)
+        .await
+        .unwrap();
+    team_member::ActiveModel {
+        team_id: Set(team.id),
+        user_id: Set(member.id),
+        role: Set("member".into()),
+        created_at: Set(chrono::Utc::now()),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+    org_ops::add_org_member(&db, org.id, member.id, "member")
+        .await
+        .unwrap();
+    assert!(
+        !crate::repo::service::can_admin_repo(&db, &repo, Some(member.id))
+            .await
+            .unwrap()
+    );
+    assert!(org_ops::list_team_members(&db, team.id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn configuration_producers_skip_no_ops_and_never_queue_destination_or_secret_values() {
+    let (db, owner) = fixture().await;
+    let repo = access_repo(&db, owner.id, None).await;
+    let now = chrono::Utc::now();
+    let hook = webhook_ops::create_webhook(
+        &db,
+        webhook::ActiveModel {
+            repo_id: Set(repo.id),
+            scope_id: Set(repo.id),
+            scope_kind: Set("repo".into()),
+            url: Set("https://private-destination.invalid/path".into()),
+            content_type: Set("json".into()),
+            secret_encrypted: Set(Some("secret-hook-ciphertext".into())),
+            active: Set(true),
+            events: Set("push".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    webhook_ops::update_webhook(
+        &db,
+        hook.id,
+        hook.url.clone(),
+        hook.content_type.clone(),
+        hook.secret_encrypted.clone(),
+        hook.active,
+        hook.events.clone(),
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(access_rows(&db, Event::WebhookChanged).await.len(), 1);
+    webhook_ops::delete_webhook_by_id(&db, hook.id)
+        .await
+        .unwrap();
+    assert!(!webhook_ops::delete_webhook_by_id(&db, hook.id)
+        .await
+        .unwrap());
+    assert_eq!(access_rows(&db, Event::WebhookChanged).await.len(), 2);
+    let mirror = mirror_ops::create(
+        &db,
+        mirror::ActiveModel {
+            repo_id: Set(repo.id),
+            url: Set("https://private-destination.invalid/repo".into()),
+            password_encrypted: Set(Some("secret-mirror-ciphertext".into())),
+            sync_interval_seconds: Set(600),
+            status: Set("active".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    mirror_ops::update_settings(
+        &db,
+        mirror.id,
+        None,
+        None,
+        None,
+        None,
+        None,
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(access_rows(&db, Event::MirrorChanged).await.len(), 1);
+    assert_eq!(
+        mirror_ops::delete_by_id_unless_syncing(
+            &db,
+            mirror.id,
+            repo.id,
+            now - chrono::Duration::hours(1)
+        )
+        .await
+        .unwrap(),
+        mirror_ops::MirrorRetirement::Deleted
+    );
+    assert_eq!(access_rows(&db, Event::MirrorChanged).await.len(), 2);
+    let tag = protected_tag_ops::create_with_push_grants(
+        &db,
+        protected_tag::ActiveModel {
+            repo_id: Set(repo.id),
+            pattern: Set("v*".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+        Some(vec![owner.id]),
+    )
+    .await
+    .unwrap();
+    protected_tag_ops::update_with_push_grants(&db, tag.clone(), vec![owner.id])
+        .await
+        .unwrap();
+    assert_eq!(access_rows(&db, Event::CiSecurityChanged).await.len(), 1);
+    assert!(protected_tag_ops::delete_by_id(&db, tag.id).await.unwrap());
+    assert_eq!(access_rows(&db, Event::CiSecurityChanged).await.len(), 2);
+    let environment = ci_environment_ops::create_with_approvers(
+        &db,
+        ci_environment::ActiveModel {
+            repo_id: Set(repo.id),
+            name: Set("production".into()),
+            protected: Set(true),
+            required_approvals: Set(1),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+        vec![owner.id],
+    )
+    .await
+    .unwrap();
+    assert!(ci_environment_ops::delete(&db, environment.id)
+        .await
+        .unwrap());
+    ci_secret_ops::upsert(&db, repo.id, None, "KEY", "secret-ci-ciphertext", owner.id)
+        .await
+        .unwrap();
+    ci_secret_ops::upsert(&db, repo.id, None, "KEY", "secret-ci-ciphertext", owner.id)
+        .await
+        .unwrap();
+    assert!(
+        ci_secret_ops::delete_by_repo_and_name(&db, repo.id, None, "KEY")
+            .await
+            .unwrap()
+    );
+    let ci_owner = ci_variable_ops::Owner::Repository(repo.id);
+    ci_variable_ops::upsert(
+        &db,
+        ci_owner,
+        "CONFIG",
+        "private-configuration-value",
+        owner.id,
+    )
+    .await
+    .unwrap();
+    ci_variable_ops::upsert(
+        &db,
+        ci_owner,
+        "CONFIG",
+        "private-configuration-value",
+        owner.id,
+    )
+    .await
+    .unwrap();
+    assert!(ci_variable_ops::delete(&db, ci_owner, "CONFIG")
+        .await
+        .unwrap());
+    assert_eq!(access_rows(&db, Event::CiSecurityChanged).await.len(), 8);
+    for row in notification_delivery::Entity::find()
+        .all(&db)
+        .await
+        .unwrap()
+    {
+        for forbidden in [
+            "private-destination",
+            "secret-hook",
+            "secret-mirror",
+            "secret-ci",
+            "private-configuration",
+        ] {
+            assert!(
+                !row.metadata.contains(forbidden),
+                "{} leaked {forbidden}",
+                row.event_key
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn grant_only_updates_emit_once_and_identical_lists_are_no_ops() {
+    let (db, owner) = fixture().await;
+    let other = user_ops::create_user(
+        &db,
+        "approver",
+        "approver@example.invalid",
+        "hash",
+        "Approver",
+    )
+    .await
+    .unwrap();
+    let repo = access_repo(&db, owner.id, None).await;
+    let now = chrono::Utc::now();
+    let branch = protected_branch_ops::create_with_push_grants(
+        &db,
+        protected_branch::ActiveModel {
+            repo_id: Set(repo.id),
+            branch_name: Set("main".into()),
+            require_pr: Set(true),
+            require_status_check: Set(false),
+            require_approval: Set(false),
+            allow_force_push: Set(false),
+            require_signed_commits: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+        Some(vec![owner.id]),
+    )
+    .await
+    .unwrap();
+    let environment = ci_environment_ops::create_with_approvers(
+        &db,
+        ci_environment::ActiveModel {
+            repo_id: Set(repo.id),
+            name: Set("production".into()),
+            protected: Set(true),
+            required_approvals: Set(1),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+        vec![owner.id],
+    )
+    .await
+    .unwrap();
+    let baseline = access_rows(&db, Event::CiSecurityChanged).await.len();
+    let changed = protected_branch_ops::update_with_push_grants(&db, branch, Some(vec![other.id]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        access_rows(&db, Event::CiSecurityChanged).await.len(),
+        baseline + 1
+    );
+    protected_branch_ops::update_with_push_grants(&db, changed, Some(vec![other.id]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        access_rows(&db, Event::CiSecurityChanged).await.len(),
+        baseline + 1
+    );
+    for expected in [baseline + 2, baseline + 2] {
+        ci_environment_ops::update_with_approvers(
+            &db,
+            environment.id,
+            repo.id,
+            environment.name.clone(),
+            environment.protected,
+            environment.required_approvals,
+            chrono::Utc::now(),
+            vec![other.id],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            access_rows(&db, Event::CiSecurityChanged).await.len(),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn transfer_notices_keep_the_new_private_namespace_out_of_former_principals_copies() {
+    let (db, owner) = fixture().await;
+    let recipient = user_ops::create_user(
+        &db,
+        "newowner",
+        "newowner@example.invalid",
+        "hash",
+        "New owner",
+    )
+    .await
+    .unwrap();
+    let collaborator = user_ops::create_user(
+        &db,
+        "collaborator",
+        "collaborator@example.invalid",
+        "hash",
+        "Collaborator",
+    )
+    .await
+    .unwrap();
+    let org = org_ops::create_org(
+        &db,
+        "secret-destination",
+        Some("Destination"),
+        None,
+        recipient.id,
+        "private",
+    )
+    .await
+    .unwrap();
+    let repo = access_repo(&db, owner.id, None).await;
+    repo_collaborator_ops::create(
+        &db,
+        repo_collaborator::ActiveModel {
+            repo_id: Set(repo.id),
+            user_id: Set(collaborator.id),
+            permission: Set("read".into()),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let outcome = repo_ops::transfer_owner(
+        &db,
+        repo.id,
+        recipient.id,
+        Some(org.id),
+        owner.id,
+        None,
+        &owner.username,
+        &org.name,
+        &repo.name,
+        &repo.name,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        repo_ops::TransferOwnerOutcome::Transferred(_)
+    ));
+    let rows = access_rows(&db, Event::RepositorySecurityChanged).await;
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        let metadata: Metadata = serde_json::from_str(&row.metadata).unwrap();
+        if row.user_id == recipient.id {
+            assert_eq!(
+                metadata.name.as_deref(),
+                Some("secret-destination/access-fixture")
+            );
+            assert!(row.admin_only);
+            assert_eq!(row.repo_id, Some(repo.id));
+        } else {
+            assert!([owner.id, collaborator.id].contains(&row.user_id));
+            assert_eq!(metadata.name.as_deref(), Some("producer/access-fixture"));
+            assert!(!row.metadata.contains("secret-destination"));
+            assert!(!row.admin_only);
+            assert_eq!(row.repo_id, None);
+        }
+    }
+}
+
+#[tokio::test]
+async fn bot_grants_notify_the_human_owner_and_name_the_affected_account() {
+    let (db, owner) = fixture().await;
+    let human = user_ops::create_user(
+        &db,
+        "agentowner",
+        "agentowner@example.invalid",
+        "hash",
+        "Agent owner",
+    )
+    .await
+    .unwrap();
+    let bot = user_ops::create_bot(
+        &db,
+        human.id,
+        "grant-bot",
+        "grant-bot@example.invalid",
+        None,
+    )
+    .await
+    .unwrap();
+    let repo = access_repo(&db, owner.id, None).await;
+    repo_collaborator_ops::create(
+        &db,
+        repo_collaborator::ActiveModel {
+            repo_id: Set(repo.id),
+            user_id: Set(bot.id),
+            permission: Set("read".into()),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let rows = access_rows(&db, Event::RepositoryAccessChanged).await;
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|r| r.user_id == human.id));
+    for row in rows {
+        let metadata: Metadata = serde_json::from_str(&row.metadata).unwrap();
+        assert_eq!(metadata.subject.as_deref(), Some("grant-bot"));
+        assert_ne!(row.user_id, bot.id);
+    }
+}
+
+#[tokio::test]
+async fn anonymous_account_proof_keeps_its_context_but_admin_action_hides_it_from_target() {
+    let (db, owner) = fixture().await;
+    let admin = user_ops::create_user(
+        &db,
+        "administrator",
+        "admin@example.invalid",
+        "hash",
+        "Admin",
+    )
+    .await
+    .unwrap();
+    let context = Metadata {
+        ip: Some("198.51.100.50".into()),
+        device: Some("Proof browser".into()),
+        ..Default::default()
+    };
+    for actor in [None, Some(admin.id)] {
+        rg_db::notification::scope(
+            actor,
+            context.clone(),
+            notification_delivery_ops::account_event(
+                &db,
+                owner.id,
+                Event::PasswordChanged,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    let rows = access_rows(&db, Event::PasswordChanged).await;
+    assert_eq!(rows.len(), 2);
+    let own: Metadata = serde_json::from_str(&rows[0].metadata).unwrap();
+    let foreign: Metadata = serde_json::from_str(&rows[1].metadata).unwrap();
+    assert_eq!(own.ip, context.ip);
+    assert_eq!(own.device, context.device);
+    assert_eq!(foreign.ip, None);
+    assert_eq!(foreign.device, None);
+}

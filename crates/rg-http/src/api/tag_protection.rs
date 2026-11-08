@@ -181,6 +181,7 @@ pub async fn create(
     State(state): State<AppState>,
     Path((owner, _)): Path<(String, String)>,
     RepoAdmin { repo, actor_id }: RepoAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Json(body): Json<CreateTagProtectionRequest>,
 ) -> impl IntoResponse {
@@ -244,6 +245,7 @@ pub async fn update(
     State(state): State<AppState>,
     Path((owner, _, id)): Path<(String, String, i64)>,
     RepoAdmin { repo, actor_id }: RepoAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Json(body): Json<UpdateTagProtectionRequest>,
 ) -> impl IntoResponse {
@@ -298,6 +300,7 @@ pub async fn delete(
     State(state): State<AppState>,
     Path((owner, _, id)): Path<(String, String, i64)>,
     RepoAdmin { repo, actor_id }: RepoAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let audit_actor = match grant_actor(&state, actor_id).await {

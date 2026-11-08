@@ -31,10 +31,36 @@ pub fn choices(
         .iter()
         .copied()
         .map(|event| {
-            let mut value = overrides.get(&event).copied().unwrap_or(Channels {
-                email: event.default_email(),
-                telegram: false,
-            });
+            let inherited = matches!(
+                event,
+                Event::RepositoryAccessChanged
+                    | Event::OrganizationAccessChanged
+                    | Event::RepositorySecurityChanged
+                    | Event::OrganizationSecurityChanged
+                    | Event::WebhookChanged
+                    | Event::MirrorChanged
+                    | Event::CiSecurityChanged
+                    | Event::AdminSecurityChanged
+            )
+            .then(|| {
+                overrides
+                    .get(&Event::NotificationSettingsChanged)
+                    .map(|old| Channels {
+                        email: event.default_email(),
+                        telegram: profile.telegram_configured()
+                            && profile.telegram_confirmed
+                            && old.telegram,
+                    })
+            })
+            .flatten();
+            let mut value = overrides
+                .get(&event)
+                .copied()
+                .or(inherited)
+                .unwrap_or(Channels {
+                    email: event.default_email(),
+                    telegram: false,
+                });
             if let Some(email) = event.legacy_email(legacy) {
                 value.email = email;
             }
@@ -92,6 +118,13 @@ impl QueueEvent {
     pub fn security(user_id: i64, event: Event, name: Option<String>) -> Self {
         let mut metadata = crate::notification::current_metadata();
         metadata.name = name;
+        // Known actor context belongs only to that account. Anonymous account
+        // ceremonies (reset/initial password/email confirmation) describe the
+        // recipient's own proof and retain the request context.
+        if crate::notification::current_actor_id().is_some_and(|actor| actor != user_id) {
+            metadata.ip = None;
+            metadata.device = None;
+        }
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             user_id,

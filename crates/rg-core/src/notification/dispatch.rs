@@ -260,6 +260,15 @@ async fn prepare(
         Err(_) => return Ok(Prepared::Stop("failed", "invalid_event")),
     };
     metadata = metadata.bounded();
+    if let Some(org_id) = metadata.organization_owner_id {
+        let member = rg_db::ops::org_ops::find_org_member(db, org_id, user.id).await?;
+        let active = rg_db::ops::org_ops::get_org(db, org_id)
+            .await?
+            .is_some_and(|org| org.deleted_at.is_none());
+        if !active || !member.is_some_and(|member| member.role == "owner") {
+            return Ok(Prepared::Stop("cancelled", "organization_access_removed"));
+        }
+    }
     if prior && held.channel == "telegram" {
         // Enforce minimization again at send, including imported/corrupt jobs.
         metadata = Metadata {

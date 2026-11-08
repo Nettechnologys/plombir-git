@@ -136,7 +136,6 @@ pub async fn complete(
         .exec(&txn)
         .await?;
         let mut event = queue::QueueEvent::security(user_id, Event::NewDevice, None);
-        event.metadata.actor = None;
         event.metadata.method = Some(method.into());
         queue::enqueue(&txn, &event).await?;
         txn.commit().await?;
@@ -209,9 +208,17 @@ mod tests {
             1
         );
         assert_eq!(
-            complete(&db, b.id, b.session_version, &witness, "ldap")
-                .await
-                .unwrap(),
+            rg_db::notification::scope(
+                None,
+                rg_db::notification::Metadata {
+                    ip: Some("198.51.100.24".into()),
+                    device: Some("New browser".into()),
+                    ..Default::default()
+                },
+                complete(&db, b.id, b.session_version, &witness, "ldap")
+            )
+            .await
+            .unwrap(),
             Some(true)
         );
         for _ in 0..2 {
@@ -229,6 +236,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 4);
+        let authenticated: rg_db::notification::Metadata = serde_json::from_str(
+            &rows
+                .iter()
+                .find(|row| row.user_id == b.id)
+                .unwrap()
+                .metadata,
+        )
+        .unwrap();
+        assert_eq!(authenticated.ip.as_deref(), Some("198.51.100.24"));
+        assert_eq!(authenticated.device.as_deref(), Some("New browser"));
         assert!(rows
             .iter()
             .all(|row| !row.metadata.contains(witness.value())));

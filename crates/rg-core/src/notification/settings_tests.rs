@@ -663,3 +663,58 @@ async fn durable_warning_insert_failure_rolls_back_the_entire_authorized_patch()
         .unwrap();
     }
 }
+
+#[tokio::test]
+async fn new_security_categories_inherit_confirmed_telegram_and_disabling_requires_proof() {
+    let (db, user) = fixture().await;
+    save(&db, user.id, &configure(), &context(), |_, _| Ok(()))
+        .await
+        .unwrap();
+    let mut profile = queue::profile(&db, user.id).await.unwrap();
+    // Stored shape from 0.4.0: no explicit choices for the new categories.
+    profile.choices =
+        serde_json::json!({"notification_settings_changed":{"email":false,"telegram":true}})
+            .to_string();
+    profile.telegram_confirmed = true;
+    queue::put_profile(&db, profile.clone()).await.unwrap();
+    let before = get(&db, user.id).await.unwrap();
+    assert!(before.events[&Event::RepositoryAccessChanged].telegram);
+    assert!(
+        before.events[&Event::RepositoryAccessChanged].email,
+        "new security email remains on"
+    );
+    let patch = Patch {
+        events: [(
+            Event::RepositoryAccessChanged,
+            ChannelPatch {
+                email: None,
+                telegram: Some(false),
+            },
+        )]
+        .into(),
+        ..Default::default()
+    };
+    assert!(save(&db, user.id, &patch, &context(), |_, sensitive| {
+        assert!(sensitive);
+        anyhow::bail!("fresh proof required")
+    })
+    .await
+    .is_err());
+    let unchanged = get(&db, user.id).await.unwrap();
+    assert_eq!(unchanged.events, before.events);
+    assert_eq!(unchanged.profile, before.profile);
+    assert_eq!(unchanged.legacy, before.legacy);
+    let changed = save(&db, user.id, &patch, &context(), |_, sensitive| {
+        assert!(sensitive);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert!(
+        !changed.events[&Event::RepositoryAccessChanged].telegram,
+        "explicit new choice wins"
+    );
+    profile.telegram_confirmed = false;
+    queue::put_profile(&db, profile).await.unwrap();
+    assert!(!get(&db, user.id).await.unwrap().events[&Event::RepositoryAccessChanged].telegram);
+}

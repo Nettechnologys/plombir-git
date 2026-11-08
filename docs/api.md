@@ -74,3 +74,22 @@ TOKEN="$(curl -fsS "$BASE_URL/api/v1/users/login" \
 
 curl -H "Authorization: Bearer ${TOKEN}" "$BASE_URL/api-docs/openapi.json"
 ```
+
+
+### Fresh proof for access administration (0.4.1)
+
+Repository collaborator, organization membership/team, webhook (repository,
+organization and system), mirror, branch/tag protection, CI secret/environment
+writes, repository transfer/deletion and organization deletion require a browser
+login session with fresh sudo proof. A PATCH containing `is_private` (repository)
+or `visibility` (organization) uses the same rule, including a mixed or no-op patch.
+Admin unlock/account/org/provider/runner deletion and bot deletion are guarded too.
+MFA-enabled accounts must have proved their current factor. Failure is `403` with
+`error.reason = "sudo_required"`; a revoked session is `401 session_revoked`.
+Resource authorization precedes this check, preserving the private/missing 404 envelope.
+PATs are rejected on these writes regardless of scope; clients must not retry with a
+PAT or treat the refusal as success. Ordinary operations, CI variables and emergency
+credential revocation retain their existing role/scope contract.
+
+Team membership creation now rejects a user who is not a current organization
+member with `400`; removal from the organization deletes its team grants atomically.

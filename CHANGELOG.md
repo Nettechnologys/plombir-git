@@ -6,18 +6,22 @@ This project records user-facing changes here. The format follows
 
 ## [Unreleased]
 
-### Fixed
-
-- First sign-in with an administrator-set password shows the required password
-  change step without a misleading "Login failed" banner.
-
 ### Security
+
+- Require current-factor fresh proof for repository/org access and security administration; PATs can no longer bypass those interactive gates. The ten-minute proof window remains in force.
+- Deliver access/configuration security notices durably to owners and affected accounts through their selected email/Telegram channels, without exposing another actor's device or network address.
+- Remove organization team grants atomically on departure; re-invitation cannot silently restore old administrator privileges, and non-members cannot receive dormant team grants.
 
 - Hidden and missing repositories now return the same REST/API 404. Repository
   pages show a full-page 404 without repository controls or clone links, and
   their HTML responses are private and not cached. Token confinement and SSH
   key refusals also conceal repository existence. Git/LFS retain the same
   credential challenge for both hidden and missing names before authentication.
+
+### Fixed
+
+- First sign-in with an administrator-set password shows the required password
+  change step without a misleading "Login failed" banner.
 
 ## [0.4.0] - 2026-11-07
 

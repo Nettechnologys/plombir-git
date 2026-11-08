@@ -463,6 +463,7 @@ pub async fn reset_user_mfa(
 pub async fn unlock_user(
     State(state): State<AppState>,
     InstanceAdmin(current_id): InstanceAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Path(user_id): Path<i64>,
 ) -> impl IntoResponse {
@@ -482,7 +483,7 @@ pub async fn unlock_user(
         Ok(actor) => actor,
         Err(error) => return AppError::from(error).into_response(),
     };
-    match rg_db::ops::user_ops::reset_login_failures_if_open(&state.db, user_id).await {
+    match rg_db::ops::user_ops::admin_unlock(&state.db, user_id).await {
         Ok(Some(updated)) => {
             rg_core::audit::record(
                 &state.db,
@@ -526,6 +527,7 @@ pub async fn unlock_user(
 pub async fn delete_user(
     State(state): State<AppState>,
     InstanceAdmin(current_id): InstanceAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Path(user_id): Path<i64>,
 ) -> impl IntoResponse {
@@ -662,6 +664,7 @@ pub async fn get_org(
 pub async fn delete_org(
     State(state): State<AppState>,
     InstanceAdmin(current_id): InstanceAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
@@ -1455,6 +1458,7 @@ pub async fn test_sso_provider_connection(
 pub async fn delete_sso_provider(
     State(state): State<AppState>,
     InstanceAdmin(admin_id): InstanceAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {

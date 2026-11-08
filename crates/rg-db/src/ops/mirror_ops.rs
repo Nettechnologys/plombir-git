@@ -13,7 +13,18 @@ use crate::entities::{mirror_sync_lease, repository};
 
 /// Create a mirror record.
 pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<Model> {
-    model.insert(db).await.context("db: create mirror")
+    let transaction = db.begin().await?;
+    let created = model.insert(&transaction).await?;
+    super::security_notification_ops::repo_event(
+        &transaction,
+        created.repo_id,
+        crate::notification::Event::MirrorChanged,
+        "pull_mirror_created",
+        &[],
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(created)
 }
 
 /// Find a mirror by repository ID.
@@ -26,7 +37,7 @@ pub async fn find_by_repo_id(db: &DatabaseConnection, repo_id: i64) -> Result<Op
 }
 
 /// Find a mirror by its row identity.
-pub async fn find_by_id(db: &DatabaseConnection, id: i64) -> Result<Option<Model>> {
+pub async fn find_by_id(db: &impl ConnectionTrait, id: i64) -> Result<Option<Model>> {
     MirrorEntity::find_by_id(id)
         .one(db)
         .await
@@ -63,6 +74,16 @@ pub async fn update_settings(
     status: Option<String>,
     updated_at: DateTimeUtc,
 ) -> Result<Option<Model>> {
+    let transaction = db.begin().await?;
+    MirrorEntity::update_many()
+        .col_expr(
+            mirror::Column::UpdatedAt,
+            Expr::col(mirror::Column::UpdatedAt).into(),
+        )
+        .filter(mirror::Column::Id.eq(id))
+        .exec(&transaction)
+        .await?;
+    let previous = find_by_id(&transaction, id).await?;
     let mut update =
         MirrorEntity::update_many().col_expr(mirror::Column::UpdatedAt, Expr::value(updated_at));
     if let Some(url) = url {
@@ -89,13 +110,33 @@ pub async fn update_settings(
 
     let result = update
         .filter(mirror::Column::Id.eq(id))
-        .exec(db)
+        .exec(&transaction)
         .await
         .context("db: update mirror settings")?;
-    match result.rows_affected {
-        0 | 1 => find_by_id(db, id).await,
-        rows => anyhow::bail!("db: mirror update affected {rows} rows for id {id}"),
+    if result.rows_affected > 1 {
+        anyhow::bail!("db: mirror update affected multiple rows");
     }
+    let updated = find_by_id(&transaction, id).await?;
+    if let Some(current) = &updated {
+        if previous.is_none_or(|old| {
+            old.url != current.url
+                || old.username != current.username
+                || old.password_encrypted != current.password_encrypted
+                || old.sync_interval_seconds != current.sync_interval_seconds
+                || old.status != current.status
+        }) {
+            super::security_notification_ops::repo_event(
+                &transaction,
+                current.repo_id,
+                crate::notification::Event::MirrorChanged,
+                "pull_mirror_updated",
+                &[],
+            )
+            .await?;
+        }
+    }
+    transaction.commit().await?;
+    Ok(updated)
 }
 
 /// How a mirror deletion ended, from the row's point of view.
@@ -171,6 +212,14 @@ pub async fn delete_by_id_unless_syncing(
         return Ok(MirrorRetirement::MirrorSyncInFlight);
     }
 
+    super::security_notification_ops::repo_event(
+        &transaction,
+        repo_id,
+        crate::notification::Event::MirrorChanged,
+        "pull_mirror_deleted",
+        &[],
+    )
+    .await?;
     transaction
         .commit()
         .await

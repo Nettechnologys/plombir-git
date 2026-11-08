@@ -152,7 +152,7 @@ describe('saved notification delivery', () => {
   });
   it('renders every event with two independent channels and a test, with no saved token input', async () => {
     page = await renderComponent(Page);
-    expect(page.container.querySelectorAll('[data-category]')).toHaveLength(36);
+    expect(page.container.querySelectorAll('[data-category]')).toHaveLength(44);
     for (const key of NOTIFICATION_EVENTS) {
       expect(row(key).querySelectorAll('input[type="checkbox"]')).toHaveLength(2);
       expect(row(key).querySelector('.test-button')).not.toBeNull();

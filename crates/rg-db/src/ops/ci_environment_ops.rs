@@ -81,6 +81,14 @@ pub async fn create_with_approvers(
     .await;
     match result {
         Ok(created) => {
+            super::security_notification_ops::repo_event(
+                &transaction,
+                created.repo_id,
+                crate::notification::Event::CiSecurityChanged,
+                "ci_environment_created",
+                &[],
+            )
+            .await?;
             transaction
                 .commit()
                 .await
@@ -125,6 +133,17 @@ pub async fn update_with_approvers(
         .begin()
         .await
         .context("db: begin CI environment grant update")?;
+    ci_environment::Entity::update_many()
+        .col_expr(
+            ci_environment::Column::UpdatedAt,
+            Expr::col(ci_environment::Column::UpdatedAt).into(),
+        )
+        .filter(ci_environment::Column::Id.eq(id))
+        .exec(&transaction)
+        .await?;
+    let previous = ci_environment::Entity::find_by_id(id)
+        .one(&transaction)
+        .await?;
     let result: Result<Option<ci_environment::Model>> = async {
         let update = ci_environment::Entity::update_many()
             .col_expr(ci_environment::Column::Name, Expr::value(name))
@@ -179,6 +198,23 @@ pub async fn update_with_approvers(
     .await;
     match result {
         Ok(updated) => {
+            if let Some(current) = &updated {
+                let changed = previous.as_ref().is_none_or(|old| {
+                    let mut current = current.clone();
+                    current.updated_at = old.updated_at;
+                    &current != old
+                });
+                if changed {
+                    super::security_notification_ops::repo_event(
+                        &transaction,
+                        current.repo_id,
+                        crate::notification::Event::CiSecurityChanged,
+                        "ci_environment_updated",
+                        &[],
+                    )
+                    .await?;
+                }
+            }
             transaction
                 .commit()
                 .await
@@ -216,10 +252,32 @@ pub async fn allowed_approver_ids(
 /// gone, which is not the same outcome as "deleted" and must not be answered
 /// as one.
 pub async fn delete(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    let transaction = db.begin().await?;
+    ci_environment::Entity::update_many()
+        .col_expr(
+            ci_environment::Column::UpdatedAt,
+            Expr::col(ci_environment::Column::UpdatedAt).into(),
+        )
+        .filter(ci_environment::Column::Id.eq(id))
+        .exec(&transaction)
+        .await?;
+    let previous = ci_environment::Entity::find_by_id(id)
+        .one(&transaction)
+        .await?;
     let result = ci_environment::Entity::delete_by_id(id)
-        .exec(db)
-        .await
-        .context("db: delete CI environment")?;
+        .exec(&transaction)
+        .await?;
+    if let Some(previous) = previous.filter(|_| result.rows_affected > 0) {
+        super::security_notification_ops::repo_event(
+            &transaction,
+            previous.repo_id,
+            crate::notification::Event::CiSecurityChanged,
+            "ci_environment_deleted",
+            &[],
+        )
+        .await?;
+    }
+    transaction.commit().await?;
     Ok(result.rows_affected > 0)
 }
 

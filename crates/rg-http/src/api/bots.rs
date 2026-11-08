@@ -378,13 +378,14 @@ pub async fn create_bot(
     responses(
         (status = 204, description = "Deleted"),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "Fresh authentication required", body = serde_json::Value),
         (status = 404, description = "No such bot of the caller's", body = serde_json::Value),
         (status = 409, description = "The bot still owns an organization", body = serde_json::Value),
     ),
 )]
 pub async fn delete_bot(
     State(state): State<AppState>,
-    AuthUser(user_id): AuthUser,
+    super::auth::SudoUser(user_id): super::auth::SudoUser,
     headers: HeaderMap,
     Path(bot): Path<String>,
 ) -> Response {

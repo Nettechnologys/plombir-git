@@ -44,3 +44,40 @@ All personal settings and test routes require a login session; PATs cannot read 
 - `GET /api/v1/users/me/notification-settings/test?event_id=...`: poll the caller's test only. Other accounts' IDs and non-test events return 404. Cooldown/pending limits return 429.
 
 The authorization, old/new comparison, configuration write and mandatory warning insert share one retryable transaction on the authoritative write pool. Authorization is re-evaluated from the locked current account on every retry. Network delivery happens after commit.
+
+
+## Access and configuration notices (0.4.1)
+
+The notification panel adds eight individually selectable email/Telegram categories:
+`repository_access_changed`, `organization_access_changed`,
+`repository_security_changed`, `organization_security_changed`, `webhook_changed`,
+`mirror_changed`, `ci_security_changed`, and `admin_security_changed`.
+They cover collaborator grants/changes/removals and private copies, organization
+membership/teams, visibility/transfer/deletion, hook and mirror configuration,
+branch/tag protection, CI secrets/variables/environments, and administrator trust changes.
+
+On upgrade, a missing new category defaults to email enabled. Its Telegram choice
+inherits the saved `notification_settings_changed` Telegram choice only for a
+configured, confirmed destination. An explicitly saved per-category choice always
+wins. Disabling an inherited choice requires fresh proof just like disabling any
+other security notice. Saving identical values creates no duplicate event.
+
+Enqueue and the mutation commit together: an outbox failure rolls the change back.
+Personal repository owners, organization members with the owner role, and affected
+accounts receive the relevant copies. Owner copies recheck authority at dispatch;
+minimal historical copies tell an affected account about its removed access even
+after revocation. Deletion/transfer notices retain only the historical identity.
+Actor IP/device context is included only when the recipient is the actor. No remote
+URL, hook/mirror credential, CI secret or variable value is included in these notices.
+Delivery still follows each recipient's saved channel choices and locale.
+
+A private-fork notice records the server-side copy creation; later cleanup of a
+failed fork does not undo the fact that the copy was made. Existing private forks
+are not physically destroyed when their owner's source access is revoked.
+
+Administrative account-deletion notices use the HTTP actor context. Operator CLI
+account deletion has no HTTP actor and does not create that administrative notice.
+Transfer notices to former owners and collaborators name the previous namespace;
+the destination's owners receive its current name. Bot access notices go to their
+human owner. Anonymous account ceremonies retain their own request context, while
+notifications to a different account omit the authenticated actor's IP and device.

@@ -256,9 +256,18 @@ pub async fn update_org(
     // instead of being turned away — a rejection that doubles as a schema
     // oracle. As an argument it runs first, and forgetting it is a compile error.
     OrgAdmin { org, actor_id }: OrgAdmin,
+    fresh_proof: Result<super::auth::SudoUser, AppError>,
     headers: HeaderMap,
     Json(body): Json<UpdateOrgRequest>,
 ) -> impl IntoResponse {
+    // A supplied visibility field can change access, including in a racing write.
+    // Preserve ordinary metadata edits while requiring proof for every such patch.
+    if body.visibility.is_some() {
+        if let Err(refusal) = fresh_proof {
+            return refusal.into_response();
+        }
+    }
+
     // The organization is the *resource*, never the actor. This file used to
     // pass `&org.name` (and, on create, `&body.name`) into the actor column —
     // one call site even said so: "username not available, use org name". The
@@ -324,6 +333,7 @@ pub async fn delete_org(
     // against `organizations.owner_id`: a creator removed from the
     // organization could still delete it, and an owner-role member could not.
     OrgOwner { org, actor_id }: OrgOwner,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     // The organization is the *resource*, never the actor. This file used to
@@ -434,6 +444,7 @@ pub async fn list_org_members(
 pub async fn add_org_member(
     State(state): State<AppState>,
     OrgAdmin { org, actor_id }: OrgAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Json(body): Json<AddOrgMemberRequest>,
 ) -> impl IntoResponse {
@@ -533,6 +544,7 @@ pub async fn add_org_member(
 pub async fn remove_org_member(
     State(state): State<AppState>,
     OrgAdmin { org, actor_id }: OrgAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Path((_name, user_id)): Path<(String, i64)>,
 ) -> impl IntoResponse {
@@ -611,6 +623,7 @@ pub async fn remove_org_member(
 pub async fn create_team(
     State(state): State<AppState>,
     OrgAdmin { org, actor_id }: OrgAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Json(body): Json<CreateTeamRequest>,
 ) -> impl IntoResponse {
@@ -757,6 +770,7 @@ pub async fn get_team(
 pub async fn delete_team(
     State(state): State<AppState>,
     OrgAdmin { org, actor_id }: OrgAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Path((_name, team_id)): Path<(String, i64)>,
 ) -> impl IntoResponse {
@@ -890,6 +904,7 @@ pub async fn list_team_members(
 pub async fn add_team_member(
     State(state): State<AppState>,
     OrgAdmin { org, actor_id }: OrgAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Path((_name, team_id)): Path<(String, i64)>,
     Json(body): Json<AddTeamMemberRequest>,
@@ -981,6 +996,7 @@ pub async fn add_team_member(
 pub async fn remove_team_member(
     State(state): State<AppState>,
     OrgAdmin { org, actor_id }: OrgAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Path((_name, team_id, user_id)): Path<(String, i64, i64)>,
 ) -> impl IntoResponse {

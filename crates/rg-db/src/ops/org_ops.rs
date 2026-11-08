@@ -196,6 +196,21 @@ pub async fn update_org(
     description: Option<&str>,
     visibility: Option<&str>,
 ) -> Result<Option<organization::Model>> {
+    let transaction = db.begin().await?;
+    organization::Entity::update_many()
+        .col_expr(
+            organization::Column::UpdatedAt,
+            Expr::col(organization::Column::UpdatedAt).into(),
+        )
+        .filter(organization::Column::Id.eq(id))
+        .exec(&transaction)
+        .await?;
+    let previous = organization::Entity::find_by_id(id)
+        .one(&transaction)
+        .await?;
+    let visibility_changed = previous
+        .as_ref()
+        .is_some_and(|row| visibility.is_some_and(|value| row.visibility != value));
     let mut update = organization::Entity::update_many().col_expr(
         organization::Column::UpdatedAt,
         Expr::value(chrono::Utc::now()),
@@ -226,7 +241,7 @@ pub async fn update_org(
         // request even though the row deliberately remains until retirement
         // completes.
         .filter(organization::Column::DeletedAt.is_null())
-        .exec(db)
+        .exec(&transaction)
         .await
         .context("db: update org")?;
     match result.rows_affected {
@@ -237,12 +252,24 @@ pub async fn update_org(
     // MySQL may report zero affected rows for a no-op update, so the row count
     // alone cannot distinguish an existing organization from a winning delete.
     // Re-read the same active identity on every backend instead.
-    organization::Entity::find()
+    let updated = organization::Entity::find()
         .filter(organization::Column::Id.eq(id))
         .filter(organization::Column::DeletedAt.is_null())
-        .one(db)
+        .one(&transaction)
         .await
-        .context("db: find updated org")
+        .context("db: find updated org")?;
+    if updated.is_some() && visibility_changed {
+        super::security_notification_ops::org_event(
+            &transaction,
+            id,
+            crate::notification::Event::OrganizationSecurityChanged,
+            "organization_visibility_changed",
+            &[],
+        )
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(updated)
 }
 
 /// Delete an organization, reporting whether this call removed it.
@@ -255,6 +282,22 @@ pub async fn update_org(
 /// client.
 pub async fn delete_org(db: &DatabaseConnection, id: i64) -> Result<bool> {
     let transaction = db.begin().await.context("db: begin org delete")?;
+    organization::Entity::update_many()
+        .col_expr(
+            organization::Column::UpdatedAt,
+            Expr::col(organization::Column::UpdatedAt).into(),
+        )
+        .filter(organization::Column::Id.eq(id))
+        .exec(&transaction)
+        .await?;
+    super::security_notification_ops::org_event(
+        &transaction,
+        id,
+        crate::notification::Event::OrganizationSecurityChanged,
+        "organization_deleted",
+        &[],
+    )
+    .await?;
     let result = organization::Entity::delete_by_id(id)
         .exec(&transaction)
         .await
@@ -373,7 +416,30 @@ pub async fn add_org_member(
         created_at: Set(chrono::Utc::now()),
         ..Default::default()
     };
-    model.insert(db).await.context("db: add org member")
+    let transaction = db.begin().await?;
+    organization::Entity::update_many()
+        .col_expr(
+            organization::Column::UpdatedAt,
+            Expr::col(organization::Column::UpdatedAt).into(),
+        )
+        .filter(organization::Column::Id.eq(org_id))
+        .exec(&transaction)
+        .await?;
+    clear_team_memberships(&transaction, org_id, user_id).await?;
+    let member = model
+        .insert(&transaction)
+        .await
+        .context("db: add org member")?;
+    super::security_notification_ops::org_event(
+        &transaction,
+        org_id,
+        crate::notification::Event::OrganizationAccessChanged,
+        "org_member_added",
+        &[user_id],
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(member)
 }
 
 /// What [`remove_org_member`] did.
@@ -452,6 +518,7 @@ pub async fn remove_org_member(
         None
     };
 
+    clear_team_memberships(&transaction, org_id, user_id).await?;
     organization_member::Entity::delete_by_id(member.id)
         .exec(&transaction)
         .await
@@ -497,6 +564,14 @@ pub async fn remove_org_member(
             .context("db: move the org's repository rows off the departed member")?;
     }
 
+    super::security_notification_ops::org_event(
+        &transaction,
+        org_id,
+        crate::notification::Event::OrganizationAccessChanged,
+        "org_member_removed",
+        &[user_id],
+    )
+    .await?;
     transaction
         .commit()
         .await
@@ -626,7 +701,21 @@ pub async fn create_team(
         updated_at: Set(now),
         ..Default::default()
     };
-    model.insert(db).await.context("db: create team")
+    let transaction = db.begin().await?;
+    let team = model
+        .insert(&transaction)
+        .await
+        .context("db: create team")?;
+    super::security_notification_ops::org_event(
+        &transaction,
+        org_id,
+        crate::notification::Event::OrganizationAccessChanged,
+        "team_created",
+        &[],
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(team)
 }
 
 /// Get a team by ID.
@@ -670,15 +759,41 @@ pub async fn list_org_teams(db: &DatabaseConnection, org_id: i64) -> Result<Vec<
 /// from this function therefore always means the database itself failed; the
 /// absent-row case travels in the value and gets typed one level up.
 pub async fn delete_team(db: &DatabaseConnection, id: i64) -> Result<bool> {
-    let Some(model) = team::Entity::find_by_id(id)
-        .one(db)
-        .await
-        .context("db: find team for delete")?
-    else {
+    let transaction = db.begin().await?;
+    // Lock before reading the member set; concurrent grants/deletes serialize.
+    team::Entity::update_many()
+        .col_expr(
+            team::Column::UpdatedAt,
+            Expr::col(team::Column::UpdatedAt).into(),
+        )
+        .filter(team::Column::Id.eq(id))
+        .exec(&transaction)
+        .await?;
+    let Some(model) = team::Entity::find_by_id(id).one(&transaction).await? else {
+        transaction.rollback().await?;
         return Ok(false);
     };
-
-    model.delete(db).await.context("db: delete team")?;
+    let affected: Vec<i64> = team_member::Entity::find()
+        .filter(team_member::Column::TeamId.eq(id))
+        .all(&transaction)
+        .await?
+        .into_iter()
+        .map(|member| member.user_id)
+        .collect();
+    let org_id = model.org_id;
+    model
+        .delete(&transaction)
+        .await
+        .context("db: delete team")?;
+    super::security_notification_ops::org_event(
+        &transaction,
+        org_id,
+        crate::notification::Event::OrganizationAccessChanged,
+        "team_deleted",
+        &affected,
+    )
+    .await?;
+    transaction.commit().await?;
     Ok(true)
 }
 
@@ -698,7 +813,54 @@ pub async fn add_team_member(
         created_at: Set(chrono::Utc::now()),
         ..Default::default()
     };
-    model.insert(db).await.context("db: add team member")
+    // Resolve only the lock key outside the transaction: no MySQL consistent
+    // snapshot before the organization write lock shared with member removal.
+    let org_id = team::Entity::find_by_id(team_id)
+        .one(db)
+        .await?
+        .ok_or(TeamAdmissionError::TeamNotFound)?
+        .org_id;
+    let transaction = db.begin().await?;
+    organization::Entity::update_many()
+        .col_expr(
+            organization::Column::UpdatedAt,
+            Expr::col(organization::Column::UpdatedAt).into(),
+        )
+        .filter(organization::Column::Id.eq(org_id))
+        .exec(&transaction)
+        .await?;
+    if !team::Entity::find_by_id(team_id)
+        .one(&transaction)
+        .await?
+        .is_some_and(|team| team.org_id == org_id)
+    {
+        return Err(TeamAdmissionError::TeamNotFound.into());
+    }
+    if organization_member::Entity::find()
+        .filter(organization_member::Column::OrgId.eq(org_id))
+        .filter(organization_member::Column::UserId.eq(user_id))
+        .one(&transaction)
+        .await?
+        .is_none()
+    {
+        return Err(TeamAdmissionError::OrganizationMembershipRequired.into());
+    }
+    let member = model
+        .insert(&transaction)
+        .await
+        .context("db: add team member")?;
+    if let Some(team) = team::Entity::find_by_id(team_id).one(&transaction).await? {
+        super::security_notification_ops::org_event(
+            &transaction,
+            team.org_id,
+            crate::notification::Event::OrganizationAccessChanged,
+            "team_member_added",
+            &[user_id],
+        )
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(member)
 }
 
 /// Remove a member from a team. Returns whether a row was removed.
@@ -707,12 +869,26 @@ pub async fn remove_team_member(
     team_id: i64,
     user_id: i64,
 ) -> Result<bool> {
+    let transaction = db.begin().await?;
     let result = team_member::Entity::delete_many()
         .filter(team_member::Column::TeamId.eq(team_id))
         .filter(team_member::Column::UserId.eq(user_id))
-        .exec(db)
+        .exec(&transaction)
         .await
         .context("db: remove team member")?;
+    if result.rows_affected > 0 {
+        if let Some(team) = team::Entity::find_by_id(team_id).one(&transaction).await? {
+            super::security_notification_ops::org_event(
+                &transaction,
+                team.org_id,
+                crate::notification::Event::OrganizationAccessChanged,
+                "team_member_removed",
+                &[user_id],
+            )
+            .await?;
+        }
+    }
+    transaction.commit().await?;
     Ok(result.rows_affected > 0)
 }
 
@@ -721,7 +897,21 @@ pub async fn list_team_members(
     db: &DatabaseConnection,
     team_id: i64,
 ) -> Result<Vec<team_member::Model>> {
+    let members = sea_orm::sea_query::Query::select()
+        .column(organization_member::Column::UserId)
+        .from(organization_member::Entity)
+        .and_where(
+            Expr::col(organization_member::Column::OrgId).in_subquery(
+                sea_orm::sea_query::Query::select()
+                    .column(team::Column::OrgId)
+                    .from(team::Entity)
+                    .and_where(Expr::col(team::Column::Id).eq(team_id))
+                    .to_owned(),
+            ),
+        )
+        .to_owned();
     team_member::Entity::find()
+        .filter(team_member::Column::UserId.in_subquery(members))
         .filter(team_member::Column::TeamId.eq(team_id))
         .all(db)
         .await
@@ -873,4 +1063,31 @@ mod tests {
             "the failure must name itself, got: {error:#}"
         );
     }
+}
+
+/// Historical team grants must never revive when a member is invited again.
+async fn clear_team_memberships(
+    db: &impl ConnectionTrait,
+    org_id: i64,
+    user_id: i64,
+) -> Result<()> {
+    let teams = sea_orm::sea_query::Query::select()
+        .column(team::Column::Id)
+        .from(team::Entity)
+        .and_where(Expr::col(team::Column::OrgId).eq(org_id))
+        .to_owned();
+    team_member::Entity::delete_many()
+        .filter(team_member::Column::UserId.eq(user_id))
+        .filter(team_member::Column::TeamId.in_subquery(teams))
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TeamAdmissionError {
+    #[error("team not found")]
+    TeamNotFound,
+    #[error("add the user to the organization before adding them to a team")]
+    OrganizationMembershipRequired,
 }

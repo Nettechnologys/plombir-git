@@ -113,7 +113,13 @@ pub async fn create(
         created_at: Set(now),
         updated_at: Set(now),
     };
-    am.insert(db).await
+    let txn = db.begin().await?;
+    let provider = am.insert(&txn).await?;
+    super::security_notification_ops::system_event(&txn, "sso_provider_created", None)
+        .await
+        .map_err(crate::notification::db_error)?;
+    txn.commit().await?;
+    Ok(provider)
 }
 
 /// What a provider write did — and, when the slug moved, what moved with it.
@@ -347,6 +353,13 @@ pub async fn update_settings(
         txn.rollback().await?;
         return Ok(SsoProviderUpdate::Gone);
     };
+    let mut comparable = provider.clone();
+    comparable.updated_at = current.updated_at;
+    if comparable != current {
+        super::security_notification_ops::system_event(&txn, "sso_provider_updated", None)
+            .await
+            .map_err(crate::notification::db_error)?;
+    }
     txn.commit().await?;
     Ok(SsoProviderUpdate::Written {
         provider: Box::new(provider),
@@ -361,7 +374,14 @@ pub async fn update_settings(
 /// getting here, in statements of their own. `false` means a concurrent delete
 /// won the race — an outcome that must not come back as `{"deleted": true}`.
 pub async fn delete_by_id(db: &DatabaseConnection, id: i64) -> Result<bool, DbErr> {
-    let result = Entity::delete_by_id(id).exec(db).await?;
+    let txn = db.begin().await?;
+    let result = Entity::delete_by_id(id).exec(&txn).await?;
+    if result.rows_affected > 0 {
+        super::security_notification_ops::system_event(&txn, "sso_provider_deleted", None)
+            .await
+            .map_err(crate::notification::db_error)?;
+    }
+    txn.commit().await?;
     Ok(result.rows_affected > 0)
 }
 

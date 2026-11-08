@@ -142,6 +142,7 @@ pub async fn upsert(
         return update_existing(db, model.id, model.repo_id, encrypted_value, now).await;
     }
 
+    let transaction = db.begin().await?;
     let insert = ActiveModel {
         id: NotSet,
         repo_id: Set(repo_id),
@@ -152,12 +153,24 @@ pub async fn upsert(
         created_at: Set(now),
         updated_at: Set(now),
     }
-    .insert(db)
+    .insert(&transaction)
     .await;
 
     match insert {
-        Ok(created) => Ok(Some(created)),
+        Ok(created) => {
+            super::security_notification_ops::repo_event(
+                &transaction,
+                repo_id,
+                crate::notification::Event::CiSecurityChanged,
+                "ci_secret_created",
+                &[],
+            )
+            .await?;
+            transaction.commit().await?;
+            Ok(Some(created))
+        }
         Err(error) if crate::is_unique_violation(&error) => {
+            transaction.rollback().await?;
             match find_by_repo_and_name(db, repo_id, environment_id, name).await? {
                 Some(model) => {
                     update_existing(db, model.id, model.repo_id, encrypted_value, now).await
@@ -184,6 +197,17 @@ pub async fn update_existing(
     encrypted_value: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<Model>> {
+    let transaction = db.begin().await?;
+    Entity::update_many()
+        .col_expr(
+            ci_secret::Column::UpdatedAt,
+            Expr::col(ci_secret::Column::UpdatedAt).into(),
+        )
+        .filter(ci_secret::Column::Id.eq(id))
+        .filter(ci_secret::Column::RepoId.eq(repo_id))
+        .exec(&transaction)
+        .await?;
+    let previous = Entity::find_by_id(id).one(&transaction).await?;
     let result = Entity::update_many()
         .col_expr(
             ci_secret::Column::EncryptedValue,
@@ -192,7 +216,7 @@ pub async fn update_existing(
         .col_expr(ci_secret::Column::UpdatedAt, Expr::value(now))
         .filter(ci_secret::Column::Id.eq(id))
         .filter(ci_secret::Column::RepoId.eq(repo_id))
-        .exec(db)
+        .exec(&transaction)
         .await
         .context("db: update CI secret")?;
     match result.rows_affected {
@@ -205,12 +229,26 @@ pub async fn update_existing(
     // MySQL may report zero affected rows for a no-op UPDATE. Re-read the same
     // stable identity on every backend to distinguish that from a winning
     // DELETE without accepting a replacement row under the same secret name.
-    Entity::find()
+    let updated = Entity::find()
         .filter(ci_secret::Column::Id.eq(id))
         .filter(ci_secret::Column::RepoId.eq(repo_id))
-        .one(db)
+        .one(&transaction)
         .await
-        .context("db: find updated CI secret")
+        .context("db: find updated CI secret")?;
+    if let Some(current) = &updated {
+        if previous.is_none_or(|old| old.encrypted_value != current.encrypted_value) {
+            super::security_notification_ops::repo_event(
+                &transaction,
+                repo_id,
+                crate::notification::Event::CiSecurityChanged,
+                "ci_secret_updated",
+                &[],
+            )
+            .await?;
+        }
+    }
+    transaction.commit().await?;
+    Ok(updated)
 }
 /// Delete one scope's secret by name. The same name in another scope is a
 /// different secret and stays.
@@ -220,13 +258,25 @@ pub async fn delete_by_repo_and_name(
     environment_id: Option<i64>,
     name: &str,
 ) -> Result<bool> {
+    let transaction = db.begin().await?;
     let result = Entity::delete_many()
         .filter(ci_secret::Column::RepoId.eq(repo_id))
         .filter(scope(environment_id))
         .filter(ci_secret::Column::Name.eq(name))
-        .exec(db)
+        .exec(&transaction)
         .await
         .context("db: delete CI secret")?;
+    if result.rows_affected > 0 {
+        super::security_notification_ops::repo_event(
+            &transaction,
+            repo_id,
+            crate::notification::Event::CiSecurityChanged,
+            "ci_secret_deleted",
+            &[],
+        )
+        .await?;
+    }
+    transaction.commit().await?;
     Ok(result.rows_affected > 0)
 }
 

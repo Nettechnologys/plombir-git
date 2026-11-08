@@ -164,6 +164,7 @@ pub async fn create_mirror(
     State(state): State<AppState>,
     Path((owner, _)): Path<(String, String)>,
     RepoAdmin { repo, actor_id }: RepoAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Json(body): Json<CreateMirrorRequest>,
 ) -> impl IntoResponse {
@@ -265,6 +266,7 @@ pub async fn update_mirror(
     State(state): State<AppState>,
     Path((owner, _)): Path<(String, String)>,
     RepoAdmin { repo, actor_id }: RepoAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
     Json(body): Json<UpdateMirrorRequest>,
 ) -> impl IntoResponse {
@@ -333,6 +335,7 @@ pub async fn delete_mirror(
     State(state): State<AppState>,
     Path((owner, _)): Path<(String, String)>,
     RepoAdmin { repo, actor_id }: RepoAdmin,
+    super::auth::SudoUser(_): super::auth::SudoUser,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let audit_actor = match grant_actor(&state, actor_id).await {

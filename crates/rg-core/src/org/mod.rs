@@ -392,7 +392,19 @@ pub async fn add_team_member(
             "role must be 'member' or 'maintainer'",
         ));
     }
-    let member = org_ops::add_team_member(db, team_id, user_id, role).await?;
+    let member = org_ops::add_team_member(db, team_id, user_id, role)
+        .await
+        .map_err(
+            |error| match error.downcast_ref::<org_ops::TeamAdmissionError>() {
+                Some(org_ops::TeamAdmissionError::TeamNotFound) => crate::error::not_found("team"),
+                Some(org_ops::TeamAdmissionError::OrganizationMembershipRequired) => {
+                    crate::error::invalid_request(
+                        "add the user to the organization before adding them to a team",
+                    )
+                }
+                None => error,
+            },
+        )?;
     // Team membership can grant repo access — flush perm cache.
     crate::repo::service::invalidate_perm_cache_all(db);
     Ok(member)
