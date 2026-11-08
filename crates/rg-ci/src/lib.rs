@@ -14101,6 +14101,11 @@ jobs:
     /// it ended — the pipeline-finished hook is what shows that.
     #[tokio::test]
     async fn fail_fast_cancels_the_unfinished_variants_unless_switched_off() {
+        if crate::isolated_observer_test(
+            "step_model_tests::fail_fast_cancels_the_unfinished_variants_unless_switched_off",
+        ) {
+            return;
+        }
         static FINISHED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         fn observe(status: &str) {
             FINISHED.lock().unwrap().push(status.to_string());
@@ -14811,4 +14816,26 @@ mod javascript_action_tests {
             "the toolchains were not kept in the tool cache"
         );
     }
+}
+
+// Metrics observers are process-global OnceLocks. Tests which install distinct
+// observers need separate processes; a mutex cannot replace the first observer.
+#[cfg(test)]
+fn isolated_observer_test(name: &str) -> bool {
+    const MARKER: &str = "PLOMBIR_CI_OBSERVER_TEST";
+    if std::env::var(MARKER).as_deref() == Ok(name) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", name, "--nocapture"])
+        .env(MARKER, name)
+        .output()
+        .expect("run isolated observer test");
+    assert!(
+        output.status.success(),
+        "isolated {name} failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
 }

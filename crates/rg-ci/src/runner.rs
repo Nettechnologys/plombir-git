@@ -5697,6 +5697,11 @@ esac
     /// `ci_pipelines_total`, which `HighPipelineFailureRate` divides by.
     #[tokio::test]
     async fn a_finished_job_and_pipeline_reach_the_metrics_hook_with_their_outcome() {
+        if crate::isolated_observer_test(
+            "runner::tests::a_finished_job_and_pipeline_reach_the_metrics_hook_with_their_outcome",
+        ) {
+            return;
+        }
         rg_core::metrics_hook::set_ci_job_finished_observer(observe_job_outcome);
         rg_core::metrics_hook::set_ci_pipeline_finished_observer(observe_pipeline_outcome);
 
