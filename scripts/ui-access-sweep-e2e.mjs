@@ -607,6 +607,7 @@ function responseMatches(coverage, response, routeUrls) {
 
 async function openPersonaTab({ browser, frontendUrl, token }) {
   const requests = new Map();
+  const requestedUrls = [];
   const responses = [];
   const problems = [];
   const httpFailures = [];
@@ -623,6 +624,7 @@ async function openPersonaTab({ browser, frontendUrl, token }) {
         pageLoads.observe(payload.params);
       } else if (payload.method === 'Network.requestWillBeSent') {
         requests.set(payload.params.requestId, payload.params.request.method);
+        requestedUrls.push(payload.params.request.url);
       } else if (payload.method === 'Network.responseReceived') {
         const response = payload.params.response;
         responses.push({
@@ -653,6 +655,11 @@ async function openPersonaTab({ browser, frontendUrl, token }) {
     },
   });
 
+  // Scenario selectors use English labels; do not inherit the host browser's
+  // language (macOS Chrome can ignore --lang for navigator.language).
+  await tab.send('Page.addScriptToEvaluateOnNewDocument', {
+    source: `if (location.origin === ${JSON.stringify(frontendUrl)}) localStorage.setItem('locale', 'en');`,
+  });
   await tab.send('Network.clearBrowserCookies');
   const cookie = await tab.send('Network.setCookie', {
     name: 'plombir_git_token',
@@ -663,7 +670,7 @@ async function openPersonaTab({ browser, frontendUrl, token }) {
     sameSite: 'Strict',
   });
   if (!cookie.success) throw new Error('Chrome refused the persona auth cookie');
-  return { ...tab, responses, problems, httpFailures, pageLoads };
+  return { ...tab, responses, problems, httpFailures, pageLoads, requestedUrls };
 }
 
 function browserContext({ tab, frontendUrl, persona, fixture }) {
@@ -700,6 +707,26 @@ function browserContext({ tab, frontendUrl, persona, fixture }) {
     ownerUsername: USER.owner.username,
     ownerRepository: USER.owner.repository,
     repositoryFor: (which) => USER[which].repository,
+    assertRepositoryConcealed: async () => {
+      await waitFor(tab, 'full repository 404',
+        'document.querySelector(".error-page .status")?.textContent.trim() === "404"');
+      const leaked = await evaluate(tab, `Boolean(
+        document.querySelector('.repo-header, .repo-tabs, .repo-actions, .clone-dropdown')
+        || document.body.textContent.includes(${JSON.stringify(USER.owner.repository)})
+        || document.title.includes(${JSON.stringify(USER.owner.repository)})
+      )`);
+      if (leaked) throw new Error('a concealed repository exposed its name or controls');
+      const repoPath = `/api/v1/repos/${USER.owner.username}/${USER.owner.repository}`;
+      const gateResponses = tab.responses.filter((response) =>
+        response.method === 'GET' && new URL(response.url).pathname === repoPath);
+      if (gateResponses.length === 0 || gateResponses.some((response) => response.status !== 404)) {
+        throw new Error('the concealed repository layout did not receive an API 404');
+      }
+      const prefix = `${repoPath}/`;
+      if (tab.requestedUrls.some((url) => new URL(url).pathname.startsWith(prefix))) {
+        throw new Error('a concealed repository mounted a child and sent its API request');
+      }
+    },
     navigate: async (path) => {
       const result = await tab.send('Page.navigate', { url: `${frontendUrl}${path}` });
       const readiness = tab.pageLoads.wait(`document for ${path}`);
@@ -892,6 +919,23 @@ async function runScenarioForPersona({
         .join(' | '));
     }
     return tab.responses;
+  } catch (error) {
+    const visible = await evaluate(tab, `({
+      path: location.pathname + location.search,
+      headings: [...document.querySelectorAll('h1, h2, .error-page .status')].slice(0, 8).map(e => e.textContent.trim().slice(0, 160)),
+      buttons: [...document.querySelectorAll('button')].slice(0, 30).map(e => e.textContent.trim().slice(0, 80)),
+      errors: [...document.querySelectorAll('.error, .error-message, .delete-error')].slice(0, 4).map(e => e.textContent.trim().slice(0, 240))
+    })`).catch(() => null);
+    const responses = tab.responses.slice(-20).map((response) => ({
+      method: response.method,
+      path: new URL(response.url).pathname,
+      status: response.status,
+    }));
+    throw new Error(
+      `${scenario.id} [${persona}]: ${error.message}; browser=${JSON.stringify(visible)}; `
+        + `responses=${JSON.stringify(responses)}; problems=${JSON.stringify(tab.problems.slice(0, 8))}`,
+      { cause: error },
+    );
   } finally {
     await tab.close();
   }

@@ -46,11 +46,18 @@ LDAP_PORT="$(head -n 1 "${FIXTURE_DIR}/port")"
     "${LDAP_PORT}" >"${FIXTURE_DIR}/plombir-git.toml"
 )
 
+# CI already built the explicit binary. --build would compile an unused release
+# binary for another 25 minutes before stand_resolve_binary selects that override.
+BUILD_ARGS=()
+if [[ -z "${PLOMBIR_GIT_BIN:-}" ]]; then
+  BUILD_ARGS=(--build)
+fi
+
 STAND_REBUILD_FRONTEND=1 \
 STAND_CONFIG_PATH="${FIXTURE_DIR}/plombir-git.toml" \
 UI_ACCESS_SWEEP_LDAP_PORT="${LDAP_PORT}" \
 "${ROOT_DIR}/scripts/ephemeral-stand.sh" \
-  --build \
+  "${BUILD_ARGS[@]}" \
   --frontend \
   --no-founder \
   -- \

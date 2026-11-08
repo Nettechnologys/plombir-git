@@ -19,10 +19,29 @@ async function dashboardCreateRepository(context) {
 
 async function privateRepositoryPage(context) {
   await context.navigate(`/${context.ownerUsername}/${context.ownerRepository}`);
+  if (context.persona === 'outsider') {
+    await context.assertRepositoryConcealed();
+    // The layout now refuses before mounting children. Probe the same routes
+    // explicitly in the outsider's browser so their API refusals remain covered.
+    await probeConcealedRepository(context, ['tree', 'branches', 'log']);
+  }
 }
 
 async function privateRepositoryBlob(context) {
   await context.navigate(`/${context.ownerUsername}/${context.ownerRepository}/blob/README.md`);
+  if (context.persona === 'outsider') {
+    await context.assertRepositoryConcealed();
+    await probeConcealedRepository(context, ['blob/README.md']);
+  }
+}
+
+async function probeConcealedRepository(context, suffixes) {
+  for (const suffix of suffixes) {
+    const response = await context.request(
+      `/api/v1/repos/${context.ownerUsername}/${context.ownerRepository}/${suffix}`,
+    );
+    if (response.status !== 404) throw new Error(`${suffix} did not conceal the private repository`);
+  }
 }
 
 function privileged(owner, outsider) {
