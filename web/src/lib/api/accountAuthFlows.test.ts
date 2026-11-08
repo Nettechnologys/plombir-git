@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import LoginPage from '../../routes/login/+page.svelte';
 import RegisterPage from '../../routes/register/+page.svelte';
-import { isPasswordChangeRequired, logout } from '../stores/auth.svelte';
+import { isLoggedIn, isMfaRequired, isPasswordChangeRequired, logout } from '../stores/auth.svelte';
 import { setSetupRequired } from '../stores/instance.svelte';
 import { auth, resetTestClient } from '../test/client';
 import { check, element, input, renderComponent, submit, type RenderedComponent } from '../test/render';
@@ -53,6 +53,9 @@ describe('first sign-in with an administrator-chosen password', () => {
 		await submit(element<HTMLFormElement>(rendered.container, 'form'));
 
 		expect(isPasswordChangeRequired()).toBe(true);
+		expect(rendered.container.querySelector('.error-banner')).toBeNull();
+		expect(element(rendered.container, '.initial-password-form .hint').textContent)
+			.toContain('An administrator set this password. Choose your own to continue.');
 		const fresh = rendered.container.querySelectorAll<HTMLInputElement>('.initial-password-form input');
 		await input(fresh[0], 'Carol-own-9');
 		await input(fresh[1], 'Carol-own-9');
@@ -65,6 +68,59 @@ describe('first sign-in with an administrator-chosen password', () => {
 			true,
 		);
 		expect(isPasswordChangeRequired()).toBe(false);
+	});
+
+	it('shows a real login failure, then clears it when password replacement is required', async () => {
+		auth.login.mockRejectedValueOnce(new Error('Invalid credentials'));
+		auth.login.mockResolvedValueOnce({
+			token: '', user_id: 3, username: 'carol', password_change_required: true,
+		});
+		rendered = await renderComponent(LoginPage);
+		const fields = rendered.container.querySelectorAll<HTMLInputElement>('form input');
+		await input(fields[0], 'carol');
+		await input(fields[1], 'wrong-password');
+		await submit(element<HTMLFormElement>(rendered.container, 'form'));
+		expect(element(rendered.container, '.error-banner').textContent).toBe('Invalid credentials');
+		expect(rendered.container.querySelector('.initial-password-form')).toBeNull();
+
+		await input(fields[1], 'abcde-FGHJK-23456-mnpqr');
+		await submit(element<HTMLFormElement>(rendered.container, 'form'));
+		expect(rendered.container.querySelector('.initial-password-form')).not.toBeNull();
+		expect(rendered.container.querySelector('.error-banner')).toBeNull();
+		expect(isLoggedIn()).toBe(false);
+		expect(auth.me).not.toHaveBeenCalled();
+	});
+
+	it('keeps password-change errors visible and clears them when continuing to MFA', async () => {
+		auth.login.mockResolvedValueOnce({
+			token: '', user_id: 3, username: 'carol', password_change_required: true,
+		});
+		auth.setInitialPassword.mockRejectedValueOnce(new Error('Password is too common'));
+		auth.setInitialPassword.mockResolvedValueOnce({ mfa_required: true, username: 'carol' });
+		rendered = await renderComponent(LoginPage);
+		const fields = rendered.container.querySelectorAll<HTMLInputElement>('form input');
+		await input(fields[0], 'carol');
+		await input(fields[1], 'abcde-FGHJK-23456-mnpqr');
+		await submit(element<HTMLFormElement>(rendered.container, 'form'));
+		const fresh = rendered.container.querySelectorAll<HTMLInputElement>('.initial-password-form input');
+		await input(fresh[0], 'Carol-own-9');
+		await input(fresh[1], 'Different-password-9');
+		await submit(element<HTMLFormElement>(rendered.container, '.initial-password-form'));
+		expect(element(rendered.container, '.error-banner').textContent).toBe('The two new passwords differ.');
+		expect(auth.setInitialPassword).not.toHaveBeenCalled();
+
+		await input(fresh[1], 'Carol-own-9');
+		await submit(element<HTMLFormElement>(rendered.container, '.initial-password-form'));
+		expect(element(rendered.container, '.error-banner').textContent).toBe('Password is too common');
+		expect(isPasswordChangeRequired()).toBe(true);
+
+		await submit(element<HTMLFormElement>(rendered.container, '.initial-password-form'));
+		expect(isPasswordChangeRequired()).toBe(false);
+		expect(isMfaRequired()).toBe(true);
+		expect(isLoggedIn()).toBe(false);
+		expect(rendered.container.querySelector('input[autocomplete="one-time-code"]')).not.toBeNull();
+		expect(rendered.container.querySelector('.error-banner')).toBeNull();
+		expect(auth.me).not.toHaveBeenCalled();
 	});
 });
 

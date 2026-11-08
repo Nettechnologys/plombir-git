@@ -6,6 +6,11 @@ This project records user-facing changes here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- First sign-in with an administrator-set password shows the required password
+  change step without a misleading "Login failed" banner.
+
 ### Security
 
 - Hidden and missing repositories now return the same REST/API 404. Repository

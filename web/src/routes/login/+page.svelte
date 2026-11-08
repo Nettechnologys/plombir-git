@@ -100,7 +100,7 @@
     const ok = await login(username, password, rememberMe);
     if (ok) {
       window.location.href = '/dashboard';
-    } else if (isMfaRequired()) {
+    } else if (isMfaRequired() || isPasswordChangeRequired()) {
       localError = '';
     } else {
       localError = getAuthError() || t('auth.login.failed');
