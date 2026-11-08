@@ -6,6 +6,11 @@ This project records user-facing changes here. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-08
+
+Read the [v0.4.1 upgrade notes](docs/releases/v0.4.1.md) for the changed
+authentication requirements and manual verification checklist.
+
 ### Security
 
 - Require current-factor fresh proof for repository/org access and security administration; PATs can no longer bypass those interactive gates. The ten-minute proof window remains in force.
@@ -1064,7 +1069,9 @@ See the [v0.1.1 release notes](docs/releases/v0.1.1.md) for upgrade and
 rollback guidance. Publication of a release does not establish that a registry
 package is publicly accessible.
 
-[Unreleased]: https://github.com/Nettechnologys/plombir-git/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Nettechnologys/plombir-git/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.4.1
+[0.4.0]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.2.0
 [0.1.1]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.1.1
