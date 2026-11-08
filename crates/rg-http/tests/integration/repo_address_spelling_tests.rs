@@ -59,13 +59,14 @@ fn paths_with_component(root: &Path, segment: &str) -> Vec<std::path::PathBuf> {
     found
 }
 
-/// What one address answers to git, LFS and releases, as `(info/refs, LFS
-/// upload batch, release creation)` statuses.
+/// What one authenticated address answers to git, LFS and releases, as
+/// `(info/refs, LFS upload batch, release creation)` statuses. Anonymous Git
+/// challenges are checked separately: hidden and missing names challenge alike.
 async fn statuses(base: &str, token: &str, owner: &str, repo: &str, tag: &str) -> [u16; 3] {
     let (git, _) = send(
         reqwest::Method::GET,
         format!("{base}/git/{owner}/{repo}.git/info/refs?service=git-upload-pack"),
-        None,
+        Some(token),
         None,
     )
     .await;
@@ -96,6 +97,22 @@ async fn statuses(base: &str, token: &str, owner: &str, repo: &str, tag: &str) -
     )
     .await;
     [git, lfs, release]
+}
+
+async fn anonymous_git(base: &str, owner: &str, repo: &str) -> (u16, Option<String>, String) {
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{base}/git/{owner}/{repo}.git/info/refs?service=git-upload-pack"
+        ))
+        .send()
+        .await
+        .expect("anonymous Git lookup");
+    let status = response.status().as_u16();
+    let challenge = response
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .map(|value| value.to_str().unwrap().to_owned());
+    (status, challenge, response.text().await.unwrap())
 }
 
 #[tokio::test]
@@ -156,12 +173,21 @@ async fn another_spelling_of_a_repository_address_is_not_found_and_writes_nothin
         assert_eq!(status, 201, "{body}");
     }
 
+    let missing = anonymous_git(&base, &owner, "NeverCreated").await;
+    assert_eq!(missing.0, 401);
+    assert_eq!(missing.1.as_deref(), Some("Basic realm=\"Plombir Git\""));
+
     for (row_owner, row_repo, other_owner, other_repo) in [
         (owner.as_str(), "MyRepo", lower_owner.as_str(), "myrepo"),
         (owner.as_str(), "MyRepo", owner.as_str(), "myrepo"),
         (org.as_str(), "OrgRepo", lower_org.as_str(), "orgrepo"),
         (org.as_str(), "OrgRepo", lower_org.as_str(), "OrgRepo"),
     ] {
+        assert_eq!(
+            anonymous_git(&base, other_owner, other_repo).await,
+            missing,
+            "anonymous Git must not distinguish an alternate spelling from a missing repository"
+        );
         assert_eq!(
             statuses(&base, &token, other_owner, other_repo, "v-other").await,
             [404, 404, 404],
