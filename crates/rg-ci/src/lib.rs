@@ -381,6 +381,28 @@ impl rg_core::ci::CiTrigger for CiEngine {
     }
 }
 
+// Metrics observers are process-global OnceLocks. Tests which install distinct
+// observers need separate processes; a mutex cannot replace the first observer.
+#[cfg(test)]
+fn isolated_observer_test(name: &str) -> bool {
+    const MARKER: &str = "PLOMBIR_CI_OBSERVER_TEST";
+    if std::env::var(MARKER).as_deref() == Ok(name) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", name, "--nocapture"])
+        .env(MARKER, name)
+        .output()
+        .expect("run isolated observer test");
+    assert!(
+        output.status.success(),
+        "isolated {name} failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
 /// The trait's `has_ci_config_checked` carries a fail-open default — `Ok` of
 /// the bool — so that the dozens of test doubles keep compiling. That default
 /// is exactly the wrong answer for the shipped engine: inheriting it would put
@@ -14816,26 +14838,4 @@ mod javascript_action_tests {
             "the toolchains were not kept in the tool cache"
         );
     }
-}
-
-// Metrics observers are process-global OnceLocks. Tests which install distinct
-// observers need separate processes; a mutex cannot replace the first observer.
-#[cfg(test)]
-fn isolated_observer_test(name: &str) -> bool {
-    const MARKER: &str = "PLOMBIR_CI_OBSERVER_TEST";
-    if std::env::var(MARKER).as_deref() == Ok(name) {
-        return false;
-    }
-    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-        .args(["--exact", name, "--nocapture"])
-        .env(MARKER, name)
-        .output()
-        .expect("run isolated observer test");
-    assert!(
-        output.status.success(),
-        "isolated {name} failed:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    true
 }
