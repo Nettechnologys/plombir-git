@@ -1141,6 +1141,7 @@
       "testedIn": [
         "rust",
         "web",
+        "smoke",
         "browser"
       ],
       "reachedFromUi": true,
@@ -5647,7 +5648,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -6321,6 +6323,7 @@
           "testedIn": [
             "rust",
             "web",
+            "smoke",
             "browser"
           ],
           "browserScenarios": [
@@ -6784,7 +6787,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -7630,7 +7634,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -8051,7 +8056,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -8372,7 +8378,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -8869,7 +8876,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -9117,7 +9125,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         },
         {
@@ -9234,7 +9243,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         },
         {
@@ -9773,7 +9783,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -10004,7 +10015,8 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "web"
+                "web",
+                "smoke"
               ]
             },
             {
@@ -10137,7 +10149,8 @@
               "matched": true,
               "testedIn": [
                 "rust",
-                "web"
+                "web",
+                "smoke"
               ]
             },
             {
@@ -10733,7 +10746,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         },
         {
@@ -11260,7 +11274,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -11606,7 +11621,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -11709,7 +11725,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         },
         {
@@ -12264,7 +12281,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -12530,7 +12548,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -12912,7 +12931,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -13215,7 +13235,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -13970,7 +13991,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -14525,7 +14547,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -17165,7 +17188,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         },
         {
@@ -17920,7 +17944,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -18247,7 +18272,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -18620,7 +18646,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -18926,7 +18953,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         },
         {
@@ -21746,7 +21774,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -22254,7 +22283,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -22579,7 +22609,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -23085,7 +23116,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
@@ -23382,7 +23414,8 @@
           "matched": true,
           "testedIn": [
             "rust",
-            "web"
+            "web",
+            "smoke"
           ]
         }
       ]
