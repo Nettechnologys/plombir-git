@@ -515,10 +515,9 @@ mod fork_auto_merge_approval_tests {
         );
         let before = rev_parse(&bare_path(&f), "refs/heads/main");
         enable_auto_merge(&f).await;
-        let error = try_auto_merge(&f)
-            .await
-            .err()
-            .expect("approved H1 must actually conflict");
+        let Err(error) = try_auto_merge(&f).await else {
+            panic!("approved H1 must actually conflict");
+        };
         assert!(
             rg_core::error::client_facing_message(&error)
                 .unwrap_or_default()
