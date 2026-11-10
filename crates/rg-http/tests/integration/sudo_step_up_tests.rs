@@ -334,10 +334,16 @@ async fn the_second_factor_is_asked_for_and_a_pat_cannot_step_up() {
         &client,
         sudo.clone(),
         &stale,
-        serde_json::json!({ "password": PASSWORD, "totp_code": "000000" }),
+        serde_json::json!({ "password": PASSWORD, "backup_code": "not-a-code" }),
     )
     .await;
     assert_eq!(status, 401);
+    assert_eq!(login_attempts(&db, user_id).await, 1);
+    let last_login = rg_db::ops::user_ops::find_by_id(&db, user_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_login_at;
     let (status, body) = post(
         &client,
         sudo.clone(),
@@ -346,6 +352,17 @@ async fn the_second_factor_is_asked_for_and_a_pat_cannot_step_up() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
+
+    let after_proof = rg_db::ops::user_ops::find_by_id(&db, user_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_proof.login_attempts, 0);
+    assert!(after_proof.locked_until.is_none());
+    assert_eq!(
+        after_proof.last_login_at, last_login,
+        "sudo is not a new login"
+    );
 
     let elevated = body["token"].as_str().unwrap().to_string();
     let (status, created) = post(

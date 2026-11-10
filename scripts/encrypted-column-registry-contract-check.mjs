@@ -25,12 +25,12 @@
 //
 //   1. every production `encryption::encrypt(...)` site is classified below,
 //      and each classified file still holds exactly as many as it says;
-//   2. every column the registry names is claimed by one of those sites.
+//   2. every column the registry names is claimed by one of those sites;
+//   3. every entity field named as ciphertext is registered, or explicitly
+//      handled outside the registry.
 //
-// The two together bite on the event the registry exists for. A new encrypted
-// column cannot appear without a new sealing site — and a new sealing site,
-// wherever it is, turns this check red until somebody writes down which column
-// it feeds and puts that column in the registry.
+// A new column can reuse a sealing helper without adding a sealing site (push
+// mirrors did exactly that). The independent entity sweep catches that case.
 //
 // WHAT IS DELIBERATELY NOT CHECKED HERE. That the registry's Rust field names
 // and their `optional` / `required` shapes match the entities: the macro
@@ -106,8 +106,8 @@ const CIPHERTEXT_PRODUCERS = [
   {
     file: 'crates/rg-core/src/mirror/service.rs',
     sites: 1,
-    writes: ['mirrors.password_encrypted'],
-    why: 'a mirror password has to be replayed to the remote, so it is sealed rather than hashed',
+    writes: ['mirrors.password_encrypted', 'push_mirrors.password_encrypted'],
+    why: 'pull and push mirrors share encrypt_password; both replay the credential to the remote',
   },
   {
     file: 'crates/rg-core/src/agent/profile.rs',
@@ -172,6 +172,47 @@ if (production.size === 0) {
     'This check found no production Rust under crates/, so every column below would read as ' +
       'unsealed. Fix the path, not the code.',
   );
+}
+
+// The key-check marker is deliberately replaced by rekey in the same
+// transaction, rather than treated as a user secret in the registry.
+const outsideRegistry = new Set(['encryption_key_check.value_encrypted']);
+// New ciphertext columns MUST end in _encrypted. These historical names
+// predate that convention; keep them visible to the independent schema sweep.
+const legacyCiphertext = new Set(['users.totp_secret', 'users.pending_totp_secret']);
+const entityCiphertext = new Set();
+for (const file of production.keys()) {
+  const name = path.relative(root, file).split(path.sep).join('/');
+  if (!name.startsWith('crates/rg-db/src/entities/')) continue;
+  // The producer view masks strings. Entity table names need the view that
+  // preserves literals while still removing comments and test-only items.
+  const source = productionRustSource(readFileSync(file, 'utf8'));
+  if (!/\bpub\s+struct\s+Model\b/.test(source)) continue;
+  const table = source.match(/\btable_name\s*=\s*"([^"]+)"/);
+  const model = source.match(/\bpub\s+struct\s+Model\s*\{([\s\S]*?)\n\}/);
+  if (!table || !model) {
+    failures.push(`${name}: cannot parse the entity table/Model; ciphertext coverage is unknown`);
+    continue;
+  }
+  for (const field of model[1].matchAll(/\bpub\s+(\w+)\s*:/g)) {
+    const label = `${table[1]}.${field[1]}`;
+    if (!/^(?:encrypted_.*|.*_(?:encrypted|enc))$/.test(field[1]) && !legacyCiphertext.has(label)) continue;
+    entityCiphertext.add(label);
+    if (!registryLabels.has(label) && !outsideRegistry.has(label)) {
+      failures.push(`Entity ciphertext column \`${label}\` is missing from \`with_encrypted_columns!\``);
+    }
+  }
+}
+if (entityCiphertext.size < MIN_REGISTRY_ENTRIES) {
+  failures.push('Too few ciphertext entity fields parsed; fix the schema sweep before trusting it');
+}
+for (const label of outsideRegistry) {
+  if (!entityCiphertext.has(label) || registryLabels.has(label)) {
+    failures.push(`Outside-registry handling of \`${label}\` is stale; review the exception`);
+  }
+}
+for (const label of legacyCiphertext) {
+  if (!entityCiphertext.has(label)) failures.push(`Legacy ciphertext field \`${label}\` disappeared; review its registration`);
 }
 
 const sealer = /\bencryption\s*::\s*encrypt\s*\(/g;

@@ -233,6 +233,34 @@ async fn finalize_mfa_login(
     Ok(user)
 }
 
+/// Reset the shared failure counter only after all required factors were
+/// proved. The database CAS prevents proof for an old factor or password from
+/// clearing failures accumulated by a changed account.
+pub(crate) async fn finalize_reauthentication(
+    state: &AppState,
+    proved_user: &rg_db::entities::user::Model,
+) -> Result<(), AppError> {
+    if rg_db::ops::user_ops::reset_login_failures_after_reauthentication(&state.db, proved_user)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    // The finalizer may have lost to a concurrent fifth failure, even though
+    // this request's initial account snapshot was still unlocked.
+    let locked = rg_db::ops::user_ops::find_by_id(&state.db, proved_user.id)
+        .await?
+        .is_some_and(|user| {
+            user.locked_until
+                .is_some_and(|until| until > chrono::Utc::now())
+        });
+    Err(AppError::unauthorized(if locked {
+        "account is temporarily locked"
+    } else {
+        "authentication changed; sign in again"
+    }))
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SetupMfaResponse {
     secret: String,
@@ -684,7 +712,10 @@ async fn authorize_mfa_change(
         // Honour it if present; the SPA uses the shared sudo dialog instead.
         return match password.flatten().filter(|_| has_local_password(user)) {
             Some(password) => {
-                confirm_account_password(state, user, password, channel, headers).await
+                confirm_account_password(state, user, password, channel, headers).await?;
+                // Current-factor sudo was checked above; password proof alone
+                // deliberately no longer clears an MFA account's failures.
+                finalize_reauthentication(state, user).await
             }
             None => Ok(()),
         };

@@ -245,48 +245,19 @@ async fn pat_to_bearer_jwt(
         return Ok(None);
     };
 
-    let candidates: Vec<String> = if let Some(t) = auth
+    // Existing Bearer/token sessions need no rewriting. All other spellings
+    // share the exact parser used by the outer session-standing gate.
+    if auth
         .strip_prefix("Bearer ")
         .or_else(|| auth.strip_prefix("token "))
+        .is_some_and(|token| rg_core::auth::jwt::validate_token(token, &state.jwt_secret).is_some())
     {
-        // A valid JWT bearer needs no translation.
-        if rg_core::auth::jwt::validate_token(t, &state.jwt_secret).is_some() {
-            return Ok(None);
-        }
-        vec![t.to_string()]
-    } else if let Some(encoded) = auth.strip_prefix("Basic ") {
-        use base64::Engine as _;
-        let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
-            return Ok(None);
-        };
-        let Ok(creds) = String::from_utf8(decoded) else {
-            return Ok(None);
-        };
-        let Some((user, pass)) = creds.split_once(':') else {
-            return Ok(None);
-        };
-        // Token may be in either the password (`user:token`) or username field.
-        [pass, user]
-            .into_iter()
-            .filter(|c| !c.is_empty())
-            .map(|c| c.to_string())
-            .collect()
-    } else if !auth.contains(' ') && !auth.is_empty() {
-        // A bare, scheme-less credential. `cargo publish` sends the registry
-        // token exactly this way — `Authorization: <token>`, no `Bearer` — so
-        // without this branch the whole cargo write API answers 401 to a
-        // correctly configured client (card_5a790cc6ac35).
-        //
-        // Deliberately narrowed to a value carrying no space, so an
-        // `Authorization: <UnknownScheme> <secret>` is still ignored rather than
-        // having its scheme name tried as a token.
-        vec![auth.to_string()]
-    } else {
         return Ok(None);
-    };
+    }
+    let candidates = crate::api::auth::authorization_credentials(auth);
 
     for cand in candidates {
-        // A JWT carried via Basic auth: pass it through as a Bearer token.
+        // A Basic or scheme-less JWT already checked by the standing gate.
         if rg_core::auth::jwt::validate_token(&cand, &state.jwt_secret).is_some() {
             return Ok(Some(Bridged {
                 jwt: cand,

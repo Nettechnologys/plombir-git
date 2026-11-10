@@ -397,11 +397,44 @@ pub(crate) fn ws_session(headers: &HeaderMap, jwt_secret: &str) -> WsSession {
     }
 }
 
+/// Credentials accepted by the REST bridge, before any normalization. The
+/// session-standing gate and the bridge must share this parser: accepting a
+/// new spelling in only the bridge would bypass revocation for that spelling.
+pub(crate) fn authorization_credentials(auth: &str) -> Vec<String> {
+    if let Some(token) = auth
+        .strip_prefix("Bearer ")
+        .or_else(|| auth.strip_prefix("token "))
+    {
+        vec![token.to_string()]
+    } else if let Some(encoded) = auth.strip_prefix("Basic ") {
+        use base64::Engine as _;
+        let creds = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()
+            .and_then(|raw| String::from_utf8(raw).ok());
+        match creds.as_deref().and_then(|value| value.split_once(':')) {
+            Some((user, pass)) => [pass, user]
+                .into_iter()
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect(),
+            None => Vec::new(),
+        }
+    } else if !auth.contains(' ') && !auth.is_empty() {
+        // Cargo sends the registry credential without an authorization scheme.
+        // Unknown schemes containing a space remain unsupported.
+        vec![auth.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Every session JWT this request presents, resolved to its user id and
 /// generation.
 ///
 /// A session may arrive in any of the shapes this server accepts: the HttpOnly
 /// cookie, `Authorization: Bearer`, the `token ` spelling some clients use,
+/// a scheme-less `Authorization` credential (Cargo),
 /// HTTP Basic with the JWT in either field (how git clients carry it), and —
 /// because a browser cannot set headers on a WebSocket handshake — the
 /// `bearer.<jwt>` subprotocol. All of them are collected here, because a gate
@@ -429,23 +462,11 @@ fn presented_session_versions(headers: &HeaderMap, jwt_secret: &str) -> Vec<(i64
         candidates.push(token);
     }
 
-    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        if let Some(token) = auth
-            .strip_prefix("Bearer ")
-            .or_else(|| auth.strip_prefix("token "))
-        {
-            candidates.push(token.to_string());
-        } else if let Some(encoded) = auth.strip_prefix("Basic ") {
-            use base64::Engine as _;
-            let creds = base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .ok()
-                .and_then(|raw| String::from_utf8(raw).ok());
-            if let Some((user, pass)) = creds.as_deref().and_then(|c| c.split_once(':')) {
-                candidates.push(pass.to_string());
-                candidates.push(user.to_string());
-            }
-        }
+    if let Some(auth) = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+    {
+        candidates.extend(authorization_credentials(auth));
     }
 
     let mut sessions = Vec::new();
@@ -828,6 +849,7 @@ mod tests {
         let jwt = session(42);
         for (shape, name, value) in [
             ("Bearer", "authorization", format!("Bearer {jwt}")),
+            ("scheme-less", "authorization", jwt.clone()),
             ("token", "authorization", format!("token {jwt}")),
             ("cookie", "cookie", format!("{AUTH_COOKIE_NAME}={jwt}")),
             ("Basic password", "authorization", basic("alice", &jwt)),

@@ -900,15 +900,16 @@ pub async fn enable_auto_merge(
     {
         return AppError::from(error).into_response();
     }
-    if let Err(error) = rg_core::pull_request::enable_auto_merge(
+    let enabled = match rg_core::pull_request::enable_auto_merge(
         &state.db, &owner, &repo, number, strategy, actor_id,
     )
     .await
     {
+        Ok(enabled) => enabled,
         // A closed PR, a draft or a queue run in progress are typed `Conflict`
         // and answer 409; an unknown PR is 404; the update behind them is ours.
-        return AppError::from(error).into_response();
-    }
+        Err(error) => return AppError::from(error).into_response(),
+    };
     match rg_core::pull_request::try_auto_merge(
         &state.db_pools(),
         &state.repo_root,
@@ -939,7 +940,15 @@ pub async fn enable_auto_merge(
         // A branch-protection rule the server could not read is on this side of
         // that line and not on the pending one: the check never ran, so there is
         // no condition to wait for (card_af2abe7904bd).
-        Err(error) => AppError::from(error).into_response(),
+        Err(error) => {
+            if let Err(clear_error) =
+                rg_db::ops::pull_request_ops::clear_auto_merge_attempt(&state.db, &enabled).await
+            {
+                tracing::error!(pr_id = enabled.id, %clear_error,
+                    "failed to clear auto-merge after a rejected enable request");
+            }
+            AppError::from(error).into_response()
+        }
     }
 }
 

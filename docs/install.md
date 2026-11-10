@@ -217,6 +217,14 @@ Values it cannot open — legacy plaintext, or rows damaged earlier — are coun
 and reported, never rewritten and never deleted. Keep the old secret until the
 server has started under the new one.
 
+If an earlier rotation skipped push-mirror passwords, keep all server processes
+stopped and repeat the rotation with the fixed binary: use the original key as
+`--old` and the current configured key as `--new`. Inspect `--dry-run` first:
+`push_mirrors.password_encrypted` must be listed, while values already using the
+current key are counted as `already_new` and left unchanged. Apply with `--yes`
+only after checking that report. Without the original key, re-enter the affected
+mirror credentials; they cannot be recovered from ciphertext alone.
+
 On startup the server samples the encrypted columns and checks the configured
 key opens them. If it opens none of them, it **refuses to start** and prints
 the recovery, instead of starting and then failing MFA logins, CI jobs, mirror

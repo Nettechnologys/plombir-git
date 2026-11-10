@@ -25,7 +25,9 @@ use utoipa::ToSchema;
 
 use crate::api::access_audit::{grant_actor, record_credential};
 use crate::api::auth::LoginSession;
-use crate::api::mfa::{confirm_account_password, confirm_second_factor, SecondFactor};
+use crate::api::mfa::{
+    confirm_account_password, confirm_second_factor, finalize_reauthentication, SecondFactor,
+};
 use crate::api::users::{build_auth_cookie, AuthResponse};
 use crate::error::AppError;
 use crate::AppState;
@@ -104,6 +106,9 @@ pub async fn step_up(
         None
     };
 
+    if let Err(error) = finalize_reauthentication(&state, &user).await {
+        return error.into_response();
+    }
     let actor = match grant_actor(&state, user_id).await {
         Ok(actor) => actor,
         Err(error) => return error.into_response(),

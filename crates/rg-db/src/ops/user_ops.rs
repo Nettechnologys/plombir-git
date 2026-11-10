@@ -1122,27 +1122,31 @@ where
 }
 
 #[derive(Clone, Copy)]
-enum AuthenticationFinalization {
+enum AuthenticationFinalization<'a> {
     /// The password or directory bind succeeded. Whether that completes login
     /// is decided from the row in the UPDATE itself: an account that currently
-    /// carries MFA gets only its primary-factor failures cleared.
+    /// carries MFA retains the shared failure counter until full proof.
     PrimaryFactor,
     /// A factor which completes authentication succeeded.
     Completed,
-    /// A non-interactive password door succeeded. Clear its strikes, but do not
-    /// claim that a human browser login completed.
+    /// A password was proved without completing an interactive login. Preserve
+    /// the shared failure counter while a second factor remains required.
     FailuresOnly,
+    /// All required factors were proved against this account snapshot. Reset
+    /// failures without recording a new login or accepting a changed identity.
+    Reauthentication(&'a User),
 }
 
 async fn finalize_authentication_state_if_open(
     db: &DatabaseConnection,
     user_id: i64,
-    finalization: AuthenticationFinalization,
+    finalization: AuthenticationFinalization<'_>,
 ) -> Result<Option<User>> {
     let operation = match finalization {
         AuthenticationFinalization::PrimaryFactor => "primary login",
         AuthenticationFinalization::Completed => "completed login",
         AuthenticationFinalization::FailuresOnly => "login-failure reset",
+        AuthenticationFinalization::Reauthentication(_) => "reauthentication",
     };
     crate::contention::retry_transaction(operation, || async move {
         let transaction = db
@@ -1197,11 +1201,50 @@ async fn finalize_authentication_state_if_open(
                     .col_expr(user::Column::LastLoginAt, Expr::value(Some(now))),
                 AuthenticationFinalization::FailuresOnly => UserEntity::update_many()
                     .col_expr(user::Column::UpdatedAt, Expr::value(now))
+                    .col_expr(
+                        user::Column::LoginAttempts,
+                        Expr::case(
+                            Expr::col(user::Column::MfaEnabled).eq(false),
+                            Expr::value(0),
+                        )
+                        .finally(Expr::col(user::Column::LoginAttempts))
+                        .into(),
+                    )
+                    .col_expr(
+                        user::Column::LockedUntil,
+                        Expr::case(
+                            Expr::col(user::Column::MfaEnabled).eq(false),
+                            Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+                        )
+                        .finally(Expr::col(user::Column::LockedUntil))
+                        .into(),
+                    ),
+                AuthenticationFinalization::Reauthentication(_) => UserEntity::update_many()
+                    .col_expr(user::Column::UpdatedAt, Expr::value(now))
                     .col_expr(user::Column::LoginAttempts, Expr::value(0))
                     .col_expr(
                         user::Column::LockedUntil,
                         Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
                     ),
+            };
+            let update = if let AuthenticationFinalization::Reauthentication(proved) = finalization
+            {
+                let update = update
+                    .filter(user::Column::IsActive.eq(true))
+                    .filter(
+                        sea_orm::Condition::any()
+                            .add(user::Column::LockedUntil.is_null())
+                            .add(user::Column::LockedUntil.lte(now)),
+                    )
+                    .filter(user::Column::SessionVersion.eq(proved.session_version))
+                    .filter(user::Column::PasswordHash.eq(proved.password_hash.clone()))
+                    .filter(user::Column::MfaEnabled.eq(proved.mfa_enabled));
+                match &proved.totp_secret {
+                    Some(secret) => update.filter(user::Column::TotpSecret.eq(secret.clone())),
+                    None => update.filter(user::Column::TotpSecret.is_null()),
+                }
+            } else {
+                update
             };
             let update = update
                 .filter(user::Column::Id.eq(user_id))
@@ -1209,7 +1252,22 @@ async fn finalize_authentication_state_if_open(
                 .exec(&transaction)
                 .await
                 .with_context(|| format!("db: {operation}"))?;
-            open_user_after_update(&transaction, user_id, update.rows_affected, operation).await
+            let updated =
+                open_user_after_update(&transaction, user_id, update.rows_affected, operation)
+                    .await?;
+            // MySQL may report zero changed rows for an unchanged update. Keep
+            // that lifecycle classifier, but also classify a lost proof CAS.
+            Ok(updated.filter(|current| match finalization {
+                AuthenticationFinalization::Reauthentication(proved) => {
+                    current.is_usable()
+                        && current.locked_until.is_none_or(|until| until <= now)
+                        && current.session_version == proved.session_version
+                        && current.password_hash == proved.password_hash
+                        && current.mfa_enabled == proved.mfa_enabled
+                        && current.totp_secret == proved.totp_secret
+                }
+                _ => true,
+            }))
         }
         .await;
         match result {
@@ -1255,7 +1313,8 @@ pub async fn record_successful_login(
     finalize_authentication_state_if_open(db, user_id, AuthenticationFinalization::Completed).await
 }
 
-/// Reset failures only while the account remains open.
+/// Finalize password proof while the account remains open. Reset failures only
+/// when MFA is off; a correct password must not erase second-factor failures.
 ///
 /// `None` covers both a retirement claim and a physical DELETE. The update and
 /// its verification read share one retryable transaction so a successful reset
@@ -1267,6 +1326,20 @@ pub async fn reset_login_failures_if_open(
 ) -> Result<Option<User>> {
     finalize_authentication_state_if_open(db, user_id, AuthenticationFinalization::FailuresOnly)
         .await
+}
+
+/// Clear failures after full reauthentication, only for the account and factor
+/// snapshot actually proved. This does not advance `last_login_at`.
+pub async fn reset_login_failures_after_reauthentication(
+    db: &DatabaseConnection,
+    proved: &User,
+) -> Result<Option<User>> {
+    finalize_authentication_state_if_open(
+        db,
+        proved.id,
+        AuthenticationFinalization::Reauthentication(proved),
+    )
+    .await
 }
 
 /// Finalize a standing credential or derived-capability proof while its owner

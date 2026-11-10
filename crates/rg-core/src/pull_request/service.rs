@@ -4458,7 +4458,24 @@ pub async fn try_auto_merge(
     let actor_id = pr.auto_merge_enabled_by_id.ok_or_else(|| {
         crate::error::forbidden("auto-merge has no authorizing actor with write access")
     })?;
-    if !pull_request_ops::claim_auto_merge(db, pr.id).await? {
+    let repository = rg_db::ops::repo_ops::find_by_id(db, pr.repo_id)
+        .await?
+        .ok_or_else(|| crate::error::not_found("repository"))?;
+    if !super::ci::fork_head_ci_is_approved(
+        db,
+        &repository,
+        &pr,
+        pr.head_sha.as_deref().unwrap_or_default(),
+    )
+    .await?
+    {
+        return Ok(AutoMergeOutcome {
+            status: "pending".into(),
+            reason: Some("this fork head needs CI approval from a current maintainer".into()),
+            merge: None,
+        });
+    }
+    if !pull_request_ops::claim_auto_merge(db, &pr).await? {
         return Ok(AutoMergeOutcome {
             status: "pending".into(),
             reason: Some("another automatic merge attempt is already running".into()),
@@ -4492,7 +4509,7 @@ pub async fn try_auto_merge(
     {
         Ok(merge) => merge,
         Err(error) => {
-            if let Err(restore_error) = pull_request_ops::restore_auto_merge(db, pr.id).await {
+            if let Err(restore_error) = pull_request_ops::restore_auto_merge(db, &pr).await {
                 tracing::error!(pr_id = pr.id, %restore_error, "failed to restore auto-merge after merge error");
             }
             return Err(error);

@@ -6,6 +6,26 @@ This project records user-facing changes here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Apply session revocation, account standing and identity-conflict checks to
+  every supported Authorization credential format, including Cargo's raw form.
+- Preserve second-factor failure counters when only a password is verified;
+  successful reauthentication clears them only while the account, credentials
+  and lockout state still match the completed proof.
+- Require explicit approval of the current fork head before merge-group CI or
+  a queued merge. Recheck the approver's active human account and write access
+  on every queue pass, including reuse of an already successful pipeline.
+- Apply the same current-head approval check to automatic fork merges. Failed
+  enable requests clear matching authority; background recovery respects
+  cancellation instead of restoring auto-merge without an authorizing actor.
+- Include push-mirror credentials in encryption-key verification and rotation.
+  Check ciphertext fields independently of sealing helpers so a reused helper
+  cannot silently leave a column outside the rotation registry.
+  If you ran `rotate-encryption-key` on 0.4.1 or earlier and use push mirrors,
+  follow the [recovery procedure](docs/install.md#secrets-and-rotation) with the
+  original and current keys before discarding the original key.
+
 ## [0.4.1] - 2026-11-08
 
 Read the [v0.4.1 upgrade notes](docs/releases/v0.4.1.md) for the changed

@@ -178,10 +178,11 @@ pub async fn settle_password_attempt(
                     );
                 }
             }
-            // The strikes are cleared above before the MFA branch is taken, and
-            // deliberately so: they count *wrong* passwords, and this one was
-            // right. Leaving them would make the second factor a slow lockout
-            // of its own — the owner's git remote retries the password it has
+            // Password and second-factor failures share a counter. A correct
+            // password clears it only when MFA is off: otherwise a registry or
+            // SSH retry could erase the failures of an ongoing MFA challenge.
+            // A correct password is still not a new failure — the client may
+            // be retrying the password it has
             // always used, and five of those would close the web login too.
         }
 

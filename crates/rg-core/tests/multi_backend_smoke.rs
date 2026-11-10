@@ -367,6 +367,48 @@ async fn exercise_login_finalization_contract(db: &DatabaseConnection, suffix: &
         "a fresh primary-factor challenge erased the second-factor failure"
     );
     assert_eq!(pending.last_login_at, None);
+    let pending = rg_db::ops::user_ops::reset_login_failures_if_open(db, mfa.id)
+        .await
+        .expect("finalize a password-only noninteractive attempt")
+        .expect("the MFA account remains open");
+    assert_eq!(
+        pending.login_attempts, 1,
+        "password-only proof erased MFA failures"
+    );
+    let reauthenticated =
+        rg_db::ops::user_ops::reset_login_failures_after_reauthentication(db, &pending)
+            .await
+            .expect("finalize full reauthentication")
+            .expect("the proved account and factor remain current");
+    assert_eq!(reauthenticated.login_attempts, 0);
+    assert_eq!(reauthenticated.last_login_at, None);
+    assert!(
+        rg_db::ops::user_ops::reset_login_failures_after_reauthentication(db, &reauthenticated)
+            .await
+            .expect("repeat reauthentication without changed counters")
+            .is_some(),
+        "a MySQL zero-change update must not reject valid proof"
+    );
+    rg_db::ops::user_ops::record_failed_login(db, mfa.id, 5)
+        .await
+        .unwrap();
+    rg_db::ops::user_ops::invalidate_sessions(db, mfa.id)
+        .await
+        .unwrap();
+    assert!(
+        rg_db::ops::user_ops::reset_login_failures_after_reauthentication(db, &pending)
+            .await
+            .expect("classify stale reauthentication proof")
+            .is_none()
+    );
+    assert_eq!(
+        rg_db::ops::user_ops::find_by_id(db, mfa.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .login_attempts,
+        1
+    );
     let completed = rg_db::ops::user_ops::record_successful_login(db, mfa.id)
         .await
         .expect("finalize the second factor")
@@ -1535,6 +1577,73 @@ async fn portable_merge_queue_pr(
     .insert(db)
     .await
     .expect("create portable merge-queue pull request")
+}
+
+async fn exercise_auto_merge_attempt_contract(
+    db: &DatabaseConnection,
+    owner: &rg_db::entities::user::Model,
+    repo: &rg_db::entities::repository::Model,
+) {
+    use rg_db::ops::pull_request_ops;
+    let pr = portable_merge_queue_pr(db, repo.id, owner.id, 9).await;
+    let enabled = rg_core::pull_request::enable_auto_merge(
+        db,
+        &owner.username,
+        &repo.name,
+        pr.number,
+        rg_core::pull_request::MergeStrategy::Merge,
+        owner.id,
+    )
+    .await
+    .expect("enable using the backend's timestamp precision");
+    let stored = pull_request_ops::find_by_id(db, pr.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(enabled.auto_merge_enabled_at, stored.auto_merge_enabled_at);
+    assert!(pull_request_ops::claim_auto_merge(db, &enabled)
+        .await
+        .unwrap());
+    assert!(
+        !pull_request_ops::find_by_id(db, pr.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .auto_merge_enabled
+    );
+    pull_request_ops::restore_auto_merge(db, &enabled)
+        .await
+        .unwrap();
+    assert!(pull_request_ops::claim_auto_merge(db, &enabled)
+        .await
+        .unwrap());
+    assert!(pull_request_ops::clear_auto_merge_attempt(db, &enabled)
+        .await
+        .unwrap());
+    pull_request_ops::restore_auto_merge(db, &enabled)
+        .await
+        .unwrap();
+    let cleared = pull_request_ops::find_by_id(db, pr.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!cleared.auto_merge_enabled);
+    assert!(cleared.auto_merge_enabled_at.is_none());
+    assert!(cleared.auto_merge_strategy.is_none());
+    assert!(cleared.auto_merge_enabled_by_id.is_none());
+    assert!(!pull_request_ops::clear_auto_merge_attempt(db, &enabled)
+        .await
+        .unwrap());
+    let events = rg_db::ops::pr_event_ops::list_by_pr(db, pr.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.event_type == "auto_merge_disabled")
+            .count(),
+        1
+    );
 }
 
 /// Keep the existing-row enqueue contract honest on backends whose no-op
@@ -2710,6 +2819,8 @@ async fn merge_queue_parent_deletes_are_portable() {
     )
     .await
     .expect("create repository for the portable repository cascade");
+
+    exercise_auto_merge_attempt_contract(&db, &owner, &pr_delete_repo).await;
 
     exercise_merge_queue_parent_delete_contract(
         &db,

@@ -39,6 +39,22 @@ keyring and SSH allowed-signers file; the host account's keyring is never a
 source of trust. Configure email confirmation before enabling the rule on a
 fresh instance, then register at least one signing key.
 
+## Merge queue
+
+The queue builds a speculative merge against the current base branch and waits
+for its CI before merging. A pull request from a fork requires explicit CI approval of its current
+head by an active human maintainer with write access to the base repository,
+even if no CI is configured. Enqueueing by a human or bot does not grant that
+approval. A changed head or an approver who no longer meets those requirements
+fails the entry and cancels its previous pipeline. After approving the current
+head, enqueue the pull request again.
+
+Auto-merge uses the same approval check and remains pending until the current
+fork head has been approved. A new push needs a new approval before that
+automatic merge can complete. If the request to enable auto-merge returns an
+error, its attempt is cleared. A failed background attempt can retry, but cannot
+restore an authorization the user has canceled.
+
 ## Browser sessions
 
 The login form offers **Remember me for 30 days** for password, passkey and SSO

@@ -419,11 +419,10 @@ pub async fn list_open_for_pipeline_commit(
 
 /// Atomically claim an auto-merge so concurrent approval/CI/push events cannot
 /// merge the same PR twice.
-pub async fn claim_auto_merge(db: &DatabaseConnection, pr_id: i64) -> Result<bool> {
+pub async fn claim_auto_merge(db: &DatabaseConnection, attempt: &PullRequest) -> Result<bool> {
     let result = PrEntity::update_many()
         .col_expr(pull_request::Column::AutoMergeEnabled, Expr::value(false))
-        .filter(pull_request::Column::Id.eq(pr_id))
-        .filter(pull_request::Column::State.eq("open"))
+        .filter(auto_merge_attempt(attempt))
         .filter(pull_request::Column::AutoMergeEnabled.eq(true))
         .exec(db)
         .await
@@ -431,15 +430,90 @@ pub async fn claim_auto_merge(db: &DatabaseConnection, pr_id: i64) -> Result<boo
     Ok(result.rows_affected == 1)
 }
 
-pub async fn restore_auto_merge(db: &DatabaseConnection, pr_id: i64) -> Result<()> {
+/// Restore matching authority, never authority removed by cancellation.
+pub async fn restore_auto_merge(db: &DatabaseConnection, attempt: &PullRequest) -> Result<()> {
     PrEntity::update_many()
         .col_expr(pull_request::Column::AutoMergeEnabled, Expr::value(true))
-        .filter(pull_request::Column::Id.eq(pr_id))
-        .filter(pull_request::Column::State.eq("open"))
+        .filter(auto_merge_attempt(attempt))
+        .filter(pull_request::Column::AutoMergeEnabled.eq(false))
         .exec(db)
         .await
         .context("db: restore auto-merge")?;
     Ok(())
+}
+
+/// Disarm a rejected enable request without touching different authority.
+pub async fn clear_auto_merge_attempt(
+    db: &DatabaseConnection,
+    attempt: &PullRequest,
+) -> Result<bool> {
+    let transaction = db
+        .begin()
+        .await
+        .context("db: begin failed auto-merge cleanup")?;
+    let changed = PrEntity::update_many()
+        .col_expr(pull_request::Column::AutoMergeEnabled, Expr::value(false))
+        .col_expr(
+            pull_request::Column::AutoMergeStrategy,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            pull_request::Column::AutoMergeEnabledById,
+            Expr::value(Option::<i64>::None),
+        )
+        .col_expr(
+            pull_request::Column::AutoMergeEnabledAt,
+            Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+        )
+        .col_expr(
+            pull_request::Column::UpdatedAt,
+            Expr::value(chrono::Utc::now()),
+        )
+        .filter(auto_merge_attempt(attempt))
+        .exec(&transaction)
+        .await
+        .context("db: clear failed auto-merge attempt")?
+        .rows_affected
+        > 0;
+    if changed {
+        super::pr_event_ops::record(
+            &transaction,
+            attempt.repo_id,
+            attempt.id,
+            attempt.auto_merge_enabled_by_id,
+            "auto_merge_disabled",
+            None,
+            serde_json::json!({"reason": "enable_failed"}),
+        )
+        .await?;
+    }
+    transaction
+        .commit()
+        .await
+        .context("db: commit failed auto-merge cleanup")?;
+    Ok(changed)
+}
+
+fn auto_merge_attempt(attempt: &PullRequest) -> Condition {
+    // These fields are read back from the database after enable, so timestamp
+    // precision is already normalized for the backend. This is an authority
+    // identity, NOT a unique generation: MySQL may store whole seconds. Same
+    // actor/strategy requests within that precision may match; cleanup can
+    // disarm an equivalent re-enable. Restore still requires complete authority,
+    // and every merge independently checks current head approval and pins it.
+    let (Some(actor), Some(strategy), Some(enabled_at)) = (
+        attempt.auto_merge_enabled_by_id,
+        attempt.auto_merge_strategy.as_deref(),
+        attempt.auto_merge_enabled_at,
+    ) else {
+        return Condition::all().add(Expr::val(1).eq(0));
+    };
+    Condition::all()
+        .add(pull_request::Column::Id.eq(attempt.id))
+        .add(pull_request::Column::State.eq("open"))
+        .add(pull_request::Column::AutoMergeEnabledById.eq(actor))
+        .add(pull_request::Column::AutoMergeStrategy.eq(strategy))
+        .add(pull_request::Column::AutoMergeEnabledAt.eq(enabled_at))
 }
 
 /// Atomically move an open PR into the short-lived `merging` state.

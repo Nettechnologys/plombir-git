@@ -41,6 +41,7 @@ mod push_mirror_tests;
 mod repo_redirect_tests;
 mod repo_settings_tests;
 mod repository_visibility_tests;
+mod second_factor_lockout_tests;
 
 mod access_security_tests;
 mod account_deletion_serialized_grant_tests;

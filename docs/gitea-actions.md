@@ -1301,6 +1301,15 @@ the repository (`contents`) and its packages (`packages`), and nothing else. So:
 - A fork's pull request runs only once a maintainer approves its head commit
   on the pull request page — a new push needs a new approval — and then with
   what the workflow declares, its secrets included.
+  The merge queue requires that same explicit approval, including when no CI
+  workflow is configured. Enqueueing a fork does not approve it. Before each
+  queue pass, the approved commit must still match the head and the approver
+  must still be an active human with write access to the base repository.
+  Otherwise the entry fails and any previous merge-group pipeline is canceled;
+  approve the current head and enqueue it again. A successful earlier pipeline
+  does not replace this check.
+  Auto-merge also checks that approval immediately before merging and waits
+  pending when the current fork head lacks it, including after a new push.
 
 ## Defaults
 
