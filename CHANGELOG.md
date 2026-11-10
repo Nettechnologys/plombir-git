@@ -21,6 +21,14 @@ This project records user-facing changes here. The format follows
 - Reserve LDAP usernames when creating organizations and bots, including
   directory members who have not signed in yet. These operations now fail
   closed with `502` when a configured directory cannot answer the reservation check.
+- Git HTTP fetch and push revalidate credentials, account standing, repository identity and access after request-body staging. Push reloads branch/tag, mirror and token policy before Git starts; a slow upload cannot preserve authority revoked during its reception. In-flight Git work after this second check may still finish.
+
+- Repository permission checks no longer cache positive decisions: collaborator, organization and team revocation is observed by subsequent checks across database pools and server processes. Repeated refusals are cached for at most five seconds; newly granted access may wait that long when granted through another pool. Authorized requests perform fresh grant queries.
+
+- Require PR authors to retain write access to private fork sources. Revocation,
+  a downgrade to reader, or deactivation freezes updates and blocks CI and
+  merging. Previously fetched diffs remain readable while their objects are
+  retained; unavailable snapshots return `409 head_source_unavailable`.
 - Apply session revocation, account standing and identity-conflict checks to
   every supported Authorization credential format, including Cargo's raw form.
 - Preserve second-factor failure counters when only a password is verified;

@@ -821,6 +821,7 @@
     "delete_confirm_title": "Delete milestone"
   },
   "pulls": {
+    "head_source_unavailable": "The source no longer permits updates to this pull request. Showing a previously fetched snapshot.",
     "delete": {
       "title": "Delete this pull request",
       "desc": "Deleting a pull request removes it with its reviews, comments, timeline and attachments, and cancels its CI. A merged pull request cannot be deleted. This cannot be undone.",

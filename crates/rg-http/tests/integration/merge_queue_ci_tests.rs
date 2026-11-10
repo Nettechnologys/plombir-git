@@ -465,7 +465,7 @@ async fn a_moved_head_cancels_the_merge_group_pipeline_it_left_behind() {
         .stdout_str()
         .trim()
         .to_string();
-    rg_db::ops::pull_request_ops::update_open_head_sha(
+    rg_core::pull_request::refresh_open_heads(
         &fixture.db,
         fixture.repo_id,
         "feature",

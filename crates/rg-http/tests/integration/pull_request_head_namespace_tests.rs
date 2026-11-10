@@ -238,6 +238,103 @@ fn seed_shared_history(upstream: &std::path::Path, fork: &std::path::Path) {
     git(&["push", fork_arg, "feature"], Some(path));
 }
 
+#[tokio::test]
+async fn private_fork_publication_requires_write_even_though_compare_only_requires_read() {
+    let (base, db, root) = crate::common::spawn_test_app_with_db_and_repo_root().await;
+    let (up_token, _) = register_full(&base, "source-up", "source-up@example.test").await;
+    let upstream = create_repo_in(&base, &up_token, "shared", None).await;
+    let (fork_token, _) = register_full(&base, "source-owner", "source-owner@example.test").await;
+    let source_id = create_repo_in(&base, &fork_token, "shared", None).await;
+    mark_as_fork(&db, source_id, upstream).await;
+    seed_shared_history(
+        &root.join("source-up/shared.git"),
+        &root.join("source-owner/shared.git"),
+    );
+    let source = repository::Entity::find_by_id(source_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut source: repository::ActiveModel = source.into();
+    source.is_private = Set(true);
+    source.update(&db).await.unwrap();
+    let (author_token, author_id) =
+        register_full(&base, "source-writer", "source-writer@example.test").await;
+    let client = reqwest::Client::new();
+    let api = format!("{base}/api/v1/repos/source-up/shared");
+    let create =
+        serde_json::json!({"title":"private source", "head":"source-owner:feature", "base":"main"});
+    let mut number = None;
+    for role in ["read", "write", "read"] {
+        rg_db::ops::repo_collaborator_ops::delete_by_repo_and_user(&db, source_id, author_id)
+            .await
+            .unwrap();
+        rg_db::ops::repo_collaborator_ops::create(
+            &db,
+            rg_db::entities::repo_collaborator::ActiveModel {
+                repo_id: Set(source_id),
+                user_id: Set(author_id),
+                permission: Set(role.into()),
+                created_at: Set(chrono::Utc::now()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // A new grant clears a cached denial. A downgrade must take effect
+        // without invalidation, including for the PR that already exists.
+        if role == "write" {
+            rg_core::repo::service::invalidate_perm_cache_user(&db, source_id, author_id);
+        }
+        if number.is_none() {
+            let compared = client
+                .get(format!("{api}/compare?base=main&head=source-owner:feature"))
+                .bearer_auth(&author_token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                compared.status(),
+                200,
+                "a personal comparison remains a read"
+            );
+            let response = client
+                .post(format!("{api}/pulls"))
+                .bearer_auth(&author_token)
+                .json(&create)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), if role == "write" { 201 } else { 403 });
+            if role == "write" {
+                let pr: serde_json::Value = response.json().await.unwrap();
+                number = Some(pr["number"].as_i64().unwrap());
+            }
+        } else {
+            let number = number.unwrap();
+            let response = client
+                .get(format!("{api}/pulls/{number}/diff"))
+                .bearer_auth(&up_token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let diff: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(diff["head_source_unavailable"], true);
+            let response = client
+                .post(format!("{api}/pulls/{number}/merge"))
+                .bearer_auth(&up_token)
+                .json(&serde_json::json!({"strategy":"merge"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 409);
+            let error: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(error["error"]["reason"], "head_source_unavailable");
+        }
+    }
+}
+
 /// End to end: an organization's repository opens a PR against the upstream and
 /// the diff comes back.
 ///
@@ -627,4 +724,95 @@ async fn a_base_only_pat_cannot_reach_an_existing_fork_prs_head() {
         git_stdout(&["rev-parse", "refs/heads/main"], &base_path),
         main_before
     );
+}
+
+#[tokio::test]
+async fn an_org_fork_creator_still_needs_the_organizations_write_grant() {
+    let (base, db, repo_root) = crate::common::spawn_test_app_with_db_and_repo_root().await;
+    let (upstream, _) = register_full(&base, "source-org-pr", "source-org-pr@example.test").await;
+    let (owner, _) = register_full(&base, "owner-org-pr", "owner-org-pr@example.test").await;
+    let (member, member_id) =
+        register_full(&base, "member-org-pr", "member-org-pr@example.test").await;
+    create_org(&base, &owner, "source-team").await;
+    let client = reqwest::Client::new();
+    let joined = client
+        .post(format!("{base}/api/v1/orgs/source-team/members"))
+        .bearer_auth(&owner)
+        .json(&serde_json::json!({"user_id": member_id, "role": "member"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(joined.status(), 201, "{}", joined.text().await.unwrap());
+    let created = client
+        .post(format!("{base}/api/v1/repos"))
+        .bearer_auth(&upstream)
+        .json(&serde_json::json!({"name": "private-pr", "is_private": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
+    let source_path = repo_root.join("source-org-pr/private-pr.git");
+    seed_shared_history(&source_path, &source_path);
+    let granted = client
+        .post(format!(
+            "{base}/api/v1/repos/source-org-pr/private-pr/collaborators"
+        ))
+        .bearer_auth(&upstream)
+        .json(&serde_json::json!({"username": "member-org-pr", "permission": "read"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(granted.status(), 201, "{}", granted.text().await.unwrap());
+    let forked = client
+        .post(format!("{base}/api/v1/repos/source-org-pr/private-pr/fork"))
+        .bearer_auth(&member)
+        .json(&serde_json::json!({"org": "source-team"}))
+        .send()
+        .await
+        .unwrap();
+    let status = forked.status();
+    let fork: serde_json::Value = forked.json().await.unwrap();
+    assert_eq!(status, 201, "{fork}");
+    assert_eq!(fork["is_private"], true);
+    let row = repository::Entity::find_by_id(fork["id"].as_i64().unwrap())
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !rg_core::repo::service::can_write_repo(&db, &row, Some(member_id))
+            .await
+            .unwrap()
+    );
+    let pr_url = format!("{base}/api/v1/repos/source-org-pr/private-pr/pulls");
+    let body = serde_json::json!({"title": "organization fork", "head": "source-team:feature", "base": "main"});
+    let refused = client
+        .post(&pr_url)
+        .bearer_auth(&member)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403, "{}", refused.text().await.unwrap());
+    let granted = client
+        .post(format!(
+            "{base}/api/v1/repos/source-team/private-pr/collaborators"
+        ))
+        .bearer_auth(&owner)
+        .json(&serde_json::json!({"username": "member-org-pr", "permission": "write"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(granted.status(), 201, "{}", granted.text().await.unwrap());
+    let accepted = client
+        .post(&pr_url)
+        .bearer_auth(&member)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = accepted.status();
+    let pr: serde_json::Value = accepted.json().await.unwrap();
+    assert_eq!(status, 201, "{pr}");
+    assert_eq!(pr["head_repo_id"], fork["id"]);
 }

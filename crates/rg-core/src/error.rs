@@ -172,6 +172,12 @@ pub fn conflict(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(Conflict::new(message))
 }
 
+/// A PR may retain a snapshot, but its private source no longer authorizes
+/// further publication. The HTTP layer exposes a stable actionable qualifier.
+#[derive(Debug, Error)]
+#[error("head repository is no longer available to the pull request author")]
+pub struct HeadSourceUnavailable;
+
 /// A policy the caller is subject to says no.
 ///
 /// Distinct from [`Conflict`] (the resource's state) and from

@@ -430,7 +430,7 @@ pub(crate) fn authorization_credentials(auth: &str) -> Vec<String> {
 }
 
 /// Every session JWT this request presents, resolved to its user id and
-/// generation.
+/// generation. Shared by admission and the Git post-staging recheck.
 ///
 /// A session may arrive in any of the shapes this server accepts: the HttpOnly
 /// cookie, `Authorization: Bearer`, the `token ` spelling some clients use,
@@ -450,7 +450,7 @@ pub(crate) fn authorization_credentials(auth: &str) -> Vec<String> {
 /// Token, a CI job token, an OCI registry token and an MFA challenge all fail
 /// `validate_token` (different claim shape or a domain-separated key), and each
 /// carries its own owner check where it is resolved.
-fn presented_session_versions(headers: &HeaderMap, jwt_secret: &str) -> Vec<(i64, i64)> {
+pub(crate) fn presented_session_versions(headers: &HeaderMap, jwt_secret: &str) -> Vec<(i64, i64)> {
     let mut candidates: Vec<String> = Vec::new();
 
     if let Some(token) = extract_token_from_cookie(headers) {

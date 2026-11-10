@@ -204,6 +204,21 @@ fn head_repository_condition(source_repo_id: i64) -> Condition {
         .add(pull_request::Column::HeadRepoId.eq(source_repo_id))
 }
 
+/// Open PRs whose head is the named branch of this source repository.
+pub async fn list_open_with_head(
+    db: &DatabaseConnection,
+    source_repo_id: i64,
+    head_branch: &str,
+) -> Result<Vec<PullRequest>> {
+    PrEntity::find()
+        .filter(head_repository_condition(source_repo_id))
+        .filter(pull_request::Column::HeadBranch.eq(head_branch))
+        .filter(pull_request::Column::State.eq("open"))
+        .all(db)
+        .await
+        .context("db: find PRs for source branch")
+}
+
 /// Result of reconciling the open PRs for one source branch.
 #[derive(Debug)]
 pub struct OpenHeadShaRefresh {
@@ -256,7 +271,8 @@ pub async fn compare_and_swap_open_head_sha(
 /// Each row is updated only while `head_sha` still equals the value selected
 /// above. A delayed hook must not turn its stale model into an unconditional
 /// `UPDATE` after a newer hook has already published a later commit.
-pub async fn update_open_head_sha(
+#[cfg(test)]
+async fn update_open_head_sha(
     db: &DatabaseConnection,
     source_repo_id: i64,
     head_branch: &str,
@@ -268,6 +284,7 @@ pub async fn update_open_head_sha(
     .await
 }
 
+#[cfg(test)]
 async fn update_open_head_sha_after_read<F, Fut>(
     db: &DatabaseConnection,
     source_repo_id: i64,
@@ -334,35 +351,6 @@ pub async fn count_open_with_head(
         .count(db)
         .await
         .context("db: count open PRs on a head branch")
-}
-
-/// Advance PR heads only while they still point at the commit that was used
-/// to prepare a server-side update. This prevents a later DB write from
-/// overwriting a newer concurrent push notification.
-pub async fn advance_open_head_sha(
-    db: &DatabaseConnection,
-    source_repo_id: i64,
-    head_branch: &str,
-    expected_head_sha: &str,
-    new_head_sha: &str,
-) -> Result<u64> {
-    let result = PrEntity::update_many()
-        .col_expr(
-            pull_request::Column::HeadSha,
-            Expr::value(Some(new_head_sha.to_string())),
-        )
-        .col_expr(
-            pull_request::Column::UpdatedAt,
-            Expr::value(chrono::Utc::now()),
-        )
-        .filter(head_repository_condition(source_repo_id))
-        .filter(pull_request::Column::HeadBranch.eq(head_branch))
-        .filter(pull_request::Column::State.eq("open"))
-        .filter(pull_request::Column::HeadSha.eq(expected_head_sha))
-        .exec(db)
-        .await
-        .context("db: advance PR head SHA")?;
-    Ok(result.rows_affected)
 }
 
 /// Find enabled auto-merge PRs for a source repository commit.

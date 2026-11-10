@@ -992,7 +992,7 @@ async fn synchronize_open_pr_heads(
                 crate::repo::service::try_get_branch_sha(&path, &branch)
             })
             .await?;
-        let refreshed = rg_db::ops::pull_request_ops::update_open_head_sha(
+        let refreshed = crate::pull_request::fork_source::refresh_open_heads(
             params.db,
             target.repo_id,
             branch_name,

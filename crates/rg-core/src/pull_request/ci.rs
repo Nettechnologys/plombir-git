@@ -151,6 +151,13 @@ pub(super) async fn fork_head_ci_is_approved(
     pr: &pull_request::Model,
     head_sha: &str,
 ) -> Result<bool> {
+    if !super::fork_source::is_live(db, pr).await? {
+        tracing::info!(
+            pr_id = pr.id,
+            "pull_request CI held: private head source is unavailable"
+        );
+        return Ok(false);
+    }
     // A fork PR's head is code the base repository's owner has not accepted, and
     // a pipeline carries that repository's CI secrets (`ci_secret_ops` are keyed
     // by `repo_id` and injected into every job). Running it automatically would

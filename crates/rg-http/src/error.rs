@@ -100,6 +100,8 @@ pub enum AppError {
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
+    HeadSourceUnavailable(String),
+    #[error("{0}")]
     Gone(String),
     #[error("{0}")]
     TooManyRequests(String),
@@ -136,7 +138,7 @@ impl AppError {
                 "UNAUTHORIZED"
             }
             Self::Forbidden(_) | Self::SudoRequired(_) => "FORBIDDEN",
-            Self::Conflict(_) => "CONFLICT",
+            Self::Conflict(_) | Self::HeadSourceUnavailable(_) => "CONFLICT",
             Self::Gone(_) => "GONE",
             Self::TooManyRequests(_) => "RATE_LIMITED",
             Self::PayloadTooLarge(_) => "PAYLOAD_TOO_LARGE",
@@ -156,7 +158,7 @@ impl AppError {
                 StatusCode::UNAUTHORIZED
             }
             Self::Forbidden(_) | Self::SudoRequired(_) => StatusCode::FORBIDDEN,
-            Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::Conflict(_) | Self::HeadSourceUnavailable(_) => StatusCode::CONFLICT,
             Self::Gone(_) => StatusCode::GONE,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
@@ -206,6 +208,7 @@ impl IntoResponse for AppError {
                     Self::SudoRequired(_) => Some(SUDO_REQUIRED_REASON),
                     Self::SessionRevoked(_) => Some("session_revoked"),
                     Self::IdentityConflict(_) => Some("identity_conflict"),
+                    Self::HeadSourceUnavailable(_) => Some("head_source_unavailable"),
                     _ => None,
                 },
             },
@@ -477,6 +480,9 @@ impl From<anyhow::Error> for AppError {
         // failure sitting next to them hides it completely.
         if let Some(conflict) = e.downcast_ref::<rg_core::error::Conflict>() {
             return Self::Conflict(conflict.to_string());
+        }
+        if let Some(error) = e.downcast_ref::<rg_core::error::HeadSourceUnavailable>() {
+            return Self::HeadSourceUnavailable(error.to_string());
         }
 
         // And the policy half: a branch-protection rule that refuses the merge

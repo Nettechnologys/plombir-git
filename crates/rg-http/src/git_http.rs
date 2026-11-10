@@ -404,6 +404,144 @@ async fn check_git_access(
     }
 }
 
+/// A staged request must retain the exact credential it started with. Basic
+/// has two candidate fields: revoking the first must not select the second.
+fn credential_identity(credential: Option<&GitCredential>) -> Option<(i64, Option<i64>)> {
+    credential.map(|credential| {
+        (
+            credential.user_id,
+            credential.grant.as_ref().map(|grant| grant.token_id()),
+        )
+    })
+}
+
+fn staged_credential_refusal() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Basic realm=\"Plombir Git\"")],
+        "authentication is no longer valid",
+    )
+        .into_response()
+}
+
+fn missing_git_repository(actor_id: Option<i64>) -> Response {
+    if actor_id.is_none() {
+        (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Basic realm=\"Plombir Git\"")],
+            "authentication required",
+        )
+            .into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "repository not found").into_response()
+    }
+}
+
+async fn current_git_repository(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    actor_id: Option<i64>,
+) -> Result<rg_db::entities::repository::Model, Response> {
+    match find_repo_by_name(&state.db, owner, repo).await {
+        Ok(Some(model)) if model.deleted_at.is_none() => Ok(model),
+        Ok(_) => Err(missing_git_repository(actor_id)),
+        Err(error) => Err((
+            git_db_status(&error),
+            git_failure_body("load repository", &error),
+        )
+            .into_response()),
+    }
+}
+
+/// Re-read authority after untrusted bytes finish arriving, before Git starts.
+/// This is deliberately independent of the initial middleware check: staging
+/// has an idle timeout, but a slow sender can keep it open across revocation.
+async fn authorize_staged_git_request(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    owner: &str,
+    repo: &str,
+    initial_repository_id: i64,
+    initial_credential: Option<&GitCredential>,
+    require_write: bool,
+) -> Result<(Option<GitCredential>, rg_db::entities::repository::Model), Response> {
+    let credential = extract_git_credential(&state.db, &state.db_write, headers, &state.jwt_secret)
+        .await
+        .map_err(|error| {
+            (
+                git_db_status(&error),
+                git_failure_body("resolve git credential", &error),
+            )
+                .into_response()
+        })?;
+    if credential_identity(credential.as_ref()) != credential_identity(initial_credential) {
+        return Err(staged_credential_refusal());
+    }
+    // The resolver validates JWT signature/expiry, but only the standing gate
+    // validates generation. Repeat it for every session presentation using the
+    // same parser, including either Basic field. PAT owner/expiry/narrowing was
+    // already reloaded by extract_git_credential above.
+    for (user_id, version) in
+        crate::api::auth::presented_session_versions(headers, &state.jwt_secret)
+    {
+        match rg_db::ops::user_ops::find_by_id(&state.db, user_id).await {
+            Ok(Some(user)) if user.is_usable() && user.session_version == version => {}
+            Ok(_) => return Err(staged_credential_refusal()),
+            Err(error) => {
+                return Err((
+                    git_db_status(&error),
+                    git_failure_body("verify git session", &error),
+                )
+                    .into_response())
+            }
+        }
+    }
+    let actor_id = credential.as_ref().map(|credential| credential.user_id);
+    git_grant_refusal(state, credential.as_ref(), owner, repo, headers)
+        .await
+        .map_err(|(status, headers, body)| (status, headers, Body::from(body)).into_response())?;
+    check_git_access(&state.db, owner, repo, actor_id, require_write)
+        .await
+        .map_err(|(status, headers, body)| (status, headers, Body::from(body)).into_response())?;
+    let repository = current_git_repository(state, owner, repo, actor_id).await?;
+    if repository.id != initial_repository_id {
+        // Renaming/transferring/deleting and reusing the URL cannot redirect an
+        // already admitted request into a different repository.
+        return Err(missing_git_repository(actor_id));
+    }
+    Ok((credential, repository))
+}
+
+async fn current_git_push_policy(
+    state: &AppState,
+    repo_id: i64,
+    credential: Option<&GitCredential>,
+) -> Result<rg_git::protocol::receive_pack::PushPolicy, Response> {
+    let actor_id = credential.map(|credential| credential.user_id);
+    let token_kept_off_protected = credential
+        .and_then(|credential| credential.grant.as_ref())
+        .is_some_and(|grant| grant.denies_protected_writes());
+    rg_core::branch_protection::push_rules::load_receive_pack_policy(
+        &state.db,
+        repo_id,
+        actor_id,
+        token_kept_off_protected,
+    )
+    .await
+    .map_err(|error| {
+        (
+            git_db_status(&error),
+            [(
+                header::CONTENT_TYPE,
+                "application/x-git-receive-pack-result",
+            )],
+            Body::from(git_failure_body("load push policy", &error)),
+        )
+            .into_response()
+    })
+}
+
 /// Apply a Personal Access Token's narrowing to a git request.
 ///
 /// Git is not behind the REST PAT middleware or the per-route layer, so the two
@@ -1335,6 +1473,11 @@ pub(crate) async fn handle_git_upload_pack(
             .into_response();
     }
 
+    let initial_repository = match current_git_repository(&state, &owner, &repo, actor_id).await {
+        Ok(repository) => repository,
+        Err(response) => return response,
+    };
+
     // Record fetch/clone/pull duration + count across every return path below.
     let _op_timer = GitOpTimer::new("fetch");
 
@@ -1371,6 +1514,19 @@ pub(crate) async fn handle_git_upload_pack(
                 .into_response();
         }
     };
+    if let Err(response) = authorize_staged_git_request(
+        &state,
+        &headers,
+        &owner,
+        &repo,
+        initial_repository.id,
+        credential.as_ref(),
+        false,
+    )
+    .await
+    {
+        return response;
+    }
     // Check if client wants Protocol V2
     let protocol = if git_v2::wants_protocol_v2(&headers) {
         UploadPackProtocol::V2
@@ -1532,35 +1688,13 @@ pub(crate) async fn handle_git_receive_pack(
     // hear that rather than "push to protected branch … is not allowed" —
     // which would blame the pusher for a broken row and, for a pusher who *is*
     // on the list, be a lie.
-    let token_kept_off_protected = credential
-        .as_ref()
-        .and_then(|credential| credential.grant.as_ref())
-        .is_some_and(|grant| grant.denies_protected_writes());
-    let push_policy = match rg_core::branch_protection::push_rules::load_receive_pack_policy(
-        &state.db,
-        repo_model.id,
-        actor_id,
-        token_kept_off_protected,
-    )
-    .await
+    if let Err(response) = current_git_push_policy(&state, repo_model.id, credential.as_ref()).await
     {
-        Ok(policy) => policy,
-        Err(e) => {
-            return (
-                git_db_status(&e),
-                [(
-                    header::CONTENT_TYPE,
-                    "application/x-git-receive-pack-result",
-                )],
-                Body::from(git_failure_body("load push policy", &e)),
-            )
-                .into_response();
-        }
-    };
+        return response;
+    }
 
-    // All access and policy reads happen before the body is consumed. A valid
-    // pusher's request is spooled to disk under the same ceiling rg-git applies
-    // again at pack ingestion, so neither HTTP nor SSH has an unbounded path.
+    // Initial checks bound unauthenticated work. Staging may outlive those
+    // decisions, so authority and the complete push policy are reloaded below.
     let coding = match request_coding(&headers) {
         Ok(coding) => coding,
         Err((status, msg)) => {
@@ -1591,6 +1725,26 @@ pub(crate) async fn handle_git_receive_pack(
                 .into_response();
         }
     };
+    let (credential, repo_model) = match authorize_staged_git_request(
+        &state,
+        &headers,
+        &owner,
+        &repo,
+        repo_model.id,
+        credential.as_ref(),
+        true,
+    )
+    .await
+    {
+        Ok(current) => current,
+        Err(response) => return response,
+    };
+    let actor_id = credential.as_ref().map(|credential| credential.user_id);
+    let push_policy =
+        match current_git_push_policy(&state, repo_model.id, credential.as_ref()).await {
+            Ok(policy) => policy,
+            Err(response) => return response,
+        };
     // Held until this handler returns, which is when the `git` children of
     // the push are gone.
     let _session = match acquire_git_session(actor_id, &headers, "receive-pack") {
@@ -2021,12 +2175,23 @@ mod tests {
     #[test]
     fn git_http_authenticates_before_staging_request_bytes() {
         let source = include_str!("git_http.rs");
+        assert_eq!(
+            rust_source::production_call_sites(source, &["stage_git_body"]).len(),
+            2,
+            "a new staging entrance needs its own post-body authorization contract"
+        );
 
         for function in ["handle_git_upload_pack", "handle_git_receive_pack"] {
             let calls = rust_source::production_function_call_sites(
                 source,
                 function,
-                &["check_git_access", "stage_git_body"],
+                &[
+                    "check_git_access",
+                    "stage_git_body",
+                    "authorize_staged_git_request",
+                    "acquire_git_session",
+                    "current_git_push_policy",
+                ],
             );
             let auth = calls
                 .iter()
@@ -2039,6 +2204,34 @@ mod tests {
                 .find(|call| rust_source::source_line(source, call.line).contains("stage_git_body"))
                 .unwrap_or_else(|| panic!("{function} no longer stages its request body"));
 
+            let recheck = calls
+                .iter()
+                .find(|call| {
+                    rust_source::source_line(source, call.line)
+                        .contains("authorize_staged_git_request")
+                })
+                .expect("staged authority recheck");
+            let acquire = calls
+                .iter()
+                .find(|call| {
+                    rust_source::source_line(source, call.line).contains("acquire_git_session")
+                })
+                .expect("Git session admission");
+            assert!(
+                staging.open_paren < recheck.open_paren && recheck.open_paren < acquire.open_paren,
+                "{function} must reauthorize after staging and before Git work"
+            );
+            if function == "handle_git_receive_pack" {
+                assert!(
+                    calls
+                        .iter()
+                        .any(|call| rust_source::source_line(source, call.line)
+                            .contains("current_git_push_policy")
+                            && recheck.open_paren < call.open_paren
+                            && call.open_paren < acquire.open_paren),
+                    "push policy must be reloaded with current authority"
+                );
+            }
             assert!(
                 auth.open_paren < staging.open_paren,
                 "{function} consumes attacker-owned request bytes before repository access is \

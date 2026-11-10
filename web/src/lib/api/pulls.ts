@@ -19,6 +19,8 @@ export type FileDiff = {
 };
 
 export type PrDiff = {
+  /** Only a previously fetched snapshot can be read after source revocation. */
+  head_source_unavailable?: boolean;
   base_branch: string;
   head_branch: string;
   files_changed: FileDiff[];

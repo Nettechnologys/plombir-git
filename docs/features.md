@@ -232,3 +232,69 @@ for the source owner; it grants no continuing access to new source changes.
 > Git object operations use a hybrid of `gix` and a `GitCommandGateway`: pack,
 > rebase, archive and some diff/GPG paths still shell out to the `git` CLI
 > while the corresponding `gix` capabilities mature.
+
+### Repository permission decisions
+
+Read and write grants are checked against the database on each authorization
+check. Positive decisions are not cached across requests, so a late lookup cannot
+restore a revoked cache entry and another database pool or server process cannot
+continue using an old grant. Repeated refusals alone are cached for five seconds;
+new access granted through another pool may take that long to become available.
+An authorized request therefore performs fresh, indexed grant lookups. This does
+not turn an authorization check followed by Git work into an atomic transaction:
+a request already admitted before revocation may still finish, and callers must
+supply a current repository model when checking visibility and ownership.
+
+### Private fork pull-request sources
+
+Opening a pull request from a private fork requires write access to that fork.
+The author must retain that permission for later head updates, diff fetches, CI
+and merges. Revoking it, downgrading it to read, or deactivating the author
+freezes the PR at its last authorized head. Returning write access allows the
+next branch synchronization to resume updates. Existing PRs opened by mere
+readers of private forks also freeze after upgrading. Public forks and
+same-repository PRs keep their existing behavior; a personal comparison still
+requires only read access to both repositories.
+
+A frozen diff reads only objects already fetched into the base repository and
+reports `head_source_unavailable: true`. It never falls back to the fork's refs.
+The last authorized head may never have been fetched, and unreachable objects
+may later be garbage-collected; in either case the diff returns HTTP 409 with
+`reason: head_source_unavailable`. Merging a frozen PR returns the same refusal;
+auto-merge remains pending, and a merge-queue entry fails without starting CI.
+Approval of fork CI is a separate requirement and never replaces source rights.
+
+Already copied objects are not erased by revocation. A source administrator can
+stop future publication by removing the author's write access or the source
+branch. A dedicated source-side revocation UI and notification on opening such
+a PR remain follow-up work; this change does not grant access to private base
+repositories to source administrators.
+
+Repository permission grants are read from the database on each check. There is
+no cached allowance that survives revocation, but a concurrent synchronization
+that already passed its check can still advance the recorded head once. Checking
+source rights and updating the head are not an atomic revocation barrier.
+Base readers can see that the source is unavailable, but not whether this was
+caused by an account change, permission change or repository removal.
+An organization member who creates a fork there does not gain implicit write
+access: opening a private-source PR still requires a write/admin grant or an
+organization role/team that permits writing.
+
+### Git HTTP admission after uploads
+
+Both smart HTTP POST endpoints authorize before reading request bytes and again
+after the complete body is staged. The second check resolves the same credential
+again (same account and credential kind, and the same PAT id), validates session
+generation/account standing, reloads token scopes and repository restrictions,
+and rechecks access to the same repository id at the requested canonical address.
+An expired or revoked credential cannot become an anonymous fetch or another
+credential from the other Basic-auth field. Refusals keep the existing Git
+401 Basic challenge and 404/403 concealment rules. Push also reloads branch/tag
+protection, mirror restrictions and token restrictions before protocol work.
+
+This closes revocation during body reception, including protocol-v2 fetches.
+Permission checks do not use a cached grant. It is not an atomic barrier around
+all later Git work: a push already indexing its pack or a fetch already streaming
+may complete after revocation. Staging still uses byte and idle limits, without
+a total wall-clock deadline. LFS, SSH and registry upload lifetimes are separate
+transport contracts.

@@ -323,3 +323,5 @@ mod wiki_tests;
 mod wildcard_branch_protection_tests;
 
 mod remembered_session_tests;
+
+mod git_staged_authorization_tests;

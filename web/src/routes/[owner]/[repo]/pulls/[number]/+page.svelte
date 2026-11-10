@@ -982,6 +982,9 @@
       <!-- Diff tab -->
       {#if activeTab === 'diff'}
         <div class="diff-view">
+          {#if diffData?.head_source_unavailable}
+            <p role="status">{t('pulls.head_source_unavailable')}</p>
+          {/if}
           {#if diffData && diffData.files_changed.length > 0}
             <div class="diff-summary">
               <strong>{t('pulls.files_changed', { count: diffData.stats.files_changed })}</strong>

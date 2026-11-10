@@ -501,7 +501,7 @@ mod fork_auto_merge_approval_tests {
         git(&["commit", "-qam", "fork conflict"], Some(path));
         git(&["push", "-q", "origin", "feature"], Some(path));
         let h1 = rev_parse(path, "HEAD");
-        pull_request_ops::update_open_head_sha(&f.db, fork.id, "feature", Some(&h1))
+        rg_core::pull_request::refresh_open_heads(&f.db, fork.id, "feature", Some(&h1))
             .await
             .unwrap();
         approve(&f, &h1).await;
@@ -538,7 +538,7 @@ mod fork_auto_merge_approval_tests {
         git(&["push", "-q", "--force", "origin", "feature"], Some(path));
         let h2 = rev_parse(path, "HEAD");
         assert_ne!(h1, h2);
-        pull_request_ops::update_open_head_sha(&f.db, fork.id, "feature", Some(&h2))
+        rg_core::pull_request::refresh_open_heads(&f.db, fork.id, "feature", Some(&h2))
             .await
             .unwrap();
         let outcomes = rg_core::pull_request::try_auto_merges_for_head_commit(

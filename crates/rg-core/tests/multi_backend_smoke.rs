@@ -5240,14 +5240,10 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     )
     .await
     .expect("create cross-backend PR head fixture");
-    let refreshed = rg_db::ops::pull_request_ops::update_open_head_sha(
-        &db,
-        repo.id,
-        "feature",
-        Some(refreshed_pr_head),
-    )
-    .await
-    .expect("CAS-refresh the PR head");
+    let refreshed =
+        rg_core::pull_request::refresh_open_heads(&db, repo.id, "feature", Some(refreshed_pr_head))
+            .await
+            .expect("CAS-refresh the PR head");
     assert_eq!(refreshed.stale_rows, 0);
     assert_eq!(
         refreshed.open_prs[0].head_sha.as_deref(),
@@ -5274,19 +5270,15 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         Some(refreshed_pr_head),
         "the losing writer must not roll the PR head back"
     );
-    let deleted = rg_db::ops::pull_request_ops::update_open_head_sha(&db, repo.id, "feature", None)
+    let deleted = rg_core::pull_request::refresh_open_heads(&db, repo.id, "feature", None)
         .await
         .expect("clear the PR head for a deleted branch");
     assert_eq!(deleted.stale_rows, 0);
     assert_eq!(deleted.open_prs[0].head_sha, None);
-    let recreated = rg_db::ops::pull_request_ops::update_open_head_sha(
-        &db,
-        repo.id,
-        "feature",
-        Some(recreated_pr_head),
-    )
-    .await
-    .expect("restore the PR head after branch recreation");
+    let recreated =
+        rg_core::pull_request::refresh_open_heads(&db, repo.id, "feature", Some(recreated_pr_head))
+            .await
+            .expect("restore the PR head after branch recreation");
     assert_eq!(recreated.stale_rows, 0);
     assert_eq!(
         recreated.open_prs[0].head_sha.as_deref(),

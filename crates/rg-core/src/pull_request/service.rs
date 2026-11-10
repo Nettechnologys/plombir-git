@@ -90,7 +90,15 @@ pub async fn create_pr(
         let head_repo = repo_entity::Entity::find_by_id(head_repo_id)
             .one(db)
             .await?
-            .context("head repository not found")?;
+            .ok_or_else(super::fork_source::unavailable)?;
+        if head_repo.deleted_at.is_some() {
+            return Err(super::fork_source::unavailable());
+        }
+        if !super::fork_source::may_publish(db, &head_repo, author_id).await? {
+            return Err(crate::error::forbidden(
+                "write access to a private head repository is required to open a pull request",
+            ));
+        }
         let head_namespace = repository_namespace(db, &head_repo).await?;
         let head_path = repo_root.join(format!("{head_namespace}/{}.git", head_repo.name));
         head_path
@@ -684,7 +692,7 @@ pub async fn update_pr(
             _ => {
                 return Err(crate::error::invalid_request(format!(
                     "invalid PR state: {s}"
-                )))
+                )));
             }
         }
     }
@@ -805,6 +813,8 @@ pub struct PrDiff {
     pub head_branch: String,
     pub files_changed: Vec<FileDiff>,
     pub stats: DiffStats,
+    /// The source no longer permits publication; this is only a held snapshot.
+    pub head_source_unavailable: bool,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -920,29 +930,38 @@ pub async fn compute_diff(
 ) -> Result<PrDiff> {
     let pr = get_pr(db, owner, repo_name, number).await?;
     let base_repo_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
-    let (head_repo_path, head_namespace) = if let Some(head_repo_id) = pr.head_repo_id {
-        let head_repo = repo_entity::Entity::find_by_id(head_repo_id)
-            .one(db)
-            .await?
-            .context("head repository not found")?;
-        // `repository_namespace`, not the owner's username: an organization's
-        // repository lives on disk under the organization's name while its row
-        // carries `owner_id = org.owner_id`, so building the path from that user
-        // pointed at a directory that does not exist. `merge_claimed_pr` and
-        // `create_pr` already resolved the namespace; this one did not, and it
-        // became reachable the moment an organization could be a fork head
-        // (card_2e84eeed4ff4) — the diff would have failed where the merge
-        // succeeded.
-        let head_namespace = repository_namespace(db, &head_repo).await?;
-        let head_repo_path = repo_root.join(format!("{head_namespace}/{}.git", head_repo.name));
-        (head_repo_path, Some(head_namespace))
-    } else {
-        (base_repo_path.clone(), None)
-    };
+    let source = super::fork_source::resolve(db, &pr).await?;
+    let frozen = matches!(source, super::fork_source::Source::Unavailable);
+    let (head_repo_path, head_namespace) =
+        if let super::fork_source::Source::Available(head_repo) = source {
+            // `repository_namespace`, not the owner's username: an organization's
+            // repository lives on disk under the organization's name while its row
+            // carries `owner_id = org.owner_id`, so building the path from that user
+            // pointed at a directory that does not exist. `merge_claimed_pr` and
+            // `create_pr` already resolved the namespace; this one did not, and it
+            // became reachable the moment an organization could be a fork head
+            // (card_2e84eeed4ff4) — the diff would have failed where the merge
+            // succeeded.
+            let head_namespace = repository_namespace(db, &head_repo).await?;
+            let head_repo_path = repo_root.join(format!("{head_namespace}/{}.git", head_repo.name));
+            (head_repo_path, Some(head_namespace))
+        } else {
+            (base_repo_path.clone(), None)
+        };
 
     crate::blocking::run_blocking_git("diffing a pull request", move || {
         if !base_repo_path.exists() {
             bail!("repository path does not exist: {:?}", base_repo_path);
+        }
+        // Do not even resolve a ref in a withdrawn private source. A legal head
+        // may never have been fetched (or may have been collected); absence is
+        // a conflict, never permission to fall back to the source's live tip.
+        if frozen {
+            let (base_sha, head_sha) = recorded_diff_revs(&base_repo_path, &pr)?
+                .ok_or_else(super::fork_source::unavailable)?;
+            let mut diff = diff_between(&base_repo_path, &pr, &base_sha, &head_sha)?;
+            diff.head_source_unavailable = true;
+            return Ok(diff);
         }
         // A merged or closed pull request is read from the commits it recorded,
         // not from its branches: deleting the branch is how a pull request
@@ -1064,6 +1083,15 @@ fn settled_diff_revs(
     if pr.state == "open" {
         return Ok(None);
     }
+    recorded_diff_revs(repo_path, pr)
+}
+
+/// Resolve only immutable commits already held by the base repository. Also
+/// used for an open PR whose private source has withdrawn publication rights.
+fn recorded_diff_revs(
+    repo_path: &std::path::Path,
+    pr: &PullRequest,
+) -> Result<Option<(String, String)>> {
     let Some(recorded_head) = pr.head_sha.as_deref().filter(|sha| !sha.is_empty()) else {
         return Ok(None);
     };
@@ -1345,6 +1373,7 @@ fn diff_between(
         head_branch: pr.head_branch.clone(),
         stats,
         files_changed: files,
+        head_source_unavailable: false,
     })
 }
 
@@ -1377,6 +1406,7 @@ fn compute_cross_repo_diff(
         head_branch: pr.head_branch.clone(),
         stats,
         files_changed: files,
+        head_source_unavailable: false,
     })
 }
 
@@ -1570,7 +1600,7 @@ fn resolve_compared_rev(repo_path: &std::path::Path, name: &str) -> Result<Optio
         Some(Err(())) => {
             return Err(crate::error::invalid_request(format!(
                 "commit SHA '{name}' is ambiguous"
-            )))
+            )));
         }
         Some(Ok(id)) => id,
     };
@@ -1641,6 +1671,7 @@ fn compare_in(
             head_branch: head_branch.to_string(),
             files_changed: files,
             stats,
+            head_source_unavailable: false,
         },
         merge_base_sha: old_rev,
         commits,
@@ -4461,6 +4492,13 @@ pub async fn try_auto_merge(
     let repository = rg_db::ops::repo_ops::find_by_id(db, pr.repo_id)
         .await?
         .ok_or_else(|| crate::error::not_found("repository"))?;
+    if !super::fork_source::is_live(db, &pr).await? {
+        return Ok(AutoMergeOutcome {
+            status: "pending".into(),
+            reason: Some(super::fork_source::UNAVAILABLE.into()),
+            merge: None,
+        });
+    }
     if !super::ci::fork_head_ci_is_approved(
         db,
         &repository,
@@ -4748,6 +4786,9 @@ pub async fn merge_pr(
             "draft pull requests cannot be merged",
         ));
     }
+    if !super::fork_source::is_live(db, &pr).await? {
+        return Err(super::fork_source::unavailable());
+    }
 
     let verdict = crate::branch_protection::service::check_merge_allowed(
         db,
@@ -4806,6 +4847,10 @@ async fn merge_claimed_pr(
     let pools = db.owned();
     let db = pools.read();
     let repo_path = repo_root.join(format!("{}/{}.git", owner, repo_name));
+    let source = super::fork_source::resolve(db, &pr).await?;
+    if matches!(source, super::fork_source::Source::Unavailable) {
+        return Err(super::fork_source::unavailable());
+    }
     if !repo_path.exists() {
         bail!("repository path does not exist: {:?}", repo_path);
     }
@@ -4834,11 +4879,7 @@ async fn merge_claimed_pr(
     };
 
     // For fork PRs, fetch head branch into target repo
-    if let Some(head_repo_id) = pr.head_repo_id {
-        let head_repo = repo_entity::Entity::find_by_id(head_repo_id)
-            .one(db)
-            .await?
-            .context("head repository not found")?;
+    if let super::fork_source::Source::Available(head_repo) = source {
         let head_namespace = repository_namespace(db, &head_repo).await?;
         let head_repo_path = repo_root.join(format!("{}/{}.git", head_namespace, head_repo.name));
 
@@ -6711,8 +6752,7 @@ mod merge_configuration_ownership_tests {
     /// open. Only Plombir Git owning its options can answer these.
     const HOSTILE_REPOSITORY_CONFIG: &str = "[merge]\n\trenames = false\n\tconflictStyle = diff3\n";
     const HOSTILE_REPOSITORY_MERGE_DEFAULT: &str = "[merge]\n\tdefault = binary\n";
-    const HOSTILE_REPOSITORY_DRIVER: &str =
-        "[merge \"operator-owned\"]\n\tdriver = plombir-git-test-command-that-does-not-exist %O %A %B\n";
+    const HOSTILE_REPOSITORY_DRIVER: &str = "[merge \"operator-owned\"]\n\tdriver = plombir-git-test-command-that-does-not-exist %O %A %B\n";
 
     pub(super) fn git(worktree: &Path, args: &[&str]) {
         let output = rg_git::cli_gateway::global_gateway()
