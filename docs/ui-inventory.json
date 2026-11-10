@@ -17256,7 +17256,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.new",
-          "line": 498,
+          "line": 499,
           "via": null,
           "href": "buildNewReleaseLink()",
           "handler": null,
@@ -17266,7 +17266,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.new",
-          "line": 512,
+          "line": 513,
           "via": null,
           "href": "buildNewReleaseLink()",
           "handler": null,
@@ -17276,7 +17276,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 550,
+          "line": 551,
           "via": null,
           "href": null,
           "handler": "(event) => handleAssetUpload(release.id, event)",
@@ -17301,7 +17301,7 @@
         {
           "tag": "button",
           "label": "· )}",
-          "line": 570,
+          "line": 571,
           "via": null,
           "href": null,
           "handler": "() => handleAssetDownload(asset)",
@@ -17326,7 +17326,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.attestation.verifying",
-          "line": 612,
+          "line": 613,
           "via": null,
           "href": null,
           "handler": "() => handleVerifyAsset(asset)",
@@ -17351,7 +17351,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.attestation.signing",
-          "line": 623,
+          "line": 624,
           "via": null,
           "href": null,
           "handler": "() => handleSignAsset(asset)",
@@ -17376,7 +17376,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 649,
+          "line": 650,
           "via": null,
           "href": null,
           "handler": "() => handleAssetDelete(release.id, asset.id)",
@@ -17405,7 +17405,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 657,
+          "line": 658,
           "via": null,
           "href": null,
           "handler": "() => (confirmDeleteAssetId = null)",
@@ -17415,7 +17415,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.asset_delete",
-          "line": 662,
+          "line": 663,
           "via": null,
           "href": null,
           "handler": "() => (confirmDeleteAssetId = asset.id)",
@@ -17425,7 +17425,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.browse_files",
-          "line": 678,
+          "line": 679,
           "via": null,
           "href": "buildBrowseLink(release.tag_name)",
           "handler": null,
@@ -17435,7 +17435,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.edit",
-          "line": 680,
+          "line": 681,
           "via": null,
           "href": "buildEditReleaseLink(release.id)",
           "handler": null,
@@ -17445,7 +17445,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 686,
+          "line": 687,
           "via": null,
           "href": null,
           "handler": "() => handleDelete(release.id)",
@@ -17545,7 +17545,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 689,
+          "line": 690,
           "via": null,
           "href": null,
           "handler": "cancelDelete",
@@ -17555,7 +17555,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.delete",
-          "line": 692,
+          "line": 693,
           "via": null,
           "href": null,
           "handler": "() => showConfirm(release.id)",
@@ -17565,7 +17565,7 @@
         {
           "tag": "button",
           "label": "i18n:common.previous",
-          "line": 701,
+          "line": 702,
           "via": null,
           "href": null,
           "handler": "() => changePage(currentPage - 1)",
@@ -17647,7 +17647,7 @@
         {
           "tag": "button",
           "label": "i18n:common.next",
-          "line": 709,
+          "line": 710,
           "via": null,
           "href": null,
           "handler": "() => changePage(currentPage + 1)",

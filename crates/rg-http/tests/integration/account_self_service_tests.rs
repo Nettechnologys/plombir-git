@@ -314,15 +314,21 @@ async fn an_address_moves_when_its_link_is_followed() {
     // The token itself only ever leaves in the mail; re-issue the pending row
     // with one this test knows, the way the request above wrote it.
     let token_hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"known-token"));
-    rg_db::ops::email_confirmation_ops::replace_pending_email_change(
-        &db,
-        user_id,
-        "frank@new.example",
-        &token_hash,
-        chrono::Utc::now() + chrono::Duration::hours(1),
-    )
-    .await
-    .unwrap();
+    let proved = rg_db::ops::user_ops::find_by_id(&db, user_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        rg_db::ops::email_confirmation_ops::replace_pending_email_change(
+            &db,
+            &proved,
+            "frank@new.example",
+            &token_hash,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .await
+        .unwrap()
+    );
     let confirmed = client()
         .post(format!("{base}/api/v1/users/verify-email"))
         .json(&serde_json::json!({ "token": "known-token" }))

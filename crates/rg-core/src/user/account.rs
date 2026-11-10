@@ -391,46 +391,27 @@ pub struct SecondFactorReset {
 /// `POST /admin/users/{id}/mfa/reset` and `plombir-git reset-mfa` so the two
 /// doors cannot drift.
 ///
-/// Every session goes first, because the one that armed the wrong factor must
-/// not outlive its removal; then the TOTP factor with its pending enrolment
-/// and unused backup codes; then every passkey, which signs in without TOTP
-/// and so is the factor a thief would rather leave behind. A failure part-way
-/// leaves the sessions revoked and the call repeatable. An account with no
+/// Sessions, TOTP with its pending enrolment and unused backup codes, passkeys,
+/// and pending address changes are revoked atomically. Failure rolls all of
+/// them back, including durable notification rows. An account with no
 /// second factor is refused rather than quietly "reset": its problem is
 /// elsewhere, and its sessions need not be revoked for it.
 pub async fn reset_mfa(db: &DatabaseConnection, target_user_id: i64) -> Result<SecondFactorReset> {
-    let target = user_ops::find_by_id(db, target_user_id)
-        .await?
-        .ok_or_else(|| crate::error::not_found("user"))?;
-    let passkeys = rg_db::ops::passkey_credential_ops::list_by_user(db, target.id)
-        .await
-        .context("list the passkeys of an account whose MFA is being reset")?;
-    if !target.mfa_enabled && passkeys.is_empty() {
-        return Err(crate::error::conflict(
+    match user_ops::reset_factors_by_administrator(db, target_user_id).await? {
+        user_ops::OperatorFactorReset::Missing => Err(crate::error::not_found("user")),
+        user_ops::OperatorFactorReset::NoFactors => Err(crate::error::conflict(
             "this account has no second factor to reset",
-        ));
+        )),
+        user_ops::OperatorFactorReset::Completed {
+            user,
+            totp_removed,
+            passkeys_removed,
+        } => Ok(SecondFactorReset {
+            user: *user,
+            totp_removed,
+            passkeys_removed,
+        }),
     }
-    user_ops::invalidate_sessions(db, target.id)
-        .await
-        .context("revoke the sessions of an account whose MFA is being reset")?;
-    let mut user = target;
-    let totp_removed = user.mfa_enabled;
-    if totp_removed {
-        user = user_ops::disable_mfa(db, user.id)
-            .await?
-            .ok_or_else(|| crate::error::not_found("user"))?;
-    }
-    let passkeys_removed = rg_db::ops::passkey_credential_ops::delete_all_for_user(db, user.id)
-        .await
-        .context("remove the passkeys of an account whose MFA is being reset")?;
-    let user = user_ops::find_by_id(db, user.id)
-        .await?
-        .ok_or_else(|| crate::error::not_found("user"))?;
-    Ok(SecondFactorReset {
-        user,
-        totp_removed,
-        passkeys_removed,
-    })
 }
 
 // ── Profile ──────────────────────────────────────────────────────────────
@@ -696,12 +677,14 @@ fn confirmation_link(mailer: Mailer<'_>, token: &str) -> String {
 /// An address another account holds gets the same answer as a free one; its
 /// owner is told somebody tried. Only local accounts carry an address of their
 /// own — a directory's or an identity provider's comes from there.
+/// `false` means the proved account changed before link issuance; no link or
+/// mail is created, and the authenticated caller must prove its identity again.
 pub async fn request_email_change(
     db: &DatabaseConnection,
     mailer: Mailer<'_>,
     user: &User,
     new_email: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let new_email = new_email.trim();
     if user.auth_provider != "local" {
         return Err(crate::error::invalid_request(format!(
@@ -720,7 +703,7 @@ pub async fn request_email_change(
         ));
     }
     if in_cooldown(db, new_email).await? {
-        return Ok(());
+        return Ok(true);
     }
     if user_ops::find_by_email(db, new_email).await?.is_some() {
         let (_, marker) = new_link_token();
@@ -734,17 +717,20 @@ pub async fn request_email_change(
                 .to_string(),
             None,
         );
-        return Ok(());
+        return Ok(true);
     }
     let (token, token_hash) = new_link_token();
-    rg_db::ops::email_confirmation_ops::replace_pending_email_change(
+    if !rg_db::ops::email_confirmation_ops::replace_pending_email_change(
         db,
-        user.id,
+        user,
         new_email,
         &token_hash,
         Utc::now() + EMAIL_CONFIRMATION_LIFETIME,
     )
-    .await?;
+    .await?
+    {
+        return Ok(false);
+    }
     send_detached(
         mailer,
         new_email,
@@ -757,7 +743,7 @@ pub async fn request_email_change(
         ),
         Some(confirmation_link(mailer, &token)),
     );
-    Ok(())
+    Ok(true)
 }
 
 /// Mail `user` a link that proves it receives mail at the address it already
@@ -822,7 +808,9 @@ pub enum Confirmed {
 /// Follow the link `token` names: create the account a registration was
 /// waiting for, or move an account to the address it asked for.
 ///
-/// The link is spent by this call whatever happens next. What was checked when
+/// Address changes spend their link in the same transaction as the change;
+/// rejected writes leave it available until expiry or credential revocation.
+/// Other links are spent before their follow-up work. What was checked when
 /// it was issued is checked again, because a day may have passed: the name and
 /// the address may have been taken meanwhile, and registration may have been
 /// closed — `permit` is decided by the caller, now, not when the mail went out
@@ -837,12 +825,33 @@ pub async fn confirm(
         PURPOSE_EMAIL_CHANGE, PURPOSE_EMAIL_VERIFY, PURPOSE_REGISTRATION,
     };
 
-    let Some(row) =
-        rg_db::ops::email_confirmation_ops::take_live(db, &rg_db::token_digest(token)).await?
-    else {
-        return Err(crate::error::invalid_request(
-            "this confirmation link is invalid, already used, or expired",
-        ));
+    let token_hash = rg_db::token_digest(token);
+    let invalid_link = || {
+        crate::error::invalid_request("this confirmation link is invalid, already used, or expired")
+    };
+    let Some(row) = rg_db::ops::email_confirmation_ops::find_live(db, &token_hash).await? else {
+        return Err(invalid_link());
+    };
+    if row.purpose == PURPOSE_EMAIL_CHANGE {
+        let (user, previous_email) = user_ops::complete_email_change(db, &row)
+            .await
+            .map_err(|error| {
+                if rg_db::is_unique_violation_anyhow(&error) {
+                    crate::error::conflict(
+                        "this address belongs to another account now; nothing was changed",
+                    )
+                } else {
+                    error
+                }
+            })?
+            .ok_or_else(invalid_link)?;
+        return Ok(Confirmed::EmailChanged {
+            user,
+            previous_email,
+        });
+    }
+    let Some(row) = rg_db::ops::email_confirmation_ops::take_live(db, &token_hash).await? else {
+        return Err(invalid_link());
     };
     match row.purpose.as_str() {
         PURPOSE_REGISTRATION => {
@@ -880,30 +889,6 @@ pub async fn confirm(
             )
             .await?;
             Ok(Confirmed::Registered(user))
-        }
-        PURPOSE_EMAIL_CHANGE => {
-            let user_id = row
-                .user_id
-                .with_context(|| format!("email change {} names no account", row.id))?;
-            let before = user_ops::find_by_id(db, user_id)
-                .await?
-                .ok_or_else(|| crate::error::not_found("user"))?;
-            let user = user_ops::update_email(db, user_id, &row.email)
-                .await
-                .map_err(|error| {
-                    if rg_db::is_unique_violation_anyhow(&error) {
-                        crate::error::conflict(
-                            "this address belongs to another account now; nothing was changed",
-                        )
-                    } else {
-                        error
-                    }
-                })?
-                .ok_or_else(|| crate::error::not_found("user"))?;
-            Ok(Confirmed::EmailChanged {
-                user,
-                previous_email: before.email,
-            })
         }
         PURPOSE_EMAIL_VERIFY => {
             let user_id = row

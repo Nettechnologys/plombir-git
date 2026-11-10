@@ -50,10 +50,11 @@ pub async fn tag_names_in_repo(db: &DatabaseConnection, repo_id: i64) -> Result<
 pub async fn list_by_repo(
     db: &DatabaseConnection,
     repo_id: i64,
+    include_drafts: bool,
     offset: u64,
     limit: u64,
 ) -> Result<(Vec<ReleaseModel>, i64)> {
-    let base = page_query(repo_id);
+    let base = page_query(repo_id, include_drafts);
 
     let total = base.clone().count(db).await.context("db: count releases")? as i64;
 
@@ -69,9 +70,14 @@ pub async fn list_by_repo(
 
 /// The ordered selection [`list_by_repo`] cuts a page from, kept apart so
 /// `query_plan_tests` explains the statement the server sends.
-pub(crate) fn page_query(repo_id: i64) -> Select<ReleaseEntity> {
-    ReleaseEntity::find()
-        .filter(release::Column::RepoId.eq(repo_id))
+pub(crate) fn page_query(repo_id: i64, include_drafts: bool) -> Select<ReleaseEntity> {
+    let query = ReleaseEntity::find().filter(release::Column::RepoId.eq(repo_id));
+    let query = if include_drafts {
+        query
+    } else {
+        query.filter(release::Column::IsDraft.eq(false))
+    };
+    query
         .order_by_desc(release::Column::CreatedAt)
         .order_by_desc(release::Column::Id)
 }

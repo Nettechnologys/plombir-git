@@ -173,6 +173,106 @@ async fn set_lock(db: &rg_db::DatabaseConnection, user_id: i64, locked: bool) {
 }
 
 #[tokio::test]
+async fn an_operator_reset_after_assertion_storage_prevents_login_and_step_up() {
+    use sea_orm::{ColumnTrait, ConnectionTrait, PaginatorTrait, QueryFilter, Statement};
+    for reauthenticate in [false, true] {
+        let (base, db) = spawn_test_app_with_db().await;
+        let (session, id) = register_full(&base, "pk-reset", "pk-reset@example.test").await;
+        let before = rg_db::ops::user_ops::find_by_id(&db, id)
+            .await
+            .unwrap()
+            .unwrap();
+        let key = authenticator();
+        rg_db::ops::passkey_credential_ops::create(
+            &db,
+            id,
+            &b64(CREDENTIAL_ID),
+            &stored_passkey(&key),
+            "reset fixture",
+            RP_ID,
+        )
+        .await
+        .unwrap();
+        let count_successes = || async {
+            rg_db::entities::login_log::Entity::find()
+                .filter(rg_db::entities::login_log::Column::UserId.eq(id))
+                .filter(rg_db::entities::login_log::Column::Success.eq(true))
+                .count(&db)
+                .await
+                .unwrap()
+        };
+        let successes = count_successes().await;
+        let notices = crate::notification_browser_tests::count(&db, id).await;
+        // The cryptographic assertion is valid and its CAS write succeeds. This
+        // models reset committing just after that write, before login finalizes.
+        db.execute(Statement::from_string(db.get_database_backend(), format!(
+            "CREATE TRIGGER reset_after_counter AFTER UPDATE OF passkey ON passkey_credentials WHEN NEW.user_id = {id} BEGIN UPDATE users SET session_version = session_version + 1, mfa_enabled = 0, totp_secret = NULL WHERE id = {id}; DELETE FROM passkey_credentials WHERE user_id = {id}; END"
+        ))).await.unwrap();
+        let client = reqwest::Client::new();
+        let mut request = client
+            .post(format!("{base}/api/v1/users/passkeys/login/start"))
+            .header(reqwest::header::HOST, RP_ID)
+            .json(&serde_json::json!({"username":"pk-reset", "reauthenticate":reauthenticate}));
+        if reauthenticate {
+            request = request.bearer_auth(&session);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let cookie = response
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let body: serde_json::Value = response.json().await.unwrap();
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(body["publicKey"]["challenge"].as_str().unwrap())
+            .unwrap();
+        let mut request = client
+            .post(format!("{base}/api/v1/users/passkeys/login/finish"))
+            .header(reqwest::header::HOST, RP_ID)
+            .header(reqwest::header::COOKIE, cookie)
+            .json(&assertion(&key, &challenge, 1, true));
+        if reauthenticate {
+            request = request.bearer_auth(&session);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), 401, "reauth={reauthenticate}");
+        assert!(!response
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .any(|v| v.starts_with("plombir_git_token=") && !v.starts_with("plombir_git_token=;")));
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(body.get("token").is_none());
+        let after = rg_db::ops::user_ops::find_by_id(&db, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.session_version,
+            before.session_version + 1,
+            "fixture must actually reset the account"
+        );
+        assert_eq!(after.last_login_at, before.last_login_at);
+        assert!(rg_db::ops::passkey_credential_ops::list_by_user(&db, id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(count_successes().await, successes);
+        assert_eq!(
+            crate::notification_browser_tests::count(&db, id).await,
+            notices
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_locked_account_answers_a_genuine_assertion_as_it_answers_a_forged_one() {
     let (base, db) = spawn_test_app_with_db().await;
     let (_, user_id) = register_full(&base, "pk-locked", "pk-locked@example.com").await;

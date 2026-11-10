@@ -8,6 +8,43 @@ use crate::entities::{organization, organization_member, team, team_member};
 
 // ── Organization ops ──────────────────────────────────────────
 
+/// Bounded startup diagnostics for values written before visibility validation.
+pub async fn invalid_visibility_sample(
+    db: &DatabaseConnection,
+) -> Result<Vec<organization::Model>> {
+    // MySQL collation may treat `Public` or `private ` as valid SQL matches.
+    // Use the same exact Rust comparison as the access gate, with keyset pages
+    // so startup diagnostics never materialize the entire organization table.
+    let mut after = None;
+    let mut invalid = Vec::new();
+    loop {
+        let mut query = organization::Entity::find()
+            .filter(organization::Column::DeletedAt.is_null())
+            .order_by_asc(organization::Column::Id)
+            .limit(256);
+        if let Some(id) = after {
+            query = query.filter(organization::Column::Id.gt(id));
+        }
+        let page = query
+            .all(db)
+            .await
+            .context("db: sample organizations with invalid visibility")?;
+        let complete = page.len() < 256;
+        after = page.last().map(|organization| organization.id);
+        for organization in page {
+            if !matches!(organization.visibility.as_str(), "public" | "private") {
+                invalid.push(organization);
+                if invalid.len() == 100 {
+                    return Ok(invalid);
+                }
+            }
+        }
+        if complete {
+            return Ok(invalid);
+        }
+    }
+}
+
 /// Create a new organization.
 pub async fn create_org(
     db: &DatabaseConnection,

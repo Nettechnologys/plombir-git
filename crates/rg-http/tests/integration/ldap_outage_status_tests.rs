@@ -564,6 +564,59 @@ impl Harness {
             .unwrap()
     }
 
+    async fn create_namespace(&self, bot: bool, name: &str) -> (StatusCode, String) {
+        let owner = match self.account_named("namespace-owner").await {
+            Some(owner) => owner,
+            None => rg_db::ops::user_ops::create_user(
+                &self.db,
+                "namespace-owner",
+                "namespace-owner@example.invalid",
+                "",
+                "Namespace Owner",
+            )
+            .await
+            .unwrap(),
+        };
+        let token = rg_core::auth::jwt::generate_token(
+            owner.id,
+            &owner.username,
+            owner.session_version,
+            "test-secret-key",
+            7,
+        )
+        .unwrap();
+        let (path, body) = if bot {
+            ("users/bots", serde_json::json!({ "username": name }))
+        } else {
+            ("orgs", serde_json::json!({ "name": name }))
+        };
+        let response = self
+            .client
+            .post(format!("{}/api/v1/{path}", self.base))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        (
+            StatusCode::from_u16(response.status().as_u16()).unwrap(),
+            response.text().await.unwrap(),
+        )
+    }
+
+    async fn assert_namespace_absent(&self, name: &str) {
+        assert!(self.account_named(name).await.is_none());
+        assert!(rg_db::ops::org_ops::get_org_by_name(&self.db, name)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            !rg_db::ops::owner_name_ops::is_held_in_any_case(&self.db, name)
+                .await
+                .unwrap()
+        );
+    }
+
     /// Store an extra provider row and return its id.
     async fn add_provider(&self, input: SsoProviderInput<'_>) -> i64 {
         rg_db::ops::sso_provider_ops::create(&self.db, input)
@@ -1053,6 +1106,95 @@ async fn an_unreachable_directory_holds_registration_closed() {
         "an unanswered directory must not read as the caller's fault or as a free name, got {status}: {body}"
     );
     assert!(harness.account_named("newcomer").await.is_none());
+}
+
+/// S6: organizations and bots occupy the same login namespace as people.
+#[tokio::test]
+async fn bot_and_organization_creation_reserve_directory_names_before_first_login() {
+    for bot in [false, true] {
+        let harness = Harness::start_with(Behaviour::Healthy, Fixture::default()).await;
+        rg_db::ops::user_ops::create_user(
+            &harness.db,
+            "local-held",
+            "local-held@example.invalid",
+            "",
+            "Existing",
+        )
+        .await
+        .unwrap();
+        let (local_status, local_body) = harness.create_namespace(bot, "local-held").await;
+        let (status, body) = harness.create_namespace(bot, USERNAME).await;
+        assert_eq!(status, StatusCode::CONFLICT, "bot={bot}: {body}");
+        assert_eq!(status, local_status);
+        let mut actual: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let mut expected: serde_json::Value =
+            serde_json::from_str(&local_body.replace("local-held", USERNAME)).unwrap();
+        for envelope in [&mut actual, &mut expected] {
+            assert!(envelope["error"]["request_id"].is_string());
+            envelope["error"]
+                .as_object_mut()
+                .unwrap()
+                .remove("request_id");
+        }
+        assert_eq!(actual, expected);
+        assert!(!body.to_lowercase().contains("directory"));
+        harness.assert_namespace_absent(USERNAME).await;
+
+        let (status, body) = harness.sign_in().await;
+        assert_eq!(status, StatusCode::OK, "bot={bot}: {body}");
+        let account = harness.account_named(USERNAME).await.unwrap();
+        assert_eq!(account.auth_provider, "ldap");
+        assert!(!account.is_bot());
+    }
+}
+
+#[tokio::test]
+async fn bot_and_organization_creation_admit_names_a_healthy_directory_does_not_hold() {
+    for bot in [false, true] {
+        let harness = Harness::start_with(Behaviour::Healthy, Fixture::default()).await;
+        let (status, body) = harness.create_namespace(bot, "new-namespace").await;
+        assert_eq!(status, StatusCode::CREATED, "bot={bot}: {body}");
+        if bot {
+            assert!(harness
+                .account_named("new-namespace")
+                .await
+                .unwrap()
+                .is_bot());
+        } else {
+            assert!(
+                rg_db::ops::org_ops::get_org_by_name(&harness.db, "new-namespace")
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(harness
+            .observed_binds
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(dn, _)| dn == SERVICE_BIND_DN));
+    }
+}
+
+#[tokio::test]
+async fn bot_and_organization_creation_fail_closed_during_directory_outages() {
+    for behaviour in [
+        Behaviour::Unreachable,
+        Behaviour::ServiceBindRefused,
+        Behaviour::SearchRefused,
+    ] {
+        for bot in [false, true] {
+            let harness = Harness::start_with(behaviour, Fixture::default()).await;
+            let (status, body) = harness.create_namespace(bot, "new-namespace").await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "bot={bot}: {body}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).unwrap()["error"]["code"],
+                "UPSTREAM_ERROR"
+            );
+            harness.assert_namespace_absent("new-namespace").await;
+        }
+    }
 }
 
 /// Decision #10: an LDAP account steps up by binding against its directory

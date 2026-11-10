@@ -121,6 +121,21 @@ pub async fn owner_name_is_taken(
         .is_some())
 }
 
+/// Whether the shared owner namespace is held locally or reserved by LDAP.
+/// Callers taking a new name must supply the instance's real directory context;
+/// an unreachable directory is an error, never evidence that a name is free.
+pub async fn owner_name_is_reserved(
+    db: &rg_db::DatabaseConnection,
+    directories: crate::user::service::LdapDirectories<'_>,
+    name: &str,
+    email: Option<&str>,
+) -> anyhow::Result<bool> {
+    if owner_name_is_taken(db, name).await? {
+        return Ok(true);
+    }
+    crate::user::service::ldap_directory_holds(db, directories, name, email).await
+}
+
 /// Name every owner whose name another holder already has in a different case.
 ///
 /// A sibling of [`report_names_held_by_an_account_and_an_organization`]: the

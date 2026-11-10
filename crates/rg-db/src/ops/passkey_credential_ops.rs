@@ -102,29 +102,6 @@ pub async fn delete(db: &DatabaseConnection, user_id: i64, id: i64) -> Result<bo
     .map_err(crate::notification::db_error)
 }
 
-/// Delete every passkey of an account, answering how many went.
-pub async fn delete_all_for_user(db: &DatabaseConnection, user_id: i64) -> Result<u64, DbErr> {
-    let txn = db.begin().await?;
-    let res = Entity::delete_many()
-        .filter(passkey_credential::Column::UserId.eq(user_id))
-        .exec(&txn)
-        .await?;
-    // Final durable stage of the shared operator reset, including a TOTP-only
-    // reset with zero passkeys. Its earlier session revocation remains staged.
-    super::notification_delivery_ops::account_event(
-        &txn,
-        user_id,
-        crate::notification::Event::AdminFactorsReset,
-        None,
-        None,
-        None,
-    )
-    .await
-    .map_err(crate::notification::db_error)?;
-    txn.commit().await?;
-    Ok(res.rows_affected)
-}
-
 /// What became of an attempt to store an advanced credential.
 ///
 /// Three outcomes rather than a `bool`, because the login path has to answer

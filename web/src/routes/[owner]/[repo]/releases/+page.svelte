@@ -27,6 +27,7 @@
   let linkedReleaseId = $derived(linkedId($page.url.searchParams.get('release')));
 
   let releaseList = $state<any[]>([]);
+  let latestPublishedId = $derived(releaseList.find((release) => !release.is_draft && !release.is_prerelease)?.id);
   let loading = $state(true);
   let error = $state('');
   let currentPage = $state(1);
@@ -514,12 +515,12 @@
     </div>
   {:else}
     <div class="release-list">
-      {#each releaseList as release, index}
+      {#each releaseList as release}
         <div class="release-card">
           <div class="release-header">
             <div class="tag-section">
               <span class="tag-badge">🏷 {release.tag_name}</span>
-              {#if index === 0}
+              {#if currentPage === 1 && !linkedReleaseId && release.id === latestPublishedId}
                 <span class="badge latest">{t('releases.latest')}</span>
               {/if}
               {#if release.is_prerelease}

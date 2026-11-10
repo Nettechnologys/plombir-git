@@ -1770,6 +1770,7 @@ async fn upgrade_stored_secrets(
 /// good. Read-only and never fatal: renaming somebody's account is the
 /// operator's decision, and a boot pass has no business making it.
 async fn report_unaddressable_owners_and_repositories(db: &rg_db::DatabaseConnection) {
+    rg_core::org::report_invalid_visibility(db).await;
     rg_core::namespace::report_owners_holding_reserved_names(db).await;
     rg_core::namespace::report_names_held_by_an_account_and_an_organization(db).await;
     rg_core::namespace::report_owner_names_that_differ_only_in_case(db).await;

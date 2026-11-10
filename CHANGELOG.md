@@ -8,11 +8,32 @@ This project records user-facing changes here. The format follows
 
 ### Security
 
+- Revoke existing sessions and pending account-email changes when deactivating
+  an account, so reactivation cannot revive them. Permanent credentials remain
+  suspended during deactivation and can be used again after reactivation.
+- Validate organization visibility before applying any PATCH fields. Historical
+  invalid values are member-only and reported in startup warnings for correction.
+- Hide draft releases, notes, assets and attestations from readers without
+  repository write access. Filter drafts before counting or paginating releases,
+  and send `private, no-store` on all release reads, including published public
+  downloads; proxies no longer cache those responses heuristically. A CI job token alone does
+  not grant draft access; workflows need an authorized writer credential.
+- Reserve LDAP usernames when creating organizations and bots, including
+  directory members who have not signed in yet. These operations now fail
+  closed with `502` when a configured directory cannot answer the reservation check.
 - Apply session revocation, account standing and identity-conflict checks to
   every supported Authorization credential format, including Cargo's raw form.
 - Preserve second-factor failure counters when only a password is verified;
   successful reauthentication clears them only while the account, credentials
   and lockout state still match the completed proof.
+- Cancel pending account-email changes atomically on password changes,
+  password resets and operator factor resets. Redeem an address-change link in
+  the same transaction as the address write, and reject stale issuance proof.
+- Revoke password-reset links on address changes, including requests already
+  in flight for the previous address. Keep the uniform forgot-password response.
+- Reset sessions, MFA material, passkeys and pending address changes atomically;
+  an in-flight passkey login or step-up cannot survive the reset by finishing
+  against the account's new session generation.
 - Require explicit approval of the current fork head before merge-group CI or
   a queued merge. Recheck the approver's active human account and write access
   on every queue pass, including reuse of an already successful pipeline.

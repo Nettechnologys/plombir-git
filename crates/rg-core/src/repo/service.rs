@@ -7941,6 +7941,10 @@ mod repository_deletion_tests {
         .expect("create forker");
         let destination = crate::org::create_org(
             &db,
+            crate::user::service::LdapDirectories {
+                encryption_key: "test-encryption-key",
+                transport_policy: &Default::default(),
+            },
             "fork-org-claim-target",
             None,
             None,
@@ -8043,6 +8047,10 @@ mod repository_deletion_tests {
             let (destination_name, claim_statement) = if destination_is_an_organization {
                 let org = crate::org::create_org(
                     &db,
+                    crate::user::service::LdapDirectories {
+                        encryption_key: "test-encryption-key",
+                        transport_policy: &Default::default(),
+                    },
                     "transfer-claim-org",
                     None,
                     None,
@@ -8378,9 +8386,20 @@ mod repository_deletion_tests {
         )
         .await
         .expect("create organization owner");
-        let org = crate::org::create_org(&db, "lease-org", None, None, owner.id, "public")
-            .await
-            .expect("create source organization");
+        let org = crate::org::create_org(
+            &db,
+            crate::user::service::LdapDirectories {
+                encryption_key: "test-encryption-key",
+                transport_policy: &Default::default(),
+            },
+            "lease-org",
+            None,
+            None,
+            owner.id,
+            "public",
+        )
+        .await
+        .expect("create source organization");
         let sandbox = tempfile::tempdir().expect("create repository root");
         let repo_root = sandbox.path().join("repos");
         let blob_storage = LocalBlobStorage::new(&repo_root);
@@ -8474,6 +8493,10 @@ mod repository_deletion_tests {
             let (source_namespace, org_id) = if source_is_an_organization {
                 let org = crate::org::create_org(
                     &db,
+                    crate::user::service::LdapDirectories {
+                        encryption_key: "test-encryption-key",
+                        transport_policy: &Default::default(),
+                    },
                     "claimed-source-org",
                     None,
                     None,
@@ -8618,6 +8641,10 @@ mod repository_deletion_tests {
             let (source_namespace, org_id) = if source_is_an_organization {
                 let org = crate::org::create_org(
                     &db,
+                    crate::user::service::LdapDirectories {
+                        encryption_key: "test-encryption-key",
+                        transport_policy: &Default::default(),
+                    },
                     "racing-source-org",
                     None,
                     None,
@@ -8809,6 +8836,10 @@ mod repository_deletion_tests {
         .expect("create destination owner");
         let destination = crate::org::create_org(
             &db,
+            crate::user::service::LdapDirectories {
+                encryption_key: "test-encryption-key",
+                transport_policy: &Default::default(),
+            },
             "committed-transfer-org",
             None,
             None,

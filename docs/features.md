@@ -55,7 +55,43 @@ automatic merge can complete. If the request to enable auto-merge returns an
 error, its attempt is cleared. A failed background attempt can retry, but cannot
 restore an authorization the user has canceled.
 
+## Release drafts
+
+Draft releases and their notes, files and provenance attestations are visible
+only to repository writers. Other readers receive the same `404` as for a
+missing release or asset; lists and totals omit drafts. Publishing makes them
+visible to repository readers, and returning a release to draft hides them
+again. Release API responses, including downloads, use `private, no-store`.
+A CI job token does not grant writer permissions: a workflow reading a draft
+needs a session or PAT with repository write access.
+
+Configured repository, organization and system webhooks remain trusted
+integrations. The existing `release.created` event includes draft metadata;
+this change does not remove that delivery to configured webhook destinations.
+
+## LDAP names
+
+Accounts, organizations and bots share an owner namespace. Creating a bot or
+organization checks enabled LDAP directories before taking a locally free name,
+so a directory member can still sign in for the first time. A reserved name
+returns the same `409` as a locally occupied name. As with registration, this
+lets a caller learn that a name is reserved without distinguishing a local
+account from a directory member. If a configured directory
+cannot answer, creation fails with `502`; each directory lookup has a ten-second
+timeout. Instances without LDAP do not make a network request for this check.
+The host-side `create-admin` command remains a trusted operator action and does
+not query LDAP.
+
+Organization visibility accepts only `public` or `private`. An invalid PATCH
+changes nothing, including other fields supplied with it. Unknown values from
+older data are treated as member-only; startup warns about the first 100
+affected organizations so an owner can choose a valid visibility explicitly.
+
 ## Browser sessions
+
+Deactivating an account revokes its existing sessions and pending address-change
+links. Reactivation does not restore them. PATs, SSH keys and passkeys are
+suspended while the account is inactive and become usable after reactivation.
 
 The login form offers **Remember me for 30 days** for password, passkey and SSO
 sign-in, including accounts with a second factor. Checked sessions renew on
@@ -97,6 +133,21 @@ cannot remove MFA. The shared confirmation dialog accepts password plus TOTP or
 an unused backup code, or an existing passkey with user verification. Provider
 reauthentication still completes the account's MFA challenge. Confirmation lasts
 10 minutes; remembered-session renewal never extends it.
+
+Changing or resetting a password (including an administrator reset), or an
+operator reset of login factors, cancels pending account-email changes.
+Following an address-change link consumes it and changes the address in one
+transaction; a failed write leaves the link available until expiry or
+revocation. Completing an address change invalidates reset links sent to the
+previous address. Link issuance rechecks the account snapshot under the same
+lock, so a request already in flight cannot recreate an invalidated link.
+Signing out alone does not cancel pending address changes.
+
+An operator factor reset revokes sessions, enrolled and pending TOTP material,
+unused backup codes, passkeys and pending address changes in one commit with
+its notifications. A failure rolls back the whole reset. Passkey login and
+step-up completion require the account generation proved before the assertion;
+a factor reset during the ceremony cannot produce a session after that reset.
 
 The same check protects issuance of personal and bot tokens, SSH and signing
 keys, repository deploy keys, passkey registration and removal, SSO linking,

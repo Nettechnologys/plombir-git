@@ -111,9 +111,18 @@ async fn live_instance(db: &DatabaseConnection, secret: &str) -> i64 {
 
     // A bot whose agent profile carries a model key, sealed through the
     // service the API uses (ADR-0001 D5).
-    let bot = rg_core::user::bots::create_bot(db, user.id, "alice-agent", None)
-        .await
-        .expect("create bot");
+    let bot = rg_core::user::bots::create_bot(
+        db,
+        rg_core::user::service::LdapDirectories {
+            encryption_key: "test-encryption-key",
+            transport_policy: &Default::default(),
+        },
+        user.id,
+        "alice-agent",
+        None,
+    )
+    .await
+    .expect("create bot");
     rg_core::agent::profile::save(
         db,
         &encryption::derive_key(secret),

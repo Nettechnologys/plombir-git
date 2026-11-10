@@ -626,7 +626,7 @@ mod release_import_tests {
     /// `(tag, created_at)` of the test repository's releases, in the order
     /// the release list serves them.
     async fn listed(db: &DatabaseConnection) -> Vec<(String, String)> {
-        let (releases, _) = rg_db::ops::release_ops::list_by_repo(db, 1, 0, 50)
+        let (releases, _) = rg_db::ops::release_ops::list_by_repo(db, 1, true, 0, 50)
             .await
             .unwrap();
         releases

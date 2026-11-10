@@ -2607,9 +2607,18 @@ async fn agent_profile_round_trip_is_portable() {
     )
     .await
     .expect("create second repository");
-    let bot = rg_core::user::bots::create_bot(&db, owner.id, &format!("agentbot{suffix}"), None)
-        .await
-        .expect("create bot");
+    let bot = rg_core::user::bots::create_bot(
+        &db,
+        rg_core::user::service::LdapDirectories {
+            encryption_key: "test-encryption-key",
+            transport_policy: &Default::default(),
+        },
+        owner.id,
+        &format!("agentbot{suffix}"),
+        None,
+    )
+    .await
+    .expect("create bot");
 
     let key = rg_core::auth::encryption::derive_key("agent-profile-smoke");
     let long_command = format!(
@@ -4063,6 +4072,259 @@ const NARROW_MYSQL_COLUMNS: &[(&str, &[&str])] = &[
     ("webhooks", &["content_type", "scope_kind"]),
     ("wiki_pages", &["sha", "title"]),
 ];
+
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn credential_change_links_and_factor_reset_are_portable() {
+    use rg_db::ops::{
+        email_confirmation_ops as links, password_reset_token_ops as resets, user_ops,
+    };
+    let url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL").expect("disposable database URL");
+    let db = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 5)
+        .await
+        .unwrap();
+    rg_db::run_migrations(&db).await.unwrap();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let name = format!("links-{}", &suffix[..10]);
+    let user = user_ops::create_user(
+        &db,
+        &name,
+        &format!("{name}@example.test"),
+        "fixture-old-hash",
+        "Links",
+    )
+    .await
+    .unwrap();
+    // create_user is the external-identity fixture helper. Address changes
+    // require a local password account, just like the HTTP registration path.
+    let user = rg_db::entities::user::ActiveModel {
+        id: Set(user.id),
+        auth_provider: Set("local".into()),
+        ..Default::default()
+    }
+    .update(&db)
+    .await
+    .unwrap();
+    let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
+    let next_email = format!("next-{name}@example.test");
+    let hash = format!("email-{suffix}");
+    assert!(
+        links::replace_pending_email_change(&db, &user, &next_email, &hash, expiry)
+            .await
+            .unwrap()
+    );
+    let link = links::find_live(&db, &hash).await.unwrap().unwrap();
+    let reset = resets::create(&db, user.id, &format!("reset-{suffix}"), expiry)
+        .await
+        .unwrap();
+    let (one, two) = tokio::join!(
+        user_ops::complete_email_change(&db, &link),
+        user_ops::complete_email_change(&db, &link)
+    );
+    assert_eq!(
+        usize::from(one.unwrap().is_some()) + usize::from(two.unwrap().is_some()),
+        1
+    );
+    assert!(
+        resets::complete_password_reset(&db, reset.id, user.id, "old-address-attack")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!resets::replace_for_current_account(
+        &db,
+        &user,
+        &format!("late-reset-{suffix}"),
+        expiry
+    )
+    .await
+    .unwrap());
+    assert!(!links::replace_pending_email_change(
+        &db,
+        &user,
+        &user.email,
+        &format!("late-email-{suffix}"),
+        expiry
+    )
+    .await
+    .unwrap());
+    let current = user_ops::find_by_id(&db, user.id).await.unwrap().unwrap();
+    assert_eq!(current.email, next_email);
+    assert_eq!(current.password_hash, user.password_hash);
+    assert!(resets::replace_for_current_account(
+        &db,
+        &current,
+        &format!("new-reset-{suffix}"),
+        expiry
+    )
+    .await
+    .unwrap());
+    let second_hash = format!("second-email-{suffix}");
+    assert!(
+        links::replace_pending_email_change(&db, &current, &user.email, &second_hash, expiry)
+            .await
+            .unwrap()
+    );
+    let second = links::find_live(&db, &second_hash).await.unwrap().unwrap();
+    let updated =
+        user_ops::change_password(&db, user.id, &current.password_hash, "fixture-new-hash")
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(user_ops::complete_email_change(&db, &second)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(updated.email, next_email);
+    user_ops::enable_mfa(&db, user.id).await.unwrap();
+    let before_reset = user_ops::find_by_id(&db, user.id).await.unwrap().unwrap();
+    let third_hash = format!("third-email-{suffix}");
+    assert!(links::replace_pending_email_change(
+        &db,
+        &before_reset,
+        &user.email,
+        &third_hash,
+        expiry
+    )
+    .await
+    .unwrap());
+    rg_db::ops::passkey_credential_ops::create(
+        &db,
+        user.id,
+        &format!("passkey-{suffix}"),
+        "fixture-json",
+        "portable key",
+        "localhost",
+    )
+    .await
+    .unwrap();
+    let outcome = rg_core::user::account::reset_mfa(&db, user.id)
+        .await
+        .unwrap();
+    assert!(outcome.totp_removed);
+    assert_eq!(outcome.passkeys_removed, 1);
+    assert_eq!(
+        outcome.user.session_version,
+        before_reset.session_version + 1
+    );
+    assert!(links::find_live(&db, &third_hash).await.unwrap().is_none());
+    assert!(
+        user_ops::record_successful_login_for_proved_account(&db, &before_reset)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Lock updates that change no value and timestamp precision are backend
+    // details, not reasons to reject a current proved account.
+    let completed = user_ops::record_successful_login_for_proved_account(&db, &outcome.user)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(completed.last_login_at.is_some());
+    assert!(
+        user_ops::record_successful_login_for_proved_account(&db, &completed)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn audited_account_and_organization_policy_transitions_are_portable() {
+    use rg_db::ops::{email_confirmation_ops as links, org_ops, user_ops};
+    let url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL").expect("disposable database URL");
+    let db = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 5)
+        .await
+        .unwrap();
+    rg_db::run_migrations(&db).await.unwrap();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let name = format!("policy-{}", &suffix[..10]);
+    let user = user_ops::create_user(
+        &db,
+        &name,
+        &format!("{name}@example.test"),
+        "fixture-hash",
+        "Policy",
+    )
+    .await
+    .unwrap();
+    let user = rg_db::entities::user::ActiveModel {
+        id: Set(user.id),
+        auth_provider: Set("local".into()),
+        ..Default::default()
+    }
+    .update(&db)
+    .await
+    .unwrap();
+    let link_hash = format!("pending-{suffix}");
+    assert!(links::replace_pending_email_change(
+        &db,
+        &user,
+        &format!("next-{name}@example.test"),
+        &link_hash,
+        chrono::Utc::now() + chrono::Duration::hours(1)
+    )
+    .await
+    .unwrap());
+    let disabled = user_ops::update_by_id(&db, user.id, None, None, None, Some(false))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(disabled.session_version, user.session_version + 1);
+    let repeated = user_ops::update_by_id(&db, user.id, None, None, None, Some(false))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeated.session_version, disabled.session_version);
+    let enabled = user_ops::update_by_id(&db, user.id, None, None, None, Some(true))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(enabled.session_version, disabled.session_version);
+    assert!(links::find_live(&db, &link_hash).await.unwrap().is_none());
+    for (index, visibility) in ["Public", "private ", "", "legacy"].iter().enumerate() {
+        let org = org_ops::create_org(
+            &db,
+            &format!("policy-org-{index}-{}", &suffix[..10]),
+            None,
+            None,
+            user.id,
+            visibility,
+        )
+        .await
+        .unwrap();
+        assert!(org_ops::invalid_visibility_sample(&db)
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.id == org.id));
+        assert!(rg_core::org::update_org(
+            &db,
+            org.id,
+            Some("must not change"),
+            None,
+            Some(visibility)
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            org_ops::get_org_by_name(&db, &org.name)
+                .await
+                .unwrap()
+                .unwrap(),
+            org
+        );
+        rg_core::org::update_org(&db, org.id, None, None, Some("private"))
+            .await
+            .unwrap();
+        assert!(!org_ops::invalid_visibility_sample(&db)
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.id == org.id));
+    }
+}
 
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]

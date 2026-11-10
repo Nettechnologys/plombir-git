@@ -1491,10 +1491,18 @@ mod fork_approval_at_enqueue_tests {
             assert!(pr.ci_approved_sha.is_none());
 
             let token = if as_bot {
-                let bot =
-                    rg_core::user::bots::create_bot(&f.db, repository.owner_id, "queuebot", None)
-                        .await
-                        .unwrap();
+                let bot = rg_core::user::bots::create_bot(
+                    &f.db,
+                    rg_core::user::service::LdapDirectories {
+                        encryption_key: crate::common::TEST_ENCRYPTION_KEY,
+                        transport_policy: &Default::default(),
+                    },
+                    repository.owner_id,
+                    "queuebot",
+                    None,
+                )
+                .await
+                .unwrap();
                 for repo_id in [f.repo_id, fork.repo.id] {
                     rg_db::ops::repo_collaborator_ops::create(
                         &f.db,

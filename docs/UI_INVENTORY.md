@@ -698,27 +698,27 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| (event) => handleAssetUpload(release.id, | :550 | `POST /api/v1/repos/{owner}/{name}/releases/{release_id}/assets` | `RepoWrite` | rust+web |
-| · )} | :570 | `GET /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/download` | `RepoRead` | rust+web |
-| i18n:releases.attestation.verifying | :612 | `POST /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation/verify` | `RepoRead` | rust+web |
-| i18n:releases.attestation.signing | :623 | `POST /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation` | `RepoWrite` | rust+web |
-| i18n:common.delete | :649 | `DELETE /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}` | `RepoWrite` | rust+web+browser |
-| i18n:common.delete | :686 | `DELETE /api/v1/repos/{owner}/{name}/releases/{id}` | `RepoWrite` | rust+web |
-| i18n:common.delete | :686 | `GET /api/v1/instance` | `Public` | rust+web+smoke+browser |
-| i18n:common.delete | :686 | `GET /api/v1/repos/{owner}/{name}/releases` | `RepoRead` | rust+web |
-| i18n:common.delete | :686 | `GET /api/v1/repos/{owner}/{name}/releases/{id}` | `RepoRead` | rust+web |
-| i18n:common.delete | :686 | `GET /api/v1/repos/{owner}/{name}/releases/{release_id}/assets` | `RepoRead` | rust+web |
-| i18n:common.delete | :686 | `GET /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation` | `RepoRead` | rust+web |
-| i18n:common.previous | :701 | `GET /api/v1/instance` | `Public` | rust+web+smoke |
-| i18n:common.previous | :701 | `GET /api/v1/repos/{owner}/{name}/releases` | `RepoRead` | rust+web |
-| i18n:common.previous | :701 | `GET /api/v1/repos/{owner}/{name}/releases/{id}` | `RepoRead` | rust+web |
-| i18n:common.previous | :701 | `GET /api/v1/repos/{owner}/{name}/releases/{release_id}/assets` | `RepoRead` | rust+web |
-| i18n:common.previous | :701 | `GET /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation` | `RepoRead` | rust+web |
-| i18n:common.next | :709 | `GET /api/v1/instance` | `Public` | rust+web+smoke |
-| i18n:common.next | :709 | `GET /api/v1/repos/{owner}/{name}/releases` | `RepoRead` | rust+web |
-| i18n:common.next | :709 | `GET /api/v1/repos/{owner}/{name}/releases/{id}` | `RepoRead` | rust+web |
-| i18n:common.next | :709 | `GET /api/v1/repos/{owner}/{name}/releases/{release_id}/assets` | `RepoRead` | rust+web |
-| i18n:common.next | :709 | `GET /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation` | `RepoRead` | rust+web |
+| (event) => handleAssetUpload(release.id, | :551 | `POST /api/v1/repos/{owner}/{name}/releases/{release_id}/assets` | `RepoWrite` | rust+web |
+| · )} | :571 | `GET /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/download` | `RepoRead` | rust+web |
+| i18n:releases.attestation.verifying | :613 | `POST /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation/verify` | `RepoRead` | rust+web |
+| i18n:releases.attestation.signing | :624 | `POST /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation` | `RepoWrite` | rust+web |
+| i18n:common.delete | :650 | `DELETE /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}` | `RepoWrite` | rust+web+browser |
+| i18n:common.delete | :687 | `DELETE /api/v1/repos/{owner}/{name}/releases/{id}` | `RepoWrite` | rust+web |
+| i18n:common.delete | :687 | `GET /api/v1/instance` | `Public` | rust+web+smoke+browser |
+| i18n:common.delete | :687 | `GET /api/v1/repos/{owner}/{name}/releases` | `RepoRead` | rust+web |
+| i18n:common.delete | :687 | `GET /api/v1/repos/{owner}/{name}/releases/{id}` | `RepoRead` | rust+web |
+| i18n:common.delete | :687 | `GET /api/v1/repos/{owner}/{name}/releases/{release_id}/assets` | `RepoRead` | rust+web |
+| i18n:common.delete | :687 | `GET /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation` | `RepoRead` | rust+web |
+| i18n:common.previous | :702 | `GET /api/v1/instance` | `Public` | rust+web+smoke |
+| i18n:common.previous | :702 | `GET /api/v1/repos/{owner}/{name}/releases` | `RepoRead` | rust+web |
+| i18n:common.previous | :702 | `GET /api/v1/repos/{owner}/{name}/releases/{id}` | `RepoRead` | rust+web |
+| i18n:common.previous | :702 | `GET /api/v1/repos/{owner}/{name}/releases/{release_id}/assets` | `RepoRead` | rust+web |
+| i18n:common.previous | :702 | `GET /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation` | `RepoRead` | rust+web |
+| i18n:common.next | :710 | `GET /api/v1/instance` | `Public` | rust+web+smoke |
+| i18n:common.next | :710 | `GET /api/v1/repos/{owner}/{name}/releases` | `RepoRead` | rust+web |
+| i18n:common.next | :710 | `GET /api/v1/repos/{owner}/{name}/releases/{id}` | `RepoRead` | rust+web |
+| i18n:common.next | :710 | `GET /api/v1/repos/{owner}/{name}/releases/{release_id}/assets` | `RepoRead` | rust+web |
+| i18n:common.next | :710 | `GET /api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation` | `RepoRead` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |

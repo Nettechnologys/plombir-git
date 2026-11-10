@@ -25,6 +25,103 @@ use reqwest::header;
 
 use crate::common::{register_full, spawn_test_app_with_db};
 
+#[tokio::test]
+async fn reactivation_does_not_revive_sessions_from_before_deactivation() {
+    use rg_db::ops::user_ops;
+    let (base, db) = spawn_test_app_with_db().await;
+    let (jwt, user_id) = register_full(&base, "reactivation", "reactivation@example.test").await;
+    let before = user_ops::find_by_id(&db, user_id).await.unwrap().unwrap();
+    assert!(
+        rg_db::ops::email_confirmation_ops::replace_pending_email_change(
+            &db,
+            &before,
+            "after-reactivation@example.test",
+            "reactivation-link",
+            chrono::Utc::now() + chrono::Duration::hours(24),
+        )
+        .await
+        .unwrap()
+    );
+    let pending = rg_db::ops::email_confirmation_ops::find_live(&db, "reactivation-link")
+        .await
+        .unwrap()
+        .unwrap();
+    let disabled = user_ops::update_by_id(&db, user_id, None, None, None, Some(false))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(disabled.session_version, before.session_version + 1);
+    let repeat = user_ops::update_by_id(&db, user_id, None, None, None, Some(false))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeat.session_version, disabled.session_version);
+    let enabled = user_ops::update_by_id(&db, user_id, None, None, None, Some(true))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(enabled.session_version, disabled.session_version);
+    assert!(user_ops::complete_email_change(&db, &pending)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(enabled.email, before.email);
+
+    for (name, value) in [
+        ("authorization", format!("Bearer {jwt}")),
+        ("authorization", jwt),
+        (
+            "cookie",
+            format!(
+                "plombir_git_token={}",
+                rg_core::auth::jwt::generate_token(
+                    user_id,
+                    &before.username,
+                    before.session_version,
+                    "test-secret-key",
+                    7
+                )
+                .unwrap()
+            ),
+        ),
+    ] {
+        let response = reqwest::Client::new()
+            .get(format!("{base}/api/v1/users/me"))
+            .header(name, value)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        if name == "cookie" {
+            // The ambient stale cookie is cleared before protected routing.
+            assert!(response.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0"));
+        }
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "UNAUTHORIZED");
+        if name != "cookie" {
+            assert_eq!(body["error"]["reason"], "session_revoked");
+        }
+    }
+    let fresh = rg_core::auth::jwt::generate_token(
+        user_id,
+        &enabled.username,
+        enabled.session_version,
+        "test-secret-key",
+        7,
+    )
+    .unwrap();
+    let response = reqwest::Client::new()
+        .get(format!("{base}/api/v1/users/me"))
+        .bearer_auth(fresh)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 /// The PAT bridge accepts Cargo's raw Authorization form for session JWTs too.
 /// Its normalization must never hide the session from the outer standing gate.
 #[tokio::test]

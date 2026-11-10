@@ -12,9 +12,9 @@ use crate::entities::{password_reset_token, user};
 /// Create a new password reset token record.
 ///
 /// Expired rows are dropped on the way past, before the insert. This is the
-/// only statement that grows the table, so sweeping here bounds it by the links
-/// still inside their fifteen-minute window — on every instance, without a
-/// background loop that has to be started, configured and shut down.
+/// same sweep precedes [`replace_for_current_account`], so both insertion paths
+/// bound the table by links still inside their fifteen-minute window, without
+/// a background loop that has to be started, configured and shut down.
 ///
 /// That is deliberate rather than convenient. [`delete_expired`] carried the
 /// doc comment "can be called periodically" and had no caller at all
@@ -49,6 +49,61 @@ pub async fn create(
         ..Default::default()
     };
     model.insert(db).await
+}
+
+/// Issue to the address/account snapshot selected by forgot-password. Address
+/// changes and credential writers take the same user lock before invalidating
+/// links, so an old-address request cannot plant a token after that invalidation.
+/// `false` is an ordinary silent no-op for the padded forgot-password endpoint.
+pub async fn replace_for_current_account(
+    db: &DatabaseConnection,
+    expected: &user::Model,
+    token_hash: &str,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<bool> {
+    // This global sweep completes before we hold any per-account lock.
+    delete_expired(db).await?;
+    crate::contention::retry_transaction("issue password reset link", || async {
+        let txn = db
+            .begin()
+            .await
+            .context("db: begin password reset issuance")?;
+        user::Entity::update_many()
+            .col_expr(
+                user::Column::SessionVersion,
+                Expr::col(user::Column::SessionVersion).into(),
+            )
+            .filter(user::Column::Id.eq(expected.id))
+            .exec(&txn)
+            .await?;
+        let current = user::Entity::find_by_id(expected.id).one(&txn).await?;
+        if !current.as_ref().is_some_and(|current| {
+            current.is_usable()
+                && current.auth_provider == "local"
+                && current.email == expected.email
+                && current.session_version == expected.session_version
+                && current.password_hash == expected.password_hash
+        }) {
+            txn.rollback().await?;
+            return Ok(false);
+        }
+        invalidate_user_tokens(&txn, expected.id).await?;
+        password_reset_token::ActiveModel {
+            user_id: Set(expected.id),
+            token_hash: Set(token_hash.to_owned()),
+            expires_at: Set(expires_at),
+            used: Set(false),
+            created_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await?;
+        txn.commit()
+            .await
+            .context("db: commit password reset issuance")?;
+        Ok(true)
+    })
+    .await
 }
 
 /// Find a token record by its hash (for validation).
@@ -118,6 +173,18 @@ pub async fn complete_password_reset(
             .await
             .context("db: begin password reset completion")?;
         let result: anyhow::Result<Option<user::Model>> = async {
+            // All credential and address writers lock users before child rows.
+            // Taking the reset-token lock first deadlocks against email/password
+            // changes which invalidate these tokens while holding the user row.
+            user::Entity::update_many()
+                .col_expr(
+                    user::Column::SessionVersion,
+                    Expr::col(user::Column::SessionVersion).into(),
+                )
+                .filter(user::Column::Id.eq(user_id))
+                .exec(&transaction)
+                .await
+                .context("db: lock account for password reset")?;
             if !consume(&transaction, token_id)
                 .await
                 .context("db: consume password reset token")?
@@ -151,6 +218,7 @@ pub async fn complete_password_reset(
             invalidate_user_tokens(&transaction, user_id)
                 .await
                 .context("db: invalidate password reset tokens")?;
+            super::email_confirmation_ops::invalidate_email_changes(&transaction, user_id).await?;
 
             user::Entity::find()
                 .filter(user::Column::Id.eq(user_id))
