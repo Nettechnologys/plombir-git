@@ -24,3 +24,17 @@ no patched 0.5.x. 0.5.5 comes from jsonwebtoken's rust_crypto p256 / p384 \
 (elliptic-curve 0.13) and the test-only P-256 authenticator. Production JWTs are \
 HS256 and EdDSA only and no EC key is ever built, so the affected arithmetic never \
 touches a secret of ours. Revisit when jsonwebtoken moves to elliptic-curve 0.14."""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0459"
+# Follow-ups: card_9883212e9192 (update), card_f8e122ff4fd8 (restore sidecars).
+reason = """\
+libsqlite3-sys 0.30.1 bundles affected SQLite 3.46. A fixed crate exists (>= 0.39), \
+but SQLx 0.8.6 requires ^0.30.1; the assessed SQLx 0.9 release still excludes \
+>= 0.38 and requires Rust 1.94. No supported compatible update is available in \
+that released dependency chain. Exploitation requires an attacker-written \
+database and WAL pair. Production database paths and restore inputs are \
+operator-controlled; the server does not accept untrusted SQLite uploads. \
+Keep the data directory and restore inputs trusted; restore-sidecar handling \
+remains a follow-up. This exception does not fix SQLite. Revisit when SQLx \
+admits patched libsqlite3-sys or the database/restore trust boundary changes."""

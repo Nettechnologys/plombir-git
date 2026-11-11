@@ -19,8 +19,9 @@ version = 2
 # the crate comes back, its advisory is waived without anyone looking. Fail on
 # it instead, so the list only ever holds what the tree really carries.
 unused-ignored-advisory = "deny"
-# Consciously accepted advisories with no fixed release. Keep in sync with
-# `.cargo/audit.toml` and `osv-scanner.toml`; each entry documents why the exposure is acceptable.
+# Consciously accepted advisories without an available compatible dependency
+# update. Keep in sync with `.cargo/audit.toml` and `osv-scanner.toml`; each entry
+# documents the remaining exposure and when to revisit the acceptance.
 ignore = [
     # rsa "Marvin Attack" timing side-channel (no patched release: `patched = []`).
     # Reaches us via two paths: `sqlx-mysql` RSA auth (server-to-DB) and `russh`
@@ -36,6 +37,18 @@ ignore = [
     # the affected arithmetic never touches a secret of ours. Revisit when
     # jsonwebtoken moves to elliptic-curve 0.14.
     "RUSTSEC-2026-0387",
+    # SQLite: libsqlite3-sys 0.30.1 bundles affected SQLite 3.46. A fixed crate
+    # exists (>= 0.39), but SQLx 0.8.6 requires ^0.30.1; the assessed SQLx 0.9
+    # release still excludes >= 0.38 and raises MSRV to 1.94. There is no
+    # supported compatible update in that released dependency chain.
+    # Exploitation requires an attacker-written database and WAL pair to be
+    # opened. Production database paths are operator-controlled; the server
+    # does not accept untrusted SQLite uploads. Keep the data directory and
+    # restore inputs trusted. Restore-sidecar handling remains a follow-up.
+    # This exception does not fix SQLite. Revisit when SQLx admits a patched
+    # libsqlite3-sys, or if the database/restore trust boundary changes.
+    # Follow-ups: card_9883212e9192 (update), card_f8e122ff4fd8 (restore sidecars).
+    "RUSTSEC-2026-0459",
 ]
 
 # ──────────────────────────────── Licenses ────────────────────────────────
