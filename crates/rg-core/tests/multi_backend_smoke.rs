@@ -2840,6 +2840,241 @@ async fn merge_queue_parent_deletes_are_portable() {
     .await;
 }
 
+/// S7: one source branch can feed PRs whose authors have different current
+/// publication rights. Exercise the real refresh and its nullable per-row CAS
+/// on server backends, including the list's same-repository/fork alternatives.
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable PostgreSQL or MySQL database"]
+async fn private_fork_head_refresh_freezes_each_unauthorized_pr_on_server_database() {
+    use rg_db::ops::{pull_request_ops, repo_collaborator_ops, repo_ops, user_ops};
+
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set; this test never self-skips");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    let backend = db.get_database_backend();
+    assert!(
+        matches!(backend, DatabaseBackend::Postgres | DatabaseBackend::MySql),
+        "the portable S7 regression requires a server database, got {backend:?}"
+    );
+    eprintln!("S7 private-fork head refresh backend: {backend:?}");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let owner_name = format!("headowner{suffix}");
+    let author_name = format!("headauthor{suffix}");
+    let owner = user_ops::create_user(
+        &db,
+        &owner_name,
+        &format!("{owner_name}@example.invalid"),
+        "unused",
+        "Private Source Owner",
+    )
+    .await
+    .unwrap();
+    let author = user_ops::create_user(
+        &db,
+        &author_name,
+        &format!("{author_name}@example.invalid"),
+        "unused",
+        "Revocable Source Writer",
+    )
+    .await
+    .unwrap();
+    let mut source = namespace_repo(owner.id, None, &format!("headsource{suffix}"));
+    source.is_private = Set(true);
+    let source = repo_ops::create(&db, source).await.unwrap();
+    let base = repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("headbase{suffix}")),
+    )
+    .await
+    .unwrap();
+    let other = repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("headother{suffix}")),
+    )
+    .await
+    .unwrap();
+    let collaborator = repo_collaborator_ops::create(
+        &db,
+        rg_db::entities::repo_collaborator::ActiveModel {
+            id: NotSet,
+            repo_id: Set(source.id),
+            user_id: Set(author.id),
+            permission: Set("write".to_string()),
+            created_at: Set(chrono::Utc::now()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let initial = "1111111111111111111111111111111111111111";
+    let published = "2222222222222222222222222222222222222222";
+    let moved = "3333333333333333333333333333333333333333";
+    let recreated = "4444444444444444444444444444444444444444";
+    let winner = "5555555555555555555555555555555555555555";
+    let stale = "6666666666666666666666666666666666666666";
+    let mut prs = Vec::new();
+    for (repo_id, number, author_id, head_repo_id, branch, state) in [
+        (base.id, 1, owner.id, Some(source.id), "feature", "open"),
+        (base.id, 2, author.id, Some(source.id), "feature", "open"),
+        (source.id, 1, owner.id, None, "feature", "open"),
+        (base.id, 3, owner.id, Some(source.id), "feature", "closed"),
+        (base.id, 4, owner.id, Some(source.id), "other", "open"),
+        // Matching base/branch alone must not select another fork's head.
+        (source.id, 2, owner.id, Some(other.id), "feature", "open"),
+    ] {
+        let now = chrono::Utc::now();
+        prs.push(
+            pull_request_ops::create(
+                &db,
+                rg_db::entities::pull_request::ActiveModel {
+                    repo_id: Set(repo_id),
+                    number: Set(number),
+                    title: Set(format!("portable private-source PR {repo_id}/{number}")),
+                    state: Set(state.to_string()),
+                    is_draft: Set(false),
+                    auto_merge_enabled: Set(false),
+                    author_id: Set(author_id),
+                    head_repo_id: Set(head_repo_id),
+                    head_branch: Set(branch.to_string()),
+                    base_branch: Set("main".to_string()),
+                    head_sha: Set(Some(initial.to_string())),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let ids = |rows: &[rg_db::entities::pull_request::Model]| {
+        let mut ids = rows.iter().map(|pr| pr.id).collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    };
+    let listed = pull_request_ops::list_open_with_head(&db, source.id, "feature")
+        .await
+        .unwrap();
+    assert_eq!(ids(&listed), ids(&prs[..3]));
+    let first =
+        rg_core::pull_request::refresh_open_heads(&db, source.id, "feature", Some(published))
+            .await
+            .unwrap();
+    assert_eq!(first.stale_rows, 0);
+    assert_eq!(ids(&first.open_prs), ids(&prs[..3]));
+    assert!(first
+        .open_prs
+        .iter()
+        .all(|pr| pr.head_sha.as_deref() == Some(published)));
+
+    repo_collaborator_ops::update_permission(&db, collaborator.id, "read".to_string())
+        .await
+        .unwrap()
+        .expect("downgrade the author's source grant");
+    // Deliberately no cache invalidation: publication must use current grants.
+    let live_ids = ids(&[prs[0].clone(), prs[2].clone()]);
+    for next in [Some(moved), None, Some(recreated)] {
+        let refreshed = rg_core::pull_request::refresh_open_heads(&db, source.id, "feature", next)
+            .await
+            .unwrap();
+        assert_eq!(
+            refreshed.stale_rows, 0,
+            "frozen rows must not cause retries"
+        );
+        assert_eq!(ids(&refreshed.open_prs), live_ids);
+        assert!(refreshed
+            .open_prs
+            .iter()
+            .all(|pr| pr.head_sha.as_deref() == next));
+        let frozen = pull_request_ops::find_by_id(&db, prs[1].id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frozen.head_sha.as_deref(), Some(published));
+    }
+
+    // An older observation loses after a newer writer wins; changing one PR
+    // must not advance its frozen neighbour on the same source branch.
+    assert!(pull_request_ops::compare_and_swap_open_head_sha(
+        &db,
+        prs[0].id,
+        Some(recreated),
+        Some(winner)
+    )
+    .await
+    .unwrap());
+    assert!(!pull_request_ops::compare_and_swap_open_head_sha(
+        &db,
+        prs[0].id,
+        Some(recreated),
+        Some(stale)
+    )
+    .await
+    .unwrap());
+    assert_eq!(
+        pull_request_ops::find_by_id(&db, prs[0].id)
+            .await
+            .unwrap()
+            .unwrap()
+            .head_sha
+            .as_deref(),
+        Some(winner)
+    );
+    assert_eq!(
+        pull_request_ops::find_by_id(&db, prs[1].id)
+            .await
+            .unwrap()
+            .unwrap()
+            .head_sha
+            .as_deref(),
+        Some(published),
+        "a successful per-PR CAS must not advance the frozen neighbour"
+    );
+    assert!(
+        !pull_request_ops::compare_and_swap_open_head_sha(
+            &db,
+            prs[3].id,
+            Some(initial),
+            Some(stale)
+        )
+        .await
+        .unwrap(),
+        "closed PRs cannot advance even with the expected head"
+    );
+    for pr in &prs[3..] {
+        assert_eq!(
+            pull_request_ops::find_by_id(&db, pr.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_sha
+                .as_deref(),
+            Some(initial),
+            "closed, other-branch and other-source PRs must remain untouched"
+        );
+    }
+    repo_collaborator_ops::update_permission(&db, collaborator.id, "write".to_string())
+        .await
+        .unwrap()
+        .expect("restore the author's publication grant");
+    let resumed =
+        rg_core::pull_request::refresh_open_heads(&db, source.id, "feature", Some(winner))
+            .await
+            .unwrap();
+    assert_eq!(resumed.stale_rows, 0);
+    assert_eq!(ids(&resumed.open_prs), ids(&prs[..3]));
+    assert!(resumed
+        .open_prs
+        .iter()
+        .all(|pr| pr.head_sha.as_deref() == Some(winner)));
+    eprintln!("S7 private-fork head refresh contract passed on {backend:?}");
+}
+
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn ci_cache_eviction_upsert_is_portable() {
