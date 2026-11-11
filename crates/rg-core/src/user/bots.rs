@@ -40,6 +40,7 @@ pub const BOT_EMAIL_DOMAIN: &str = "bots.invalid";
 /// both as an account and as an organization — the two share one URL space.
 pub async fn create_bot(
     db: &DatabaseConnection,
+    directories: crate::user::service::LdapDirectories<'_>,
     owner_id: i64,
     username: &str,
     display_name: Option<&str>,
@@ -66,7 +67,7 @@ pub async fn create_bot(
     }
 
     let taken = || crate::error::conflict(format!("username '{username}' is already taken"));
-    if crate::namespace::owner_name_is_taken(db, username).await? {
+    if crate::namespace::owner_name_is_reserved(db, directories, username, None).await? {
         return Err(taken());
     }
 
@@ -141,9 +142,18 @@ mod tests {
     async fn a_bot_is_an_owned_account_no_login_reaches() {
         let db = db().await;
         let alice = human(&db, "alice").await;
-        let bot = create_bot(&db, alice.id, "alice-agent", Some("Alice's agent"))
-            .await
-            .unwrap();
+        let bot = create_bot(
+            &db,
+            crate::user::service::LdapDirectories {
+                encryption_key: "test-encryption-key",
+                transport_policy: &Default::default(),
+            },
+            alice.id,
+            "alice-agent",
+            Some("Alice's agent"),
+        )
+        .await
+        .unwrap();
         assert_eq!(bot.bot_owner_id, Some(alice.id));
         assert!(bot.is_bot());
         assert!(!bot.is_admin);
@@ -165,21 +175,59 @@ mod tests {
     async fn a_bot_cannot_own_a_bot_and_names_stay_unique() {
         let db = db().await;
         let alice = human(&db, "alice").await;
-        let bot = create_bot(&db, alice.id, "alice-agent", None)
-            .await
-            .unwrap();
+        let bot = create_bot(
+            &db,
+            crate::user::service::LdapDirectories {
+                encryption_key: "test-encryption-key",
+                transport_policy: &Default::default(),
+            },
+            alice.id,
+            "alice-agent",
+            None,
+        )
+        .await
+        .unwrap();
 
-        let nested = create_bot(&db, bot.id, "agent-of-agent", None)
-            .await
-            .unwrap_err();
+        let nested = create_bot(
+            &db,
+            crate::user::service::LdapDirectories {
+                encryption_key: "test-encryption-key",
+                transport_policy: &Default::default(),
+            },
+            bot.id,
+            "agent-of-agent",
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(status(&nested).contains("a bot cannot create bots"));
 
-        let taken = create_bot(&db, alice.id, "alice", None).await.unwrap_err();
+        let taken = create_bot(
+            &db,
+            crate::user::service::LdapDirectories {
+                encryption_key: "test-encryption-key",
+                transport_policy: &Default::default(),
+            },
+            alice.id,
+            "alice",
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(status(&taken).contains("already taken"));
 
-        let reserved = create_bot(&db, alice.id, "settings", None)
-            .await
-            .unwrap_err();
+        let reserved = create_bot(
+            &db,
+            crate::user::service::LdapDirectories {
+                encryption_key: "test-encryption-key",
+                transport_policy: &Default::default(),
+            },
+            alice.id,
+            "settings",
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(status(&reserved).contains("reserved"), "{reserved:#}");
     }
 
@@ -188,9 +236,18 @@ mod tests {
         let db = db().await;
         let alice = human(&db, "alice").await;
         let mallory = human(&db, "mallory").await;
-        let bot = create_bot(&db, alice.id, "alice-agent", None)
-            .await
-            .unwrap();
+        let bot = create_bot(
+            &db,
+            crate::user::service::LdapDirectories {
+                encryption_key: "test-encryption-key",
+                transport_policy: &Default::default(),
+            },
+            alice.id,
+            "alice-agent",
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(find_owned_bot(&db, alice.id, "alice-agent")
             .await

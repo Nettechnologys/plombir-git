@@ -821,6 +821,7 @@
     "delete_confirm_title": "Delete milestone"
   },
   "pulls": {
+    "head_source_unavailable": "The source no longer permits updates to this pull request. Showing a previously fetched snapshot.",
     "delete": {
       "title": "Delete this pull request",
       "desc": "Deleting a pull request removes it with its reviews, comments, timeline and attachments, and cancels its CI. A merged pull request cannot be deleted. This cannot be undone.",
@@ -892,6 +893,8 @@
       "merged": "⊛ Merged"
     },
     "fork_ci": {
+      "reapprove": "Reapprove CI for this commit",
+      "reapprove_explanation": "If the previous approver is inactive or no longer has write access, approve this commit again. CI can use this repository's secrets.",
       "held": "CI is held for this fork's head",
       "explanation": "A pipeline runs under this repository and is handed its CI secrets, so a fork's commits do not build until someone with write access has looked at them. Approving covers this commit only — a new push to the fork holds CI again.",
       "approve": "Approve CI for this commit",

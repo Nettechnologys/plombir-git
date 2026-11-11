@@ -25,6 +25,178 @@ use reqwest::header;
 
 use crate::common::{register_full, spawn_test_app_with_db};
 
+#[tokio::test]
+async fn reactivation_does_not_revive_sessions_from_before_deactivation() {
+    use rg_db::ops::user_ops;
+    let (base, db) = spawn_test_app_with_db().await;
+    let (jwt, user_id) = register_full(&base, "reactivation", "reactivation@example.test").await;
+    let before = user_ops::find_by_id(&db, user_id).await.unwrap().unwrap();
+    assert!(
+        rg_db::ops::email_confirmation_ops::replace_pending_email_change(
+            &db,
+            &before,
+            "after-reactivation@example.test",
+            "reactivation-link",
+            chrono::Utc::now() + chrono::Duration::hours(24),
+        )
+        .await
+        .unwrap()
+    );
+    let pending = rg_db::ops::email_confirmation_ops::find_live(&db, "reactivation-link")
+        .await
+        .unwrap()
+        .unwrap();
+    let disabled = user_ops::update_by_id(&db, user_id, None, None, None, Some(false))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(disabled.session_version, before.session_version + 1);
+    let repeat = user_ops::update_by_id(&db, user_id, None, None, None, Some(false))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeat.session_version, disabled.session_version);
+    let enabled = user_ops::update_by_id(&db, user_id, None, None, None, Some(true))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(enabled.session_version, disabled.session_version);
+    assert!(user_ops::complete_email_change(&db, &pending)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(enabled.email, before.email);
+
+    for (name, value) in [
+        ("authorization", format!("Bearer {jwt}")),
+        ("authorization", jwt),
+        (
+            "cookie",
+            format!(
+                "plombir_git_token={}",
+                rg_core::auth::jwt::generate_token(
+                    user_id,
+                    &before.username,
+                    before.session_version,
+                    "test-secret-key",
+                    7
+                )
+                .unwrap()
+            ),
+        ),
+    ] {
+        let response = reqwest::Client::new()
+            .get(format!("{base}/api/v1/users/me"))
+            .header(name, value)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        if name == "cookie" {
+            // The ambient stale cookie is cleared before protected routing.
+            assert!(response.headers()[header::SET_COOKIE]
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0"));
+        }
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "UNAUTHORIZED");
+        if name != "cookie" {
+            assert_eq!(body["error"]["reason"], "session_revoked");
+        }
+    }
+    let fresh = rg_core::auth::jwt::generate_token(
+        user_id,
+        &enabled.username,
+        enabled.session_version,
+        "test-secret-key",
+        7,
+    )
+    .unwrap();
+    let response = reqwest::Client::new()
+        .get(format!("{base}/api/v1/users/me"))
+        .bearer_auth(fresh)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// The PAT bridge accepts Cargo's raw Authorization form for session JWTs too.
+/// Its normalization must never hide the session from the outer standing gate.
+#[tokio::test]
+async fn scheme_less_sessions_obey_revocation_and_account_standing() {
+    use rg_db::{
+        entities::{repository, user},
+        sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter},
+    };
+
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    for (name, deactivate) in [("raw-revoked", false), ("raw-inactive", true)] {
+        let (jwt, id) = register_full(&base, name, &format!("{name}@example.test")).await;
+        for auth in [format!("Bearer {jwt}"), jwt.clone()] {
+            let live = client
+                .get(format!("{base}/api/v1/users/me"))
+                .header(header::AUTHORIZATION, auth)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(live.status(), StatusCode::OK);
+            assert_eq!(live.json::<serde_json::Value>().await.unwrap()["id"], id);
+        }
+
+        if deactivate {
+            user::Entity::update_many()
+                .col_expr(user::Column::IsActive, Expr::value(false))
+                .filter(user::Column::Id.eq(id))
+                .exec(&db)
+                .await
+                .unwrap();
+        } else {
+            rg_db::ops::user_ops::invalidate_sessions(&db, id)
+                .await
+                .unwrap();
+        }
+
+        for auth in [format!("Bearer {jwt}"), jwt.clone()] {
+            // Stripping an ambient stale cookie must not also discard an
+            // explicit presentation of the same revoked session.
+            for with_cookie in [false, true] {
+                for request in [
+                    client.get(format!("{base}/api/v1/users/me")),
+                    client
+                        .post(format!("{base}/api/v1/repos"))
+                        .json(&serde_json::json!({ "name": "must-not-exist" })),
+                ] {
+                    let mut request = request.header(header::AUTHORIZATION, &auth);
+                    if with_cookie {
+                        request =
+                            request.header(header::COOKIE, format!("plombir_git_token={jwt}"));
+                    }
+                    let response = request.send().await.unwrap();
+                    assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{name}");
+                    assert_eq!(
+                        response.json::<serde_json::Value>().await.unwrap()["error"]["reason"],
+                        "session_revoked",
+                        "{name}"
+                    );
+                }
+            }
+        }
+        assert!(
+            repository::Entity::find()
+                .filter(repository::Column::OwnerId.eq(id))
+                .filter(repository::Column::Name.eq("must-not-exist"))
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused session must not create a repository"
+        );
+    }
+}
+
 /// A revoked session on `/api/v1/users/me` must arrive as the API's own
 /// `{error:{code,message}}` envelope — the same shape the frontend and MCP
 /// clients branch on for every other 401.
@@ -397,27 +569,29 @@ async fn mixed_accounts_cannot_read_mutate_or_logout_as_the_cookie_owner() {
                 .await
                 .unwrap();
         }
-        for request in [
-            client.get(format!("{base}/api/v1/users/me")),
-            client.get(format!("{base}/api/v1/instance")),
-            client
-                .post(format!("{base}/api/v1/repos"))
-                .json(&serde_json::json!({ "name": "must-not-exist" })),
-            client.post(format!("{base}/api/v1/users/logout")),
-        ] {
-            let response = request
-                .header(header::COOKIE, &cookie)
-                .header(header::ORIGIN, &base)
-                .bearer_auth(&bearer_a)
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(response.status(), 401);
-            assert!(!response.headers().contains_key(header::SET_COOKIE));
-            assert!(!response.headers().contains_key(header::WWW_AUTHENTICATE));
-            let body: serde_json::Value = response.json().await.unwrap();
-            assert_eq!(body["error"]["code"], "UNAUTHORIZED");
-            assert_eq!(body["error"]["reason"], "identity_conflict");
+        for authorization in [format!("Bearer {bearer_a}"), bearer_a.clone()] {
+            for request in [
+                client.get(format!("{base}/api/v1/users/me")),
+                client.get(format!("{base}/api/v1/instance")),
+                client
+                    .post(format!("{base}/api/v1/repos"))
+                    .json(&serde_json::json!({ "name": "must-not-exist" })),
+                client.post(format!("{base}/api/v1/users/logout")),
+            ] {
+                let response = request
+                    .header(header::COOKIE, &cookie)
+                    .header(header::ORIGIN, &base)
+                    .header(header::AUTHORIZATION, &authorization)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 401);
+                assert!(!response.headers().contains_key(header::SET_COOKIE));
+                assert!(!response.headers().contains_key(header::WWW_AUTHENTICATE));
+                let body: serde_json::Value = response.json().await.unwrap();
+                assert_eq!(body["error"]["code"], "UNAUTHORIZED");
+                assert_eq!(body["error"]["reason"], "identity_conflict");
+            }
         }
         for (id, version) in [(a_id, i64::from(revoked_a)), (b_id, 0)] {
             assert_eq!(

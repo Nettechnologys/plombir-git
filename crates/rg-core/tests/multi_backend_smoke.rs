@@ -367,6 +367,48 @@ async fn exercise_login_finalization_contract(db: &DatabaseConnection, suffix: &
         "a fresh primary-factor challenge erased the second-factor failure"
     );
     assert_eq!(pending.last_login_at, None);
+    let pending = rg_db::ops::user_ops::reset_login_failures_if_open(db, mfa.id)
+        .await
+        .expect("finalize a password-only noninteractive attempt")
+        .expect("the MFA account remains open");
+    assert_eq!(
+        pending.login_attempts, 1,
+        "password-only proof erased MFA failures"
+    );
+    let reauthenticated =
+        rg_db::ops::user_ops::reset_login_failures_after_reauthentication(db, &pending)
+            .await
+            .expect("finalize full reauthentication")
+            .expect("the proved account and factor remain current");
+    assert_eq!(reauthenticated.login_attempts, 0);
+    assert_eq!(reauthenticated.last_login_at, None);
+    assert!(
+        rg_db::ops::user_ops::reset_login_failures_after_reauthentication(db, &reauthenticated)
+            .await
+            .expect("repeat reauthentication without changed counters")
+            .is_some(),
+        "a MySQL zero-change update must not reject valid proof"
+    );
+    rg_db::ops::user_ops::record_failed_login(db, mfa.id, 5)
+        .await
+        .unwrap();
+    rg_db::ops::user_ops::invalidate_sessions(db, mfa.id)
+        .await
+        .unwrap();
+    assert!(
+        rg_db::ops::user_ops::reset_login_failures_after_reauthentication(db, &pending)
+            .await
+            .expect("classify stale reauthentication proof")
+            .is_none()
+    );
+    assert_eq!(
+        rg_db::ops::user_ops::find_by_id(db, mfa.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .login_attempts,
+        1
+    );
     let completed = rg_db::ops::user_ops::record_successful_login(db, mfa.id)
         .await
         .expect("finalize the second factor")
@@ -1537,6 +1579,73 @@ async fn portable_merge_queue_pr(
     .expect("create portable merge-queue pull request")
 }
 
+async fn exercise_auto_merge_attempt_contract(
+    db: &DatabaseConnection,
+    owner: &rg_db::entities::user::Model,
+    repo: &rg_db::entities::repository::Model,
+) {
+    use rg_db::ops::pull_request_ops;
+    let pr = portable_merge_queue_pr(db, repo.id, owner.id, 9).await;
+    let enabled = rg_core::pull_request::enable_auto_merge(
+        db,
+        &owner.username,
+        &repo.name,
+        pr.number,
+        rg_core::pull_request::MergeStrategy::Merge,
+        owner.id,
+    )
+    .await
+    .expect("enable using the backend's timestamp precision");
+    let stored = pull_request_ops::find_by_id(db, pr.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(enabled.auto_merge_enabled_at, stored.auto_merge_enabled_at);
+    assert!(pull_request_ops::claim_auto_merge(db, &enabled)
+        .await
+        .unwrap());
+    assert!(
+        !pull_request_ops::find_by_id(db, pr.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .auto_merge_enabled
+    );
+    pull_request_ops::restore_auto_merge(db, &enabled)
+        .await
+        .unwrap();
+    assert!(pull_request_ops::claim_auto_merge(db, &enabled)
+        .await
+        .unwrap());
+    assert!(pull_request_ops::clear_auto_merge_attempt(db, &enabled)
+        .await
+        .unwrap());
+    pull_request_ops::restore_auto_merge(db, &enabled)
+        .await
+        .unwrap();
+    let cleared = pull_request_ops::find_by_id(db, pr.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!cleared.auto_merge_enabled);
+    assert!(cleared.auto_merge_enabled_at.is_none());
+    assert!(cleared.auto_merge_strategy.is_none());
+    assert!(cleared.auto_merge_enabled_by_id.is_none());
+    assert!(!pull_request_ops::clear_auto_merge_attempt(db, &enabled)
+        .await
+        .unwrap());
+    let events = rg_db::ops::pr_event_ops::list_by_pr(db, pr.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.event_type == "auto_merge_disabled")
+            .count(),
+        1
+    );
+}
+
 /// Keep the existing-row enqueue contract honest on backends whose no-op
 /// `UPDATE` counts differ. This covers queued/running idempotency, terminal row
 /// recycling, stale-attempt fencing, and both parent-cascade outcomes without
@@ -2498,9 +2607,18 @@ async fn agent_profile_round_trip_is_portable() {
     )
     .await
     .expect("create second repository");
-    let bot = rg_core::user::bots::create_bot(&db, owner.id, &format!("agentbot{suffix}"), None)
-        .await
-        .expect("create bot");
+    let bot = rg_core::user::bots::create_bot(
+        &db,
+        rg_core::user::service::LdapDirectories {
+            encryption_key: "test-encryption-key",
+            transport_policy: &Default::default(),
+        },
+        owner.id,
+        &format!("agentbot{suffix}"),
+        None,
+    )
+    .await
+    .expect("create bot");
 
     let key = rg_core::auth::encryption::derive_key("agent-profile-smoke");
     let long_command = format!(
@@ -2711,6 +2829,8 @@ async fn merge_queue_parent_deletes_are_portable() {
     .await
     .expect("create repository for the portable repository cascade");
 
+    exercise_auto_merge_attempt_contract(&db, &owner, &pr_delete_repo).await;
+
     exercise_merge_queue_parent_delete_contract(
         &db,
         pr_delete_repo.id,
@@ -2718,6 +2838,245 @@ async fn merge_queue_parent_deletes_are_portable() {
         owner.id,
     )
     .await;
+}
+
+/// S7: one source branch can feed PRs whose authors have different current
+/// publication rights. Exercise the real refresh and its nullable per-row CAS
+/// on server backends, including the list's same-repository/fork alternatives.
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable PostgreSQL or MySQL database"]
+async fn private_fork_head_refresh_freezes_each_unauthorized_pr_on_server_database() {
+    use rg_db::ops::{pull_request_ops, repo_collaborator_ops, repo_ops, user_ops};
+
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set; this test never self-skips");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    let backend = db.get_database_backend();
+    assert!(
+        matches!(backend, DatabaseBackend::Postgres | DatabaseBackend::MySql),
+        "the portable S7 regression requires a server database, got {backend:?}"
+    );
+    eprintln!("S7 private-fork head refresh backend: {backend:?}");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let owner_name = format!("headowner{suffix}");
+    let author_name = format!("headauthor{suffix}");
+    let owner = user_ops::create_user(
+        &db,
+        &owner_name,
+        &format!("{owner_name}@example.invalid"),
+        "unused",
+        "Private Source Owner",
+    )
+    .await
+    .unwrap();
+    let author = user_ops::create_user(
+        &db,
+        &author_name,
+        &format!("{author_name}@example.invalid"),
+        "unused",
+        "Revocable Source Writer",
+    )
+    .await
+    .unwrap();
+    let mut source = namespace_repo(owner.id, None, &format!("headsource{suffix}"));
+    source.is_private = Set(true);
+    let source = repo_ops::create(&db, source).await.unwrap();
+    let base = repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("headbase{suffix}")),
+    )
+    .await
+    .unwrap();
+    let other = repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("headother{suffix}")),
+    )
+    .await
+    .unwrap();
+    let collaborator = repo_collaborator_ops::create(
+        &db,
+        rg_db::entities::repo_collaborator::ActiveModel {
+            id: NotSet,
+            repo_id: Set(source.id),
+            user_id: Set(author.id),
+            permission: Set("write".to_string()),
+            created_at: Set(chrono::Utc::now()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let initial = "1111111111111111111111111111111111111111";
+    let published = "2222222222222222222222222222222222222222";
+    let moved = "3333333333333333333333333333333333333333";
+    let recreated = "4444444444444444444444444444444444444444";
+    let winner = "5555555555555555555555555555555555555555";
+    let stale = "6666666666666666666666666666666666666666";
+    let mut prs = Vec::new();
+    for (repo_id, number, author_id, head_repo_id, branch, state) in [
+        (base.id, 1, owner.id, Some(source.id), "feature", "open"),
+        (base.id, 2, author.id, Some(source.id), "feature", "open"),
+        (source.id, 1, owner.id, None, "feature", "open"),
+        (base.id, 3, owner.id, Some(source.id), "feature", "closed"),
+        (base.id, 4, owner.id, Some(source.id), "other", "open"),
+        // Matching base/branch alone must not select another fork's head.
+        (source.id, 2, owner.id, Some(other.id), "feature", "open"),
+    ] {
+        let now = chrono::Utc::now();
+        prs.push(
+            pull_request_ops::create(
+                &db,
+                rg_db::entities::pull_request::ActiveModel {
+                    repo_id: Set(repo_id),
+                    number: Set(number),
+                    title: Set(format!("portable private-source PR {repo_id}/{number}")),
+                    state: Set(state.to_string()),
+                    is_draft: Set(false),
+                    auto_merge_enabled: Set(false),
+                    author_id: Set(author_id),
+                    head_repo_id: Set(head_repo_id),
+                    head_branch: Set(branch.to_string()),
+                    base_branch: Set("main".to_string()),
+                    head_sha: Set(Some(initial.to_string())),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let ids = |rows: &[rg_db::entities::pull_request::Model]| {
+        let mut ids = rows.iter().map(|pr| pr.id).collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    };
+    let listed = pull_request_ops::list_open_with_head(&db, source.id, "feature")
+        .await
+        .unwrap();
+    assert_eq!(ids(&listed), ids(&prs[..3]));
+    let first =
+        rg_core::pull_request::refresh_open_heads(&db, source.id, "feature", Some(published))
+            .await
+            .unwrap();
+    assert_eq!(first.stale_rows, 0);
+    assert_eq!(ids(&first.open_prs), ids(&prs[..3]));
+    assert!(first
+        .open_prs
+        .iter()
+        .all(|pr| pr.head_sha.as_deref() == Some(published)));
+
+    repo_collaborator_ops::update_permission(&db, collaborator.id, "read".to_string())
+        .await
+        .unwrap()
+        .expect("downgrade the author's source grant");
+    // Deliberately no cache invalidation: publication must use current grants.
+    let live_ids = ids(&[prs[0].clone(), prs[2].clone()]);
+    for next in [Some(moved), None, Some(recreated)] {
+        let refreshed = rg_core::pull_request::refresh_open_heads(&db, source.id, "feature", next)
+            .await
+            .unwrap();
+        assert_eq!(
+            refreshed.stale_rows, 0,
+            "frozen rows must not cause retries"
+        );
+        assert_eq!(ids(&refreshed.open_prs), live_ids);
+        assert!(refreshed
+            .open_prs
+            .iter()
+            .all(|pr| pr.head_sha.as_deref() == next));
+        let frozen = pull_request_ops::find_by_id(&db, prs[1].id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frozen.head_sha.as_deref(), Some(published));
+    }
+
+    // An older observation loses after a newer writer wins; changing one PR
+    // must not advance its frozen neighbour on the same source branch.
+    assert!(pull_request_ops::compare_and_swap_open_head_sha(
+        &db,
+        prs[0].id,
+        Some(recreated),
+        Some(winner)
+    )
+    .await
+    .unwrap());
+    assert!(!pull_request_ops::compare_and_swap_open_head_sha(
+        &db,
+        prs[0].id,
+        Some(recreated),
+        Some(stale)
+    )
+    .await
+    .unwrap());
+    assert_eq!(
+        pull_request_ops::find_by_id(&db, prs[0].id)
+            .await
+            .unwrap()
+            .unwrap()
+            .head_sha
+            .as_deref(),
+        Some(winner)
+    );
+    assert_eq!(
+        pull_request_ops::find_by_id(&db, prs[1].id)
+            .await
+            .unwrap()
+            .unwrap()
+            .head_sha
+            .as_deref(),
+        Some(published),
+        "a successful per-PR CAS must not advance the frozen neighbour"
+    );
+    assert!(
+        !pull_request_ops::compare_and_swap_open_head_sha(
+            &db,
+            prs[3].id,
+            Some(initial),
+            Some(stale)
+        )
+        .await
+        .unwrap(),
+        "closed PRs cannot advance even with the expected head"
+    );
+    for pr in &prs[3..] {
+        assert_eq!(
+            pull_request_ops::find_by_id(&db, pr.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_sha
+                .as_deref(),
+            Some(initial),
+            "closed, other-branch and other-source PRs must remain untouched"
+        );
+    }
+    repo_collaborator_ops::update_permission(&db, collaborator.id, "write".to_string())
+        .await
+        .unwrap()
+        .expect("restore the author's publication grant");
+    // A grant may retain a short negative-cache entry. Invalidate only when
+    // granting, as the product mutation does; the downgrade above must work
+    // without invalidation so it proves that positive grants are not leased.
+    rg_core::repo::service::invalidate_perm_cache_user(&db, source.id, author.id);
+    let resumed =
+        rg_core::pull_request::refresh_open_heads(&db, source.id, "feature", Some(winner))
+            .await
+            .unwrap();
+    assert_eq!(resumed.stale_rows, 0);
+    assert_eq!(ids(&resumed.open_prs), ids(&prs[..3]));
+    assert!(resumed
+        .open_prs
+        .iter()
+        .all(|pr| pr.head_sha.as_deref() == Some(winner)));
+    eprintln!("S7 private-fork head refresh contract passed on {backend:?}");
 }
 
 #[tokio::test]
@@ -3955,6 +4314,259 @@ const NARROW_MYSQL_COLUMNS: &[(&str, &[&str])] = &[
 
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn credential_change_links_and_factor_reset_are_portable() {
+    use rg_db::ops::{
+        email_confirmation_ops as links, password_reset_token_ops as resets, user_ops,
+    };
+    let url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL").expect("disposable database URL");
+    let db = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 5)
+        .await
+        .unwrap();
+    rg_db::run_migrations(&db).await.unwrap();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let name = format!("links-{}", &suffix[..10]);
+    let user = user_ops::create_user(
+        &db,
+        &name,
+        &format!("{name}@example.test"),
+        "fixture-old-hash",
+        "Links",
+    )
+    .await
+    .unwrap();
+    // create_user is the external-identity fixture helper. Address changes
+    // require a local password account, just like the HTTP registration path.
+    let user = rg_db::entities::user::ActiveModel {
+        id: Set(user.id),
+        auth_provider: Set("local".into()),
+        ..Default::default()
+    }
+    .update(&db)
+    .await
+    .unwrap();
+    let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
+    let next_email = format!("next-{name}@example.test");
+    let hash = format!("email-{suffix}");
+    assert!(
+        links::replace_pending_email_change(&db, &user, &next_email, &hash, expiry)
+            .await
+            .unwrap()
+    );
+    let link = links::find_live(&db, &hash).await.unwrap().unwrap();
+    let reset = resets::create(&db, user.id, &format!("reset-{suffix}"), expiry)
+        .await
+        .unwrap();
+    let (one, two) = tokio::join!(
+        user_ops::complete_email_change(&db, &link),
+        user_ops::complete_email_change(&db, &link)
+    );
+    assert_eq!(
+        usize::from(one.unwrap().is_some()) + usize::from(two.unwrap().is_some()),
+        1
+    );
+    assert!(
+        resets::complete_password_reset(&db, reset.id, user.id, "old-address-attack")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!resets::replace_for_current_account(
+        &db,
+        &user,
+        &format!("late-reset-{suffix}"),
+        expiry
+    )
+    .await
+    .unwrap());
+    assert!(!links::replace_pending_email_change(
+        &db,
+        &user,
+        &user.email,
+        &format!("late-email-{suffix}"),
+        expiry
+    )
+    .await
+    .unwrap());
+    let current = user_ops::find_by_id(&db, user.id).await.unwrap().unwrap();
+    assert_eq!(current.email, next_email);
+    assert_eq!(current.password_hash, user.password_hash);
+    assert!(resets::replace_for_current_account(
+        &db,
+        &current,
+        &format!("new-reset-{suffix}"),
+        expiry
+    )
+    .await
+    .unwrap());
+    let second_hash = format!("second-email-{suffix}");
+    assert!(
+        links::replace_pending_email_change(&db, &current, &user.email, &second_hash, expiry)
+            .await
+            .unwrap()
+    );
+    let second = links::find_live(&db, &second_hash).await.unwrap().unwrap();
+    let updated =
+        user_ops::change_password(&db, user.id, &current.password_hash, "fixture-new-hash")
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(user_ops::complete_email_change(&db, &second)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(updated.email, next_email);
+    user_ops::enable_mfa(&db, user.id).await.unwrap();
+    let before_reset = user_ops::find_by_id(&db, user.id).await.unwrap().unwrap();
+    let third_hash = format!("third-email-{suffix}");
+    assert!(links::replace_pending_email_change(
+        &db,
+        &before_reset,
+        &user.email,
+        &third_hash,
+        expiry
+    )
+    .await
+    .unwrap());
+    rg_db::ops::passkey_credential_ops::create(
+        &db,
+        user.id,
+        &format!("passkey-{suffix}"),
+        "fixture-json",
+        "portable key",
+        "localhost",
+    )
+    .await
+    .unwrap();
+    let outcome = rg_core::user::account::reset_mfa(&db, user.id)
+        .await
+        .unwrap();
+    assert!(outcome.totp_removed);
+    assert_eq!(outcome.passkeys_removed, 1);
+    assert_eq!(
+        outcome.user.session_version,
+        before_reset.session_version + 1
+    );
+    assert!(links::find_live(&db, &third_hash).await.unwrap().is_none());
+    assert!(
+        user_ops::record_successful_login_for_proved_account(&db, &before_reset)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Lock updates that change no value and timestamp precision are backend
+    // details, not reasons to reject a current proved account.
+    let completed = user_ops::record_successful_login_for_proved_account(&db, &outcome.user)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(completed.last_login_at.is_some());
+    assert!(
+        user_ops::record_successful_login_for_proved_account(&db, &completed)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn audited_account_and_organization_policy_transitions_are_portable() {
+    use rg_db::ops::{email_confirmation_ops as links, org_ops, user_ops};
+    let url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL").expect("disposable database URL");
+    let db = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 5)
+        .await
+        .unwrap();
+    rg_db::run_migrations(&db).await.unwrap();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let name = format!("policy-{}", &suffix[..10]);
+    let user = user_ops::create_user(
+        &db,
+        &name,
+        &format!("{name}@example.test"),
+        "fixture-hash",
+        "Policy",
+    )
+    .await
+    .unwrap();
+    let user = rg_db::entities::user::ActiveModel {
+        id: Set(user.id),
+        auth_provider: Set("local".into()),
+        ..Default::default()
+    }
+    .update(&db)
+    .await
+    .unwrap();
+    let link_hash = format!("pending-{suffix}");
+    assert!(links::replace_pending_email_change(
+        &db,
+        &user,
+        &format!("next-{name}@example.test"),
+        &link_hash,
+        chrono::Utc::now() + chrono::Duration::hours(1)
+    )
+    .await
+    .unwrap());
+    let disabled = user_ops::update_by_id(&db, user.id, None, None, None, Some(false))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(disabled.session_version, user.session_version + 1);
+    let repeated = user_ops::update_by_id(&db, user.id, None, None, None, Some(false))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeated.session_version, disabled.session_version);
+    let enabled = user_ops::update_by_id(&db, user.id, None, None, None, Some(true))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(enabled.session_version, disabled.session_version);
+    assert!(links::find_live(&db, &link_hash).await.unwrap().is_none());
+    for (index, visibility) in ["Public", "private ", "", "legacy"].iter().enumerate() {
+        let org = org_ops::create_org(
+            &db,
+            &format!("policy-org-{index}-{}", &suffix[..10]),
+            None,
+            None,
+            user.id,
+            visibility,
+        )
+        .await
+        .unwrap();
+        assert!(org_ops::invalid_visibility_sample(&db)
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.id == org.id));
+        assert!(rg_core::org::update_org(
+            &db,
+            org.id,
+            Some("must not change"),
+            None,
+            Some(visibility)
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            org_ops::get_org_by_name(&db, &org.name)
+                .await
+                .unwrap()
+                .unwrap(),
+            org
+        );
+        rg_core::org::update_org(&db, org.id, None, None, Some("private"))
+            .await
+            .unwrap();
+        assert!(!org_ops::invalid_visibility_sample(&db)
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.id == org.id));
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn mfa_lifecycle_account_delete_is_portable() {
     let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
         .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
@@ -4867,14 +5479,10 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
     )
     .await
     .expect("create cross-backend PR head fixture");
-    let refreshed = rg_db::ops::pull_request_ops::update_open_head_sha(
-        &db,
-        repo.id,
-        "feature",
-        Some(refreshed_pr_head),
-    )
-    .await
-    .expect("CAS-refresh the PR head");
+    let refreshed =
+        rg_core::pull_request::refresh_open_heads(&db, repo.id, "feature", Some(refreshed_pr_head))
+            .await
+            .expect("CAS-refresh the PR head");
     assert_eq!(refreshed.stale_rows, 0);
     assert_eq!(
         refreshed.open_prs[0].head_sha.as_deref(),
@@ -4901,19 +5509,15 @@ async fn migrations_crud_counters_and_fts_work_on_server_database() {
         Some(refreshed_pr_head),
         "the losing writer must not roll the PR head back"
     );
-    let deleted = rg_db::ops::pull_request_ops::update_open_head_sha(&db, repo.id, "feature", None)
+    let deleted = rg_core::pull_request::refresh_open_heads(&db, repo.id, "feature", None)
         .await
         .expect("clear the PR head for a deleted branch");
     assert_eq!(deleted.stale_rows, 0);
     assert_eq!(deleted.open_prs[0].head_sha, None);
-    let recreated = rg_db::ops::pull_request_ops::update_open_head_sha(
-        &db,
-        repo.id,
-        "feature",
-        Some(recreated_pr_head),
-    )
-    .await
-    .expect("restore the PR head after branch recreation");
+    let recreated =
+        rg_core::pull_request::refresh_open_heads(&db, repo.id, "feature", Some(recreated_pr_head))
+            .await
+            .expect("restore the PR head after branch recreation");
     assert_eq!(recreated.stale_rows, 0);
     assert_eq!(
         recreated.open_prs[0].head_sha.as_deref(),

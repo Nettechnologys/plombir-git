@@ -13,9 +13,39 @@ fn check_org_lengths(display_name: Option<&str>, description: Option<&str>) -> R
     check_optional("description", description, MAX_LINE_CHARS)
 }
 
+fn check_org_visibility(visibility: &str) -> Result<()> {
+    if matches!(visibility, "public" | "private") {
+        Ok(())
+    } else {
+        Err(crate::error::invalid_request(
+            "visibility must be 'public' or 'private'",
+        ))
+    }
+}
+
+/// Unknown historical visibility values are member-only. Report them at boot
+/// so an operator can choose a valid policy without rewriting data silently.
+pub async fn report_invalid_visibility(db: &DatabaseConnection) {
+    let organizations = match org_ops::invalid_visibility_sample(db).await {
+        Ok(organizations) => organizations,
+        Err(error) => {
+            tracing::warn!(error = %error, "could not check organization visibility values");
+            return;
+        }
+    };
+    if organizations.len() == 100 {
+        tracing::warn!("organization visibility diagnostics are limited to the first 100 affected organizations");
+    }
+    for organization in organizations {
+        tracing::warn!(org_id = organization.id, org = %organization.name, visibility = ?organization.visibility,
+            "invalid organization visibility is treated as member-only; set public or private explicitly");
+    }
+}
+
 /// Create a new organization.
 pub async fn create_org(
     db: &DatabaseConnection,
+    directories: crate::user::service::LdapDirectories<'_>,
     name: &str,
     display_name: Option<&str>,
     description: Option<&str>,
@@ -27,11 +57,7 @@ pub async fn create_org(
     check_org_lengths(display_name, description)?;
 
     // Check visibility
-    if visibility != "public" && visibility != "private" {
-        return Err(crate::error::invalid_request(
-            "visibility must be 'public' or 'private'",
-        ));
-    }
+    check_org_visibility(visibility)?;
 
     // The one answer both the pre-read and a losing insert give, so a caller
     // cannot tell which of the two noticed — and so the response code does not
@@ -46,7 +72,7 @@ pub async fn create_org(
 
     // Taken by an organization or by an account: both answer to `/{name}`,
     // and the account would win that lookup (card_4b0594a02218).
-    if crate::namespace::owner_name_is_taken(db, name).await? {
+    if crate::namespace::owner_name_is_reserved(db, directories, name, None).await? {
         return Err(already_taken());
     }
 
@@ -86,6 +112,9 @@ pub async fn update_org(
     visibility: Option<&str>,
 ) -> Result<rg_db::entities::organization::Model> {
     check_org_lengths(display_name, description)?;
+    if let Some(visibility) = visibility {
+        check_org_visibility(visibility)?;
+    }
     org_ops::update_org(db, id, display_name, description, visibility)
         .await?
         .ok_or_else(|| crate::error::not_found("organization"))
@@ -579,9 +608,20 @@ mod org_retirement_race_tests {
         )
         .await
         .expect("create owner");
-        let org = create_org(db, org_name, None, None, owner.id, "public")
-            .await
-            .expect("create organization");
+        let org = create_org(
+            db,
+            crate::user::service::LdapDirectories {
+                encryption_key: "test-encryption-key",
+                transport_policy: &Default::default(),
+            },
+            org_name,
+            None,
+            None,
+            owner.id,
+            "public",
+        )
+        .await
+        .expect("create organization");
         let sandbox = tempfile::tempdir().expect("create repository root");
         let repo_root = sandbox.path().join("repos");
         (owner.id, org.id, sandbox, repo_root)

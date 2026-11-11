@@ -329,6 +329,7 @@ pub async fn list_bots(State(state): State<AppState>, AuthUser(user_id): AuthUse
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 403, description = "A bot or a disabled account cannot create bots", body = serde_json::Value),
         (status = 409, description = "The name is taken", body = serde_json::Value),
+        (status = 502, description = "A configured directory is unavailable", body = serde_json::Value),
     ),
 )]
 pub async fn create_bot(
@@ -343,6 +344,10 @@ pub async fn create_bot(
     };
     let bot = match rg_core::user::bots::create_bot(
         &state.db,
+        rg_core::user::service::LdapDirectories {
+            encryption_key: &state.encryption_key,
+            transport_policy: &state.ldap_transport_policy,
+        },
         user_id,
         &body.username,
         body.display_name.as_deref(),

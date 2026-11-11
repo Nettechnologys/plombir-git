@@ -5032,7 +5032,7 @@ dependencies = [
 
 [[package]]
 name = "rg-ci"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5055,7 +5055,7 @@ dependencies = [
 
 [[package]]
 name = "rg-cli"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5089,7 +5089,7 @@ dependencies = [
 
 [[package]]
 name = "rg-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "aes-gcm 0.10.3",
  "anyhow",
@@ -5145,7 +5145,7 @@ dependencies = [
 
 [[package]]
 name = "rg-db"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5165,7 +5165,7 @@ dependencies = [
 
 [[package]]
 name = "rg-db-migration"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5186,7 +5186,7 @@ dependencies = [
 
 [[package]]
 name = "rg-git"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "gix",
@@ -5201,7 +5201,7 @@ dependencies = [
 
 [[package]]
 name = "rg-http"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -5257,7 +5257,7 @@ dependencies = [
 
 [[package]]
 name = "rg-mcp"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
@@ -5273,7 +5273,7 @@ dependencies = [
 
 [[package]]
 name = "rg-process"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5289,7 +5289,7 @@ dependencies = [
 
 [[package]]
 name = "rg-runner"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5312,7 +5312,7 @@ dependencies = [
 
 [[package]]
 name = "rg-ssh"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5522,9 +5522,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.11.1",
  "errno",
@@ -7981,9 +7981,9 @@ dependencies = [
 
 [[package]]
 name = "xattr"
-version = "1.6.1"
+version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+checksum = "963d6fab92d5504b971dc8bd90ca743c2575e590bc8071ea5bc571598667ae08"
 dependencies = [
  "libc",
  "rustix",

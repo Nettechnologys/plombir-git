@@ -19,6 +19,113 @@
 
 use crate::common::{register_full, spawn_test_app};
 
+#[tokio::test]
+async fn organization_visibility_patch_validates_before_any_mutation() {
+    use rg_db::{entities::notification_delivery, ops::org_ops};
+    use sea_orm::{EntityTrait, PaginatorTrait};
+    let (base, db) = crate::common::spawn_test_app_with_db().await;
+    let (owner, _) =
+        register_full(&base, "visibility-owner", "visibility-owner@example.test").await;
+    create_org(&base, &owner, "visibility-org", "private").await;
+    let before = org_ops::get_org_by_name(&db, "visibility-org")
+        .await
+        .unwrap()
+        .unwrap();
+    let queued = notification_delivery::Entity::find()
+        .count(&db)
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+    for visibility in ["", "PUBLIC", "private ", "internal", "privtae"] {
+        let response = client.patch(format!("{base}/api/v1/orgs/visibility-org"))
+            .bearer_auth(&owner).json(&serde_json::json!({
+                "visibility":visibility, "display_name":"Must not change", "description":"Must not change"
+            })).send().await.unwrap();
+        assert_eq!(response.status(), 400, "{visibility}");
+        assert_eq!(
+            org_ops::get_org_by_name(&db, "visibility-org")
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            notification_delivery::Entity::find()
+                .count(&db)
+                .await
+                .unwrap(),
+            queued
+        );
+    }
+    for visibility in ["public", "private"] {
+        let response = client
+            .patch(format!("{base}/api/v1/orgs/visibility-org"))
+            .bearer_auth(&owner)
+            .json(&serde_json::json!({"visibility":visibility}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            org_ops::get_org_by_name(&db, "visibility-org")
+                .await
+                .unwrap()
+                .unwrap()
+                .visibility,
+            visibility
+        );
+    }
+}
+
+#[tokio::test]
+async fn unknown_legacy_org_visibility_is_member_only_and_reported() {
+    use rg_db::{entities::organization, ops::org_ops};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    let (base, db) = crate::common::spawn_test_app_with_db().await;
+    let (owner, _) = register_full(&base, "legacy-owner", "legacy-owner@example.test").await;
+    let (outsider, _) =
+        register_full(&base, "legacy-outsider", "legacy-outsider@example.test").await;
+    create_org(&base, &owner, "legacy-org", "private").await;
+    let original = org_ops::get_org_by_name(&db, "legacy-org")
+        .await
+        .unwrap()
+        .unwrap();
+    organization::Entity::update_many()
+        .col_expr(
+            organization::Column::Visibility,
+            sea_orm::sea_query::Expr::value("legacy"),
+        )
+        .filter(organization::Column::Id.eq(original.id))
+        .exec(&db)
+        .await
+        .unwrap();
+    let invalid = org_ops::invalid_visibility_sample(&db).await.unwrap();
+    assert_eq!(invalid.len(), 1);
+    assert_eq!(invalid[0].id, original.id);
+    let client = reqwest::Client::new();
+    for suffix in ["", "/members", "/teams"] {
+        for (token, expected) in [(None, 404), (Some(&outsider), 404), (Some(&owner), 200)] {
+            let mut request = client.get(format!("{base}/api/v1/orgs/legacy-org{suffix}"));
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            assert_eq!(request.send().await.unwrap().status().as_u16(), expected);
+        }
+    }
+    let corrected = client
+        .patch(format!("{base}/api/v1/orgs/legacy-org"))
+        .bearer_auth(&owner)
+        .json(&serde_json::json!({"visibility":"private"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(corrected.status(), 200);
+    assert!(org_ops::invalid_visibility_sample(&db)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 /// Create an org owned by `token`; returns nothing but asserts the 201.
 async fn create_org(base: &str, token: &str, name: &str, visibility: &str) {
     let resp = reqwest::Client::new()

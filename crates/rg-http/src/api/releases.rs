@@ -121,6 +121,19 @@ async fn stage_release_upload(
     })
 }
 
+// Release visibility depends on the caller and can change on publication or
+// withdrawal. Never let a shared cache replay a writer's draft response.
+async fn private_release_response(
+    response: impl std::future::Future<Output = axum::response::Response>,
+) -> axum::response::Response {
+    let mut response = response.await;
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
+}
+
 // ── Access gates ──────────────────────────────────────────────────────
 //
 // These routes carry the repository in the path but address the release (or
@@ -140,9 +153,12 @@ async fn release_in_repo(
     state: &AppState,
     repo: &rg_db::entities::repository::Model,
     release_id: i64,
+    viewer: Option<i64>,
 ) -> Result<rg_db::entities::release::Model, AppError> {
     let release = rg_core::release::service::get_release(&state.db, release_id).await?;
-    if release.repo_id != repo.id {
+    if release.repo_id != repo.id
+        || (release.is_draft && !super::repo_access::may_write(state, repo, viewer).await?)
+    {
         return Err(AppError::not_found("release not found"));
     }
 
@@ -154,8 +170,9 @@ async fn asset_in_repo(
     state: &AppState,
     repo: &rg_db::entities::repository::Model,
     asset_id: i64,
+    viewer: Option<i64>,
 ) -> Result<rg_db::entities::release_asset::Model, AppError> {
-    asset_and_release_in_repo(state, repo, asset_id)
+    asset_and_release_in_repo(state, repo, asset_id, viewer)
         .await
         .map(|(asset, _)| asset)
 }
@@ -166,6 +183,7 @@ async fn asset_and_release_in_repo(
     state: &AppState,
     repo: &rg_db::entities::repository::Model,
     asset_id: i64,
+    viewer: Option<i64>,
 ) -> Result<
     (
         rg_db::entities::release_asset::Model,
@@ -175,8 +193,10 @@ async fn asset_and_release_in_repo(
 > {
     let asset = rg_core::release::service::get_asset(&state.db, asset_id).await?;
     let release = rg_core::release::service::get_release(&state.db, asset.release_id).await?;
-    if release.repo_id != repo.id {
-        return Err(AppError::not_found("asset not found"));
+    if release.repo_id != repo.id
+        || (release.is_draft && !super::repo_access::may_write(state, repo, viewer).await?)
+    {
+        return Err(AppError::from(rg_core::error::not_found("asset")));
     }
 
     Ok((asset, release))
@@ -290,31 +310,49 @@ pub struct UpdateReleaseRequest {
 pub async fn list_releases(
     State(state): State<AppState>,
     RepoRead { repo }: RepoRead,
+    headers: HeaderMap,
     Path((owner, name)): Path<(String, String)>,
     Query(params): Query<PaginationParams>,
 ) -> impl IntoResponse {
-    let pagination = params.clamp();
-    let offset = pagination.offset();
-    let limit = pagination.limit();
+    private_release_response(async {
+        let viewer = super::auth::extract_user_id(&headers, &state.jwt_secret);
 
-    match rg_core::release::service::list_releases(&state.db, repo.id, offset, limit).await {
-        Ok((releases, total)) => {
-            let links = crate::html_url::Links::new(&state, &owner, &name);
-            let releases: Vec<serde_json::Value> = releases
-                .into_iter()
-                .map(|release| {
-                    let html_url = links.release(release.id);
-                    crate::html_url::with_html_url(release, html_url)
-                })
-                .collect();
-            (
-                StatusCode::OK,
-                Json(PaginatedResponse::new(releases, &pagination, total as u64)),
-            )
-                .into_response()
+        let pagination = params.clamp();
+        let offset = pagination.offset();
+        let limit = pagination.limit();
+
+        let include_drafts = match super::repo_access::may_write(&state, &repo, viewer).await {
+            Ok(allowed) => allowed,
+            Err(error) => return error.into_response(),
+        };
+        match rg_core::release::service::list_releases(
+            &state.db,
+            repo.id,
+            include_drafts,
+            offset,
+            limit,
+        )
+        .await
+        {
+            Ok((releases, total)) => {
+                let links = crate::html_url::Links::new(&state, &owner, &name);
+                let releases: Vec<serde_json::Value> = releases
+                    .into_iter()
+                    .map(|release| {
+                        let html_url = links.release(release.id);
+                        crate::html_url::with_html_url(release, html_url)
+                    })
+                    .collect();
+                (
+                    StatusCode::OK,
+                    Json(PaginatedResponse::new(releases, &pagination, total as u64)),
+                )
+                    .into_response()
+            }
+            Err(e) => AppError::from(e).into_response(),
         }
-        Err(e) => AppError::from(e).into_response(),
-    }
+    })
+    .await
 }
 
 /// POST /api/v1/repos/:owner/:name/releases
@@ -421,21 +459,28 @@ pub async fn get_release(
     State(state): State<AppState>,
     Path((owner, name, id)): Path<(String, String, i64)>,
     RepoRead { repo }: RepoRead,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    // The service marks a genuine miss with `rg_core::error::NotFound`, so this
-    // still answers 404 for a deleted release — but a database outage surfaces
-    // as 503 instead of telling the client the release is gone.
-    match release_in_repo(&state, &repo, id).await {
-        Ok(release) => {
-            let html_url = crate::html_url::Links::new(&state, &owner, &name).release(release.id);
-            (
-                StatusCode::OK,
-                Json(crate::html_url::with_html_url(release, html_url)),
-            )
-                .into_response()
+    private_release_response(async {
+        let viewer = super::auth::extract_user_id(&headers, &state.jwt_secret);
+
+        // The service marks a genuine miss with `rg_core::error::NotFound`, so this
+        // still answers 404 for a deleted release — but a database outage surfaces
+        // as 503 instead of telling the client the release is gone.
+        match release_in_repo(&state, &repo, id, viewer).await {
+            Ok(release) => {
+                let html_url =
+                    crate::html_url::Links::new(&state, &owner, &name).release(release.id);
+                (
+                    StatusCode::OK,
+                    Json(crate::html_url::with_html_url(release, html_url)),
+                )
+                    .into_response()
+            }
+            Err(e) => e.into_response(),
         }
-        Err(e) => e.into_response(),
-    }
+    })
+    .await
 }
 
 /// PATCH /api/v1/repos/:owner/:name/releases/:id
@@ -463,7 +508,7 @@ pub async fn update_release(
 ) -> impl IntoResponse {
     // Write access to `owner/name` says nothing about where `id` points: the
     // release has to live in the repository the permission was checked against.
-    let release = match release_in_repo(&state, &repo, id).await {
+    let release = match release_in_repo(&state, &repo, id, Some(actor_id)).await {
         Ok(release) => release,
         Err(e) => return e.into_response(),
     };
@@ -582,7 +627,7 @@ pub async fn delete_release(
     RepoWrite { repo, actor_id }: RepoWrite,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let release = match release_in_repo(&state, &repo, id).await {
+    let release = match release_in_repo(&state, &repo, id, Some(actor_id)).await {
         Ok(release) => release,
         Err(e) => return e.into_response(),
     };
@@ -650,15 +695,21 @@ pub async fn list_assets(
     State(state): State<AppState>,
     Path((_, _, release_id)): Path<(String, String, i64)>,
     RepoRead { repo }: RepoRead,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(e) = release_in_repo(&state, &repo, release_id).await {
-        return e.into_response();
-    }
+    private_release_response(async {
+        let viewer = super::auth::extract_user_id(&headers, &state.jwt_secret);
 
-    match rg_core::release::service::list_assets(&state.db, release_id).await {
-        Ok(assets) => (StatusCode::OK, Json(serde_json::json!(assets))).into_response(),
-        Err(e) => AppError::from(e).into_response(),
-    }
+        if let Err(e) = release_in_repo(&state, &repo, release_id, viewer).await {
+            return e.into_response();
+        }
+
+        match rg_core::release::service::list_assets(&state.db, release_id).await {
+            Ok(assets) => (StatusCode::OK, Json(serde_json::json!(assets))).into_response(),
+            Err(e) => AppError::from(e).into_response(),
+        }
+    })
+    .await
 }
 
 /// POST /api/v1/repos/:owner/:name/releases/:release_id/assets
@@ -698,7 +749,7 @@ pub async fn upload_asset(
     // Gate before reading the body: the release must belong to the repository
     // whose write permission was just checked, otherwise the asset lands in
     // someone else's release.
-    let release = match release_in_repo(&state, &repo, release_id).await {
+    let release = match release_in_repo(&state, &repo, release_id, Some(user_id)).await {
         Ok(release) => release,
         Err(e) => return e.into_response(),
     };
@@ -820,11 +871,17 @@ pub async fn get_asset(
     State(state): State<AppState>,
     Path((_, _, asset_id)): Path<(String, String, i64)>,
     RepoRead { repo }: RepoRead,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    match asset_in_repo(&state, &repo, asset_id).await {
-        Ok(asset) => (StatusCode::OK, Json(serde_json::json!(asset))).into_response(),
-        Err(e) => e.into_response(),
-    }
+    private_release_response(async {
+        let viewer = super::auth::extract_user_id(&headers, &state.jwt_secret);
+
+        match asset_in_repo(&state, &repo, asset_id, viewer).await {
+            Ok(asset) => (StatusCode::OK, Json(serde_json::json!(asset))).into_response(),
+            Err(e) => e.into_response(),
+        }
+    })
+    .await
 }
 
 /// GET /api/v1/repos/:owner/:name/releases/assets/:asset_id/download
@@ -852,132 +909,138 @@ pub async fn download_asset(
     State(state): State<AppState>,
     Path((owner, name, asset_id)): Path<(String, String, i64)>,
     RepoRead { repo }: RepoRead,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    // Read access to the repository is only half of it — the asset id is
-    // global, so it also has to belong to this repository or the check guards
-    // the wrong object.
-    if let Err(e) = asset_in_repo(&state, &repo, asset_id).await {
-        return e.into_response();
-    }
+    private_release_response(async {
+        let viewer = super::auth::extract_user_id(&headers, &state.jwt_secret);
 
-    let (asset, source) = match rg_core::release::service::download_asset(
-        &state.db,
-        asset_id,
-        state.blob_storage.as_ref(),
-        &state.repo_root,
-        &owner,
-        &name,
-    )
-    .await
-    {
-        Ok(pair) => pair,
-        // The read half of the same split: a missing asset row is a 404, but an
-        // unreadable blob store is not — and reporting it as one both hides the
-        // outage and (since a 404 body is not sanitized) hands the client the
-        // storage path from the error text.
-        Err(error) => return AppError::from(error).into_response(),
-    };
+        // Read access to the repository is only half of it — the asset id is
+        // global, so it also has to belong to this repository or the check guards
+        // the wrong object.
+        if let Err(e) = asset_in_repo(&state, &repo, asset_id, viewer).await {
+            return e.into_response();
+        }
 
-    let mut resp_headers = HeaderMap::new();
-    // Never the uploader's type verbatim: a `.js` asset uploaded as
-    // `text/javascript` was a script of this origin (card_36b620ab3467). The
-    // name is unconditional: the old `if let Ok(..)` around a plain
-    // `filename="…"` dropped the header entirely for an asset whose name is
-    // not ASCII, and the browser then saved the file under whatever the URL
-    // suggested — a `200` that quietly did not do what the endpoint documents.
-    crate::content_disposition::apply_download_headers(
-        &mut resp_headers,
-        crate::content_disposition::served_upload_type(&asset.content_type),
-        Some(&asset.filename),
-    );
+        let (asset, source) = match rg_core::release::service::download_asset(
+            &state.db,
+            asset_id,
+            state.blob_storage.as_ref(),
+            &state.repo_root,
+            &owner,
+            &name,
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            // The read half of the same split: a missing asset row is a 404, but an
+            // unreadable blob store is not — and reporting it as one both hides the
+            // outage and (since a 404 body is not sanitized) hands the client the
+            // storage path from the error text.
+            Err(error) => return AppError::from(error).into_response(),
+        };
 
-    match source {
-        rg_core::release::service::AssetSource::LocalFile { path, size } => {
-            // Integrity check on disk: a mismatch answers `500` BEFORE the
-            // first byte of body leaves. Reading the whole asset into a `Vec`
-            // just to hash it (card_7e762d2c19b0) made every download cost the
-            // server the asset's own size in heap on the local backend that
-            // ships as the default. Legacy assets carry no recorded digest and
-            // are served without the check, but they still stream off disk
-            // rather than into memory.
-            let sha256 = match crate::http_stream::hash_local_file(&path).await {
-                Ok(sha) => sha,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return AppError::not_found("release asset not found").into_response();
-                }
-                Err(error) => {
-                    return AppError::internal(anyhow::anyhow!(
-                        "failed to hash release asset: {error}"
-                    ))
-                    .into_response();
-                }
-            };
-            if let Some(expected) = asset.sha256.as_deref() {
-                if sha256 != expected {
-                    return AppError::internal(anyhow::anyhow!(
+        let mut resp_headers = HeaderMap::new();
+        // Never the uploader's type verbatim: a `.js` asset uploaded as
+        // `text/javascript` was a script of this origin (card_36b620ab3467). The
+        // name is unconditional: the old `if let Ok(..)` around a plain
+        // `filename="…"` dropped the header entirely for an asset whose name is
+        // not ASCII, and the browser then saved the file under whatever the URL
+        // suggested — a `200` that quietly did not do what the endpoint documents.
+        crate::content_disposition::apply_download_headers(
+            &mut resp_headers,
+            crate::content_disposition::served_upload_type(&asset.content_type),
+            Some(&asset.filename),
+        );
+
+        match source {
+            rg_core::release::service::AssetSource::LocalFile { path, size } => {
+                // Integrity check on disk: a mismatch answers `500` BEFORE the
+                // first byte of body leaves. Reading the whole asset into a `Vec`
+                // just to hash it (card_7e762d2c19b0) made every download cost the
+                // server the asset's own size in heap on the local backend that
+                // ships as the default. Legacy assets carry no recorded digest and
+                // are served without the check, but they still stream off disk
+                // rather than into memory.
+                let sha256 = match crate::http_stream::hash_local_file(&path).await {
+                    Ok(sha) => sha,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return AppError::not_found("release asset not found").into_response();
+                    }
+                    Err(error) => {
+                        return AppError::internal(anyhow::anyhow!(
+                            "failed to hash release asset: {error}"
+                        ))
+                        .into_response();
+                    }
+                };
+                if let Some(expected) = asset.sha256.as_deref() {
+                    if sha256 != expected {
+                        return AppError::internal(anyhow::anyhow!(
                         "asset integrity check failed: expected sha256 {expected}, got {sha256}"
                     ))
-                    .into_response();
+                        .into_response();
+                    }
                 }
-            }
-            let (file, _) = match crate::http_stream::open_local_file_for_stream(&path).await {
-                Ok(pair) => pair,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return AppError::not_found("release asset not found").into_response();
+                let (file, _) = match crate::http_stream::open_local_file_for_stream(&path).await {
+                    Ok(pair) => pair,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return AppError::not_found("release asset not found").into_response();
+                    }
+                    Err(error) => {
+                        return AppError::internal(anyhow::anyhow!(
+                            "failed to open release asset: {error}"
+                        ))
+                        .into_response();
+                    }
+                };
+                if let Ok(v) = HeaderValue::from_str(&size.to_string()) {
+                    resp_headers.insert(header::CONTENT_LENGTH, v);
                 }
-                Err(error) => {
-                    return AppError::internal(anyhow::anyhow!(
-                        "failed to open release asset: {error}"
-                    ))
-                    .into_response();
+                if let Ok(v) = HeaderValue::from_str(&sha256) {
+                    resp_headers.insert(header::HeaderName::from_static("x-checksum-sha256"), v);
                 }
-            };
-            if let Ok(v) = HeaderValue::from_str(&size.to_string()) {
-                resp_headers.insert(header::CONTENT_LENGTH, v);
+                // Stream the asset straight off disk: the memory bound is the
+                // hashing window rather than the asset size (card_7e762d2c19b0).
+                // The idle guard from card_9cd96bafd879 still bites — a slow client
+                // trips the idle window and the file handle is released.
+                (
+                    StatusCode::OK,
+                    resp_headers,
+                    crate::http_stream::file_body_with_idle(file, state.git_idle_timeout_secs),
+                )
+                    .into_response()
             }
-            if let Ok(v) = HeaderValue::from_str(&sha256) {
-                resp_headers.insert(header::HeaderName::from_static("x-checksum-sha256"), v);
-            }
-            // Stream the asset straight off disk: the memory bound is the
-            // hashing window rather than the asset size (card_7e762d2c19b0).
-            // The idle guard from card_9cd96bafd879 still bites — a slow client
-            // trips the idle window and the file handle is released.
-            (
-                StatusCode::OK,
-                resp_headers,
-                crate::http_stream::file_body_with_idle(file, state.git_idle_timeout_secs),
-            )
-                .into_response()
-        }
-        rg_core::release::service::AssetSource::Buffered(bytes) => {
-            // The remote-backend fallback: a blob store that exposes no local
-            // path has to travel through memory once. `LocalBlobStorage` never
-            // falls here — this covers a future S3-like backend, where the
-            // per-request buffer is unavoidable but still gets an idle guard
-            // and an up-front integrity check.
-            let actual = hex::encode(Sha256::digest(&bytes));
-            if let Some(expected) = asset.sha256.as_deref() {
-                if actual != expected {
-                    return AppError::internal(anyhow::anyhow!(
+            rg_core::release::service::AssetSource::Buffered(bytes) => {
+                // The remote-backend fallback: a blob store that exposes no local
+                // path has to travel through memory once. `LocalBlobStorage` never
+                // falls here — this covers a future S3-like backend, where the
+                // per-request buffer is unavoidable but still gets an idle guard
+                // and an up-front integrity check.
+                let actual = hex::encode(Sha256::digest(&bytes));
+                if let Some(expected) = asset.sha256.as_deref() {
+                    if actual != expected {
+                        return AppError::internal(anyhow::anyhow!(
                         "asset integrity check failed: expected sha256 {expected}, got {actual}"
                     ))
-                    .into_response();
+                        .into_response();
+                    }
                 }
+                if let Ok(v) = HeaderValue::from_str(&bytes.len().to_string()) {
+                    resp_headers.insert(header::CONTENT_LENGTH, v);
+                }
+                if let Ok(v) = HeaderValue::from_str(&actual) {
+                    resp_headers.insert(header::HeaderName::from_static("x-checksum-sha256"), v);
+                }
+                (
+                    StatusCode::OK,
+                    resp_headers,
+                    crate::http_stream::buffered_body_with_idle(bytes, state.git_idle_timeout_secs),
+                )
+                    .into_response()
             }
-            if let Ok(v) = HeaderValue::from_str(&bytes.len().to_string()) {
-                resp_headers.insert(header::CONTENT_LENGTH, v);
-            }
-            if let Ok(v) = HeaderValue::from_str(&actual) {
-                resp_headers.insert(header::HeaderName::from_static("x-checksum-sha256"), v);
-            }
-            (
-                StatusCode::OK,
-                resp_headers,
-                crate::http_stream::buffered_body_with_idle(bytes, state.git_idle_timeout_secs),
-            )
-                .into_response()
         }
-    }
+    })
+    .await
 }
 
 // ─── Release Asset Attestations (opt-in) ───────────────────────────────────
@@ -1022,10 +1085,11 @@ pub async fn sign_asset_attestation(
         return AppError::not_found("attestation is not enabled").into_response();
     }
 
-    let (asset, release) = match asset_and_release_in_repo(&state, &repo, asset_id).await {
-        Ok(anchored) => anchored,
-        Err(e) => return e.into_response(),
-    };
+    let (asset, release) =
+        match asset_and_release_in_repo(&state, &repo, asset_id, Some(actor_id)).await {
+            Ok(anchored) => anchored,
+            Err(e) => return e.into_response(),
+        };
 
     let builder_id = attestation_builder_id(&state);
     match rg_core::release::service::sign_asset_attestation(
@@ -1079,25 +1143,33 @@ pub async fn get_asset_attestation(
     State(state): State<AppState>,
     Path((_, _, asset_id)): Path<(String, String, i64)>,
     RepoRead { repo }: RepoRead,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !state.attestation_enabled {
-        return AppError::not_found("attestation is not enabled").into_response();
-    }
+    private_release_response(async {
+        let viewer = super::auth::extract_user_id(&headers, &state.jwt_secret);
 
-    // Read access to the repository in the path is only half of it — the
-    // envelope belongs to a globally addressed asset, and it carries the
-    // filename and digest of a release that may live in a private repository
-    // the caller cannot open.
-    let asset = match asset_in_repo(&state, &repo, asset_id).await {
-        Ok(asset) => asset,
-        Err(e) => return e.into_response(),
-    };
+        if !state.attestation_enabled {
+            return AppError::not_found("attestation is not enabled").into_response();
+        }
 
-    match rg_core::release::service::get_asset_attestation(&state.db, asset.id).await {
-        Ok(Some(envelope)) => (StatusCode::OK, Json(serde_json::json!(envelope))).into_response(),
-        Ok(None) => AppError::not_found("asset has no attestation").into_response(),
-        Err(e) => AppError::from(e).into_response(),
-    }
+        // Read access to the repository in the path is only half of it — the
+        // envelope belongs to a globally addressed asset, and it carries the
+        // filename and digest of a release that may live in a private repository
+        // the caller cannot open.
+        let asset = match asset_in_repo(&state, &repo, asset_id, viewer).await {
+            Ok(asset) => asset,
+            Err(e) => return e.into_response(),
+        };
+
+        match rg_core::release::service::get_asset_attestation(&state.db, asset.id).await {
+            Ok(Some(envelope)) => {
+                (StatusCode::OK, Json(serde_json::json!(envelope))).into_response()
+            }
+            Ok(None) => AppError::not_found("asset has no attestation").into_response(),
+            Err(e) => AppError::from(e).into_response(),
+        }
+    })
+    .await
 }
 
 /// POST /api/v1/repos/:owner/:name/releases/assets/:asset_id/attestation/verify
@@ -1122,33 +1194,39 @@ pub async fn verify_asset_attestation(
     State(state): State<AppState>,
     Path((owner, name, asset_id)): Path<(String, String, i64)>,
     RepoRead { repo }: RepoRead,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !state.attestation_enabled {
-        return AppError::not_found("attestation is not enabled").into_response();
-    }
+    private_release_response(async {
+        let viewer = super::auth::extract_user_id(&headers, &state.jwt_secret);
 
-    let asset = match asset_in_repo(&state, &repo, asset_id).await {
-        Ok(asset) => asset,
-        Err(e) => return e.into_response(),
-    };
+        if !state.attestation_enabled {
+            return AppError::not_found("attestation is not enabled").into_response();
+        }
 
-    match rg_core::release::service::verify_asset_attestation(
-        &state.db,
-        asset.id,
-        state.blob_storage.as_ref(),
-        &state.repo_root,
-        &owner,
-        &name,
-        &state.instance_key,
-    )
+        let asset = match asset_in_repo(&state, &repo, asset_id, viewer).await {
+            Ok(asset) => asset,
+            Err(e) => return e.into_response(),
+        };
+
+        match rg_core::release::service::verify_asset_attestation(
+            &state.db,
+            asset.id,
+            state.blob_storage.as_ref(),
+            &state.repo_root,
+            &owner,
+            &name,
+            &state.instance_key,
+        )
+        .await
+        {
+            Ok(report) => (StatusCode::OK, Json(serde_json::json!(report))).into_response(),
+            // Verification reads the asset's current bytes, so an unreadable blob
+            // store used to be reported as "no such attestation" — with the storage
+            // path in the (unsanitized) 404 body.
+            Err(e) => AppError::from(e).into_response(),
+        }
+    })
     .await
-    {
-        Ok(report) => (StatusCode::OK, Json(serde_json::json!(report))).into_response(),
-        // Verification reads the asset's current bytes, so an unreadable blob
-        // store used to be reported as "no such attestation" — with the storage
-        // path in the (unsanitized) 404 body.
-        Err(e) => AppError::from(e).into_response(),
-    }
 }
 
 /// DELETE /api/v1/repos/:owner/:name/releases/assets/:asset_id
@@ -1175,10 +1253,11 @@ pub async fn delete_asset(
 ) -> impl IntoResponse {
     // `owner`/`name` below only build the storage path — on their own they never
     // constrain which asset row is deleted, so the id has to be anchored first.
-    let (asset, release) = match asset_and_release_in_repo(&state, &repo, asset_id).await {
-        Ok(anchored) => anchored,
-        Err(e) => return e.into_response(),
-    };
+    let (asset, release) =
+        match asset_and_release_in_repo(&state, &repo, asset_id, Some(actor_id)).await {
+            Ok(anchored) => anchored,
+            Err(e) => return e.into_response(),
+        };
 
     match rg_core::release::service::delete_asset(
         &state.db,

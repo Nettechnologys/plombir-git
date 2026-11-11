@@ -128,6 +128,7 @@ pub struct AddTeamMemberRequest {
         (status = 400, description = "Bad request", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 409, description = "That organization name is already taken", body = serde_json::Value),
+        (status = 502, description = "A configured directory is unavailable", body = serde_json::Value),
     ),
 )]
 pub async fn create_org(
@@ -150,6 +151,10 @@ pub async fn create_org(
 
     match rg_core::org::create_org(
         &state.db,
+        rg_core::user::service::LdapDirectories {
+            encryption_key: &state.encryption_key,
+            transport_policy: &state.ldap_transport_policy,
+        },
         &body.name,
         body.display_name.as_deref(),
         body.description.as_deref(),
@@ -1207,7 +1212,8 @@ async fn require_org_visible(
     org: &rg_db::entities::organization::Model,
     user_id: Option<i64>,
 ) -> Result<(), AppError> {
-    if org.visibility != "private" {
+    // Unknown legacy values are member-only, never an implicit public grant.
+    if org.visibility == "public" {
         return Ok(());
     }
     let Some(user_id) = user_id else {

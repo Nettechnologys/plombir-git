@@ -18,6 +18,11 @@
 //! required`. The label is what an operator reads in a refusal or a rotation
 //! report, so it names the SQL table and column rather than the Rust field.
 //! `optional` / `required` says whether the model field is an `Option<String>`.
+//!
+//! New ciphertext columns must use the `_encrypted` suffix and be registered
+//! here even when they reuse an existing sealing helper. The contract check
+//! reads entity fields independently. Historical TOTP names (`totp_secret` and
+//! `pending_totp_secret`) are explicit exceptions in that check.
 
 /// Expand `$callback!` once over the whole registry.
 ///
@@ -66,6 +71,8 @@ macro_rules! with_encrypted_columns {
                 "instance_signing_key.seed_encrypted", required;
             mirror, PasswordEncrypted, password_encrypted,
                 "mirrors.password_encrypted", optional;
+            push_mirror, PasswordEncrypted, password_encrypted,
+                "push_mirrors.password_encrypted", optional;
             // Read back on every delivery to sign it, so this one is encrypted
             // rather than hashed — see `crate::webhook::service`.
             webhook, SecretEncrypted, secret_encrypted,

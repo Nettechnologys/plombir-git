@@ -142,6 +142,86 @@ async fn reconcile_published_pull_request_pipeline(
     false
 }
 
+/// Whether this exact fork head may run with the base repository's CI authority.
+/// Both ordinary PR CI and merge-group CI must use this gate, including when
+/// reusing an existing pipeline. An enqueue is not a fork-CI approval.
+pub(super) async fn fork_head_ci_is_approved(
+    db: &DatabaseConnection,
+    repository: &repository::Model,
+    pr: &pull_request::Model,
+    head_sha: &str,
+) -> Result<bool> {
+    if !super::fork_source::is_live(db, pr).await? {
+        tracing::info!(
+            pr_id = pr.id,
+            "pull_request CI held: private head source is unavailable"
+        );
+        return Ok(false);
+    }
+    // A fork PR's head is code the base repository's owner has not accepted, and
+    // a pipeline carries that repository's CI secrets (`ci_secret_ops` are keyed
+    // by `repo_id` and injected into every job). Running it automatically would
+    // hand every one of them to anyone who can open a PR.
+    //
+    // So it waits for a maintainer to say yes — [`approve_pull_request_ci`] —
+    // and the permission is recorded against the head commit rather than against
+    // the PR. That is the whole safety of the gate: `approve`, then push
+    // something else, and `ci_approved_sha` no longer equals `head_sha`, so this
+    // returns to refusing until the new head is approved in turn
+    // (card_94834ecee708).
+    //
+    // Before that gate existed the refusal was unconditional, which meant the
+    // one contribution shape that most needs a check — code from someone without
+    // write access — was the only one that never got one.
+    if let Some(head_repo_id) = pr.head_repo_id {
+        if pr.ci_approved_sha.as_deref() != Some(head_sha) {
+            tracing::info!(
+                pr_id = pr.id,
+                head_repo_id,
+                approved_sha = pr.ci_approved_sha.as_deref().unwrap_or("<none>"),
+                head_sha,
+                "pull_request CI held for a fork PR: this head is not approved to run with this repository's CI secrets"
+            );
+            return Ok(false);
+        }
+        // Old approvals remain on the PR row. Refusing bot accounts only at
+        // the HTTP endpoint would leave an already-stamped bot approval able
+        // to release this head on the next push/retry.
+        let human_approver = match pr.ci_approved_by {
+            Some(id) => rg_db::ops::user_ops::find_by_id(db, id)
+                .await?
+                .is_some_and(|user| user.is_usable() && !user.is_bot()),
+            None => false,
+        };
+        if !human_approver {
+            tracing::info!(
+                pr_id = pr.id,
+                head_repo_id,
+                "pull_request CI held for a fork PR: approval has no active human approver"
+            );
+            return Ok(false);
+        }
+        if !crate::repo::service::can_write_repo(db, repository, pr.ci_approved_by).await? {
+            tracing::info!(
+                pr_id = pr.id,
+                head_repo_id,
+                approved_by = pr.ci_approved_by,
+                "pull_request CI held for a fork PR: approver no longer has write access to the base repository"
+            );
+            return Ok(false);
+        }
+        tracing::info!(
+            pr_id = pr.id,
+            head_repo_id,
+            head_sha,
+            approved_by = pr.ci_approved_by,
+            "pull_request CI released for a fork PR: a maintainer approved this head"
+        );
+    }
+
+    Ok(true)
+}
+
 /// Trigger the `pull_request` pipeline for a PR whose head is current.
 ///
 /// Returns the new pipeline's id, or `None` when there is nothing to run — the
@@ -172,65 +252,8 @@ pub async fn trigger_pull_request_ci(
         .one(db)
         .await?
         .context("pull request repository not found")?;
-    // A fork PR's head is code the base repository's owner has not accepted, and
-    // a pipeline carries that repository's CI secrets (`ci_secret_ops` are keyed
-    // by `repo_id` and injected into every job). Running it automatically would
-    // hand every one of them to anyone who can open a PR.
-    //
-    // So it waits for a maintainer to say yes — [`approve_pull_request_ci`] —
-    // and the permission is recorded against the head commit rather than against
-    // the PR. That is the whole safety of the gate: `approve`, then push
-    // something else, and `ci_approved_sha` no longer equals `head_sha`, so this
-    // returns to refusing until the new head is approved in turn
-    // (card_94834ecee708).
-    //
-    // Before that gate existed the refusal was unconditional, which meant the
-    // one contribution shape that most needs a check — code from someone without
-    // write access — was the only one that never got one.
-    if let Some(head_repo_id) = pr.head_repo_id {
-        if pr.ci_approved_sha.as_deref() != Some(head_sha) {
-            tracing::info!(
-                pr_id = pr.id,
-                head_repo_id,
-                approved_sha = pr.ci_approved_sha.as_deref().unwrap_or("<none>"),
-                head_sha,
-                "pull_request CI held for a fork PR: this head is not approved to run with this repository's CI secrets"
-            );
-            return Ok(None);
-        }
-        // Old approvals remain on the PR row. Refusing bot accounts only at
-        // the HTTP endpoint would leave an already-stamped bot approval able
-        // to release this head on the next push/retry.
-        let human_approver = match pr.ci_approved_by {
-            Some(id) => rg_db::ops::user_ops::find_by_id(db, id)
-                .await?
-                .is_some_and(|user| user.is_usable() && !user.is_bot()),
-            None => false,
-        };
-        if !human_approver {
-            tracing::info!(
-                pr_id = pr.id,
-                head_repo_id,
-                "pull_request CI held for a fork PR: approval has no active human approver"
-            );
-            return Ok(None);
-        }
-        if !crate::repo::service::can_write_repo(db, &repository, pr.ci_approved_by).await? {
-            tracing::info!(
-                pr_id = pr.id,
-                head_repo_id,
-                approved_by = pr.ci_approved_by,
-                "pull_request CI held for a fork PR: approver no longer has write access to the base repository"
-            );
-            return Ok(None);
-        }
-        tracing::info!(
-            pr_id = pr.id,
-            head_repo_id,
-            head_sha,
-            approved_by = pr.ci_approved_by,
-            "pull_request CI released for a fork PR: a maintainer approved this head"
-        );
+    if !fork_head_ci_is_approved(db, &repository, pr, head_sha).await? {
+        return Ok(None);
     }
 
     let namespace = super::service::repository_namespace(db, &repository).await?;

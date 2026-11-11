@@ -317,10 +317,11 @@ pub async fn publish_release(
 pub async fn list_releases(
     db: &DatabaseConnection,
     repo_id: i64,
+    include_drafts: bool,
     offset: u64,
     limit: u64,
 ) -> Result<(Vec<Release>, i64)> {
-    rg_db::ops::release_ops::list_by_repo(db, repo_id, offset, limit).await
+    rg_db::ops::release_ops::list_by_repo(db, repo_id, include_drafts, offset, limit).await
 }
 
 /// Get a release by ID.

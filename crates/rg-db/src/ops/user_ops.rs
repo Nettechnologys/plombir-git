@@ -335,6 +335,16 @@ pub async fn update_by_id(
                 has_changes = true;
             }
             if let Some(is_active) = is_active {
+                // Retirement of login authority is permanent for sessions that
+                // existed at deactivation; reactivation must not revive them.
+                // `previous` was read under the user lock. A repeated disable
+                // is a no-op and does not consume another generation.
+                if !is_active && previous.as_ref().is_some_and(|user| user.is_active) {
+                    update = update.col_expr(
+                        user::Column::SessionVersion,
+                        Expr::col(user::Column::SessionVersion).add(1),
+                    );
+                }
                 update = update.col_expr(user::Column::IsActive, Expr::value(*is_active));
                 has_changes = true;
             }
@@ -356,6 +366,10 @@ pub async fn update_by_id(
         match result {
             Ok(updated) => {
                 if let (Some(old), Some(current)) = (&previous, &updated) {
+                    if old.is_active && !current.is_active {
+                        super::email_confirmation_ops::invalidate_email_changes(&transaction, id)
+                            .await?;
+                    }
                     if old.is_admin != current.is_admin || old.is_active != current.is_active {
                         super::security_notification_ops::system_event(
                             &transaction,
@@ -1012,6 +1026,133 @@ pub async fn disable_mfa(db: &DatabaseConnection, user_id: i64) -> Result<Option
     disable_mfa_with_after_read(db, user_id, || std::future::ready(Ok(()))).await
 }
 
+/// Result of the operator's atomic reset of all login factors.
+pub enum OperatorFactorReset {
+    Missing,
+    NoFactors,
+    Completed {
+        user: Box<User>,
+        totp_removed: bool,
+        passkeys_removed: u64,
+    },
+}
+
+/// Revoke sessions, enrolled/pending TOTP, backup codes, passkeys and pending
+/// address changes in one commit. User-row locking precedes every child table.
+pub async fn reset_factors_by_administrator(
+    db: &DatabaseConnection,
+    user_id: i64,
+) -> Result<OperatorFactorReset> {
+    use crate::entities::passkey_credential;
+    crate::contention::retry_transaction("operator factor reset", || async {
+        let txn = db
+            .begin()
+            .await
+            .context("db: begin operator factor reset")?;
+        UserEntity::update_many()
+            .col_expr(
+                user::Column::SessionVersion,
+                Expr::col(user::Column::SessionVersion).into(),
+            )
+            .filter(user::Column::Id.eq(user_id))
+            .exec(&txn)
+            .await?;
+        let Some(before) = UserEntity::find_by_id(user_id)
+            .filter(user::Column::DeletedAt.is_null())
+            .one(&txn)
+            .await?
+        else {
+            txn.rollback().await?;
+            return Ok(OperatorFactorReset::Missing);
+        };
+        let passkey_count = passkey_credential::Entity::find()
+            .filter(passkey_credential::Column::UserId.eq(user_id))
+            .count(&txn)
+            .await?;
+        if !before.mfa_enabled && passkey_count == 0 {
+            txn.rollback().await?;
+            return Ok(OperatorFactorReset::NoFactors);
+        }
+        let changed = UserEntity::update_many()
+            .col_expr(
+                user::Column::SessionVersion,
+                Expr::col(user::Column::SessionVersion).add(1),
+            )
+            .col_expr(user::Column::MfaEnabled, Expr::value(false))
+            .col_expr(
+                user::Column::TotpSecret,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(user::Column::TotpLastStep, Expr::value(Option::<i64>::None))
+            .col_expr(
+                user::Column::PendingTotpSecret,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                user::Column::PendingTotpSecretAt,
+                Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+            )
+            .col_expr(user::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
+            .filter(user::Column::Id.eq(user_id))
+            .filter(user::Column::DeletedAt.is_null())
+            .exec(&txn)
+            .await?;
+        let Some(user) = open_user_after_update(
+            &txn,
+            user_id,
+            changed.rows_affected,
+            "operator factor reset",
+        )
+        .await?
+        else {
+            txn.rollback().await?;
+            return Ok(OperatorFactorReset::Missing);
+        };
+        // A conditional write lost to a retirement or trigger refusal must not
+        // publish success merely because a still-open snapshot can be read.
+        if user.session_version != before.session_version + 1 || user.mfa_enabled {
+            txn.rollback().await?;
+            return Ok(OperatorFactorReset::Missing);
+        }
+        super::mfa_backup_code_ops::set_codes(&txn, user_id, &[]).await?;
+        let passkeys_removed = passkey_credential::Entity::delete_many()
+            .filter(passkey_credential::Column::UserId.eq(user_id))
+            .exec(&txn)
+            .await?
+            .rows_affected;
+        super::email_confirmation_ops::invalidate_email_changes(&txn, user_id).await?;
+        if before.mfa_enabled {
+            super::notification_delivery_ops::account_event(
+                &txn,
+                user_id,
+                crate::notification::Event::MfaDisabled,
+                None,
+                None,
+                None,
+            )
+            .await?;
+        }
+        super::notification_delivery_ops::account_event(
+            &txn,
+            user_id,
+            crate::notification::Event::AdminFactorsReset,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        txn.commit()
+            .await
+            .context("db: commit operator factor reset")?;
+        Ok(OperatorFactorReset::Completed {
+            user: Box::new(user),
+            totp_removed: before.mfa_enabled,
+            passkeys_removed,
+        })
+    })
+    .await
+}
+
 /// The retryable transaction behind [`disable_mfa`].
 ///
 /// `after_read` is a private test seam. Production passes a ready future; the
@@ -1122,27 +1263,35 @@ where
 }
 
 #[derive(Clone, Copy)]
-enum AuthenticationFinalization {
+enum AuthenticationFinalization<'a> {
     /// The password or directory bind succeeded. Whether that completes login
     /// is decided from the row in the UPDATE itself: an account that currently
-    /// carries MFA gets only its primary-factor failures cleared.
+    /// carries MFA retains the shared failure counter until full proof.
     PrimaryFactor,
     /// A factor which completes authentication succeeded.
     Completed,
-    /// A non-interactive password door succeeded. Clear its strikes, but do not
-    /// claim that a human browser login completed.
+    /// Complete a passkey login only for the account snapshot proved before
+    /// the assertion. A reset committed in flight must invalidate that proof.
+    CompletedFor(&'a User),
+    /// A password was proved without completing an interactive login. Preserve
+    /// the shared failure counter while a second factor remains required.
     FailuresOnly,
+    /// All required factors were proved against this account snapshot. Reset
+    /// failures without recording a new login or accepting a changed identity.
+    Reauthentication(&'a User),
 }
 
 async fn finalize_authentication_state_if_open(
     db: &DatabaseConnection,
     user_id: i64,
-    finalization: AuthenticationFinalization,
+    finalization: AuthenticationFinalization<'_>,
 ) -> Result<Option<User>> {
     let operation = match finalization {
         AuthenticationFinalization::PrimaryFactor => "primary login",
         AuthenticationFinalization::Completed => "completed login",
+        AuthenticationFinalization::CompletedFor(_) => "proved completed login",
         AuthenticationFinalization::FailuresOnly => "login-failure reset",
+        AuthenticationFinalization::Reauthentication(_) => "reauthentication",
     };
     crate::contention::retry_transaction(operation, || async move {
         let transaction = db
@@ -1187,7 +1336,8 @@ async fn finalize_authentication_state_if_open(
                         .finally(Expr::col(user::Column::LastLoginAt))
                         .into(),
                     ),
-                AuthenticationFinalization::Completed => UserEntity::update_many()
+                AuthenticationFinalization::Completed
+                | AuthenticationFinalization::CompletedFor(_) => UserEntity::update_many()
                     .col_expr(user::Column::UpdatedAt, Expr::value(now))
                     .col_expr(user::Column::LoginAttempts, Expr::value(0))
                     .col_expr(
@@ -1197,11 +1347,54 @@ async fn finalize_authentication_state_if_open(
                     .col_expr(user::Column::LastLoginAt, Expr::value(Some(now))),
                 AuthenticationFinalization::FailuresOnly => UserEntity::update_many()
                     .col_expr(user::Column::UpdatedAt, Expr::value(now))
+                    .col_expr(
+                        user::Column::LoginAttempts,
+                        Expr::case(
+                            Expr::col(user::Column::MfaEnabled).eq(false),
+                            Expr::value(0),
+                        )
+                        .finally(Expr::col(user::Column::LoginAttempts))
+                        .into(),
+                    )
+                    .col_expr(
+                        user::Column::LockedUntil,
+                        Expr::case(
+                            Expr::col(user::Column::MfaEnabled).eq(false),
+                            Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+                        )
+                        .finally(Expr::col(user::Column::LockedUntil))
+                        .into(),
+                    ),
+                AuthenticationFinalization::Reauthentication(_) => UserEntity::update_many()
+                    .col_expr(user::Column::UpdatedAt, Expr::value(now))
                     .col_expr(user::Column::LoginAttempts, Expr::value(0))
                     .col_expr(
                         user::Column::LockedUntil,
                         Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
                     ),
+            };
+            let proved = match finalization {
+                AuthenticationFinalization::Reauthentication(proved)
+                | AuthenticationFinalization::CompletedFor(proved) => Some(proved),
+                _ => None,
+            };
+            let update = if let Some(proved) = proved {
+                let update = update
+                    .filter(user::Column::IsActive.eq(true))
+                    .filter(
+                        sea_orm::Condition::any()
+                            .add(user::Column::LockedUntil.is_null())
+                            .add(user::Column::LockedUntil.lte(now)),
+                    )
+                    .filter(user::Column::SessionVersion.eq(proved.session_version))
+                    .filter(user::Column::PasswordHash.eq(proved.password_hash.clone()))
+                    .filter(user::Column::MfaEnabled.eq(proved.mfa_enabled));
+                match &proved.totp_secret {
+                    Some(secret) => update.filter(user::Column::TotpSecret.eq(secret.clone())),
+                    None => update.filter(user::Column::TotpSecret.is_null()),
+                }
+            } else {
+                update
             };
             let update = update
                 .filter(user::Column::Id.eq(user_id))
@@ -1209,7 +1402,23 @@ async fn finalize_authentication_state_if_open(
                 .exec(&transaction)
                 .await
                 .with_context(|| format!("db: {operation}"))?;
-            open_user_after_update(&transaction, user_id, update.rows_affected, operation).await
+            let updated =
+                open_user_after_update(&transaction, user_id, update.rows_affected, operation)
+                    .await?;
+            // MySQL may report zero changed rows for an unchanged update. Keep
+            // that lifecycle classifier, but also classify a lost proof CAS.
+            Ok(updated.filter(|current| match finalization {
+                AuthenticationFinalization::Reauthentication(proved)
+                | AuthenticationFinalization::CompletedFor(proved) => {
+                    current.is_usable()
+                        && current.locked_until.is_none_or(|until| until <= now)
+                        && current.session_version == proved.session_version
+                        && current.password_hash == proved.password_hash
+                        && current.mfa_enabled == proved.mfa_enabled
+                        && current.totp_secret == proved.totp_secret
+                }
+                _ => true,
+            }))
         }
         .await;
         match result {
@@ -1255,7 +1464,22 @@ pub async fn record_successful_login(
     finalize_authentication_state_if_open(db, user_id, AuthenticationFinalization::Completed).await
 }
 
-/// Reset failures only while the account remains open.
+/// Finish a passkey login against the same account generation and factors that
+/// were read before the assertion. Reset cannot revive already-verified proof.
+pub async fn record_successful_login_for_proved_account(
+    db: &DatabaseConnection,
+    proved: &User,
+) -> Result<Option<User>> {
+    finalize_authentication_state_if_open(
+        db,
+        proved.id,
+        AuthenticationFinalization::CompletedFor(proved),
+    )
+    .await
+}
+
+/// Finalize password proof while the account remains open. Reset failures only
+/// when MFA is off; a correct password must not erase second-factor failures.
 ///
 /// `None` covers both a retirement claim and a physical DELETE. The update and
 /// its verification read share one retryable transaction so a successful reset
@@ -1267,6 +1491,20 @@ pub async fn reset_login_failures_if_open(
 ) -> Result<Option<User>> {
     finalize_authentication_state_if_open(db, user_id, AuthenticationFinalization::FailuresOnly)
         .await
+}
+
+/// Clear failures after full reauthentication, only for the account and factor
+/// snapshot actually proved. This does not advance `last_login_at`.
+pub async fn reset_login_failures_after_reauthentication(
+    db: &DatabaseConnection,
+    proved: &User,
+) -> Result<Option<User>> {
+    finalize_authentication_state_if_open(
+        db,
+        proved.id,
+        AuthenticationFinalization::Reauthentication(proved),
+    )
+    .await
 }
 
 /// Finalize a standing credential or derived-capability proof while its owner
@@ -1529,6 +1767,7 @@ async fn write_password(
             crate::ops::password_reset_token_ops::invalidate_user_tokens(&transaction, user_id)
                 .await
                 .with_context(|| format!("db: invalidate reset links on {what}"))?;
+            super::email_confirmation_ops::invalidate_email_changes(&transaction, user_id).await?;
             UserEntity::find_by_id(user_id)
                 .one(&transaction)
                 .await
@@ -1595,37 +1834,116 @@ pub async fn update_email(
             .exec(&txn)
             .await?;
         let before = UserEntity::find_by_id(user_id).one(&txn).await?;
-        let now = chrono::Utc::now();
-        UserEntity::update_many()
-            .col_expr(user::Column::Email, Expr::value(email.to_string()))
-            .col_expr(user::Column::EmailVerifiedAt, Expr::value(now))
-            .col_expr(user::Column::UpdatedAt, Expr::value(now))
-            .filter(user::Column::Id.eq(user_id))
-            .filter(user::Column::IsActive.eq(true))
-            .filter(user::Column::DeletedAt.is_null())
-            .exec(&txn)
-            .await
-            .context("db: change a user's email")?;
-        let current = UserEntity::find_by_id(user_id)
-            .filter(user::Column::IsActive.eq(true))
-            .filter(user::Column::DeletedAt.is_null())
-            .one(&txn)
-            .await?;
-        if current.is_some() && before.as_ref().is_some_and(|old| old.email != email) {
-            super::notification_delivery_ops::account_event(
-                &txn,
-                user_id,
-                crate::notification::Event::EmailChanged,
-                None,
-                None,
-                None,
-            )
-            .await?;
-        }
+        let current = match before.filter(User::is_usable) {
+            Some(before) => write_confirmed_email(&txn, &before, email).await?,
+            None => None,
+        };
         txn.commit().await?;
         Ok(current)
     })
     .await
+}
+
+/// Redeem a pending address change and write the new address in one transaction.
+/// `link` is only a preliminary lookup: a conditional DELETE after the user lock
+/// decides whether it survived any password/factor reset and remains live.
+pub async fn complete_email_change(
+    db: &DatabaseConnection,
+    link: &crate::entities::email_confirmation::Model,
+) -> Result<Option<(User, String)>> {
+    use crate::entities::email_confirmation as confirmation;
+    let Some(user_id) = link.user_id else {
+        return Ok(None);
+    };
+    if link.purpose != confirmation::PURPOSE_EMAIL_CHANGE {
+        return Ok(None);
+    }
+    crate::contention::retry_transaction("complete email change", || async {
+        let txn = db
+            .begin()
+            .await
+            .context("db: begin email change completion")?;
+        UserEntity::update_many()
+            .col_expr(
+                user::Column::SessionVersion,
+                Expr::col(user::Column::SessionVersion).into(),
+            )
+            .filter(user::Column::Id.eq(user_id))
+            .exec(&txn)
+            .await?;
+        let Some(before) = UserEntity::find_by_id(user_id)
+            .one(&txn)
+            .await?
+            .filter(User::is_usable)
+        else {
+            txn.rollback().await?;
+            return Ok(None);
+        };
+        // DELETE is a current read on MySQL too; a snapshot SELECT alone could
+        // see a link already removed by a credential writer we waited behind.
+        let spent = confirmation::Entity::delete_many()
+            .filter(confirmation::Column::Id.eq(link.id))
+            .filter(confirmation::Column::UserId.eq(user_id))
+            .filter(confirmation::Column::TokenHash.eq(&link.token_hash))
+            .filter(confirmation::Column::Email.eq(&link.email))
+            .filter(confirmation::Column::Purpose.eq(confirmation::PURPOSE_EMAIL_CHANGE))
+            .filter(confirmation::Column::ExpiresAt.gt(chrono::Utc::now()))
+            .exec(&txn)
+            .await?;
+        if spent.rows_affected != 1 {
+            txn.rollback().await?;
+            return Ok(None);
+        }
+        let Some(current) = write_confirmed_email(&txn, &before, &link.email).await? else {
+            txn.rollback().await?;
+            return Ok(None);
+        };
+        txn.commit()
+            .await
+            .context("db: commit email change completion")?;
+        Ok(Some((current, before.email)))
+    })
+    .await
+}
+
+/// Caller holds the user lock. Notifications and both kinds of obsolete link
+/// are changed in the same commit as the address itself.
+async fn write_confirmed_email(
+    txn: &DatabaseTransaction,
+    before: &User,
+    email: &str,
+) -> Result<Option<User>> {
+    let now = chrono::Utc::now();
+    UserEntity::update_many()
+        .col_expr(user::Column::Email, Expr::value(email.to_string()))
+        .col_expr(user::Column::EmailVerifiedAt, Expr::value(now))
+        .col_expr(user::Column::UpdatedAt, Expr::value(now))
+        .filter(user::Column::Id.eq(before.id))
+        .filter(user::Column::IsActive.eq(true))
+        .filter(user::Column::DeletedAt.is_null())
+        .exec(txn)
+        .await
+        .context("db: change a user's email")?;
+    let current = UserEntity::find_by_id(before.id)
+        .filter(user::Column::IsActive.eq(true))
+        .filter(user::Column::DeletedAt.is_null())
+        .filter(user::Column::Email.eq(email))
+        .one(txn)
+        .await?;
+    if current.is_some() && before.email != email {
+        super::password_reset_token_ops::invalidate_user_tokens(txn, before.id).await?;
+        super::email_confirmation_ops::invalidate_email_changes(txn, before.id).await?;
+        super::notification_delivery_ops::account_event(
+            txn,
+            before.id,
+            crate::notification::Event::EmailChanged,
+            None,
+            None,
+            None,
+        )
+        .await?;
+    }
+    Ok(current)
 }
 
 /// Record that `user_id` proved it receives mail at `email`.

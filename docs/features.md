@@ -39,7 +39,59 @@ keyring and SSH allowed-signers file; the host account's keyring is never a
 source of trust. Configure email confirmation before enabling the rule on a
 fresh instance, then register at least one signing key.
 
+## Merge queue
+
+The queue builds a speculative merge against the current base branch and waits
+for its CI before merging. A pull request from a fork requires explicit CI approval of its current
+head by an active human maintainer with write access to the base repository,
+even if no CI is configured. Enqueueing by a human or bot does not grant that
+approval. A changed head or an approver who no longer meets those requirements
+fails the entry and cancels its previous pipeline. After approving the current
+head, enqueue the pull request again.
+
+Auto-merge uses the same approval check and remains pending until the current
+fork head has been approved. A new push needs a new approval before that
+automatic merge can complete. If the request to enable auto-merge returns an
+error, its attempt is cleared. A failed background attempt can retry, but cannot
+restore an authorization the user has canceled.
+
+## Release drafts
+
+Draft releases and their notes, files and provenance attestations are visible
+only to repository writers. Other readers receive the same `404` as for a
+missing release or asset; lists and totals omit drafts. Publishing makes them
+visible to repository readers, and returning a release to draft hides them
+again. Release API responses, including downloads, use `private, no-store`.
+A CI job token does not grant writer permissions: a workflow reading a draft
+needs a session or PAT with repository write access.
+
+Configured repository, organization and system webhooks remain trusted
+integrations. The existing `release.created` event includes draft metadata;
+this change does not remove that delivery to configured webhook destinations.
+
+## LDAP names
+
+Accounts, organizations and bots share an owner namespace. Creating a bot or
+organization checks enabled LDAP directories before taking a locally free name,
+so a directory member can still sign in for the first time. A reserved name
+returns the same `409` as a locally occupied name. As with registration, this
+lets a caller learn that a name is reserved without distinguishing a local
+account from a directory member. If a configured directory
+cannot answer, creation fails with `502`; each directory lookup has a ten-second
+timeout. Instances without LDAP do not make a network request for this check.
+The host-side `create-admin` command remains a trusted operator action and does
+not query LDAP.
+
+Organization visibility accepts only `public` or `private`. An invalid PATCH
+changes nothing, including other fields supplied with it. Unknown values from
+older data are treated as member-only; startup warns about the first 100
+affected organizations so an owner can choose a valid visibility explicitly.
+
 ## Browser sessions
+
+Deactivating an account revokes its existing sessions and pending address-change
+links. Reactivation does not restore them. PATs, SSH keys and passkeys are
+suspended while the account is inactive and become usable after reactivation.
 
 The login form offers **Remember me for 30 days** for password, passkey and SSO
 sign-in, including accounts with a second factor. Checked sessions renew on
@@ -81,6 +133,21 @@ cannot remove MFA. The shared confirmation dialog accepts password plus TOTP or
 an unused backup code, or an existing passkey with user verification. Provider
 reauthentication still completes the account's MFA challenge. Confirmation lasts
 10 minutes; remembered-session renewal never extends it.
+
+Changing or resetting a password (including an administrator reset), or an
+operator reset of login factors, cancels pending account-email changes.
+Following an address-change link consumes it and changes the address in one
+transaction; a failed write leaves the link available until expiry or
+revocation. Completing an address change invalidates reset links sent to the
+previous address. Link issuance rechecks the account snapshot under the same
+lock, so a request already in flight cannot recreate an invalidated link.
+Signing out alone does not cancel pending address changes.
+
+An operator factor reset revokes sessions, enrolled and pending TOTP material,
+unused backup codes, passkeys and pending address changes in one commit with
+its notifications. A failure rolls back the whole reset. Passkey login and
+step-up completion require the account generation proved before the assertion;
+a factor reset during the ceremony cannot produce a session after that reset.
 
 The same check protects issuance of personal and bot tokens, SSH and signing
 keys, repository deploy keys, passkey registration and removal, SSO linking,
@@ -165,3 +232,69 @@ for the source owner; it grants no continuing access to new source changes.
 > Git object operations use a hybrid of `gix` and a `GitCommandGateway`: pack,
 > rebase, archive and some diff/GPG paths still shell out to the `git` CLI
 > while the corresponding `gix` capabilities mature.
+
+### Repository permission decisions
+
+Read and write grants are checked against the database on each authorization
+check. Positive decisions are not cached across requests, so a late lookup cannot
+restore a revoked cache entry and another database pool or server process cannot
+continue using an old grant. Repeated refusals alone are cached for five seconds;
+new access granted through another pool may take that long to become available.
+An authorized request therefore performs fresh, indexed grant lookups. This does
+not turn an authorization check followed by Git work into an atomic transaction:
+a request already admitted before revocation may still finish, and callers must
+supply a current repository model when checking visibility and ownership.
+
+### Private fork pull-request sources
+
+Opening a pull request from a private fork requires write access to that fork.
+The author must retain that permission for later head updates, diff fetches, CI
+and merges. Revoking it, downgrading it to read, or deactivating the author
+freezes the PR at its last authorized head. Returning write access allows the
+next branch synchronization to resume updates. Existing PRs opened by mere
+readers of private forks also freeze after upgrading. Public forks and
+same-repository PRs keep their existing behavior; a personal comparison still
+requires only read access to both repositories.
+
+A frozen diff reads only objects already fetched into the base repository and
+reports `head_source_unavailable: true`. It never falls back to the fork's refs.
+The last authorized head may never have been fetched, and unreachable objects
+may later be garbage-collected; in either case the diff returns HTTP 409 with
+`reason: head_source_unavailable`. Merging a frozen PR returns the same refusal;
+auto-merge remains pending, and a merge-queue entry fails without starting CI.
+Approval of fork CI is a separate requirement and never replaces source rights.
+
+Already copied objects are not erased by revocation. A source administrator can
+stop future publication by removing the author's write access or the source
+branch. A dedicated source-side revocation UI and notification on opening such
+a PR remain follow-up work; this change does not grant access to private base
+repositories to source administrators.
+
+Repository permission grants are read from the database on each check. There is
+no cached allowance that survives revocation, but a concurrent synchronization
+that already passed its check can still advance the recorded head once. Checking
+source rights and updating the head are not an atomic revocation barrier.
+Base readers can see that the source is unavailable, but not whether this was
+caused by an account change, permission change or repository removal.
+An organization member who creates a fork there does not gain implicit write
+access: opening a private-source PR still requires a write/admin grant or an
+organization role/team that permits writing.
+
+### Git HTTP admission after uploads
+
+Both smart HTTP POST endpoints authorize before reading request bytes and again
+after the complete body is staged. The second check resolves the same credential
+again (same account and credential kind, and the same PAT id), validates session
+generation/account standing, reloads token scopes and repository restrictions,
+and rechecks access to the same repository id at the requested canonical address.
+An expired or revoked credential cannot become an anonymous fetch or another
+credential from the other Basic-auth field. Refusals keep the existing Git
+401 Basic challenge and 404/403 concealment rules. Push also reloads branch/tag
+protection, mirror restrictions and token restrictions before protocol work.
+
+This closes revocation during body reception, including protocol-v2 fetches.
+Permission checks do not use a cached grant. It is not an atomic barrier around
+all later Git work: a push already indexing its pack or a fetch already streaming
+may complete after revocation. Staging still uses byte and idle limits, without
+a total wall-clock deadline. LFS, SSH and registry upload lifetimes are separate
+transport contracts.

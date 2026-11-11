@@ -120,7 +120,7 @@ async fn paginated_listings_read_their_page_off_an_index() {
         ),
         (
             "releases",
-            plan(&db, release_ops::page_query(1).limit(20)).await,
+            plan(&db, release_ops::page_query(1, false).limit(20)).await,
             "idx_releases_repo_created",
         ),
         (

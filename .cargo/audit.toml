@@ -1,9 +1,10 @@
 # cargo-audit configuration — see https://docs.rs/cargo-audit
 #
-# Every entry here is an ADVISORY WE HAVE CONSCIOUSLY ACCEPTED because no fixed
-# release exists yet and the exposure in Plombir Git is low. Each carries a reason
-# and, where relevant, the follow-up. Keep this list in sync with deny.toml and
-# osv-scanner.toml (scripts/advisory-ignore-list-contract-check.mjs).
+# Every entry here is an ADVISORY WE HAVE CONSCIOUSLY ACCEPTED: a patched
+# release is either unavailable or not admitted by the current dependency graph,
+# and the documented exposure is accepted. Each carries a reason and follow-up.
+# Keep this list in sync with deny.toml and osv-scanner.toml
+# (scripts/advisory-ignore-list-contract-check.mjs).
 [advisories]
 ignore = [
     # rsa "Marvin Attack" timing side-channel — NO patched release exists
@@ -23,4 +24,16 @@ ignore = [
     # affected arithmetic never runs on a secret of ours. Revisit when
     # jsonwebtoken moves to elliptic-curve 0.14 or we drop its EC algorithms.
     "RUSTSEC-2026-0387",
+    # SQLite: libsqlite3-sys 0.30.1 bundles affected SQLite 3.46. A fixed crate
+    # exists (>= 0.39), but SQLx 0.8.6 requires ^0.30.1; the assessed SQLx 0.9
+    # release still excludes >= 0.38 and raises MSRV to 1.94. There is no
+    # supported compatible update in that released dependency chain.
+    # Exploitation requires an attacker-written database and WAL pair to be
+    # opened. Production database paths are operator-controlled; the server
+    # does not accept untrusted SQLite uploads. Keep the data directory and
+    # restore inputs trusted. Restore-sidecar handling remains a follow-up.
+    # This exception does not fix SQLite. Revisit when SQLx admits a patched
+    # libsqlite3-sys, or if the database/restore trust boundary changes.
+    # Follow-ups: card_9883212e9192 (update), card_f8e122ff4fd8 (restore sidecars).
+    "RUSTSEC-2026-0459",
 ]

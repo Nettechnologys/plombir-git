@@ -398,9 +398,15 @@ const WORKSPACE_FUNCTION_SIGNED_OFF: &[(&str, &str, &str)] = &[
     ),
     (
         "rg-core/src/pull_request/ci.rs",
-        "trigger_pull_request_ci",
+        "fork_head_ci_is_approved",
         "checks whether the recorded human approver still has write access before a fork head \
          receives base-repository CI secrets; detached producers have no request extractor",
+    ),
+    (
+        "rg-core/src/pull_request/fork_source.rs",
+        "may_publish",
+        "checks the PR author's current authority to publish a private fork; \
+         background head synchronization, CI and merging have no request extractor",
     ),
 ];
 

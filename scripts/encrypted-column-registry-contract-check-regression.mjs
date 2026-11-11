@@ -68,6 +68,41 @@ function runFixture(name, mutate, expectedStatus, expectedOutput) {
 // below is about the copy rather than about the mutation.
 runFixture('an unmutated copy of the tree passes', null, 0, 'each sealed by a recorded producer');
 
+// Reusing a helper adds no encryption::encrypt call. The entity schema must
+// independently detect the new column, even when both inventories omit it.
+runFixture(
+  'a new ciphertext column without a new sealing site is reported',
+  (fixture) => edit(
+    join(fixture, 'crates', 'rg-db', 'src', 'entities', 'push_mirror.rs'),
+    'pub password_encrypted: Option<String>,',
+    'pub password_encrypted: Option<String>,\n    pub token_encrypted: Option<String>,',
+  ),
+  1,
+  'Entity ciphertext column `push_mirrors.token_encrypted` is missing',
+);
+
+runFixture(
+  'omitting the push mirror from the registry is detected from its entity',
+  (fixture) => edit(
+    join(fixture, REGISTRY),
+    '            push_mirror, PasswordEncrypted, password_encrypted,\n                "push_mirrors.password_encrypted", optional;\n',
+    '',
+  ),
+  1,
+  'Entity ciphertext column `push_mirrors.password_encrypted` is missing',
+);
+
+runFixture(
+  'an unreadable entity mapping does not silently pass',
+  (fixture) => edit(
+    join(fixture, 'crates', 'rg-db', 'src', 'entities', 'push_mirror.rs'),
+    '#[sea_orm(table_name = "push_mirrors")]',
+    '// mapping moved elsewhere',
+  ),
+  1,
+  'push_mirror.rs: cannot parse the entity table/Model',
+);
+
 // The defect this check exists for, in the shape it will actually arrive: a
 // feature seals a new value in a file that has never sealed anything, and the
 // registry line is the step nobody remembers.

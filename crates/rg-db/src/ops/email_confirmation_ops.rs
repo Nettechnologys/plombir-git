@@ -2,9 +2,9 @@
 //! address, an account moving to a new one, an account proving the one it has. See
 //! [`crate::entities::email_confirmation`].
 //!
-//! A link works once and only while it is fresh: [`take_live`] deletes the row
-//! it returns in the same statement that proves it is still there, so two
-//! clicks race for one row and exactly one of them wins it.
+//! A link works once and only while fresh. Registration and address verification
+//! use [`take_live`]; address changes are spent inside
+//! [`super::user_ops::complete_email_change`] with the account mutation.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -74,24 +74,74 @@ pub async fn replace_pending_registration(
     .await
 }
 
-/// Record that `user_id` asked to move to `email`, replacing any earlier
-/// request of the same account.
+/// Record an email change only while the account snapshot whose password and
+/// second factor were proved remains current. The user row is locked before
+/// child rows, shared with password writes, reset and link redemption.
+/// `false` is stale proof; a MySQL no-change lock update is not a refusal.
 pub async fn replace_pending_email_change(
     db: &DatabaseConnection,
-    user_id: i64,
+    proved: &crate::entities::user::Model,
     email: &str,
     token_hash: &str,
     expires_at: DateTime<Utc>,
-) -> Result<()> {
-    replace_pending_for_account(
-        db,
-        PURPOSE_EMAIL_CHANGE,
-        user_id,
-        email,
-        token_hash,
-        expires_at,
-    )
+) -> Result<bool> {
+    use crate::entities::user;
+    crate::contention::retry_transaction("record a pending email change", || async {
+        let transaction = db.begin().await.context("db: begin pending email change")?;
+        user::Entity::update_many()
+            .col_expr(
+                user::Column::SessionVersion,
+                sea_query::Expr::col(user::Column::SessionVersion).into(),
+            )
+            .filter(user::Column::Id.eq(proved.id))
+            .exec(&transaction)
+            .await?;
+        let current = user::Entity::find_by_id(proved.id)
+            .one(&transaction)
+            .await?;
+        if !current.as_ref().is_some_and(|current| {
+            current.is_usable()
+                && current.auth_provider == "local"
+                && current.locked_until.is_none_or(|until| until <= Utc::now())
+                && current.session_version == proved.session_version
+                && current.password_hash == proved.password_hash
+                && current.mfa_enabled == proved.mfa_enabled
+                && current.totp_secret == proved.totp_secret
+                && current.email == proved.email
+        }) {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        invalidate_email_changes(&transaction, proved.id).await?;
+        insert(
+            &transaction,
+            PURPOSE_EMAIL_CHANGE,
+            email,
+            Some(proved.id),
+            None,
+            None,
+            token_hash,
+            expires_at,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .context("db: commit pending email change")?;
+        Ok(true)
+    })
     .await
+}
+
+/// Revoke pending address changes inside the credential mutation transaction.
+pub async fn invalidate_email_changes<C: ConnectionTrait>(db: &C, user_id: i64) -> Result<()> {
+    Entity::delete_many()
+        .filter(email_confirmation::Column::UserId.eq(user_id))
+        .filter(email_confirmation::Column::Purpose.eq(PURPOSE_EMAIL_CHANGE))
+        .exec(db)
+        .await
+        .context("db: invalidate pending email changes")?;
+    Ok(())
 }
 
 /// Record the link that proves `user_id` receives mail at the address it
@@ -175,24 +225,36 @@ pub async fn record_notice(db: &DatabaseConnection, email: &str, marker_hash: &s
 /// exactly once however many times it is clicked at once. A notice row never
 /// qualifies.
 pub async fn take_live(db: &DatabaseConnection, token_hash: &str) -> Result<Option<Model>> {
+    let Some(row) = find_live(db, token_hash).await? else {
+        return Ok(None);
+    };
+    // Address changes must be spent atomically with the account write, under
+    // its lock. A generic take must never detach that proof from the mutation.
+    if row.purpose == PURPOSE_EMAIL_CHANGE {
+        return Ok(None);
+    }
+    let spent = Entity::delete_many()
+        .filter(email_confirmation::Column::Id.eq(row.id))
+        .filter(email_confirmation::Column::TokenHash.eq(token_hash))
+        .filter(email_confirmation::Column::Purpose.ne(PURPOSE_EMAIL_CHANGE))
+        .filter(email_confirmation::Column::ExpiresAt.gt(Utc::now()))
+        .exec(db)
+        .await
+        .context("db: spend an email confirmation")?;
+    Ok((spent.rows_affected == 1).then_some(row))
+}
+
+/// A preliminary lookup, never authorization to mutate an account. The
+/// conditional spend under the user lock is the source of truth for changes.
+pub async fn find_live(db: &DatabaseConnection, token_hash: &str) -> Result<Option<Model>> {
     let now = Utc::now();
-    let Some(row) = Entity::find()
+    Entity::find()
         .filter(email_confirmation::Column::TokenHash.eq(token_hash))
         .filter(email_confirmation::Column::Purpose.ne(PURPOSE_NOTICE))
         .filter(email_confirmation::Column::ExpiresAt.gt(now))
         .one(db)
         .await
-        .context("db: look up an email confirmation")?
-    else {
-        return Ok(None);
-    };
-    let spent = Entity::delete_many()
-        .filter(email_confirmation::Column::Id.eq(row.id))
-        .filter(email_confirmation::Column::ExpiresAt.gt(now))
-        .exec(db)
-        .await
-        .context("db: spend an email confirmation")?;
-    Ok((spent.rows_affected == 1).then_some(row))
+        .context("db: look up an email confirmation")
 }
 
 /// Drop every row that can no longer be redeemed and is older than `before`.

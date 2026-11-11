@@ -462,7 +462,10 @@ pub async fn request_email_change(
     }
     match rg_core::user::account::request_email_change(&state.db, mailer, &user, &body.email).await
     {
-        Ok(()) => (
+        Ok(false) => {
+            AppError::unauthorized("authentication changed; sign in again").into_response()
+        }
+        Ok(true) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({
                 "status": "confirmation_sent",

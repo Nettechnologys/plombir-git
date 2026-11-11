@@ -1454,15 +1454,22 @@ async fn forgot_password_inner(
         return Ok(None);
     }
 
-    // Invalidate old unused tokens
-    rg_db::ops::password_reset_token_ops::invalidate_user_tokens(db, user.id).await?;
-
     let (raw_token, token_hash) = new_reset_token();
 
     // Token valid for 15 minutes
     let expires_at = Utc::now() + Duration::minutes(15);
 
-    rg_db::ops::password_reset_token_ops::create(db, user.id, &token_hash, expires_at).await?;
+    if !rg_db::ops::password_reset_token_ops::replace_for_current_account(
+        db,
+        &user,
+        &token_hash,
+        expires_at,
+    )
+    .await?
+    {
+        // Keep the common padded response, without mailing the former address.
+        return Ok(None);
+    }
 
     // Build reset link
     let reset_url = format!(

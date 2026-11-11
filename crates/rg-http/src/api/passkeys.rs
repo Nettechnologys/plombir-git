@@ -1100,7 +1100,7 @@ pub async fn login_finish(
     // followed by a success log or a token.
     let user = crate::api::users::finalized_login_user(
         user.id,
-        rg_db::ops::user_ops::record_successful_login(&state.db, user.id).await,
+        rg_db::ops::user_ops::record_successful_login_for_proved_account(&state.db, &user).await,
     )?;
     if sealed
         .reauthentication_version

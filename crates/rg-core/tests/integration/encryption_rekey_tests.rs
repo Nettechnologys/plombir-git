@@ -111,9 +111,18 @@ async fn live_instance(db: &DatabaseConnection, secret: &str) -> i64 {
 
     // A bot whose agent profile carries a model key, sealed through the
     // service the API uses (ADR-0001 D5).
-    let bot = rg_core::user::bots::create_bot(db, user.id, "alice-agent", None)
-        .await
-        .expect("create bot");
+    let bot = rg_core::user::bots::create_bot(
+        db,
+        rg_core::user::service::LdapDirectories {
+            encryption_key: "test-encryption-key",
+            transport_policy: &Default::default(),
+        },
+        user.id,
+        "alice-agent",
+        None,
+    )
+    .await
+    .expect("create bot");
     rg_core::agent::profile::save(
         db,
         &encryption::derive_key(secret),
@@ -504,5 +513,138 @@ async fn the_rotation_covers_every_registered_column() {
     assert!(
         LABELS.contains(&"instance_signing_key.seed_encrypted"),
         "the registry must include the stored signing key, not just user data"
+    );
+}
+
+async fn store_push_mirror(
+    db: &DatabaseConnection,
+    repo_id: i64,
+) -> rg_db::entities::push_mirror::Model {
+    rg_core::mirror::push::create_push_mirror(
+        db,
+        repo_id,
+        rg_core::mirror::push::NewPushMirror {
+            url: "https://mirror.example.invalid/fixture.git".to_string(),
+            username: Some("fixture".to_string()),
+            password: Some("fixture-push-password".to_string()),
+            sync_on_commit: false,
+            sync_interval_seconds: 0,
+            force: false,
+        },
+        rg_core::mirror::transport::MirrorTransportPolicy::default(),
+        OLD_SECRET,
+    )
+    .await
+    .unwrap()
+}
+
+async fn stored_push_password(db: &DatabaseConnection, id: i64) -> String {
+    use sea_orm::EntityTrait;
+    rg_db::entities::push_mirror::Entity::find_by_id(id)
+        .one(db)
+        .await
+        .unwrap()
+        .unwrap()
+        .password_encrypted
+        .unwrap()
+}
+
+#[tokio::test]
+async fn push_mirror_only_database_checks_and_rotates_its_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_db(dir.path()).await;
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        "mirrorowner",
+        "mirrorowner@example.invalid",
+        "unused",
+        "Mirror owner",
+    )
+    .await
+    .unwrap();
+    let now = chrono::Utc::now();
+    let repository = rg_db::ops::repo_ops::create(
+        &db,
+        rg_db::entities::repository::ActiveModel {
+            id: NotSet,
+            owner_id: Set(owner.id),
+            name: Set("push".to_string()),
+            description: Set(None),
+            is_private: Set(true),
+            default_branch: Set("main".to_string()),
+            fork_id: Set(None),
+            stars_count: Set(0),
+            forks_count: Set(0),
+            org_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            deleted_at: Set(None),
+            origin_repo_id: Set(None),
+        },
+    )
+    .await
+    .unwrap();
+    let mirror = store_push_mirror(&db, repository.id).await;
+    let old = stored_push_password(&db, mirror.id).await;
+
+    // No marker or other encrypted value can mask an omitted push-mirror column.
+    verify_encryption_key(&db, OLD_SECRET).await.unwrap();
+    verify_encryption_key(&db, NEW_SECRET)
+        .await
+        .expect_err("wrong key must fail on the push mirror alone");
+    let dry = rekey(&db, OLD_SECRET, NEW_SECRET, true).await.unwrap();
+    assert_eq!(column(&dry, "push_mirrors.password_encrypted").rewritten, 1);
+    assert_eq!(dry.rewritten(), 1);
+    assert_eq!(stored_push_password(&db, mirror.id).await, old);
+    let report = rekey(&db, OLD_SECRET, NEW_SECRET, false).await.unwrap();
+    assert_eq!(
+        column(&report, "push_mirrors.password_encrypted").rewritten,
+        1
+    );
+    assert_eq!(report.unreadable(), 0);
+    let new = stored_push_password(&db, mirror.id).await;
+    assert_ne!(new, old);
+    assert_eq!(
+        encryption::decrypt(&new, &encryption::derive_key(NEW_SECRET)).unwrap(),
+        "fixture-push-password"
+    );
+    assert!(!opens(&new, OLD_SECRET));
+    verify_encryption_key(&db, NEW_SECRET).await.unwrap();
+    verify_encryption_key(&db, OLD_SECRET).await.unwrap_err();
+    let repeated = rekey(&db, OLD_SECRET, NEW_SECRET, false).await.unwrap();
+    assert_eq!(
+        column(&repeated, "push_mirrors.password_encrypted").already_new,
+        1
+    );
+    assert_eq!(repeated.rewritten(), 0);
+    assert_eq!(stored_push_password(&db, mirror.id).await, new);
+}
+
+#[tokio::test]
+async fn a_previously_skipped_push_mirror_can_be_recovered_without_rewriting_new_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_db(dir.path()).await;
+    let repo_id = live_instance(&db, NEW_SECRET).await;
+    rg_core::auth::key_check::ensure_encryption_key_check(&db, NEW_SECRET)
+        .await
+        .unwrap();
+    let mirror = store_push_mirror(&db, repo_id).await;
+    let unchanged_totp = stored_totp(&db).await;
+    let report = rekey(&db, OLD_SECRET, NEW_SECRET, false).await.unwrap();
+    assert_eq!(report.rewritten(), 1);
+    assert_eq!(
+        column(&report, "push_mirrors.password_encrypted").rewritten,
+        1
+    );
+    assert_eq!(report.already_new(), 5);
+    assert_eq!(report.unreadable(), 0);
+    assert_eq!(stored_totp(&db).await, unchanged_totp);
+    assert_eq!(
+        encryption::decrypt(
+            &stored_push_password(&db, mirror.id).await,
+            &encryption::derive_key(NEW_SECRET),
+        )
+        .unwrap(),
+        "fixture-push-password"
     );
 }

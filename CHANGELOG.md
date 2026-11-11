@@ -6,6 +6,60 @@ This project records user-facing changes here. The format follows
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-11
+
+Read the [v0.4.2 upgrade notes](docs/releases/v0.4.2.md) before deploying,
+especially if an earlier encryption-key rotation skipped push-mirror credentials.
+
+### Security
+
+- Revoke existing sessions and pending account-email changes when deactivating
+  an account, so reactivation cannot revive them. Permanent credentials remain
+  suspended during deactivation and can be used again after reactivation.
+- Validate organization visibility before applying any PATCH fields. Historical
+  invalid values are member-only and reported in startup warnings for correction.
+- Hide draft releases, notes, assets and attestations from readers without
+  repository write access. Filter drafts before counting or paginating releases,
+  and send `private, no-store` on all release reads, including published public
+  downloads; proxies no longer cache those responses heuristically. A CI job token alone does
+  not grant draft access; workflows need an authorized writer credential.
+- Reserve LDAP usernames when creating organizations and bots, including
+  directory members who have not signed in yet. These operations now fail
+  closed with `502` when a configured directory cannot answer the reservation check.
+- Git HTTP fetch and push revalidate credentials, account standing, repository identity and access after request-body staging. Push reloads branch/tag, mirror and token policy before Git starts; a slow upload cannot preserve authority revoked during its reception. In-flight Git work after this second check may still finish.
+
+- Repository permission checks no longer cache positive decisions: collaborator, organization and team revocation is observed by subsequent checks across database pools and server processes. Repeated refusals are cached for at most five seconds; newly granted access may wait that long when granted through another pool. Authorized requests perform fresh grant queries.
+
+- Require PR authors to retain write access to private fork sources. Revocation,
+  a downgrade to reader, or deactivation freezes updates and blocks CI and
+  merging. Previously fetched diffs remain readable while their objects are
+  retained; unavailable snapshots return `409 head_source_unavailable`.
+- Apply session revocation, account standing and identity-conflict checks to
+  every supported Authorization credential format, including Cargo's raw form.
+- Preserve second-factor failure counters when only a password is verified;
+  successful reauthentication clears them only while the account, credentials
+  and lockout state still match the completed proof.
+- Cancel pending account-email changes atomically on password changes,
+  password resets and operator factor resets. Redeem an address-change link in
+  the same transaction as the address write, and reject stale issuance proof.
+- Revoke password-reset links on address changes, including requests already
+  in flight for the previous address. Keep the uniform forgot-password response.
+- Reset sessions, MFA material, passkeys and pending address changes atomically;
+  an in-flight passkey login or step-up cannot survive the reset by finishing
+  against the account's new session generation.
+- Require explicit approval of the current fork head before merge-group CI or
+  a queued merge. Recheck the approver's active human account and write access
+  on every queue pass, including reuse of an already successful pipeline.
+- Apply the same current-head approval check to automatic fork merges. Failed
+  enable requests clear matching authority; background recovery respects
+  cancellation instead of restoring auto-merge without an authorizing actor.
+- Include push-mirror credentials in encryption-key verification and rotation.
+  Check ciphertext fields independently of sealing helpers so a reused helper
+  cannot silently leave a column outside the rotation registry.
+  If you ran `rotate-encryption-key` on 0.4.1 or earlier and use push mirrors,
+  follow the [recovery procedure](docs/install.md#secrets-and-rotation) with the
+  original and current keys before discarding the original key.
+
 ## [0.4.1] - 2026-11-08
 
 Read the [v0.4.1 upgrade notes](docs/releases/v0.4.1.md) for the changed
@@ -1069,7 +1123,8 @@ See the [v0.1.1 release notes](docs/releases/v0.1.1.md) for upgrade and
 rollback guidance. Publication of a release does not establish that a registry
 package is publicly accessible.
 
-[Unreleased]: https://github.com/Nettechnologys/plombir-git/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/Nettechnologys/plombir-git/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.4.2
 [0.4.1]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.4.1
 [0.4.0]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.3.0

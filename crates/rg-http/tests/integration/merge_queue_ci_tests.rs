@@ -465,7 +465,7 @@ async fn a_moved_head_cancels_the_merge_group_pipeline_it_left_behind() {
         .stdout_str()
         .trim()
         .to_string();
-    rg_db::ops::pull_request_ops::update_open_head_sha(
+    rg_core::pull_request::refresh_open_heads(
         &fixture.db,
         fixture.repo_id,
         "feature",
@@ -1407,5 +1407,234 @@ async fn a_failed_merge_persists_the_missing_head_branch_reason() {
     assert!(
         reason.contains("pull request head branch 'feature' no longer exists"),
         "the persisted reason must name the deleted head branch: {reason}"
+    );
+}
+
+mod fork_approval_at_enqueue_tests {
+    use super::*;
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+    /// Only merge-group CI exists, so opening the fixture PR creates no pipeline.
+    struct MergeGroupOnlyCi;
+
+    impl rg_core::ci::CiTrigger for MergeGroupOnlyCi {
+        fn has_ci_config(&self, _path: &std::path::Path, _sha: &str) -> bool {
+            true
+        }
+
+        fn has_workflow_for_event(&self, query: rg_core::ci::WorkflowEventQuery<'_>) -> bool {
+            query.event == "merge_group"
+        }
+
+        fn trigger_pipeline<'a>(
+            &'a self,
+            params: rg_core::ci::TriggerPipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<i64>> + Send + 'a>>
+        {
+            assert_eq!(params.trigger_type, "merge_group");
+            PendingMergeGroupCi.trigger_pipeline(params)
+        }
+
+        fn resume_pipeline<'a>(
+            &'a self,
+            params: rg_core::ci::ResumePipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>
+        {
+            PendingMergeGroupCi.resume_pipeline(params)
+        }
+    }
+
+    #[tokio::test]
+    async fn neither_a_human_nor_a_bot_token_approves_fork_ci_by_enqueueing() {
+        use rg_db::entities::{pull_request, repo_collaborator};
+        use rg_db::ops::{repo_ops, user_ops};
+
+        for as_bot in [false, true] {
+            let f =
+                QueueFixture::build_with_ci("queueowner", "base", Arc::new(MergeGroupOnlyCi)).await;
+            let repository = repo_ops::find_by_id(&f.db, f.repo_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let forker = user_ops::create_user(
+                &f.db,
+                "forkauthor",
+                "forkauthor@example.test",
+                "unused",
+                "Fork author",
+            )
+            .await
+            .unwrap();
+            let repo_root = f.bare.parent().unwrap().parent().unwrap();
+            let fork = rg_core::repo::service::fork_repo(
+                &f.db,
+                forker.id,
+                None,
+                None,
+                "queueowner",
+                &repository,
+                &rg_core::blob_storage::LocalBlobStorage::new(repo_root),
+                repo_root,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+            let mut pr: pull_request::ActiveModel = pull_request::Entity::find_by_id(f.pr_id)
+                .one(&f.db)
+                .await
+                .unwrap()
+                .unwrap()
+                .into();
+            pr.head_repo_id = Set(Some(fork.repo.id));
+            pr.author_id = Set(forker.id);
+            let pr = pr.update(&f.db).await.unwrap();
+            assert!(pr.ci_approved_sha.is_none());
+
+            let token = if as_bot {
+                let bot = rg_core::user::bots::create_bot(
+                    &f.db,
+                    rg_core::user::service::LdapDirectories {
+                        encryption_key: crate::common::TEST_ENCRYPTION_KEY,
+                        transport_policy: &Default::default(),
+                    },
+                    repository.owner_id,
+                    "queuebot",
+                    None,
+                )
+                .await
+                .unwrap();
+                for repo_id in [f.repo_id, fork.repo.id] {
+                    rg_db::ops::repo_collaborator_ops::create(
+                        &f.db,
+                        repo_collaborator::ActiveModel {
+                            repo_id: Set(repo_id),
+                            user_id: Set(bot.id),
+                            permission: Set("write".to_string()),
+                            created_at: Set(chrono::Utc::now()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                rg_core::auth::access_token::issue(
+                    &f.db,
+                    rg_core::auth::access_token::NewAccessToken {
+                        user_id: bot.id,
+                        name: "queue".to_string(),
+                        scopes: "repo".to_string(),
+                        expires_at: None,
+                        repository_ids: Some(vec![f.repo_id, fork.repo.id]),
+                        mcp_tools: None,
+                        deny_protected_merge: false,
+                    },
+                )
+                .await
+                .unwrap()
+                .raw
+            } else {
+                f.token.clone()
+            };
+            let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+            let before = git
+                .run(&["rev-parse", "refs/heads/main"], Some(&f.bare))
+                .unwrap();
+            before.ensure_success().unwrap();
+            let response = reqwest::Client::new()
+                .put(f.queue_url("queueowner", "base"))
+                .bearer_auth(token)
+                .json(&serde_json::json!({"strategy": "merge"}))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(status, 200, "bot={as_bot}: {body}");
+            assert_eq!(body["process"]["failed"], serde_json::json!([f.pr_id]));
+            let entry = f.entry().await;
+            assert_eq!(entry.status, "failed");
+            assert!(entry
+                .failure_reason
+                .as_deref()
+                .unwrap()
+                .contains("needs CI approval"));
+            let (pipelines, _) =
+                rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&f.db, f.repo_id, 0, 50)
+                    .await
+                    .unwrap();
+            assert!(
+                pipelines.is_empty(),
+                "bot={as_bot}: unapproved fork launched base CI"
+            );
+            let after = git
+                .run(&["rev-parse", "refs/heads/main"], Some(&f.bare))
+                .unwrap();
+            after.ensure_success().unwrap();
+            assert_eq!(after.stdout_str(), before.stdout_str());
+            let current = pull_request::Entity::find_by_id(f.pr_id)
+                .one(&f.db)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(current.state, "open");
+            assert!(current.ci_approved_sha.is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn rejected_auto_merge_enable_does_not_leave_an_armed_request() {
+    use sea_orm::EntityTrait;
+    let f = QueueFixture::build("autofailure", "base").await;
+    let git = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+    let path = f.worktree.path();
+    git.run(&["checkout", "main"], Some(path))
+        .unwrap()
+        .ensure_success()
+        .unwrap();
+    std::fs::write(path.join("value.txt"), "conflicting base\n").unwrap();
+    for args in [
+        vec!["commit", "-am", "base conflict"],
+        vec!["push", "origin", "main"],
+    ] {
+        git.run(&args, Some(path))
+            .unwrap()
+            .ensure_success()
+            .unwrap();
+    }
+    let response = reqwest::Client::new()
+        .put(format!(
+            "{}/api/v1/repos/autofailure/base/pulls/1/auto-merge",
+            f.base
+        ))
+        .bearer_auth(&f.token)
+        .json(&serde_json::json!({"strategy": "merge"}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, 409, "{body}");
+    let current = rg_db::entities::pull_request::Entity::find_by_id(f.pr_id)
+        .one(&f.db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.state, "open");
+    assert!(!current.auto_merge_enabled);
+    assert!(current.auto_merge_strategy.is_none());
+    assert!(current.auto_merge_enabled_by_id.is_none());
+    assert!(current.auto_merge_enabled_at.is_none());
+    let events = rg_db::ops::pr_event_ops::list_by_pr(&f.db, f.pr_id)
+        .await
+        .unwrap();
+    let canceled: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "auto_merge_disabled")
+        .collect();
+    assert_eq!(canceled.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&canceled[0].metadata).unwrap()["reason"],
+        "enable_failed"
     );
 }

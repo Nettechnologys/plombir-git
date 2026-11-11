@@ -265,7 +265,7 @@ fn login_finish_cannot_issue_a_token_without_the_counter_write() {
     let finalizer_region = &code[finalizer_at..audit_context_at];
     assert!(
         finalizer_region.contains("finalized_login_user(")
-            && finalizer_region.contains("record_successful_login(")
+            && finalizer_region.contains("record_successful_login_for_proved_account(")
             && finalizer_region.contains("?;"),
         "passkey login must propagate retirement, deletion, and finalizer failure before token issuance"
     );

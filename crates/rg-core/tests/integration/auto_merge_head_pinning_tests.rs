@@ -418,3 +418,289 @@ async fn the_diff_shows_the_commit_the_review_will_be_recorded_against() {
         "the diff shows the branch tip {moved}, which no approval will cover: {patch}"
     );
 }
+
+mod fork_auto_merge_approval_tests {
+    use super::*;
+    use rg_db::entities::pull_request;
+    use rg_db::ops::pull_request_ops;
+    use sea_orm::ActiveModelTrait;
+
+    async fn fork(f: &Fixture) -> rg_db::entities::repository::Model {
+        let forker = rg_db::ops::user_ops::create_user(
+            &f.db,
+            "forkauthor",
+            "forkauthor@example.invalid",
+            "unused",
+            "Fork author",
+        )
+        .await
+        .unwrap();
+        let fork = rg_core::repo::service::fork_repo(
+            &f.db,
+            forker.id,
+            None,
+            None,
+            &f.owner.username,
+            &f.repo,
+            &rg_core::blob_storage::LocalBlobStorage::new(&f.repo_root),
+            &f.repo_root,
+            &Default::default(),
+        )
+        .await
+        .unwrap()
+        .repo;
+        let mut current: pull_request::ActiveModel = pr(f).await.into();
+        current.head_repo_id = Set(Some(fork.id));
+        current.author_id = Set(forker.id);
+        current.update(&f.db).await.unwrap();
+        let path = f
+            .repo_root
+            .join(format!("{}/{}.git", forker.username, fork.name));
+        git(
+            &["remote", "set-url", "origin", path.to_str().unwrap()],
+            Some(f.worktree.path()),
+        );
+        fork
+    }
+
+    async fn pr(f: &Fixture) -> pull_request::Model {
+        pull_request_ops::find_by_repo_and_number(&f.db, f.repo.id, 1)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn approve(f: &Fixture, head: &str) {
+        assert!(
+            pull_request_ops::approve_ci_for_head(&f.db, pr(f).await.id, head, f.owner.id)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn enabling_auto_merge_does_not_approve_a_fork_head() {
+        let f = fixture("autoforkfirst").await;
+        fork(&f).await;
+        enable_auto_merge(&f).await;
+        let before = rev_parse(&bare_path(&f), "refs/heads/main");
+        let outcome = try_auto_merge(&f).await.unwrap();
+        assert_eq!(outcome.status, "pending");
+        assert!(outcome.reason.unwrap().contains("needs CI approval"));
+        assert!(outcome.merge.is_none());
+        assert_eq!(rev_parse(&bare_path(&f), "refs/heads/main"), before);
+        assert!(pr(&f).await.auto_merge_enabled);
+    }
+
+    #[tokio::test]
+    async fn resolving_a_fork_conflict_does_not_merge_an_unapproved_new_head() {
+        let f = fixture("autoforkmove").await;
+        let fork = fork(&f).await;
+        let path = f.worktree.path();
+        std::fs::write(path.join("base.txt"), "fork change\n").unwrap();
+        git(&["commit", "-qam", "fork conflict"], Some(path));
+        git(&["push", "-q", "origin", "feature"], Some(path));
+        let h1 = rev_parse(path, "HEAD");
+        rg_core::pull_request::refresh_open_heads(&f.db, fork.id, "feature", Some(&h1))
+            .await
+            .unwrap();
+        approve(&f, &h1).await;
+
+        git(&["checkout", "-q", "main"], Some(path));
+        std::fs::write(path.join("base.txt"), "base change\n").unwrap();
+        git(&["commit", "-qam", "base conflict"], Some(path));
+        git(
+            &["push", "-q", bare_path(&f).to_str().unwrap(), "main"],
+            Some(path),
+        );
+        let before = rev_parse(&bare_path(&f), "refs/heads/main");
+        enable_auto_merge(&f).await;
+        let Err(error) = try_auto_merge(&f).await else {
+            panic!("approved H1 must actually conflict");
+        };
+        assert!(
+            rg_core::error::client_facing_message(&error)
+                .unwrap_or_default()
+                .contains("conflict"),
+            "{error:#}"
+        );
+        assert!(
+            pr(&f).await.auto_merge_enabled,
+            "background failure keeps this attempt armed"
+        );
+
+        // The fork author replaces the conflicting head with a mergeable payload.
+        git(&["checkout", "-q", "feature"], Some(path));
+        git(&["reset", "--hard", "main"], Some(path));
+        std::fs::write(path.join("payload.txt"), "not yet approved\n").unwrap();
+        git(&["add", "."], Some(path));
+        git(&["commit", "-qm", "unapproved replacement"], Some(path));
+        git(&["push", "-q", "--force", "origin", "feature"], Some(path));
+        let h2 = rev_parse(path, "HEAD");
+        assert_ne!(h1, h2);
+        rg_core::pull_request::refresh_open_heads(&f.db, fork.id, "feature", Some(&h2))
+            .await
+            .unwrap();
+        let outcomes = rg_core::pull_request::try_auto_merges_for_head_commit(
+            &f.db,
+            &f.repo_root,
+            fork.id,
+            &h2,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].status, "pending");
+        assert!(outcomes[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("needs CI approval"));
+        assert!(outcomes[0].merge.is_none());
+        assert_eq!(rev_parse(&bare_path(&f), "refs/heads/main"), before);
+        assert_eq!(pr(&f).await.state, "open");
+
+        // Explicit approval of H2 is sufficient; the old intent may now complete.
+        approve(&f, &h2).await;
+        let outcome = try_auto_merge(&f).await.unwrap();
+        assert_eq!(outcome.status, "merged");
+        let head = rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .unwrap()
+            .run(
+                &["merge-base", "--is-ancestor", &h2, "refs/heads/main"],
+                Some(&bare_path(&f)),
+            )
+            .unwrap();
+        head.ensure_success().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_old_auto_merge_attempt_cannot_revive_cancel_or_claim_a_new_request() {
+        let f = fixture("autoattempt").await;
+        enable_auto_merge(&f).await;
+        let old = pr(&f).await;
+        assert!(pull_request_ops::claim_auto_merge(&f.db, &old)
+            .await
+            .unwrap());
+        rg_core::pull_request::disable_auto_merge(
+            &f.db,
+            &f.owner.username,
+            &f.repo.name,
+            1,
+            f.owner.id,
+        )
+        .await
+        .unwrap();
+        pull_request_ops::restore_auto_merge(&f.db, &old)
+            .await
+            .unwrap();
+        let canceled = pr(&f).await;
+        assert!(!canceled.auto_merge_enabled);
+        assert!(canceled.auto_merge_strategy.is_none());
+        assert!(canceled.auto_merge_enabled_by_id.is_none());
+        assert!(canceled.auto_merge_enabled_at.is_none());
+
+        rg_core::pull_request::enable_auto_merge(
+            &f.db,
+            &f.owner.username,
+            &f.repo.name,
+            1,
+            rg_core::pull_request::MergeStrategy::Squash,
+            f.owner.id,
+        )
+        .await
+        .unwrap();
+        let current = pr(&f).await;
+        assert_ne!(current.auto_merge_strategy, old.auto_merge_strategy);
+        assert!(!pull_request_ops::claim_auto_merge(&f.db, &old)
+            .await
+            .unwrap());
+        pull_request_ops::restore_auto_merge(&f.db, &old)
+            .await
+            .unwrap();
+        pull_request_ops::clear_auto_merge_attempt(&f.db, &old)
+            .await
+            .unwrap();
+        let retained = pr(&f).await;
+        assert!(retained.auto_merge_enabled);
+        assert_eq!(
+            retained.auto_merge_enabled_at,
+            current.auto_merge_enabled_at
+        );
+        assert_eq!(
+            retained.auto_merge_enabled_by_id,
+            current.auto_merge_enabled_by_id
+        );
+        assert_eq!(retained.auto_merge_strategy, current.auto_merge_strategy);
+        assert!(pull_request_ops::claim_auto_merge(&f.db, &current)
+            .await
+            .unwrap());
+        pull_request_ops::restore_auto_merge(&f.db, &current)
+            .await
+            .unwrap();
+        assert!(pr(&f).await.auto_merge_enabled);
+        pull_request_ops::clear_auto_merge_attempt(&f.db, &current)
+            .await
+            .unwrap();
+        assert!(!pr(&f).await.auto_merge_enabled);
+    }
+    #[tokio::test]
+    async fn equivalent_timestamp_requests_can_only_restore_complete_authority_or_disarm() {
+        let f = fixture("autoequivalent").await;
+        enable_auto_merge(&f).await;
+        let old = pr(&f).await;
+        assert!(pull_request_ops::claim_auto_merge(&f.db, &old)
+            .await
+            .unwrap());
+        rg_core::pull_request::disable_auto_merge(
+            &f.db,
+            &f.owner.username,
+            &f.repo.name,
+            1,
+            f.owner.id,
+        )
+        .await
+        .unwrap();
+        enable_auto_merge(&f).await;
+        // Force the whole-second timestamp equivalence MySQL may produce.
+        let mut twin: pull_request::ActiveModel = pr(&f).await.into();
+        twin.auto_merge_enabled_at = Set(old.auto_merge_enabled_at);
+        let twin = twin.update(&f.db).await.unwrap();
+        assert!(pull_request_ops::claim_auto_merge(&f.db, &twin)
+            .await
+            .unwrap());
+        pull_request_ops::restore_auto_merge(&f.db, &old)
+            .await
+            .unwrap();
+        let restored = pr(&f).await;
+        assert!(restored.auto_merge_enabled);
+        assert_eq!(restored.auto_merge_strategy, old.auto_merge_strategy);
+        assert_eq!(
+            restored.auto_merge_enabled_by_id,
+            old.auto_merge_enabled_by_id
+        );
+        assert_eq!(restored.auto_merge_enabled_at, old.auto_merge_enabled_at);
+        assert!(pull_request_ops::clear_auto_merge_attempt(&f.db, &old)
+            .await
+            .unwrap());
+        let cleared = pr(&f).await;
+        assert!(!cleared.auto_merge_enabled);
+        assert!(cleared.auto_merge_strategy.is_none());
+        assert!(cleared.auto_merge_enabled_by_id.is_none());
+        assert!(cleared.auto_merge_enabled_at.is_none());
+        let events = rg_db::ops::pr_event_ops::list_by_pr(&f.db, old.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.event_type == "auto_merge_disabled"
+                    && serde_json::from_str::<serde_json::Value>(&e.metadata).unwrap()["reason"]
+                        == "enable_failed")
+                .count(),
+            1
+        );
+    }
+}

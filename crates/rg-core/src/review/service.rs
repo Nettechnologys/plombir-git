@@ -802,7 +802,7 @@ pub async fn apply_suggestions(
     // merge-queue evaluation the new head can unblock. That is the whole set
     // card_e324a9281789 was written to deliver; a locked database must not be
     // able to withdraw it while answering the author `5xx: not applied`.
-    if let Err(error) = pull_request_ops::advance_open_head_sha(
+    if let Err(error) = crate::pull_request::fork_source::advance_open_heads(
         db,
         source_repo.id,
         &pr.head_branch,

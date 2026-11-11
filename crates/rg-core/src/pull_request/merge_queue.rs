@@ -1425,6 +1425,43 @@ async fn ensure_merge_group_ci(
     pr: &pull_request::Model,
     ci: &PipelineCi<'_>,
 ) -> Result<MergeGroupState> {
+    let source = super::fork_source::resolve(db, pr).await?;
+    if matches!(source, super::fork_source::Source::Unavailable) {
+        return Ok(
+            if finish_entry(
+                db,
+                repo_root,
+                entry,
+                "failed",
+                Some(super::fork_source::UNAVAILABLE.to_string()),
+            )
+            .await?
+            {
+                MergeGroupState::Failed
+            } else {
+                MergeGroupState::Abandoned
+            },
+        );
+    }
+    let head_sha = pr
+        .head_sha
+        .clone()
+        .context("pull request head SHA is missing")?;
+    if !super::ci::fork_head_ci_is_approved(db, repository, pr, &head_sha).await? {
+        return Ok(if finish_entry(
+            db,
+            repo_root,
+            entry,
+            "failed",
+            Some("this fork head needs CI approval from a current maintainer before it can enter the merge group".to_string()),
+        )
+        .await?
+        {
+            MergeGroupState::Failed
+        } else {
+            MergeGroupState::Abandoned
+        });
+    }
     let namespace = service::repository_namespace(db, repository).await?;
     let repo_path = repo_root.join(format!("{namespace}/{}.git", repository.name));
     let gateway = rg_git::cli_gateway::global_gateway()
@@ -1446,16 +1483,7 @@ async fn ensure_merge_group_ci(
         Ok(output.stdout_str().trim().to_string())
     })
     .await?;
-    let head_sha = pr
-        .head_sha
-        .clone()
-        .context("pull request head SHA is missing")?;
-
-    if let Some(head_repo_id) = pr.head_repo_id {
-        let head_repo = repository::Entity::find_by_id(head_repo_id)
-            .one(db)
-            .await?
-            .context("pull request head repository not found")?;
+    if let super::fork_source::Source::Available(head_repo) = source {
         let head_namespace = service::repository_namespace(db, &head_repo).await?;
         let head_repo_path = repo_root.join(format!("{head_namespace}/{}.git", head_repo.name));
         let repo_path_for_fetch = repo_path.clone();
@@ -4762,5 +4790,557 @@ mod merge_group_head_pinning_tests {
             "the attempt is settled with the reason instead of merging: {:?}",
             run.done
         );
+    }
+}
+
+/// A queue entry cannot substitute for approval to run foreign code with the
+/// base repository's secrets. Exercise the real queue and real fork refs;
+/// only execution of the pipeline itself is replaced with a pending fixture.
+#[cfg(test)]
+mod fork_merge_group_approval_tests {
+    use super::merge_group_config_refusal_tests::ci;
+    use super::merge_group_ref_cleanup_tests::{fixture, git, Fixture};
+    use super::merged_ref_survives_entry_settlement_tests::{make_mergeable, rev_parse};
+    use super::*;
+    use sea_orm::ActiveModelTrait;
+
+    struct PendingCi;
+
+    impl crate::ci::CiTrigger for PendingCi {
+        fn has_ci_config(&self, _path: &Path, _sha: &str) -> bool {
+            true
+        }
+        fn has_workflow_for_event(&self, _query: crate::ci::WorkflowEventQuery<'_>) -> bool {
+            true
+        }
+        fn trigger_pipeline<'a>(
+            &'a self,
+            params: crate::ci::TriggerPipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64>> + Send + 'a>> {
+            Box::pin(async move {
+                assert_eq!(params.trigger_type, "merge_group");
+                Ok(rg_db::ops::pipeline_ops::create_pipeline(
+                    params.db,
+                    params.repo_id,
+                    params.commit_sha,
+                    params.ref_name,
+                    params.trigger_type,
+                    params.triggered_by,
+                )
+                .await?
+                .id)
+            })
+        }
+        fn resume_pipeline<'a>(
+            &'a self,
+            _params: crate::ci::ResumePipelineParams<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+            unreachable!("queue fixture does not resume pipelines")
+        }
+    }
+
+    async fn fork_fixture(name: &str) -> (Fixture, String, PathBuf) {
+        let mut f = fixture(name).await;
+        let base = make_mergeable(&f).await;
+        let forker = rg_db::ops::user_ops::create_user(
+            &f.db,
+            &format!("{name}-forker"),
+            &format!("{name}-forker@example.test"),
+            "unused",
+            "Fork author",
+        )
+        .await
+        .unwrap();
+        let fork = crate::repo::service::fork_repo(
+            &f.db,
+            forker.id,
+            None,
+            None,
+            &f.owner.username,
+            &f.repository,
+            &crate::blob_storage::LocalBlobStorage::new(&f.repo_root),
+            &f.repo_root,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        let fork_path = f
+            .repo_root
+            .join(format!("{}/{}.git", forker.username, fork.repo.name));
+        let mut pr: pull_request::ActiveModel = pull_request::Entity::find_by_id(f.pr.id)
+            .one(&f.db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        pr.head_repo_id = Set(Some(fork.repo.id));
+        pr.author_id = Set(forker.id);
+        f.pr = pr.update(&f.db).await.unwrap();
+        (f, base, fork_path)
+    }
+
+    async fn approve(f: &Fixture, approver: i64) {
+        let pr = pull_request::Entity::find_by_id(f.pr.id)
+            .one(&f.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pull_request_ops::approve_ci_for_head(
+            &f.db,
+            pr.id,
+            pr.head_sha.as_deref().unwrap(),
+            approver,
+        )
+        .await
+        .unwrap());
+    }
+
+    async fn pipelines(f: &Fixture) -> Vec<pipeline::Model> {
+        rg_db::ops::pipeline_ops::list_pipelines_by_repo_paginated(&f.db, f.repository.id, 0, 50)
+            .await
+            .unwrap()
+            .0
+    }
+
+    async fn run(f: &Fixture) -> MergeQueueProcessResult {
+        let result =
+            process_repository_with_ci(&f.db, &f.repo_root, &f.repository, &ci(&PendingCi)).await;
+        assert!(result.error.is_none(), "{:?}", result.error);
+        result.done
+    }
+
+    #[tokio::test]
+    async fn enqueue_does_not_approve_a_fork_head_to_run_ci() {
+        let (f, base, _) = fork_fixture("q-fork-first").await;
+        let done = run(&f).await;
+        assert_eq!(done.failed, vec![f.pr.id]);
+        assert!(done.merged.is_empty());
+        assert!(
+            pipelines(&f).await.is_empty(),
+            "unapproved code acquired base CI authority"
+        );
+        assert_eq!(rev_parse(&f, "refs/heads/main"), base);
+    }
+
+    #[tokio::test]
+    async fn an_approved_unchanged_fork_head_can_run_and_merge() {
+        let (f, base, _) = fork_fixture("q-fork-approved").await;
+        approve(&f, f.owner.id).await;
+        assert!(run(&f).await.waiting_reason.is_some());
+        let created = pipelines(&f).await;
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].repo_id, f.repository.id);
+        rg_db::ops::pipeline_ops::update_pipeline_status(
+            &f.db,
+            created[0].id,
+            "success",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let done = run(&f).await;
+        assert_eq!(done.merged, vec![f.pr.id]);
+        assert_ne!(rev_parse(&f, "refs/heads/main"), base);
+        assert_eq!(pipelines(&f).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_new_fork_head_cannot_rebuild_ci_under_an_old_approval() {
+        let (f, base, fork_path) = fork_fixture("q-fork-moved").await;
+        approve(&f, f.owner.id).await;
+        assert!(run(&f).await.waiting_reason.is_some());
+        let old_pipeline = pipelines(&f).await.remove(0);
+        let old = f.pr.head_sha.as_deref().unwrap();
+        let tree = git()
+            .run(&["rev-parse", &format!("{old}^{{tree}}")], Some(&fork_path))
+            .unwrap();
+        tree.ensure_success().unwrap();
+        let tree = tree.stdout_str().trim().to_string();
+        let moved = git()
+            .run_with_env(
+                &["commit-tree", &tree, "-p", old, "-m", "unapproved head"],
+                Some(&fork_path),
+                &[
+                    ("GIT_AUTHOR_NAME", "Fork"),
+                    ("GIT_AUTHOR_EMAIL", "fork@example.test"),
+                    ("GIT_COMMITTER_NAME", "Fork"),
+                    ("GIT_COMMITTER_EMAIL", "fork@example.test"),
+                ],
+            )
+            .unwrap();
+        moved.ensure_success().unwrap();
+        let moved = moved.stdout_str().trim().to_string();
+        git()
+            .run(
+                &["update-ref", "refs/heads/feature", &moved],
+                Some(&fork_path),
+            )
+            .unwrap()
+            .ensure_success()
+            .unwrap();
+        assert!(pull_request_ops::compare_and_swap_open_head_sha(
+            &f.db,
+            f.pr.id,
+            Some(old),
+            Some(&moved),
+        )
+        .await
+        .unwrap());
+        let done = run(&f).await;
+        assert_eq!(done.failed, vec![f.pr.id]);
+        assert!(done.merged.is_empty());
+        let remaining = pipelines(&f).await;
+        assert_eq!(
+            remaining.len(),
+            1,
+            "unapproved replacement head created another pipeline"
+        );
+        assert_eq!(remaining[0].id, old_pipeline.id);
+        assert_eq!(remaining[0].status, "canceled");
+        assert_eq!(rev_parse(&f, "refs/heads/main"), base);
+    }
+
+    #[tokio::test]
+    async fn a_green_group_still_requires_a_current_human_approver_with_write_access() {
+        for change in ["permission", "disabled", "bot"] {
+            let (f, base, _) = fork_fixture(&format!("q-fork-{change}")).await;
+            let approver = rg_db::ops::user_ops::create_user(
+                &f.db,
+                "reviewer",
+                "reviewer@example.test",
+                "unused",
+                "Reviewer",
+            )
+            .await
+            .unwrap();
+            rg_db::ops::repo_collaborator_ops::create(
+                &f.db,
+                rg_db::entities::repo_collaborator::ActiveModel {
+                    repo_id: Set(f.repository.id),
+                    user_id: Set(approver.id),
+                    permission: Set("write".to_string()),
+                    created_at: Set(Utc::now()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            approve(&f, approver.id).await;
+            assert!(run(&f).await.waiting_reason.is_some());
+            let created = pipelines(&f).await;
+            assert_eq!(created.len(), 1);
+            rg_db::ops::pipeline_ops::update_pipeline_status(
+                &f.db,
+                created[0].id,
+                "success",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            if change == "permission" {
+                rg_db::ops::repo_collaborator_ops::delete_by_repo_and_user(
+                    &f.db,
+                    f.repository.id,
+                    approver.id,
+                )
+                .await
+                .unwrap();
+                crate::repo::service::invalidate_perm_cache_user(
+                    &f.db,
+                    f.repository.id,
+                    approver.id,
+                );
+            } else {
+                let mut changed: rg_db::entities::user::ActiveModel = approver.into();
+                if change == "disabled" {
+                    changed.is_active = Set(false);
+                } else {
+                    changed.bot_owner_id = Set(Some(f.owner.id));
+                }
+                changed.update(&f.db).await.unwrap();
+            }
+            let done = run(&f).await;
+            assert_eq!(done.failed, vec![f.pr.id], "{change}");
+            assert!(done.merged.is_empty(), "{change}");
+            assert_eq!(rev_parse(&f, "refs/heads/main"), base, "{change}");
+            assert_eq!(pipelines(&f).await.len(), 1, "{change}");
+        }
+    }
+
+    async fn private_contributor_fixture(name: &str) -> (Fixture, String, PathBuf, i64) {
+        let (mut f, base, path) = fork_fixture(name).await;
+        let source_id = f.pr.head_repo_id.unwrap();
+        let source = repository::Entity::find_by_id(source_id)
+            .one(&f.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut source: repository::ActiveModel = source.into();
+        source.is_private = Set(true);
+        source.update(&f.db).await.unwrap();
+        let author = rg_db::ops::user_ops::create_user(
+            &f.db,
+            "contributor",
+            "contributor@example.test",
+            "unused",
+            "Contributor",
+        )
+        .await
+        .unwrap();
+        let mut pr: pull_request::ActiveModel = f.pr.into();
+        pr.author_id = Set(author.id);
+        f.pr = pr.update(&f.db).await.unwrap();
+        set_source_role(&f, author.id, Some("write")).await;
+        (f, base, path, author.id)
+    }
+
+    async fn set_source_role(f: &Fixture, user_id: i64, role: Option<&str>) {
+        let source_id = f.pr.head_repo_id.unwrap();
+        rg_db::ops::repo_collaborator_ops::delete_by_repo_and_user(&f.db, source_id, user_id)
+            .await
+            .unwrap();
+        if let Some(role) = role {
+            rg_db::ops::repo_collaborator_ops::create(
+                &f.db,
+                rg_db::entities::repo_collaborator::ActiveModel {
+                    repo_id: Set(source_id),
+                    user_id: Set(user_id),
+                    permission: Set(role.into()),
+                    created_at: Set(Utc::now()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // Clear a cached refusal when granting write. Revocation deliberately
+        // gets no invalidation: source publication must re-read the grant.
+        if role == Some("write") {
+            crate::repo::service::invalidate_perm_cache_user(&f.db, source_id, user_id);
+        }
+    }
+
+    fn advance_private_branch(path: &Path, parent: &str, label: &str) -> String {
+        let tree = git()
+            .run(&["rev-parse", &format!("{parent}^{{tree}}")], Some(path))
+            .unwrap();
+        tree.ensure_success().unwrap();
+        let tree = tree.stdout_str().trim().to_string();
+        let output = git()
+            .run_with_env(
+                &["commit-tree", &tree, "-p", parent, "-m", label],
+                Some(path),
+                &[
+                    ("GIT_AUTHOR_NAME", "Private source"),
+                    ("GIT_AUTHOR_EMAIL", "source@example.test"),
+                    ("GIT_COMMITTER_NAME", "Private source"),
+                    ("GIT_COMMITTER_EMAIL", "source@example.test"),
+                ],
+            )
+            .unwrap();
+        output.ensure_success().unwrap();
+        let head = output.stdout_str().trim().to_string();
+        git()
+            .run(&["update-ref", "refs/heads/feature", &head], Some(path))
+            .unwrap()
+            .ensure_success()
+            .unwrap();
+        head
+    }
+
+    fn base_holds(f: &Fixture, sha: &str) -> bool {
+        let base_path = f
+            .repo_root
+            .join(format!("{}/{}.git", f.owner.username, f.repository.name));
+        git()
+            .run(
+                &["cat-file", "-e", &format!("{sha}^{{commit}}")],
+                Some(&base_path),
+            )
+            .unwrap()
+            .success()
+    }
+
+    #[tokio::test]
+    async fn a_private_fork_requires_write_to_start_and_keep_publishing() {
+        let (f, base, source_path, author) = private_contributor_fixture("source-withdrawn").await;
+        let source_id = f.pr.head_repo_id.unwrap();
+        let h2 =
+            advance_private_branch(&source_path, f.pr.head_sha.as_deref().unwrap(), "legal H2");
+        let refreshed =
+            crate::pull_request::refresh_open_heads(&f.db, source_id, "feature", Some(&h2))
+                .await
+                .unwrap();
+        assert_eq!(refreshed.open_prs.len(), 1);
+        assert_eq!(refreshed.open_prs[0].head_sha.as_deref(), Some(h2.as_str()));
+        let before = service::compute_diff(
+            &f.db,
+            &f.repo_root,
+            &f.owner.username,
+            &f.repository.name,
+            f.pr.number,
+        )
+        .await
+        .unwrap();
+        assert!(!before.head_source_unavailable);
+        assert!(base_holds(&f, &h2));
+        approve(&f, f.owner.id).await;
+
+        set_source_role(&f, author, Some("read")).await;
+        let refusal = service::create_pr(
+            &f.db,
+            &f.repo_root,
+            f.repository.id,
+            author,
+            "reader channel".into(),
+            None,
+            "feature".into(),
+            "main".into(),
+            Some(source_id),
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(refusal.is::<crate::error::Forbidden>());
+        let h3 = advance_private_branch(&source_path, &h2, "private H3 after downgrade");
+        assert!(!base_holds(&f, &h3));
+        let refreshed =
+            crate::pull_request::refresh_open_heads(&f.db, source_id, "feature", Some(&h3))
+                .await
+                .unwrap();
+        assert!(refreshed.open_prs.is_empty());
+        assert_eq!(
+            super::super::fork_source::advance_open_heads(&f.db, source_id, "feature", &h2, &h3)
+                .await
+                .unwrap(),
+            0,
+            "a different PR's suggestion must not advance this channel"
+        );
+        let frozen = pull_request::Entity::find_by_id(f.pr.id)
+            .one(&f.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frozen.head_sha.as_deref(), Some(h2.as_str()));
+        let diff = service::compute_diff(
+            &f.db,
+            &f.repo_root,
+            &f.owner.username,
+            &f.repository.name,
+            f.pr.number,
+        )
+        .await
+        .unwrap();
+        assert!(diff.head_source_unavailable);
+        assert_eq!(
+            serde_json::to_value(&diff.files_changed).unwrap(),
+            serde_json::to_value(&before.files_changed).unwrap()
+        );
+        let merge = service::merge_pr(
+            &f.db,
+            &f.repo_root,
+            &f.owner.username,
+            &f.repository.name,
+            f.pr.number,
+            f.owner.id,
+            MergeStrategy::Merge,
+            Some(&h2),
+            None,
+            &Default::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(merge.is::<crate::error::HeadSourceUnavailable>());
+        let done = run(&f).await;
+        assert_eq!(done.failed, vec![f.pr.id]);
+        assert!(pipelines(&f).await.is_empty());
+        assert_eq!(rev_parse(&f, "refs/heads/main"), base);
+        assert!(
+            !base_holds(&f, &h3),
+            "a blocked diff/merge/queue imported the private commit"
+        );
+
+        set_source_role(&f, author, Some("write")).await;
+        let refreshed =
+            crate::pull_request::refresh_open_heads(&f.db, source_id, "feature", Some(&h3))
+                .await
+                .unwrap();
+        assert_eq!(refreshed.open_prs[0].head_sha.as_deref(), Some(h3.as_str()));
+        assert!(
+            !service::compute_diff(
+                &f.db,
+                &f.repo_root,
+                &f.owner.username,
+                &f.repository.name,
+                f.pr.number
+            )
+            .await
+            .unwrap()
+            .head_source_unavailable
+        );
+        assert!(base_holds(&f, &h3));
+    }
+
+    #[tokio::test]
+    async fn an_unfetched_frozen_head_is_a_conflict_without_reading_the_source() {
+        for change in ["revoked", "inactive", "deleted"] {
+            let (f, _, source_path, author) =
+                private_contributor_fixture(&format!("unfetched-{change}")).await;
+            let head = advance_private_branch(
+                &source_path,
+                f.pr.head_sha.as_deref().unwrap(),
+                "unfetched legal head",
+            );
+            crate::pull_request::refresh_open_heads(
+                &f.db,
+                f.pr.head_repo_id.unwrap(),
+                "feature",
+                Some(&head),
+            )
+            .await
+            .unwrap();
+            assert!(!base_holds(&f, &head));
+            match change {
+                "revoked" => set_source_role(&f, author, None).await,
+                "inactive" => {
+                    let user = rg_db::ops::user_ops::find_by_id(&f.db, author)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut user: rg_db::entities::user::ActiveModel = user.into();
+                    user.is_active = Set(false);
+                    user.update(&f.db).await.unwrap();
+                }
+                _ => {
+                    let source = repository::Entity::find_by_id(f.pr.head_repo_id.unwrap())
+                        .one(&f.db)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut source: repository::ActiveModel = source.into();
+                    source.deleted_at = Set(Some(Utc::now()));
+                    source.update(&f.db).await.unwrap();
+                }
+            }
+            // Even a broken/missing source directory must not be accessed here.
+            std::fs::rename(&source_path, source_path.with_extension("withdrawn")).unwrap();
+            let error = service::compute_diff(
+                &f.db,
+                &f.repo_root,
+                &f.owner.username,
+                &f.repository.name,
+                f.pr.number,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.is::<crate::error::HeadSourceUnavailable>(),
+                "{change}: {error:#}"
+            );
+            assert!(!base_holds(&f, &head));
+        }
     }
 }

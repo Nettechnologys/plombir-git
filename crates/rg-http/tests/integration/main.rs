@@ -32,6 +32,7 @@ mod comment_moderation_tests;
 mod commit_diff_tests;
 mod common;
 mod compare_and_fork_head_tests;
+mod credential_change_link_tests;
 mod link_preview_tests;
 mod notification_browser_tests;
 mod notification_delivery_settings_tests;
@@ -41,6 +42,7 @@ mod push_mirror_tests;
 mod repo_redirect_tests;
 mod repo_settings_tests;
 mod repository_visibility_tests;
+mod second_factor_lockout_tests;
 
 mod access_security_tests;
 mod account_deletion_serialized_grant_tests;
@@ -227,6 +229,7 @@ mod registry_mfa_tests;
 mod release_asset_filename_tests;
 mod release_attestation_tests;
 mod release_deletion_storage_tests;
+mod release_draft_visibility_tests;
 mod release_tests;
 mod remote_storage_lifecycle_tests;
 mod repo_address_spelling_tests;
@@ -320,3 +323,5 @@ mod wiki_tests;
 mod wildcard_branch_protection_tests;
 
 mod remembered_session_tests;
+
+mod git_staged_authorization_tests;
