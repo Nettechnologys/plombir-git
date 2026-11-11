@@ -12,6 +12,7 @@ vi.mock('./_base.svelte', () => base);
 
 import PullRequestPage from '../../routes/[owner]/[repo]/pulls/[number]/+page.svelte';
 import en from '../i18n/translations/en.json';
+import ru from '../i18n/translations/ru.json';
 import zhCN from '../i18n/translations/zh-CN.json';
 import { setTestPage } from '../test/app';
 import {
@@ -21,7 +22,7 @@ import {
 	resetTestClient,
 	repos,
 } from '../test/client';
-import { click, element, renderComponent, type RenderedComponent } from '../test/render';
+import { click, element, renderComponent, settle, type RenderedComponent } from '../test/render';
 import { pulls } from './pulls';
 
 let rendered: RenderedComponent | undefined;
@@ -109,17 +110,66 @@ describe('fork CI approval production wiring', () => {
 		['the current fork head is approved', { ci_approved_sha: 'new-head' }],
 		['the pull request is closed', { state: 'closed', ci_approved_sha: null }],
 		['the pull request uses the base repository', { head_repo_id: null, ci_approved_sha: null }],
-	])('does not offer approval when %s', async (_case, overrides) => {
+	])('does not show the held banner when %s', async (_case, overrides) => {
 		routePulls.get.mockResolvedValue(pullRequest(overrides));
 		rendered = await renderComponent(PullRequestPage);
 
 		expect(rendered.container.querySelector('.ci-held')).toBeNull();
 	});
 
-	it.each(['held', 'explanation', 'approve', 'approving'])(
-		'has a real label in both catalogs: pulls.fork_ci.%s',
+	it('lets a writer replace an old approver for the unchanged fork head through the existing endpoint', async () => {
+		repos.get.mockResolvedValue({ viewer_permission: 'write' });
+		let resolve!: (value: unknown) => void;
+		routePulls.approveCi.mockReturnValue(new Promise(done => { resolve = done; }));
+		routePulls.get
+			.mockResolvedValueOnce(pullRequest({ ci_approved_sha: 'new-head', ci_approved_by: 99 }))
+			.mockResolvedValueOnce(pullRequest({ ci_approved_sha: 'new-head', ci_approved_by: 1 }));
+		rendered = await renderComponent(PullRequestPage);
+		const action = element<HTMLButtonElement>(rendered.container, '.ci-reapprove');
+		expect(action.textContent).toContain(en.pulls.fork_ci.reapprove);
+		expect(action.type).toBe('button');
+		expect(element(rendered.container, '.ci-reapproval').textContent).toContain(en.pulls.fork_ci.reapprove_explanation);
+		await click(action);
+		expect(action.disabled).toBe(true);
+		await click(action);
+		expect(routePulls.approveCi).toHaveBeenCalledExactlyOnceWith('alice', 'demo', 7);
+		resolve({}); await settle();
+		expect(routePulls.get).toHaveBeenCalledTimes(2);
+		expect(element<HTMLButtonElement>(rendered.container, '.ci-reapprove').disabled).toBe(false);
+		expect(rendered.container.querySelector('.ci-held')).toBeNull();
+	});
+
+	it('shows a server refusal without treating repeated approval as successful', async () => {
+		routePulls.get.mockResolvedValue(pullRequest({ ci_approved_sha: 'new-head', ci_approved_by: 99 }));
+		routePulls.approveCi.mockRejectedValue(new Error('The source is no longer available'));
+		rendered = await renderComponent(PullRequestPage);
+		await click(element(rendered.container, '.ci-reapprove'));
+		expect(rendered.container.textContent).toContain('The source is no longer available');
+		expect(routePulls.get).toHaveBeenCalledTimes(1);
+		expect(element<HTMLButtonElement>(rendered.container, '.ci-reapprove').disabled).toBe(false);
+	});
+
+	it.each(['read', null])('does not offer reapproval without write access (%s)', async permission => {
+		repos.get.mockResolvedValue({ viewer_permission: permission });
+		routePulls.get.mockResolvedValue(pullRequest({ ci_approved_sha: 'new-head', ci_approved_by: 99 }));
+		rendered = await renderComponent(PullRequestPage);
+		expect(rendered.container.querySelector('.ci-reapprove')).toBeNull();
+		expect(routePulls.approveCi).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		{ state: 'closed' }, { state: 'merged' }, { head_repo_id: null }, { head_sha: null },
+	])('does not offer reapproval for an inapplicable PR: %j', async overrides => {
+		routePulls.get.mockResolvedValue(pullRequest({ ci_approved_sha: 'new-head', ...overrides }));
+		rendered = await renderComponent(PullRequestPage);
+		expect(rendered.container.querySelector('.ci-reapprove')).toBeNull();
+	});
+
+	it.each(['held', 'explanation', 'approve', 'approving', 'reapprove', 'reapprove_explanation'])(
+		'has a real label in all catalogs: pulls.fork_ci.%s',
 		(key) => {
 			expect(en.pulls.fork_ci).toHaveProperty(key);
+			expect(ru.pulls.fork_ci).toHaveProperty(key);
 			expect(zhCN.pulls.fork_ci).toHaveProperty(key);
 		},
 	);

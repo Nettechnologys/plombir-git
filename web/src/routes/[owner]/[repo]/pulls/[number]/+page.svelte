@@ -121,12 +121,12 @@
   // makes the approval expire on the next push to the fork — an approval that
   // outlived the diff it was given for would be worth nothing
   // (card_3c0751fbf09d).
-  let ciHeldForFork = $derived(
+  let hasApprovableForkHead = $derived(
     pr?.state === 'open' &&
     pr?.head_repo_id !== null && pr?.head_repo_id !== undefined &&
-    !!pr?.head_sha &&
-    pr?.ci_approved_sha !== pr?.head_sha
+    !!pr?.head_sha
   );
+  let ciHeldForFork = $derived(hasApprovableForkHead && pr?.ci_approved_sha !== pr?.head_sha);
 
   $effect(() => {
     const expectedOwner = owner;
@@ -775,6 +775,13 @@
                 </button>
               {/if}
             </div>
+          {:else if hasApprovableForkHead && permission.canWrite}
+            <div class="ci-reapproval">
+              <p>{t('pulls.fork_ci.reapprove_explanation')}</p>
+              <button type="button" class="btn btn-outline ci-reapprove" onclick={approveForkCi} disabled={mutationBusy || approvingCi}>
+                {approvingCi ? t('pulls.fork_ci.approving') : t('pulls.fork_ci.reapprove')}
+              </button>
+            </div>
           {/if}
 
           {#if headBranchOutcome}
@@ -1307,6 +1314,9 @@
   .ci-held { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 16px 0; padding: 12px 16px; border: 1px solid var(--warning, var(--border)); border-radius: var(--radius); background: var(--bg-tertiary); }
   .ci-held > div { display: flex; flex-direction: column; gap: 4px; }
   .ci-held span { color: var(--text-secondary); font-size: 12px; }
+  .ci-reapproval { margin: 16px 0; }
+  .ci-reapproval p { color: var(--text-secondary); font-size: 13px; margin-bottom: 8px; }
+  .ci-reapprove { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
   .thread { margin-top: 12px; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); }
   .thread.resolved { opacity: 0.72; }
   .thread header, .thread footer { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; background: var(--bg-tertiary); font-size: 12px; }
