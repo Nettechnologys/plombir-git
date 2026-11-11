@@ -6,6 +6,11 @@ This project records user-facing changes here. The format follows
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-11
+
+Read the [v0.4.2 upgrade notes](docs/releases/v0.4.2.md) before deploying,
+especially if an earlier encryption-key rotation skipped push-mirror credentials.
+
 ### Security
 
 - Revoke existing sessions and pending account-email changes when deactivating
@@ -1118,7 +1123,8 @@ See the [v0.1.1 release notes](docs/releases/v0.1.1.md) for upgrade and
 rollback guidance. Publication of a release does not establish that a registry
 package is publicly accessible.
 
-[Unreleased]: https://github.com/Nettechnologys/plombir-git/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/Nettechnologys/plombir-git/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.4.2
 [0.4.1]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.4.1
 [0.4.0]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.4.0
 [0.3.0]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.3.0
