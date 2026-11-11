@@ -3062,6 +3062,10 @@ async fn private_fork_head_refresh_freezes_each_unauthorized_pr_on_server_databa
         .await
         .unwrap()
         .expect("restore the author's publication grant");
+    // A grant may retain a short negative-cache entry. Invalidate only when
+    // granting, as the product mutation does; the downgrade above must work
+    // without invalidation so it proves that positive grants are not leased.
+    rg_core::repo::service::invalidate_perm_cache_user(&db, source.id, author.id);
     let resumed =
         rg_core::pull_request::refresh_open_heads(&db, source.id, "feature", Some(winner))
             .await
