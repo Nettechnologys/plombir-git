@@ -13,6 +13,10 @@
 > still admits that first account). Keep its HTTP port where only you can reach
 > it until you have registered.
 
+For the owner's separately configured `public` and `internal` instances, see
+the [public/internal upgrade runbook (Russian)](UPGRADE-PUBLIC-INTERNAL.md):
+release pins, per-instance backups, root commands, verification and recovery.
+
 Three compose files, pick one:
 
 | File | Data lives in | Settings come from | Use it when |

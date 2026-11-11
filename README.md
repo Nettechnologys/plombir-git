@@ -84,6 +84,7 @@ terminal recording, [`docs/demo/agent-review.cast`](docs/demo/agent-review.cast)
 | [Connect your agent](docs/agents.md) | Bot account, narrowed token, Claude Code / Codex / Cursor configs |
 | [MCP reference](docs/mcp.md) | The stdio binary, MCP over HTTP, agent accounts, working alone with your bot |
 | [Production deployment](deploy/README.md) | Docker Compose, reverse proxy, backups, upgrades and rollback |
+| [Public/internal upgrades — RU](deploy/UPGRADE-PUBLIC-INTERNAL.md) | Operator runbook for the two configured instances: release pins, backups, verification and recovery |
 | [Install from source](docs/install.md) | Requirements, build, secrets and rotation, first repository |
 | [Using Git](docs/using-git.md) | SSH and HTTPS, pull and push mirrors, Git LFS |
 | [CI](docs/ci.md) and [Actions subset](docs/gitea-actions.md) | Pipelines, workflows, and the [runner](docs/runner.md) |
