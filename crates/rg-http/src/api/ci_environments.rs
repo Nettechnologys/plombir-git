@@ -617,13 +617,14 @@ async fn authorize_approval(
 /// environment *now*.
 ///
 /// An approval row records that somebody was allowed to say yes when they said
-/// it. Removing them from the allow-list, or taking away the administration
-/// that let them approve without one, revokes the right — and must revoke the
-/// vote still waiting for the threshold with it, or a revoked approver plus one
-/// newcomer would release a deployment neither alone could (card_aa1d374901e3).
-/// So each vote is judged by `authorize_approval`'s rule as it stands, the way
-/// branch protection re-checks write access for a review approval at merge
-/// time. The rows themselves stay, as history.
+/// it. Removing them from the allow-list, taking away the administration that
+/// let them approve without one, or taking away the read access `approve`
+/// demands of every voter revokes the right — and must revoke the vote still
+/// waiting for the threshold with it, or a revoked approver plus one newcomer
+/// would release a deployment neither alone could (card_aa1d374901e3,
+/// card_d34edfc1b689). So each vote is judged by the rule it was cast under as
+/// it stands, the way branch protection re-checks write access for a review
+/// approval at merge time. The rows themselves stay, as history.
 async fn authorized_approvals(
     state: &AppState,
     ctx: &ApprovalContext,
@@ -646,9 +647,12 @@ async fn authorized_approvals(
                     .await?,
             );
         }
+        // Listed is not enough: an approver removed from a private repository,
+        // or outside one that became private, may still be on the list.
         if allowed
             .as_ref()
             .is_some_and(|allowed| allowed.contains(&approver))
+            && repo_access::may_read(state, &ctx.repo, Some(approver)).await?
         {
             counted += 1;
         }

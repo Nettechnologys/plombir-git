@@ -56,6 +56,11 @@ This project records user-facing changes here. The format follows
   under a revoked key, and the fields `key_status` and `key_origin` for the key
   that signed. A retired key verifies on the server only; re-sign an asset that
   needs external verification.
+- Stop counting an approval of a protected environment once its approver can
+  no longer read the repository: removed as a collaborator of a private
+  repository, or outside a repository that became private. Such a vote still
+  counted while the approver stayed on the allow-list, and could complete the
+  threshold that releases the deployment.
 
 ## [0.4.2] - 2026-11-11
 
