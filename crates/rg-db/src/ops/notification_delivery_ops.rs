@@ -190,8 +190,12 @@ pub const QUEUED_PER_EVENT: u64 = 50;
 /// previous destination, that destination), the repository, and whether it
 /// is a test.
 type Kind = (i64, String, String, String, Option<i64>, bool);
-/// The coarser budget: recipient, event, test flag.
-type EventBudget = (i64, String, bool);
+/// The coarser budget: recipient, event, test flag, and whether the rows are
+/// warnings to a previous destination. Those have a budget of their own: if
+/// they shared it with ordinary rows, whoever holds the account could fill it
+/// with ordinary settings changes and then change the destination, and the
+/// warning owed to the old destination would be the row that is dropped.
+type EventBudget = (i64, String, bool, bool);
 
 fn kind_of(row: &delivery::ActiveModel) -> Option<Kind> {
     use crate::notification::PRIORITY_SHARED;
@@ -209,13 +213,17 @@ fn kind_of(row: &delivery::ActiveModel) -> Option<Kind> {
 }
 
 async fn held_of_event(db: &impl ConnectionTrait, budget: &EventBudget) -> Result<u64> {
-    Ok(delivery::Entity::find()
+    let query = delivery::Entity::find()
         .filter(delivery::Column::UserId.eq(budget.0))
         .filter(delivery::Column::EventKey.eq(budget.1.as_str()))
         .filter(delivery::Column::Status.is_in(["queued", "inflight"]))
-        .filter(delivery::Column::IsTest.eq(budget.2))
-        .count(db)
-        .await?)
+        .filter(delivery::Column::IsTest.eq(budget.2));
+    let query = if budget.3 {
+        query.filter(delivery::Column::PreviousDestinationEncrypted.is_not_null())
+    } else {
+        query.filter(delivery::Column::PreviousDestinationEncrypted.is_null())
+    };
+    Ok(query.count(db).await?)
 }
 
 async fn held_of_kind(db: &impl ConnectionTrait, kind: &Kind) -> Result<u64> {
@@ -252,7 +260,12 @@ async fn admit(
             admitted.push(row);
             continue;
         };
-        let budget = (kind.0, kind.1.clone(), kind.5);
+        let prior = row
+            .previous_destination_encrypted
+            .clone()
+            .unwrap()
+            .is_some();
+        let budget = (kind.0, kind.1.clone(), kind.5, prior);
         let count = match held.get(&kind) {
             Some(count) => *count,
             None => held_of_kind(db, &kind).await?,

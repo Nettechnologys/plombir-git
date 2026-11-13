@@ -1309,12 +1309,14 @@ async fn a_settings_change_loop_is_bounded_and_keeps_the_first_warning() {
             .await
             .unwrap();
     }
-    let queued = queued_of(&db, user.id, "notification_settings_changed").await;
-    assert!(
-        queued.len() <= queue::QUEUED_PER_EVENT as usize,
-        "{}",
-        queued.len()
-    );
+    // Every change of destination is a new kind, so only the budget of prior
+    // warnings bounds them.
+    let queued_prior = queued_of(&db, user.id, "notification_settings_changed")
+        .await
+        .into_iter()
+        .filter(|r| r.previous_destination_encrypted.is_some())
+        .count();
+    assert_eq!(queued_prior, queue::QUEUED_PER_EVENT as usize);
     let first = notification_delivery::Entity::find()
         .filter(notification_delivery::Column::UserId.eq(user.id))
         .filter(notification_delivery::Column::Channel.eq("telegram"))
@@ -1332,4 +1334,59 @@ async fn a_settings_change_loop_is_bounded_and_keeps_the_first_warning() {
     )
     .unwrap();
     assert!(opened.contains("-1001234"), "{opened}");
+}
+
+/// B-S10: ordinary settings-change rows filling their budget must not leave
+/// the warning to the previous destination without a place — the two do not
+/// share a budget.
+#[tokio::test]
+async fn ordinary_rows_cannot_take_the_budget_of_a_prior_destination_warning() {
+    let (db, user) = fixture().await;
+    let ctx = settings::SaveContext {
+        encryption_secret: KEY,
+        smtp_available: false,
+        metadata: Metadata::default(),
+    };
+    let generation = queue::profile(&db, user.id).await.unwrap().generation;
+    queue::confirm_telegram(&db, user.id, generation)
+        .await
+        .unwrap();
+    // Ordinary rows of one event and destination share a kind (5 at most);
+    // with the address changed each time they are 60 kinds, enough to fill the
+    // event budget.
+    let profile = queue::profile(&db, user.id).await.unwrap();
+    for i in 0..60 {
+        let event = queue::QueueEvent::security(user.id, Event::NotificationSettingsChanged, None);
+        let mut row = queue::row(&event, &user, &profile, "email").unwrap();
+        row.destination_hash = Set(format!("address-{i}"));
+        queue::insert(&db, row).await.unwrap();
+    }
+    let ordinary = queued_of(&db, user.id, "notification_settings_changed").await;
+    assert_eq!(ordinary.len(), queue::QUEUED_PER_EVENT as usize);
+
+    settings::save(
+        &db,
+        user.id,
+        &settings::Patch {
+            telegram: Some(settings::TelegramChange::Set {
+                token: Some(TOKEN.into()),
+                chat_id: -1_004_000,
+                message_thread_id: None,
+            }),
+            ..Default::default()
+        },
+        &ctx,
+        |_, _| Ok(()),
+    )
+    .await
+    .unwrap();
+    let warning = notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::UserId.eq(user.id))
+        .filter(notification_delivery::Column::Channel.eq("telegram"))
+        .filter(notification_delivery::Column::PreviousDestinationEncrypted.is_not_null())
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("the warning to the previous Telegram destination");
+    assert_eq!(warning.status, "queued");
 }
