@@ -394,18 +394,18 @@ pub async fn pass(
     config: &Config<'_>,
     sender: &dyn Sender,
 ) -> Result<usize> {
+    queue::cleanup(db).await?;
     pass_until(db, config, sender, &|| false).await
 }
 
-/// [`pass`], checking `stop` between rows so a shutdown does not wait for the
-/// rest of the page.
+/// One page without the cleanup, checking `stop` between rows so a shutdown
+/// does not wait for the rest of the page.
 pub async fn pass_until(
     db: &DatabaseConnection,
     config: &Config<'_>,
     sender: &dyn Sender,
     stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<usize> {
-    queue::cleanup(db).await?;
     let mut settled = 0;
     for id in queue::due(db, 50).await? {
         if stop() {
@@ -434,6 +434,9 @@ pub async fn drain(
     sender: &dyn Sender,
     stop: &(dyn Fn() -> bool + Sync),
 ) -> Result<usize> {
+    // Once per drain, not per page: under a backlog the pages follow one
+    // another, and cleanup is the second most expensive statement of a pass.
+    queue::cleanup(db).await?;
     let mut settled = 0;
     loop {
         let page = pass_until(db, config, sender, stop).await?;

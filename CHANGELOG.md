@@ -37,6 +37,9 @@ This project records user-facing changes here. The format follows
   delivery page in the security classes, the other classes keep a share of
   every page, the dispatcher no longer pauses five seconds after each page,
   and folding a thread cancels the queued rows of its earlier versions.
+  Security notifications are also bounded per recipient when queued — five of
+  one kind, fifty of one event — keeping the oldest, so a flood can neither
+  grow the queue without limit nor push out a warning already waiting.
   Previously one account producing activity faster than about ten rows a
   second delayed every user's security notifications and could make them
   expire. See docs/notifications.md for the order and the remaining limits.

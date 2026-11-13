@@ -324,10 +324,14 @@ async fn enqueue_previous(
             )?);
             row.previous_token_encrypted = Set(old.telegram_token_encrypted.clone());
         }
-        row.previous_destination_encrypted = Set(Some(crate::auth::encryption::encrypt(
-            &serde_json::to_string(&target)?,
-            &key,
-        )?));
+        let target = serde_json::to_string(&target)?;
+        // The previous destination, not the current address: each previous
+        // destination is its own kind for the enqueue bound, so changing the
+        // destination again and again cannot push out the warning owed to the
+        // first one. The dispatcher does not compare this for prior rows.
+        row.destination_hash = Set(rg_db::token_digest(&target));
+        row.previous_destination_encrypted =
+            Set(Some(crate::auth::encryption::encrypt(&target, &key)?));
         row.prior_locale = Set(Some(old.locale.clone()));
         queue::insert(db, row).await?;
         queued = true;

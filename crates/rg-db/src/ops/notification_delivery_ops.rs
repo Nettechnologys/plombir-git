@@ -177,7 +177,112 @@ pub fn row(
     })
 }
 
+/// Queued or in-flight security rows of one kind one recipient may hold.
+pub const QUEUED_PER_KIND: u64 = 5;
+/// Queued or in-flight security rows of one event one recipient may hold,
+/// whatever their destination, channel or repository. Kinds are not bounded
+/// in number — every change of destination makes a new one — so without this
+/// an account changing its own settings in a loop could queue without limit.
+pub const QUEUED_PER_EVENT: u64 = 50;
+
+/// What makes two security rows "the same warning to the same place": the
+/// recipient, the event, the channel, the destination (for a warning to a
+/// previous destination, that destination), the repository, and whether it
+/// is a test.
+type Kind = (i64, String, String, String, Option<i64>, bool);
+/// The coarser budget: recipient, event, test flag.
+type EventBudget = (i64, String, bool);
+
+fn kind_of(row: &delivery::ActiveModel) -> Option<Kind> {
+    use crate::notification::PRIORITY_SHARED;
+    if row.priority.clone().unwrap() > PRIORITY_SHARED {
+        return None;
+    }
+    Some((
+        row.user_id.clone().unwrap(),
+        row.event_key.clone().unwrap(),
+        row.channel.clone().unwrap(),
+        row.destination_hash.clone().unwrap(),
+        row.repo_id.clone().unwrap(),
+        row.is_test.clone().unwrap(),
+    ))
+}
+
+async fn held_of_event(db: &impl ConnectionTrait, budget: &EventBudget) -> Result<u64> {
+    Ok(delivery::Entity::find()
+        .filter(delivery::Column::UserId.eq(budget.0))
+        .filter(delivery::Column::EventKey.eq(budget.1.as_str()))
+        .filter(delivery::Column::Status.is_in(["queued", "inflight"]))
+        .filter(delivery::Column::IsTest.eq(budget.2))
+        .count(db)
+        .await?)
+}
+
+async fn held_of_kind(db: &impl ConnectionTrait, kind: &Kind) -> Result<u64> {
+    let query = delivery::Entity::find()
+        .filter(delivery::Column::UserId.eq(kind.0))
+        .filter(delivery::Column::EventKey.eq(kind.1.as_str()))
+        .filter(delivery::Column::Channel.eq(kind.2.as_str()))
+        .filter(delivery::Column::Status.is_in(["queued", "inflight"]))
+        .filter(delivery::Column::DestinationHash.eq(kind.3.as_str()))
+        .filter(delivery::Column::IsTest.eq(kind.5));
+    let query = match kind.4 {
+        Some(repo_id) => query.filter(delivery::Column::RepoId.eq(repo_id)),
+        None => query.filter(delivery::Column::RepoId.is_null()),
+    };
+    Ok(query.count(db).await?)
+}
+
+/// Keep the oldest: a security row arriving while [`QUEUED_PER_KIND`] rows of
+/// its kind already wait is recorded as `coalesced` instead of queued. Rows
+/// already queued are never displaced — evicting them would let whoever can
+/// cause the event erase a warning somebody else caused. Without the bound, a
+/// flood grows the due set the page query has to rank on every pass.
+/// Concurrent enqueues can overshoot by a few; the bound only has to hold.
+async fn admit(
+    db: &impl ConnectionTrait,
+    rows: Vec<delivery::ActiveModel>,
+) -> Result<Vec<delivery::ActiveModel>> {
+    let mut held: std::collections::HashMap<Kind, u64> = std::collections::HashMap::new();
+    let mut per_event: std::collections::HashMap<EventBudget, u64> =
+        std::collections::HashMap::new();
+    let mut admitted = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        let Some(kind) = kind_of(&row) else {
+            admitted.push(row);
+            continue;
+        };
+        let budget = (kind.0, kind.1.clone(), kind.5);
+        let count = match held.get(&kind) {
+            Some(count) => *count,
+            None => held_of_kind(db, &kind).await?,
+        };
+        let event_count = match per_event.get(&budget) {
+            Some(count) => *count,
+            None => held_of_event(db, &budget).await?,
+        };
+        if count >= QUEUED_PER_KIND || event_count >= QUEUED_PER_EVENT {
+            row.status = Set("cancelled".into());
+            row.last_error = Set(Some("coalesced".into()));
+            row.metadata = Set("{}".into());
+            row.destination_hash = Set(String::new());
+            row.previous_destination_encrypted = Set(None);
+            row.previous_token_encrypted = Set(None);
+            row.prior_locale = Set(None);
+            row.completed_at = Set(Some(chrono::Utc::now()));
+            held.insert(kind, count);
+            per_event.insert(budget, event_count);
+        } else {
+            held.insert(kind, count + 1);
+            per_event.insert(budget, event_count + 1);
+        }
+        admitted.push(row);
+    }
+    Ok(admitted)
+}
+
 pub async fn insert(db: &impl ConnectionTrait, row: delivery::ActiveModel) -> Result<()> {
+    let row = admit(db, vec![row]).await?.remove(0);
     delivery::Entity::insert(row)
         .on_conflict(
             OnConflict::columns([
@@ -251,6 +356,7 @@ pub async fn enqueue_many(db: &impl ConnectionTrait, events: &[QueueEvent]) -> R
             rows.push(row(event, user, profile, "telegram")?);
         }
     }
+    let rows = admit(db, rows).await?;
     for page in rows.chunks(500) {
         delivery::Entity::insert_many(page.to_vec())
             .on_conflict(

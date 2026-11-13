@@ -103,8 +103,29 @@ async fn queued_rows_are_classified_and_terminal_rows_are_not() {
         .has_index("notification_deliveries", "idx_notification_delivery_class")
         .await
         .unwrap());
+    for index in [
+        "idx_notification_delivery_kind",
+        "idx_notification_delivery_expiry",
+        "idx_notification_delivery_completed",
+    ] {
+        assert!(
+            manager
+                .has_index("notification_deliveries", index)
+                .await
+                .unwrap(),
+            "{index}"
+        );
+    }
+    assert!(!manager
+        .has_index("notification_deliveries", "idx_notification_delivery_due")
+        .await
+        .unwrap());
 
     Migration.down(&manager).await.unwrap();
+    assert!(manager
+        .has_index("notification_deliveries", "idx_notification_delivery_due")
+        .await
+        .unwrap());
     assert!(!manager
         .has_column("notification_deliveries", "priority")
         .await

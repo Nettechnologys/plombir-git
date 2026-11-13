@@ -22,6 +22,22 @@ pub struct Migration;
 const TABLE: &str = "notification_deliveries";
 const COLUMN: &str = "priority";
 const INDEX: &str = "idx_notification_delivery_class";
+/// Superseded by [`INDEX`]: every due query now names the class.
+const OLD_DUE_INDEX: &str = "idx_notification_delivery_due";
+
+/// Further indexes: the enqueue bound counts rows of one kind; cleanup
+/// expires queued rows and deletes old terminal ones on every drain.
+const EXTRA_INDEXES: &[(&str, &[&str])] = &[
+    (
+        "idx_notification_delivery_kind",
+        &["user_id", "event_key", "channel", "status"],
+    ),
+    (
+        "idx_notification_delivery_expiry",
+        &["status", "expires_at"],
+    ),
+    ("idx_notification_delivery_completed", &["completed_at"]),
+];
 
 /// Class 0: the account's own credentials and factors.
 pub(crate) const ACCOUNT_EVENTS: &[&str] = &[
@@ -118,10 +134,49 @@ impl MigrationTrait for Migration {
                 )
                 .await?;
         }
+        for (name, columns) in EXTRA_INDEXES {
+            if !manager.has_index(TABLE, name).await? {
+                let mut index = Index::create();
+                index.name(*name).table(alias(TABLE));
+                for column in *columns {
+                    index.col(alias(column));
+                }
+                manager.create_index(index.to_owned()).await?;
+            }
+        }
+        if manager.has_index(TABLE, OLD_DUE_INDEX).await? {
+            manager
+                .drop_index(
+                    Index::drop()
+                        .name(OLD_DUE_INDEX)
+                        .table(alias(TABLE))
+                        .to_owned(),
+                )
+                .await?;
+        }
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        if !manager.has_index(TABLE, OLD_DUE_INDEX).await? {
+            manager
+                .create_index(
+                    Index::create()
+                        .name(OLD_DUE_INDEX)
+                        .table(alias(TABLE))
+                        .col(alias("status"))
+                        .col(alias("next_attempt_at"))
+                        .to_owned(),
+                )
+                .await?;
+        }
+        for (name, _) in EXTRA_INDEXES {
+            if manager.has_index(TABLE, name).await? {
+                manager
+                    .drop_index(Index::drop().name(*name).table(alias(TABLE)).to_owned())
+                    .await?;
+            }
+        }
         if manager.has_index(TABLE, INDEX).await? {
             manager
                 .drop_index(Index::drop().name(INDEX).table(alias(TABLE)).to_owned())

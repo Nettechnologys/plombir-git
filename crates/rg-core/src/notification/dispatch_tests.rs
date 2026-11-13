@@ -1058,3 +1058,278 @@ async fn a_completed_deletion_removes_the_rows_with_the_account() {
         .unwrap()
         .is_none());
 }
+
+async fn kind_rows(
+    db: &DatabaseConnection,
+    user_id: i64,
+    key: &str,
+) -> Vec<notification_delivery::Model> {
+    notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::UserId.eq(user_id))
+        .filter(notification_delivery::Column::EventKey.eq(key))
+        .filter(notification_delivery::Column::Channel.eq("email"))
+        .all(db)
+        .await
+        .unwrap()
+}
+
+/// S10 bound, keep-oldest: the sixth warning of a kind to the same recipient
+/// and destination is recorded as coalesced; the five already waiting keep
+/// their payload.
+#[tokio::test]
+async fn a_full_kind_drops_the_new_row_and_keeps_the_waiting_ones() {
+    let (db, user) = fixture().await;
+    for _ in 0..6 {
+        enqueue(&db, user.id, Event::NewDevice).await;
+    }
+    let rows = kind_rows(&db, user.id, "new_device").await;
+    let queued: Vec<_> = rows.iter().filter(|r| r.status == "queued").collect();
+    let dropped: Vec<_> = rows
+        .iter()
+        .filter(|r| r.last_error.as_deref() == Some("coalesced"))
+        .collect();
+    assert_eq!(queued.len(), queue::QUEUED_PER_KIND as usize);
+    assert_eq!(dropped.len(), 1);
+    assert!(queued.iter().all(|r| r.metadata != "{}"));
+    assert_eq!(dropped[0].status, "cancelled");
+    assert_eq!(dropped[0].metadata, "{}");
+    assert!(dropped[0].id > queued.iter().map(|r| r.id).max().unwrap());
+}
+
+/// Somebody else's flood of a shared-resource event cannot push out the
+/// recipient's waiting warning of that kind.
+#[tokio::test]
+async fn a_flood_never_displaces_a_waiting_warning() {
+    let (db, user) = fixture().await;
+    let real = enqueue(&db, user.id, Event::OrganizationAccessChanged).await;
+    for _ in 0..20 {
+        enqueue(&db, user.id, Event::OrganizationAccessChanged).await;
+    }
+    let first = notification_delivery::Entity::find_by_id(
+        real.iter().find(|r| r.channel == "email").unwrap().id,
+    )
+    .one(&db)
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(first.status, "queued");
+    assert_eq!(
+        first.metadata,
+        real.iter().find(|r| r.channel == "email").unwrap().metadata
+    );
+    let queued = kind_rows(&db, user.id, "organization_access_changed")
+        .await
+        .into_iter()
+        .filter(|r| r.status == "queued")
+        .count();
+    assert_eq!(queued, queue::QUEUED_PER_KIND as usize);
+}
+
+/// Delivering one of the five frees a place; other kinds, channels and
+/// activity are not bounded by it.
+#[tokio::test]
+async fn the_bound_is_per_kind_and_frees_with_delivery() {
+    let (db, user) = fixture().await;
+    for _ in 0..5 {
+        enqueue(&db, user.id, Event::NewDevice).await;
+    }
+    let other_kind = enqueue(&db, user.id, Event::PasswordChanged).await;
+    assert!(status_of(&db, &other_kind)
+        .await
+        .iter()
+        .all(|s| s == "queued"));
+    let activity: Vec<_> = {
+        let mut rows = Vec::new();
+        for _ in 0..8 {
+            rows.extend(enqueue(&db, user.id, Event::Participating).await);
+        }
+        rows
+    };
+    assert!(status_of(&db, &activity)
+        .await
+        .iter()
+        .all(|s| s == "queued"));
+
+    let waiting = kind_rows(&db, user.id, "new_device").await;
+    deliver_one(&db, waiting[0].id, &config(true), &Recorder::default())
+        .await
+        .unwrap();
+    let next = enqueue(&db, user.id, Event::NewDevice).await;
+    let email = next.iter().find(|r| r.channel == "email").unwrap();
+    assert_eq!(
+        status_of(&db, std::slice::from_ref(email)).await,
+        vec!["queued"]
+    );
+}
+
+/// Changing the Telegram destination again and again cannot push out the
+/// warning owed to the first destination: each previous destination is its
+/// own kind.
+#[tokio::test]
+async fn repeated_destination_changes_keep_the_first_destinations_warning() {
+    let (db, user) = fixture().await;
+    let ctx = settings::SaveContext {
+        encryption_secret: KEY,
+        smtp_available: false,
+        metadata: Metadata::default(),
+    };
+    let generation = queue::profile(&db, user.id).await.unwrap().generation;
+    queue::confirm_telegram(&db, user.id, generation)
+        .await
+        .unwrap();
+    for chat in 1..=7 {
+        settings::save(
+            &db,
+            user.id,
+            &settings::Patch {
+                telegram: Some(settings::TelegramChange::Set {
+                    token: Some(TOKEN.into()),
+                    chat_id: -1_002_000 - chat,
+                    message_thread_id: None,
+                }),
+                ..Default::default()
+            },
+            &ctx,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let generation = queue::profile(&db, user.id).await.unwrap().generation;
+        queue::confirm_telegram(&db, user.id, generation)
+            .await
+            .unwrap();
+    }
+    let warnings: Vec<_> = notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::UserId.eq(user.id))
+        .filter(notification_delivery::Column::Channel.eq("telegram"))
+        .filter(notification_delivery::Column::PreviousDestinationEncrypted.is_not_null())
+        .all(&db)
+        .await
+        .unwrap();
+    assert!(warnings.len() >= 7, "{}", warnings.len());
+    assert!(warnings.iter().all(|r| r.status == "queued"));
+    let first = warnings.iter().min_by_key(|r| r.id).unwrap();
+    let opened = crate::auth::encryption::decrypt(
+        first.previous_destination_encrypted.as_deref().unwrap(),
+        &crate::auth::encryption::derive_key(KEY),
+    )
+    .unwrap();
+    assert!(opened.contains("-1001234"), "{opened}");
+}
+
+async fn queued_of(
+    db: &DatabaseConnection,
+    user_id: i64,
+    key: &str,
+) -> Vec<notification_delivery::Model> {
+    notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::UserId.eq(user_id))
+        .filter(notification_delivery::Column::EventKey.eq(key))
+        .filter(notification_delivery::Column::Status.eq("queued"))
+        .all(db)
+        .await
+        .unwrap()
+}
+
+/// Kinds are unbounded in number (each repository, each destination is one),
+/// so one event also has a per-recipient budget: past it a new row is
+/// coalesced whatever its kind, and the oldest rows keep their payload.
+#[tokio::test]
+async fn one_event_has_a_budget_across_its_kinds() {
+    let (db, user) = fixture().await;
+    let mut first = None;
+    for i in 0..60 {
+        let mut event = queue::QueueEvent::security(user.id, Event::RepositoryAccessChanged, None);
+        event.repo_id = Some(10_000 + i);
+        queue::enqueue(&db, &event).await.unwrap();
+        if first.is_none() {
+            first = Some(queue::event_rows(&db, user.id, &event.id).await.unwrap());
+        }
+    }
+    let queued = queued_of(&db, user.id, "repository_access_changed").await;
+    assert_eq!(queued.len(), queue::QUEUED_PER_EVENT as usize);
+    let coalesced = sea_orm::PaginatorTrait::count(
+        notification_delivery::Entity::find()
+            .filter(notification_delivery::Column::UserId.eq(user.id))
+            .filter(notification_delivery::Column::LastError.eq("coalesced")),
+        &db,
+    )
+    .await
+    .unwrap();
+    assert!(coalesced > 0);
+    for row in first.unwrap() {
+        let kept = notification_delivery::Entity::find_by_id(row.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.status, "queued");
+        assert_eq!(kept.metadata, row.metadata);
+    }
+
+    // A full budget of one event leaves another event untouched.
+    let other = enqueue(&db, user.id, Event::EmailChanged).await;
+    assert!(status_of(&db, &other).await.iter().all(|s| s == "queued"));
+}
+
+/// Changing the destination in a loop makes a new kind each time; the event
+/// budget still bounds the queue, and the warning owed to the first
+/// destination — the oldest — is kept.
+#[tokio::test]
+async fn a_settings_change_loop_is_bounded_and_keeps_the_first_warning() {
+    let (db, user) = fixture().await;
+    let ctx = settings::SaveContext {
+        encryption_secret: KEY,
+        smtp_available: false,
+        metadata: Metadata::default(),
+    };
+    let generation = queue::profile(&db, user.id).await.unwrap().generation;
+    queue::confirm_telegram(&db, user.id, generation)
+        .await
+        .unwrap();
+    for chat in 1..=60 {
+        settings::save(
+            &db,
+            user.id,
+            &settings::Patch {
+                telegram: Some(settings::TelegramChange::Set {
+                    token: Some(TOKEN.into()),
+                    chat_id: -1_003_000 - chat,
+                    message_thread_id: None,
+                }),
+                ..Default::default()
+            },
+            &ctx,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let generation = queue::profile(&db, user.id).await.unwrap().generation;
+        queue::confirm_telegram(&db, user.id, generation)
+            .await
+            .unwrap();
+    }
+    let queued = queued_of(&db, user.id, "notification_settings_changed").await;
+    assert!(
+        queued.len() <= queue::QUEUED_PER_EVENT as usize,
+        "{}",
+        queued.len()
+    );
+    let first = notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::UserId.eq(user.id))
+        .filter(notification_delivery::Column::Channel.eq("telegram"))
+        .filter(notification_delivery::Column::PreviousDestinationEncrypted.is_not_null())
+        .all(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .min_by_key(|r| r.id)
+        .expect("the warning to the first destination");
+    assert_eq!(first.status, "queued");
+    let opened = crate::auth::encryption::decrypt(
+        first.previous_destination_encrypted.as_deref().unwrap(),
+        &crate::auth::encryption::derive_key(KEY),
+    )
+    .unwrap();
+    assert!(opened.contains("-1001234"), "{opened}");
+}
