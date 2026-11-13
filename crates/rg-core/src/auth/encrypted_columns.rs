@@ -64,11 +64,13 @@ macro_rules! with_encrypted_columns {
             // else's live provider credentials — and rotating them on every
             // rekey — for no feature at all (card_51dd82b6dc82).
             //
-            // Unlike the columns above this one exists on every instance that
-            // has started once, which is what makes the preflight bite on a
-            // deployment that stores nothing else encrypted.
+            // Unlike the columns above this one is filled on every instance
+            // that has started once, which is what makes the preflight bite on
+            // a deployment that stores nothing else encrypted. Optional because
+            // only the active key keeps its seed; retired and revoked rows keep
+            // the public half alone.
             instance_signing_key, SeedEncrypted, seed_encrypted,
-                "instance_signing_key.seed_encrypted", required;
+                "instance_signing_keys.seed_encrypted", optional;
             mirror, PasswordEncrypted, password_encrypted,
                 "mirrors.password_encrypted", optional;
             push_mirror, PasswordEncrypted, password_encrypted,

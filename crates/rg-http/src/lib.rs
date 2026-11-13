@@ -114,16 +114,14 @@ pub struct AppState {
     /// defaults to `jwt_secret` so existing data stays readable, but it is a
     /// separate knob and rotating either one alone is now a safe operation.
     pub encryption_key: Arc<String>,
-    /// This instance's long-lived Ed25519 identity: it signs release provenance
-    /// attestations and backs the CI OIDC JWKS.
+    /// This instance's Ed25519 keys: the active one signs release provenance
+    /// attestations and CI OIDC tokens; the JWKS and attestation verification
+    /// read the whole ring.
     ///
-    /// **Not derived from `jwt_secret`** — it used to be, and rotating the
-    /// signing secret then changed the instance's public identity behind
-    /// everyone's back: stored DSSE envelopes stopped verifying and the
-    /// published `kid` changed under external verifiers (card_3aecf3708ebe).
-    /// It is loaded from the database at startup, so it survives every later
-    /// change to either secret; see [`rg_core::auth::instance_key`].
-    pub instance_key: Arc<rg_core::auth::instance_key::InstanceKey>,
+    /// Re-read from the database at most `instance_key::CACHE_TTL` after a
+    /// change, so a key rotated or revoked by the CLI stops signing here
+    /// without a restart; see [`rg_core::auth::instance_key`].
+    pub instance_keys: Arc<rg_core::auth::instance_key::InstanceKeys>,
     /// Optional shared secret for verifying HMAC-SHA256 signatures on *inbound*
     /// external webhooks (defense-in-depth on `/webhooks/external/*`). `None`
     /// (the default) disables signature checking; the endpoints then rely on
@@ -533,9 +531,8 @@ pub struct HttpServerConfig {
     pub jwt_secret: String,
     /// At-rest encryption key. See [`AppState::encryption_key`].
     pub encryption_key: String,
-    /// This instance's Ed25519 provenance identity, already loaded from the
-    /// database. See [`AppState::instance_key`].
-    pub instance_key: Arc<rg_core::auth::instance_key::InstanceKey>,
+    /// This instance's Ed25519 keys. See [`AppState::instance_keys`].
+    pub instance_keys: Arc<rg_core::auth::instance_key::InstanceKeys>,
     /// Optional shared secret for verifying HMAC-SHA256 signatures on inbound
     /// external webhooks. `None` disables signature checking (auth-only).
     pub external_webhook_secret: Option<String>,
@@ -835,7 +832,7 @@ async fn run_with_listener(
         db_write,
         jwt_secret: Arc::new(config.jwt_secret),
         encryption_key: Arc::new(config.encryption_key),
-        instance_key: config.instance_key,
+        instance_keys: config.instance_keys,
         external_webhook_secret: config.external_webhook_secret.map(Arc::new),
         docker_enabled: config.docker_enabled,
         external_runners: config.external_runners,

@@ -591,6 +591,12 @@
                                  is the loudest thing this feature can say. -->
                             <span class="attestation-badge failed">{t('releases.attestation.verify_failed')}</span>
                             <span class="attestation-reason">{attestationReports[asset.id].reason}</span>
+                          {:else if attestationReports[asset.id].status === 'revoked'}
+                            <!-- The signature holds under a key revoked as compromised:
+                                 whoever held that key could have made it, so it is
+                                 refused rather than shown as merely uncheckable. -->
+                            <span class="attestation-badge failed">{t('releases.attestation.revoked')}</span>
+                            <span class="attestation-reason">{attestationReports[asset.id].reason}</span>
                           {:else}
                             <!-- The server answered, and its answer is "I cannot tell":
                                  a predicate type this build has no verifier for, an

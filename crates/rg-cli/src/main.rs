@@ -152,9 +152,38 @@ async fn run() -> anyhow::Result<()> {
             config: _,
             jwt_secret,
             encryption_key,
+            reason,
             yes,
         } => {
-            commands::cmd_rotate_instance_key(db_url, state_cfg(), jwt_secret, encryption_key, yes)
+            commands::cmd_rotate_instance_key(
+                db_url,
+                state_cfg(),
+                jwt_secret,
+                encryption_key,
+                reason,
+                yes,
+            )
+            .await?
+        }
+
+        Commands::RevokeInstanceKey {
+            kid,
+            db_url,
+            config: _,
+            jwt_secret,
+            encryption_key,
+        } => {
+            commands::cmd_revoke_instance_key(kid, db_url, state_cfg(), jwt_secret, encryption_key)
+                .await?
+        }
+
+        Commands::InstanceKeyStatus {
+            db_url,
+            config: _,
+            jwt_secret,
+            encryption_key,
+        } => {
+            commands::cmd_instance_key_status(db_url, state_cfg(), jwt_secret, encryption_key)
                 .await?
         }
 

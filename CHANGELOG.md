@@ -6,6 +6,23 @@ This project records user-facing changes here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- Generate the instance signing key (release attestations, CI OIDC tokens and
+  the JWKS) at random instead of adopting a key derived from `jwt_secret`.
+  An instance upgraded with a derived key retires it on its first start: its
+  attestations keep verifying on the server, it leaves the JWKS after 10
+  minutes, and a random key signs from then on. Relying parties that pinned the
+  old public key instead of reading the JWKS URL must update it.
+- Keep every instance signing key as a public half. `rotate-instance-key` now
+  takes `--reason routine` (old key retired, still verifying) or
+  `--reason compromised` (old key revoked: removed from the JWKS at once and
+  its attestations reported as `revoked`); `revoke-instance-key` and
+  `instance-key-status` are new. A running server switches keys within 30
+  seconds instead of signing with the old key until restart. Retired and
+  revoked keys no longer keep their private seed in the database. The JWKS is
+  served with `Cache-Control: public, max-age=300`.
+
 ## [0.4.2] - 2026-11-11
 
 Read the [v0.4.2 upgrade notes](docs/releases/v0.4.2.md) before deploying,

@@ -143,11 +143,19 @@ async fn live_instance(db: &DatabaseConnection, secret: &str) -> i64 {
     .await
     .expect("store agent profile");
 
-    // Establishes `instance_signing_key.seed_encrypted` the way the first
-    // server start does.
-    rg_core::auth::instance_key::load_or_adopt(db, "a-signing-secret", secret)
+    // Establishes `instance_signing_keys.seed_encrypted` the way the first
+    // server start does, then retires that key: the retired row keeps no seed,
+    // and the rotation below must step over it rather than trip on it.
+    rg_core::auth::instance_key::establish(db, "a-signing-secret", secret)
         .await
         .expect("establish the instance signing key");
+    rg_core::auth::instance_key::rotate(
+        db,
+        secret,
+        rg_core::auth::instance_key::RotationReason::Routine,
+    )
+    .await
+    .expect("retire the first instance signing key");
     repo.id
 }
 
@@ -198,7 +206,7 @@ async fn a_live_database_moves_onto_the_new_key() {
     assert_eq!(column(&report, "users.totp_secret").rewritten, 1);
     assert_eq!(column(&report, "ci_secrets.encrypted_value").rewritten, 1);
     assert_eq!(
-        column(&report, "instance_signing_key.seed_encrypted").rewritten,
+        column(&report, "instance_signing_keys.seed_encrypted").rewritten,
         1
     );
     assert_eq!(column(&report, "webhooks.secret_encrypted").rewritten, 1);
@@ -334,21 +342,26 @@ async fn the_instance_signing_key_keeps_its_identity() {
     let db = fresh_db(dir.path()).await;
     live_instance(&db, OLD_SECRET).await;
 
-    let before = rg_core::auth::instance_key::load_or_adopt(&db, "a-signing-secret", OLD_SECRET)
+    let before = rg_core::auth::instance_key::load(&db, OLD_SECRET)
         .await
-        .expect("read the established key");
+        .expect("read the established keys");
 
     rekey(&db, OLD_SECRET, NEW_SECRET, false)
         .await
         .expect("rotate the encryption key");
 
-    let after = rg_core::auth::instance_key::load_or_adopt(&db, "a-signing-secret", NEW_SECRET)
+    let after = rg_core::auth::instance_key::load(&db, NEW_SECRET)
         .await
-        .expect("read the key under the new encryption key");
+        .expect("read the keys under the new encryption key");
     assert_eq!(
-        before.kid(),
-        after.kid(),
+        before.active().kid(),
+        after.active().kid(),
         "re-encrypting the seed must not change the instance's identity"
+    );
+    assert_eq!(
+        after.keys().len(),
+        2,
+        "the retired key must survive the rotation"
     );
 }
 
@@ -511,7 +524,7 @@ async fn the_rotation_covers_every_registered_column() {
     let covered: Vec<&str> = report.columns.iter().map(|c| c.column).collect();
     assert_eq!(covered, LABELS.to_vec(), "{report:?}");
     assert!(
-        LABELS.contains(&"instance_signing_key.seed_encrypted"),
+        LABELS.contains(&"instance_signing_keys.seed_encrypted"),
         "the registry must include the stored signing key, not just user data"
     );
 }

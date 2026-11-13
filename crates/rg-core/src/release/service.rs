@@ -1042,9 +1042,10 @@ pub async fn resolve_asset_source(
 /// Result of verifying a stored asset attestation.
 ///
 /// There is deliberately no `verified: bool` here. A boolean has room for two
-/// answers and this check has three: it held, it is contradicted, or this
-/// instance could not reach a verdict at all. Collapsing the third into `false`
-/// tells a reader that an asset's bytes no longer match what was signed —
+/// answers and this check has four: it held, it is contradicted, it rests on a
+/// revoked key, or this instance could not reach a verdict at all. Collapsing
+/// the last into `false` tells a reader that an asset's bytes no longer match
+/// what was signed —
 /// the loudest thing this feature can say — because of a predicate type the
 /// server does not happen to know (card_4579598691ce).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1056,8 +1057,15 @@ pub struct AttestationReport {
     pub reason: Option<String>,
     /// Predicate type of the verified statement.
     pub predicate_type: Option<String>,
-    /// `kid` of the signature that verified.
+    /// `kid` of the signature that verified (also set for `revoked`).
     pub keyid: Option<String>,
+    /// Status of that key: an `active` key still signs; a `retired` one only
+    /// verifies here and may be gone from the JWKS, so external verification
+    /// needs a re-signed attestation.
+    pub key_status: Option<crate::auth::instance_key::KeyStatus>,
+    /// Origin of that key: `legacy_derived` keys were computable from the JWT
+    /// secret of the day they were adopted.
+    pub key_origin: Option<crate::auth::instance_key::KeyOrigin>,
     /// SHA-256 recomputed from the stored bytes at verification time.
     pub asset_sha256: String,
 }
@@ -1116,15 +1124,16 @@ pub async fn get_asset_attestation(
     }
 }
 
-/// Verify an asset's stored attestation against the instance key and the asset's
-/// *current* bytes.
+/// Verify an asset's stored attestation against the keys this instance has held
+/// and the asset's *current* bytes.
 ///
 /// A tampered asset (bytes no longer matching the signed subject digest) or a
 /// signature that fails under this instance's own key yields
 /// [`VerificationStatus::Mismatch`](crate::attestation::VerificationStatus::Mismatch);
 /// an envelope this instance cannot interpret — unknown predicate type,
-/// unreadable payload, key rotated away — yields `Undeterminable`, because none
-/// of that observes the asset's bytes. Infra errors (missing asset/attestation,
+/// unreadable payload, a key this instance never held — yields `Undeterminable`,
+/// because none of that observes the asset's bytes. A signature under a revoked
+/// key yields `Revoked`. Infra errors (missing asset/attestation,
 /// unreadable bytes) are returned as `Err`.
 pub async fn verify_asset_attestation(
     db: &DatabaseConnection,
@@ -1133,7 +1142,7 @@ pub async fn verify_asset_attestation(
     repo_root: &Path,
     owner: &str,
     repo_name: &str,
-    key: &crate::auth::instance_key::InstanceKey,
+    keys: &crate::auth::instance_key::KeyRing,
 ) -> Result<AttestationReport> {
     let asset = get_asset(db, asset_id).await?;
     let json = asset
@@ -1156,11 +1165,14 @@ pub async fn verify_asset_attestation(
     };
 
     let registry = crate::attestation::VerifierRegistry::with_defaults();
-    match crate::attestation::verify_envelope(key, &envelope, &actual_sha, &registry) {
+    let key = |kid: Option<&str>| kid.and_then(|kid| keys.find(kid));
+    match crate::attestation::verify_envelope(keys, &envelope, &actual_sha, &registry) {
         Ok(v) => Ok(AttestationReport {
             status: crate::attestation::VerificationStatus::Verified,
             reason: None,
             predicate_type: Some(v.statement.predicate_type),
+            key_status: key(Some(&v.keyid)).map(|k| k.status),
+            key_origin: key(Some(&v.keyid)).map(|k| k.origin),
             keyid: Some(v.keyid),
             asset_sha256: actual_sha,
         }),
@@ -1172,7 +1184,9 @@ pub async fn verify_asset_attestation(
             status: e.status(),
             reason: Some(format!("{e:#}")),
             predicate_type: None,
-            keyid: None,
+            key_status: key(e.keyid()).map(|k| k.status),
+            key_origin: key(e.keyid()).map(|k| k.origin),
+            keyid: e.keyid().map(str::to_owned),
             asset_sha256: actual_sha,
         }),
     }

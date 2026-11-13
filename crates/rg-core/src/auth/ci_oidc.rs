@@ -7,7 +7,7 @@ use ed25519_dalek::pkcs8::EncodePrivateKey;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::instance_key::InstanceKey;
+use crate::auth::instance_key::{InstanceKey, KeyRing, PublicKey};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CiOidcClaims {
@@ -51,23 +51,27 @@ pub struct CiOidcJwk {
     pub x: String,
 }
 
-/// The JWKS entry published for the instance key.
+/// The JWKS entry published for one instance key.
 ///
-/// Sibling subsystems (release-asset attestation) sign and verify with the
-/// *same* [`InstanceKey`] that backs this document — its public half is already
-/// served at `/api/v1/ci/oidc/jwks`, so any external verifier can check those
-/// signatures without a second key to distribute. That sharing is also why the
-/// key must outlive `jwt_secret`: see [`crate::auth::instance_key`].
-pub fn jwk(key: &InstanceKey) -> CiOidcJwk {
-    let verifying = key.verifying_key();
+/// Sibling subsystems (release-asset attestation) sign with the *same* active
+/// key that backs this document, so an external verifier can check a fresh
+/// attestation without a second key to distribute. Keys stay published only
+/// while they may still sign a valid token: see
+/// [`crate::auth::instance_key::KeyRing::published`].
+pub fn jwk(key: &PublicKey) -> CiOidcJwk {
     CiOidcJwk {
         kty: "OKP",
         crv: "Ed25519",
         key_use: "sig",
         alg: "EdDSA",
-        kid: key.kid().to_string(),
-        x: URL_SAFE_NO_PAD.encode(verifying.as_bytes()),
+        kid: key.kid.clone(),
+        x: URL_SAFE_NO_PAD.encode(key.verifying.as_bytes()),
     }
+}
+
+/// The JWKS document at `now`.
+pub fn jwks(keys: &KeyRing, now: chrono::DateTime<Utc>) -> Vec<CiOidcJwk> {
+    keys.published(now).into_iter().map(jwk).collect()
 }
 
 /// What a token states about the job it was issued to.

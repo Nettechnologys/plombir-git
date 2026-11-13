@@ -13,6 +13,21 @@ use sea_orm::{ConnectionTrait, Statement};
 
 const PW: &str = "Qz7$wRtm";
 
+/// Database-backed keys, established as the server does on start.
+async fn instance_keys(
+    db: &sea_orm::DatabaseConnection,
+    jwt_secret: &str,
+) -> std::sync::Arc<rg_core::auth::instance_key::InstanceKeys> {
+    let ring = rg_core::auth::instance_key::establish(db, jwt_secret, TEST_ENCRYPTION_KEY)
+        .await
+        .expect("establish instance keys");
+    std::sync::Arc::new(rg_core::auth::instance_key::InstanceKeys::new(
+        db.clone(),
+        TEST_ENCRYPTION_KEY,
+        ring,
+    ))
+}
+
 async fn create_release(base: &str, token: &str, owner: &str, repo: &str) -> i64 {
     let client = reqwest::Client::new();
     let resp = client
@@ -170,20 +185,21 @@ async fn a_rotated_jwt_secret_leaves_earlier_attestations_verifiable() {
     let (db, dir) = setup_test_db().await;
     let repo_root = dir.path().join("repos");
 
-    // First boot: the instance adopts and stores its identity, derived from the
-    // signing secret in force at the time.
-    let key_before = rg_core::auth::instance_key::load_or_adopt(
-        &db,
-        "the-original-jwt-secret",
-        TEST_ENCRYPTION_KEY,
-    )
-    .await
-    .expect("adopt instance key");
+    // First boot: the instance establishes and stores its identity while one
+    // signing secret is in force.
+    let keys_before = instance_keys(&db, "the-original-jwt-secret").await;
+    let kid_before = keys_before
+        .current()
+        .await
+        .unwrap()
+        .active()
+        .kid()
+        .to_owned();
     let base = spawn_test_app_over_db_with(
         db.clone(),
         repo_root.clone(),
         StateOverrides {
-            instance_key: Some(std::sync::Arc::new(key_before.clone())),
+            instance_keys: Some(keys_before),
             ..Default::default()
         },
     )
@@ -211,16 +227,10 @@ async fn a_rotated_jwt_secret_leaves_earlier_attestations_verifiable() {
     // The operator rotates the signing secret and restarts. Same database, same
     // repo root, cold state — only the secret the key would have been derived
     // from differs.
-    let key_after = rg_core::auth::instance_key::load_or_adopt(
-        &db,
-        "the-rotated-jwt-secret",
-        TEST_ENCRYPTION_KEY,
-    )
-    .await
-    .expect("load instance key after rotation");
+    let keys_after = instance_keys(&db, "the-rotated-jwt-secret").await;
     assert_eq!(
-        key_after.kid(),
-        key_before.kid(),
+        keys_after.current().await.unwrap().active().kid(),
+        kid_before,
         "the published kid must survive a rotated signing secret"
     );
 
@@ -228,7 +238,7 @@ async fn a_rotated_jwt_secret_leaves_earlier_attestations_verifiable() {
         db.clone(),
         repo_root,
         StateOverrides {
-            instance_key: Some(std::sync::Arc::new(key_after)),
+            instance_keys: Some(keys_after),
             ..Default::default()
         },
     )
@@ -282,15 +292,13 @@ async fn an_uncheckable_envelope_is_undeterminable_and_a_wrong_digest_is_a_misma
 
     let (db, dir) = setup_test_db().await;
     let repo_root = dir.path().join("repos");
-    let key =
-        rg_core::auth::instance_key::load_or_adopt(&db, "attestation-secret", TEST_ENCRYPTION_KEY)
-            .await
-            .expect("adopt instance key");
+    let keys = instance_keys(&db, "attestation-secret").await;
+    let key = keys.current().await.unwrap().active().clone();
     let base = spawn_test_app_over_db_with(
         db.clone(),
         repo_root,
         StateOverrides {
-            instance_key: Some(std::sync::Arc::new(key.clone())),
+            instance_keys: Some(keys),
             ..Default::default()
         },
     )
@@ -398,15 +406,13 @@ async fn an_uncheckable_envelope_is_undeterminable_and_a_wrong_digest_is_a_misma
 async fn an_attestation_stored_under_the_former_type_still_verifies() {
     let (db, dir) = setup_test_db().await;
     let repo_root = dir.path().join("repos");
-    let key =
-        rg_core::auth::instance_key::load_or_adopt(&db, "attestation-secret", TEST_ENCRYPTION_KEY)
-            .await
-            .expect("adopt instance key");
+    let keys = instance_keys(&db, "attestation-secret").await;
+    let key = keys.current().await.unwrap().active().clone();
     let base = spawn_test_app_over_db_with(
         db.clone(),
         repo_root,
         StateOverrides {
-            instance_key: Some(std::sync::Arc::new(key.clone())),
+            instance_keys: Some(keys),
             ..Default::default()
         },
     )
@@ -590,4 +596,115 @@ async fn disabled_endpoints_return_404() {
         404,
         "verify must 404 when feature disabled"
     );
+}
+
+async fn published_kids(base: &str) -> (Vec<String>, String) {
+    let response = reqwest::get(format!("{base}/api/v1/ci/oidc/jwks"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let cache = response
+        .headers()
+        .get(reqwest::header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let document: serde_json::Value = response.json().await.unwrap();
+    let kids = document["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|key| key["kid"].as_str().unwrap().to_owned())
+        .collect();
+    (kids, cache)
+}
+
+async fn post_json(url: String, token: &str) -> (u16, serde_json::Value) {
+    let response = reqwest::Client::new()
+        .post(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    (response.status().as_u16(), response.json().await.unwrap())
+}
+
+/// S11 / R1: `rotate-instance-key` runs against the database of a running
+/// server. The server must stop publishing and signing with the old key once
+/// its cache expires — here the TTL is zero — without a restart, and a
+/// compromise rotation must turn the old key's attestations into `revoked`.
+#[tokio::test]
+async fn a_rotation_reaches_the_running_server_without_a_restart() {
+    use rg_core::auth::instance_key::{revoke, rotate, InstanceKeys, RotationReason};
+
+    let (db, dir) = setup_test_db().await;
+    let ring = rg_core::auth::instance_key::establish(&db, "s11-secret", TEST_ENCRYPTION_KEY)
+        .await
+        .unwrap();
+    let first = ring.active().kid().to_owned();
+    let keys = InstanceKeys::new(db.clone(), TEST_ENCRYPTION_KEY, ring)
+        .with_ttl(std::time::Duration::ZERO);
+    let base = spawn_test_app_over_db_with(
+        db.clone(),
+        dir.path().join("repos"),
+        StateOverrides {
+            instance_keys: Some(std::sync::Arc::new(keys)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let owner = "s11user".to_string();
+    let token = register_user(&base, &owner, "s11user@example.com", PW).await;
+    let repo = "s11repo".to_string();
+    create_initialised_repo(&base, &token, &repo).await;
+    let release_id = create_release(&base, &token, &owner, &repo).await;
+    let asset_id = upload_asset(&base, &token, &owner, &repo, release_id).await;
+    let attestation =
+        format!("{base}/api/v1/repos/{owner}/{repo}/releases/assets/{asset_id}/attestation");
+
+    let (kids, cache) = published_kids(&base).await;
+    assert_eq!(kids, vec![first.clone()]);
+    assert_eq!(cache, "public, max-age=300");
+    let (status, _) = post_json(attestation.clone(), &token).await;
+    assert_eq!(status, 201);
+
+    // Routine: the old key verifies its attestation and stays published for
+    // the overlap; new signatures use the new key.
+    let second = rotate(&db, TEST_ENCRYPTION_KEY, RotationReason::Routine)
+        .await
+        .unwrap()
+        .key
+        .kid()
+        .to_owned();
+    let (kids, _) = published_kids(&base).await;
+    assert!(kids.contains(&first) && kids.contains(&second), "{kids:?}");
+    let (_, report) = post_json(format!("{attestation}/verify"), &token).await;
+    assert_eq!(report["status"], "verified", "{report}");
+    assert_eq!(report["keyid"], first.as_str(), "{report}");
+    assert_eq!(report["key_status"], "retired", "{report}");
+    assert_eq!(report["key_origin"], "generated", "{report}");
+    let (status, envelope) = post_json(attestation.clone(), &token).await;
+    assert_eq!(status, 201);
+    assert_eq!(envelope["signatures"][0]["keyid"], second.as_str());
+
+    // Compromised: the key leaves the JWKS at once and what it signed is
+    // refused by name.
+    let third = rotate(&db, TEST_ENCRYPTION_KEY, RotationReason::Compromised)
+        .await
+        .unwrap()
+        .key
+        .kid()
+        .to_owned();
+    let (kids, _) = published_kids(&base).await;
+    assert!(!kids.contains(&second) && kids.contains(&third), "{kids:?}");
+    let (_, report) = post_json(format!("{attestation}/verify"), &token).await;
+    assert_eq!(report["status"], "revoked", "{report}");
+    assert_eq!(report["keyid"], second.as_str(), "{report}");
+    assert_eq!(report["key_status"], "revoked", "{report}");
+
+    // A retired key revoked later leaves the JWKS within the TTL as well.
+    revoke(&db, TEST_ENCRYPTION_KEY, &first).await.unwrap();
+    let (kids, _) = published_kids(&base).await;
+    assert_eq!(kids, vec![third]);
+    drop(dir);
 }

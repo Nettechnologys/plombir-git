@@ -60,7 +60,21 @@ pub async fn discovery(State(state): State<AppState>, headers: HeaderMap) -> imp
 
 #[utoipa::path(get, path = "/ci/oidc/jwks", tag = "CI/CD", responses((status = 200, description = "Public Ed25519 signing keys")))]
 pub async fn jwks(State(state): State<AppState>) -> impl IntoResponse {
-    Json(serde_json::json!({ "keys": [rg_core::auth::ci_oidc::jwk(&state.instance_key)] }))
+    let keys = match state.instance_keys.current().await {
+        Ok(keys) => keys,
+        Err(error) => return AppError::from(error).into_response(),
+    };
+    let mut response = Json(serde_json::json!({
+        "keys": rg_core::auth::ci_oidc::jwks(&keys, chrono::Utc::now())
+    }))
+    .into_response();
+    // Bounds how long a relying party keeps a key after it is revoked: without
+    // a header each one caches the document for as long as it likes.
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=300"),
+    );
+    response
 }
 
 #[derive(Serialize)]
@@ -131,8 +145,12 @@ pub async fn token(
         .environment_id
         .and(job.environment_name.as_deref())
         .filter(|name| !name.is_empty());
+    let keys = match state.instance_keys.current().await {
+        Ok(keys) => keys,
+        Err(error) => return AppError::from(error).into_response(),
+    };
     let (value, expires_at) = match rg_core::auth::ci_oidc::issue(
-        &state.instance_key,
+        keys.active(),
         &issuer,
         &query.audience,
         &rg_core::auth::ci_oidc::JobIdentity {

@@ -173,20 +173,35 @@ and restart. Existing sessions are invalidated — everyone logs in again — wh
 the durable at-rest key file remains unchanged.
 
 **The instance signing key is not a config value.** It signs release-asset
-attestations and backs the public keys at `/api/v1/ci/oidc/jwks`, so it has to
-outlive the secrets you rotate: a key that changed with `jwt_secret` would make
-every attestation this server ever issued fail verification — against the very
-server that signed it — and change the `kid` under external verifiers that
-already fetched it. The server establishes the key on first start (adopting the
-one the old derivation produced, so nothing signed earlier is invalidated by
-upgrading), seals it with the encryption key, and keeps it in the database.
+attestations and CI OIDC tokens, and its public half is published at
+`/api/v1/ci/oidc/jwks`. A new installation generates it at random on first
+start, seals it with the encryption key and keeps it in the database; rotating
+`jwt_secret` does not touch it. Versions before 0.4.3 derived it from
+`jwt_secret`; 0.4.3 retires such a key on its first start (see the upgrade
+notes).
 
-Replace it only if the key itself is compromised, and knowing that every
-attestation signed with it stops verifying for good:
+The database keeps every key the instance has held. The active key signs. A
+replaced key is kept as a public half only: `retired` keys still verify what
+they signed through `…/attestation/verify` on this server and stay in the JWKS
+for 10 minutes; `revoked` keys leave the JWKS at once, and an attestation they
+signed is reported as `revoked`. External verifiers can check only keys in the
+JWKS, so an attestation signed by a retired key has to be re-signed
+(`POST …/attestation`) before it can be verified outside this server.
 
 ```bash
-./target/release/plombir-git rotate-instance-key --config plombir-git.toml --yes
+# routine replacement
+./target/release/plombir-git rotate-instance-key --config plombir-git.toml --reason routine --yes
+# the key (or the JWT secret it was derived from) may have leaked
+./target/release/plombir-git rotate-instance-key --config plombir-git.toml --reason compromised --yes
+# revoke a key that is already retired, e.g. the one 0.4.3 retired on upgrade
+./target/release/plombir-git revoke-instance-key <kid> --config plombir-git.toml
+# list keys with kid, status and origin
+./target/release/plombir-git instance-key-status --config plombir-git.toml
 ```
+
+A running server switches to the new key within 30 seconds; no restart is
+needed. The JWKS response carries `Cache-Control: public, max-age=300`; after
+revoking a key, ask relying parties to refetch it.
 
 **Rotating the encryption key** is a different operation — the stored
 ciphertext has to be re-encrypted — so it has its own command. It refuses to
@@ -233,8 +248,9 @@ database has nothing to check, so a fresh install is never blocked.
 
 If the old secret is genuinely lost, no tool can recover the encrypted values:
 clear them and have MFA re-enrolled and the stored credentials re-entered. That
-includes the instance signing key — `rotate-instance-key` mints a new identity,
-and attestations signed under the old one stay unverifiable.
+includes the active instance signing key: clear its row and start the server to
+generate a new one; attestations signed under the lost key verify only while its
+public half stays recorded.
 
 ### Create a repository and clone it
 

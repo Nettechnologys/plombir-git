@@ -32,7 +32,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use ed25519_dalek::{Signature, Verifier};
 use serde_json::Value;
 
-use crate::auth::instance_key::InstanceKey;
+use crate::auth::instance_key::{InstanceKey, KeyRing, KeyStatus};
 pub use predicate::{PredicateVerifier, VerifierRegistry, PLOMBIR_GIT_PROVENANCE_TYPE};
 pub use types::{Envelope, Signature as EnvelopeSignature, Statement, Subject, DSSE_PAYLOAD_TYPE};
 
@@ -134,8 +134,13 @@ pub enum VerificationStatus {
     /// The check could not reach a verdict, and therefore says nothing about
     /// the asset: an envelope this instance cannot read, a predicate type it
     /// has no verifier for, a statement carrying no subject digest, or an
-    /// envelope signed before the provenance key was rotated away.
+    /// envelope signed by a key this instance never held.
     Undeterminable,
+    /// The signature verifies under a key this instance has revoked as
+    /// compromised. Whoever held that key could have produced it, so it proves
+    /// nothing, and it is reported by name rather than hidden as
+    /// undeterminable.
+    Revoked,
 }
 
 /// A verification that did not end in [`VerificationStatus::Verified`],
@@ -147,6 +152,7 @@ pub enum VerificationStatus {
 pub struct VerifyError {
     status: VerificationStatus,
     source: anyhow::Error,
+    keyid: Option<String>,
 }
 
 impl VerifyError {
@@ -156,6 +162,7 @@ impl VerifyError {
         Self {
             status: VerificationStatus::Mismatch,
             source,
+            keyid: None,
         }
     }
 
@@ -165,6 +172,16 @@ impl VerifyError {
         Self {
             status: VerificationStatus::Undeterminable,
             source,
+            keyid: None,
+        }
+    }
+
+    /// Signed under a revoked key — see [`VerificationStatus::Revoked`].
+    fn revoked(keyid: String) -> Self {
+        Self {
+            status: VerificationStatus::Revoked,
+            source: anyhow!("attestation was signed by a revoked instance key (kid {keyid})"),
+            keyid: Some(keyid),
         }
     }
 
@@ -172,6 +189,12 @@ impl VerifyError {
     /// [`VerificationStatus::Verified`].
     pub fn status(&self) -> VerificationStatus {
         self.status
+    }
+
+    /// The key a signature verified under, when that is part of the answer
+    /// ([`VerificationStatus::Revoked`]).
+    pub fn keyid(&self) -> Option<&str> {
+        self.keyid.as_deref()
     }
 }
 
@@ -189,24 +212,26 @@ impl std::fmt::Display for VerifyError {
 
 impl std::error::Error for VerifyError {}
 
-/// Verify a detached envelope against the instance key and an expected asset
-/// digest, then run the type-specific predicate verifier.
+/// Verify a detached envelope against the keys this instance has held and an
+/// expected asset digest, then run the type-specific predicate verifier.
 ///
 /// The error carries a [`VerificationStatus`] separating the two answers that
 /// must never be reported as one:
 ///
 /// - [`Mismatch`](VerificationStatus::Mismatch) — the statement's subject
 ///   SHA-256 does not equal `expected_sha256` (the asset was tampered with, or
-///   the attestation belongs to different bytes), or a signature carrying this
-///   instance's `kid` does not verify under it.
+///   the attestation belongs to different bytes), or a signature carrying a
+///   `kid` this instance holds does not verify under it.
+/// - [`Revoked`](VerificationStatus::Revoked) — it verifies, but under a key
+///   revoked as compromised.
 /// - [`Undeterminable`](VerificationStatus::Undeterminable) — the envelope is
 ///   not a readable DSSE/in-toto document, its statement carries no subject
 ///   digest, its predicate type has no registered verifier or fails its
-///   type-specific checks, or it was signed under a key this instance no
-///   longer holds. None of these observes the asset's bytes, so none of them
+///   type-specific checks, or it was signed under a key this instance never
+///   held. None of these observes the asset's bytes, so none of them
 ///   may be reported as tampering.
 pub fn verify_envelope(
-    key: &InstanceKey,
+    keys: &KeyRing,
     envelope: &Envelope,
     expected_sha256: &str,
     registry: &VerifierRegistry,
@@ -225,17 +250,13 @@ pub fn verify_envelope(
         .map_err(VerifyError::undeterminable)?;
     let msg = pae(DSSE_PAYLOAD_TYPE, &payload);
 
-    let verifying = key.verifying_key();
-    let expected_kid = key.kid();
-
-    // A signature verifies only when both the bytes AND the advertised kid match
-    // the instance key — so a valid signature carrying someone else's kid is
-    // still rejected.
-    let mut verified_kid: Option<String> = None;
+    // A signature verifies only when its bytes verify under the key its `kid`
+    // names — so a valid signature carrying another key's kid is rejected.
+    let mut verified = None;
     for sig in &envelope.signatures {
-        if sig.keyid != expected_kid {
+        let Some(known) = keys.find(&sig.keyid) else {
             continue;
-        }
+        };
         let raw = match STANDARD.decode(sig.sig.as_bytes()) {
             Ok(r) => r,
             Err(_) => continue,
@@ -244,43 +265,47 @@ pub fn verify_envelope(
             Ok(s) => s,
             Err(_) => continue,
         };
-        if verifying.verify(&msg, &signature).is_ok() {
-            verified_kid = Some(sig.keyid.clone());
+        if known.verifying.verify(&msg, &signature).is_ok() {
+            verified = Some(known);
             break;
         }
     }
-    let keyid = match verified_kid {
-        Some(keyid) => keyid,
-        // Naming the mismatch is the difference between "your asset is
-        // suspect" and "this instance no longer holds the key that signed it".
-        // The second is what an operator sees after deliberately rotating the
-        // provenance key, and it used to be indistinguishable from tampering
-        // (card_3aecf3708ebe). It is also not a verdict about the bytes at
-        // all, which is why it carries `Undeterminable` rather than a message
-        // wrapped around `false`.
-        None if envelope.signatures.iter().all(|s| s.keyid != expected_kid) => {
+    let keyid = match verified {
+        Some(known) if known.status == KeyStatus::Revoked => {
+            return Err(VerifyError::revoked(known.kid.clone()))
+        }
+        Some(known) => known.kid.clone(),
+        // Naming the gap is the difference between "your asset is suspect"
+        // and "this instance never held the key that signed it" — the second
+        // used to be indistinguishable from tampering (card_3aecf3708ebe), and
+        // it is not a verdict about the bytes at all.
+        None if envelope
+            .signatures
+            .iter()
+            .all(|s| keys.find(&s.keyid).is_none()) =>
+        {
             let offered: Vec<&str> = envelope
                 .signatures
                 .iter()
                 .map(|s| s.keyid.as_str())
                 .collect();
             return Err(VerifyError::undeterminable(anyhow!(
-                "attestation was signed by a different instance key (kid {}) than this instance \
-                 now holds (kid {expected_kid}) — it predates a rotation of the provenance \
-                 signing key",
+                "attestation was signed by a key this instance never held (kid {}); its \
+                 current key is kid {}",
                 if offered.is_empty() {
                     "none".to_string()
                 } else {
                     offered.join(", ")
-                }
+                },
+                keys.active().kid()
             )));
         }
-        // A signature offered under *this* instance's kid that does not verify
-        // is the one signature failure that is evidence: the envelope's bytes
-        // are not the bytes this key signed.
+        // A signature offered under a kid this instance holds that does not
+        // verify is the one signature failure that is evidence: the envelope's
+        // bytes are not the bytes that key signed.
         None => {
             return Err(VerifyError::mismatch(anyhow!(
-                "no signature verified under the instance key"
+                "no signature verified under the instance key it names"
             )))
         }
     };
@@ -322,6 +347,10 @@ mod tests {
 
     fn instance_key() -> InstanceKey {
         InstanceKey::derived_from_secret("instance-secret")
+    }
+
+    fn ring() -> KeyRing {
+        KeyRing::single(instance_key())
     }
 
     // SHA-256 of the empty string — a convenient fixed digest for vectors.
@@ -384,7 +413,7 @@ mod tests {
             }],
         };
         let reg = VerifierRegistry::with_defaults();
-        let verified = verify_envelope(&instance_key(), &envelope, EMPTY_SHA256, &reg)
+        let verified = verify_envelope(&ring(), &envelope, EMPTY_SHA256, &reg)
             .unwrap_or_else(|e| panic!("a pre-rename attestation must still verify: {e:#}"));
         assert_eq!(
             verified.statement.predicate_type,
@@ -404,7 +433,7 @@ mod tests {
     fn sign_then_verify_roundtrips() {
         let env = sign_statement(&instance_key(), &sample_statement()).unwrap();
         let reg = VerifierRegistry::with_defaults();
-        let verified = verify_envelope(&instance_key(), &env, EMPTY_SHA256, &reg).unwrap();
+        let verified = verify_envelope(&ring(), &env, EMPTY_SHA256, &reg).unwrap();
         assert_eq!(verified.statement.subject_sha256(), Some(EMPTY_SHA256));
         assert_eq!(verified.keyid, instance_key().kid());
     }
@@ -416,7 +445,7 @@ mod tests {
         let env = sign_statement(&instance_key(), &sample_statement()).unwrap();
         let reg = VerifierRegistry::with_defaults();
         let other = "0".repeat(64);
-        let error = verify_envelope(&instance_key(), &env, &other, &reg)
+        let error = verify_envelope(&ring(), &env, &other, &reg)
             .expect_err("a digest that is not the signed one must not verify");
         assert_eq!(error.status(), VerificationStatus::Mismatch);
         assert!(format!("{error:#}").contains("does not match asset digest"));
@@ -431,14 +460,14 @@ mod tests {
         let env = sign_statement(&instance_key(), &sample_statement()).unwrap();
         let reg = VerifierRegistry::with_defaults();
         let other = InstanceKey::derived_from_secret("a-rotated-instance");
-        let error = verify_envelope(&other, &env, EMPTY_SHA256, &reg)
+        let error = verify_envelope(&KeyRing::single(other.clone()), &env, EMPTY_SHA256, &reg)
             .expect_err("an envelope signed by another key must not verify");
         let message = format!("{error:#}");
         assert!(message.contains(instance_key().kid()), "{message}");
         assert!(message.contains(other.kid()), "{message}");
-        assert!(message.contains("rotation"), "{message}");
-        // And not only in words: a rotated key means this instance cannot
-        // check the envelope at all, which is a different answer from "these
+        assert!(message.contains("never held"), "{message}");
+        // And not only in words: a key this instance never held means it
+        // cannot check the envelope at all, which is a different answer from "these
         // bytes were substituted" (card_4579598691ce).
         assert_eq!(error.status(), VerificationStatus::Undeterminable);
     }
@@ -453,7 +482,7 @@ mod tests {
         raw[0] ^= 0x01;
         env.signatures[0].sig = STANDARD.encode(&raw);
         let reg = VerifierRegistry::with_defaults();
-        let error = verify_envelope(&instance_key(), &env, EMPTY_SHA256, &reg)
+        let error = verify_envelope(&ring(), &env, EMPTY_SHA256, &reg)
             .expect_err("a corrupted signature must not verify");
         assert_eq!(error.status(), VerificationStatus::Mismatch);
     }
@@ -463,7 +492,7 @@ mod tests {
         let mut env = sign_statement(&instance_key(), &sample_statement()).unwrap();
         env.signatures[0].keyid = "deadbeef".to_string();
         let reg = VerifierRegistry::with_defaults();
-        let error = verify_envelope(&instance_key(), &env, EMPTY_SHA256, &reg)
+        let error = verify_envelope(&ring(), &env, EMPTY_SHA256, &reg)
             .expect_err("a signature advertising a foreign kid must not verify");
         // This instance holds no key that signed it, so it has no verdict to
         // give about the bytes.
@@ -484,7 +513,7 @@ mod tests {
         );
         let env = sign_statement(&instance_key(), &statement).unwrap();
         let reg = VerifierRegistry::with_defaults();
-        let error = verify_envelope(&instance_key(), &env, EMPTY_SHA256, &reg)
+        let error = verify_envelope(&ring(), &env, EMPTY_SHA256, &reg)
             .expect_err("an unregistered predicate type is still not verified");
         assert_eq!(
             error.status(),
@@ -507,7 +536,7 @@ mod tests {
         );
         let env = sign_statement(&instance_key(), &statement).unwrap();
         let reg = VerifierRegistry::with_defaults();
-        let error = verify_envelope(&instance_key(), &env, EMPTY_SHA256, &reg)
+        let error = verify_envelope(&ring(), &env, EMPTY_SHA256, &reg)
             .expect_err("an empty builder.id must not verify");
         assert_eq!(error.status(), VerificationStatus::Undeterminable);
     }
@@ -522,7 +551,7 @@ mod tests {
         wrong_type.payload_type = "application/vnd.something+json".to_string();
         let reg = VerifierRegistry::with_defaults();
         assert_eq!(
-            verify_envelope(&instance_key(), &wrong_type, EMPTY_SHA256, &reg)
+            verify_envelope(&ring(), &wrong_type, EMPTY_SHA256, &reg)
                 .expect_err("a foreign payloadType must not verify")
                 .status(),
             VerificationStatus::Undeterminable
@@ -531,7 +560,7 @@ mod tests {
         let mut undecodable = signed;
         undecodable.payload = "not-base64!!".to_string();
         assert_eq!(
-            verify_envelope(&instance_key(), &undecodable, EMPTY_SHA256, &reg)
+            verify_envelope(&ring(), &undecodable, EMPTY_SHA256, &reg)
                 .expect_err("an undecodable payload must not verify")
                 .status(),
             VerificationStatus::Undeterminable
@@ -557,7 +586,7 @@ mod tests {
         )
         .unwrap();
         let reg = VerifierRegistry::with_defaults();
-        let v = verify_envelope(&instance_key(), &env, EMPTY_SHA256, &reg).unwrap();
+        let v = verify_envelope(&ring(), &env, EMPTY_SHA256, &reg).unwrap();
         // New attestations are issued under the Plombir type, never the
         // pre-rename one (card_f835b97ca951).
         assert_eq!(

@@ -65,11 +65,13 @@ const ONLINE_POOL_COMMANDS = [
     sites: 4,
     commands: [
       'plombir-git rotate-instance-key',
+      'plombir-git revoke-instance-key',
+      'plombir-git instance-key-status',
       'plombir-git create-admin',
       'plombir-git index-repo',
       'plombir-git reset-mfa',
     ],
-    why: 'two write a single row through one statement (the signing key; the administrator account, which has to land while the server is up so the operator can sign in); the others run exactly what `POST /repos/{owner}/{repo}/ai/index` and `POST /admin/users/{id}/mfa/reset` run on request',
+    why: 'the instance-key commands share one opener and write a few key rows in one short transaction; create-admin writes a single row (the administrator account, which has to land while the server is up so the operator can sign in); the others run exactly what `POST /repos/{owner}/{repo}/ai/index` and `POST /admin/users/{id}/mfa/reset` run on request',
   },
   {
     file: 'crates/rg-cli/src/admin.rs',

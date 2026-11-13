@@ -285,87 +285,159 @@ fn read_line_without_echo() -> anyhow::Result<String> {
     Ok(line.trim_end_matches(['\r', '\n']).to_owned())
 }
 
-/// `plombir-git rotate-instance-key` — replace this instance's provenance
-/// signing key.
+/// Open the database for an instance-key command and prove the configured
+/// encryption key opens it.
 ///
-/// The deliberate, destructive counterpart to the key's whole point. Since
-/// card_3aecf3708ebe the Ed25519 identity that signs release attestations and
-/// backs the CI OIDC JWKS is stored rather than derived from `jwt_secret`, so
-/// rotating the signing secret no longer touches it — which also means a
-/// *leaked* instance key has no other way out. This is that way out, and it is
-/// explicit because everything the old key signed stops verifying.
-pub(crate) async fn cmd_rotate_instance_key(
+/// An ordinary pool, unlike `rotate-encryption-key`: each command writes a
+/// handful of rows in one short transaction, so it holds SQLite's write lock
+/// for a moment, not for a whole-database pass (card_74c8b8754e97). And it
+/// has to work against a running server — that is where a compromised key is
+/// rotated.
+async fn open_instance_key_db(
+    command: &'static str,
     db_url: Option<String>,
     cfg: Option<&config::ConfigFile>,
     jwt_secret: Option<String>,
     encryption_key: Option<String>,
-    yes: bool,
-) -> anyhow::Result<()> {
-    init_cli_logging();
-
+) -> anyhow::Result<(rg_db::DatabaseConnection, String)> {
     let db_url = config::resolve_db_url(db_url, cfg);
     let key_file = config::resolve_encryption_key_file(
         cfg,
         cfg.and_then(|config| config.server.host_key.as_deref()),
     );
-    let resolved_encryption_key =
+    let encryption_key =
         crate::serve::resolve_auth_secrets(cfg, jwt_secret, encryption_key, &key_file)?
             .encryption_key;
+    let db = dbconn::connect_online(&db_url, command, dbconn::OnlineAccess::SingleRowWrite).await?;
+    rg_core::auth::key_check::verify_encryption_key(&db, &encryption_key).await?;
+    Ok((db, encryption_key))
+}
 
-    // Stays on the ordinary pool, unlike its `rotate-encryption-key` neighbour,
-    // and the difference is measured rather than assumed: `instance_key::rotate`
-    // writes a single row through `instance_signing_key_ops::replace`, so it
-    // holds SQLite's write lock for one statement. That is an ordinary write,
-    // not a whole-database pass, and demanding a stopped server for it would be
-    // a contract with nothing behind it (card_74c8b8754e97).
-    let db = dbconn::connect_online(
-        &db_url,
+fn describe_instance_key(key: &rg_core::auth::instance_key::PublicKey) -> String {
+    let mut line = format!(
+        "{}  {}  {}  created {}",
+        key.kid,
+        key.status.as_str(),
+        key.origin.as_str(),
+        key.created_at.to_rfc3339()
+    );
+    if let Some(at) = key.retired_at {
+        line.push_str(&format!("  retired {}", at.to_rfc3339()));
+    }
+    if let Some(at) = key.revoked_at {
+        line.push_str(&format!("  revoked {}", at.to_rfc3339()));
+    }
+    line
+}
+
+/// `plombir-git rotate-instance-key --reason routine|compromised --yes`.
+///
+/// Replaces the active signing key. A running server picks the new key up
+/// within `instance_key::CACHE_TTL`; no restart.
+pub(crate) async fn cmd_rotate_instance_key(
+    db_url: Option<String>,
+    cfg: Option<&config::ConfigFile>,
+    jwt_secret: Option<String>,
+    encryption_key: Option<String>,
+    reason: crate::cli::InstanceKeyRotationReason,
+    yes: bool,
+) -> anyhow::Result<()> {
+    use rg_core::auth::instance_key::RotationReason;
+    init_cli_logging();
+    let (db, encryption_key) = open_instance_key_db(
         "plombir-git rotate-instance-key",
-        dbconn::OnlineAccess::SingleRowWrite,
+        db_url,
+        cfg,
+        jwt_secret,
+        encryption_key,
     )
     .await?;
-    rg_core::auth::key_check::verify_encryption_key(&db, &resolved_encryption_key).await?;
-    let current = rg_db::ops::instance_signing_key_ops::find(&db)
-        .await
-        .context("read the current instance signing key")?;
+    let reason = match reason {
+        crate::cli::InstanceKeyRotationReason::Routine => RotationReason::Routine,
+        crate::cli::InstanceKeyRotationReason::Compromised => RotationReason::Compromised,
+    };
 
     if !yes {
-        // Both dates, because they answer different questions and only one of
-        // them was ever shown. `created_at` dates the identity this instance has
-        // had since it first signed anything; `rotated_at` says whether that
-        // identity has already been replaced once — which is exactly what an
-        // operator standing in front of an irreversible rotation needs to know,
-        // and the reason the column exists at all (card_b70de2169bd6).
-        let established = match current.as_ref() {
-            Some(row) => {
-                let rotated = match row.rotated_at {
-                    Some(rotated_at) => {
-                        format!("last rotated {}", rotated_at.to_rfc3339())
-                    }
-                    None => "never rotated".to_string(),
-                };
-                format!("established {}, {rotated}", row.created_at.to_rfc3339())
+        let ring = rg_core::auth::instance_key::load(&db, &encryption_key).await?;
+        let current = ring
+            .find(ring.active().kid())
+            .map(describe_instance_key)
+            .unwrap_or_default();
+        let effect = match reason {
+            RotationReason::Routine => {
+                "The current key is retired: what it signed keeps verifying on this server, and \
+                 it stays in /api/v1/ci/oidc/jwks for 10 minutes so CI tokens it signed can \
+                 still be checked."
             }
-            None => "not established yet".to_string(),
+            RotationReason::Compromised => {
+                "The current key is revoked: it leaves /api/v1/ci/oidc/jwks at once and every \
+                 attestation it signed is reported as signed by a revoked key. Ask relying \
+                 parties to refetch the JWKS."
+            }
         };
         anyhow::bail!(
-            "refusing to rotate the instance signing key without --yes ({established}).\n\
+            "refusing to rotate the instance signing key without --yes.\n\
              \n\
-             Rotating mints a new Ed25519 identity for this instance. Every release \
-             attestation signed with the current key stops verifying — permanently, for \
-             everyone — and every external verifier that fetched /api/v1/ci/oidc/jwks has to \
-             refetch it. Do this when the key itself is compromised, not to recover from a \
-             rotated jwt_secret: the signing secret and this key have been independent since \
-             card_3aecf3708ebe."
+             Current key: {current}\n\
+             \n\
+             {effect} A new random key signs from then on; a running server switches within \
+             30 seconds."
         );
     }
 
-    let rotated = rg_core::auth::instance_key::rotate(&db, &resolved_encryption_key).await?;
-    println!("{}", rotated.kid());
+    let rotation = rg_core::auth::instance_key::rotate(&db, &encryption_key, reason).await?;
+    println!("{}", rotation.key.kid());
     tracing::warn!(
-        kid = %rotated.kid(),
-        "instance signing key rotated; previously signed attestations no longer verify"
+        previous_kid = %rotation.previous_kid,
+        kid = %rotation.key.kid(),
+        reason = ?reason,
+        "instance signing key rotated; running servers switch within 30 seconds"
     );
+    Ok(())
+}
+
+/// `plombir-git revoke-instance-key <kid>` — revoke a retired key.
+pub(crate) async fn cmd_revoke_instance_key(
+    kid: String,
+    db_url: Option<String>,
+    cfg: Option<&config::ConfigFile>,
+    jwt_secret: Option<String>,
+    encryption_key: Option<String>,
+) -> anyhow::Result<()> {
+    init_cli_logging();
+    let (db, encryption_key) = open_instance_key_db(
+        "plombir-git revoke-instance-key",
+        db_url,
+        cfg,
+        jwt_secret,
+        encryption_key,
+    )
+    .await?;
+    rg_core::auth::instance_key::revoke(&db, &encryption_key, &kid).await?;
+    println!("{kid} revoked");
+    Ok(())
+}
+
+/// `plombir-git instance-key-status` — every key with its status and origin.
+pub(crate) async fn cmd_instance_key_status(
+    db_url: Option<String>,
+    cfg: Option<&config::ConfigFile>,
+    jwt_secret: Option<String>,
+    encryption_key: Option<String>,
+) -> anyhow::Result<()> {
+    init_cli_logging();
+    let (db, encryption_key) = open_instance_key_db(
+        "plombir-git instance-key-status",
+        db_url,
+        cfg,
+        jwt_secret,
+        encryption_key,
+    )
+    .await?;
+    let ring = rg_core::auth::instance_key::load(&db, &encryption_key).await?;
+    for key in ring.keys() {
+        println!("{}", describe_instance_key(key));
+    }
     Ok(())
 }
 
@@ -1320,7 +1392,8 @@ fn human_bytes(bytes: u64) -> String {
 mod tests {
     use super::{
         build_package_publish_client, cmd_list_tombstones, cmd_migrate, cmd_package,
-        cmd_rotate_instance_key, human_bytes, require_confidential_package_server,
+        cmd_revoke_instance_key, cmd_rotate_instance_key, human_bytes,
+        require_confidential_package_server,
     };
     use crate::cli::PackageCmd;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1871,28 +1944,31 @@ mod tests {
         .unwrap();
 
         let cfg = crate::config::load_optional_config_file(config_path.to_str()).unwrap();
-        let error = cmd_rotate_instance_key(None, cfg.as_ref(), None, None, true)
-            .await
-            .expect_err("the command must preflight the configured encryption key");
+        let error = cmd_rotate_instance_key(
+            None,
+            cfg.as_ref(),
+            None,
+            None,
+            crate::cli::InstanceKeyRotationReason::Compromised,
+            true,
+        )
+        .await
+        .expect_err("the command must preflight the configured encryption key");
         let message = format!("{error:#}");
         assert!(message.contains("check marker"), "{message}");
         assert!(
-            rg_db::ops::instance_signing_key_ops::find(&db)
+            rg_db::ops::instance_signing_key_ops::all(&db)
                 .await
                 .unwrap()
-                .is_none(),
+                .is_empty(),
             "the command must not write a new signing key after a failed preflight"
         );
     }
 
-    /// The refusal names the key's history, not just its age.
-    ///
-    /// card_b70de2169bd6: `rotated_at` was written by `instance_signing_key_ops::
-    /// replace` and read by nothing, so the one moment an operator is asked to
-    /// confirm an irreversible rotation was also the one moment the server knew
-    /// whether it had already rotated once and did not say.
+    /// Without `--yes` the refusal names the key that would go and what
+    /// happens to it, which differs between the two reasons.
     #[tokio::test]
-    async fn refusing_to_rotate_names_the_previous_rotation() {
+    async fn refusing_to_rotate_names_the_current_key_and_the_effect() {
         let dir = tempfile::tempdir().unwrap();
         let db_url =
             "sqlite://file:rotate-instance-key-history?mode=memory&cache=shared".to_string();
@@ -1919,39 +1995,51 @@ mod tests {
         )
         .unwrap();
         let config = crate::config::load_optional_config_file(config_path.to_str()).unwrap();
+        let ring =
+            rg_core::auth::instance_key::establish(&db, "a-sufficiently-long-jwt-secret", key)
+                .await
+                .unwrap();
+        let active = ring.active().kid().to_owned();
 
-        // A key that exists and has never been replaced.
-        rg_core::auth::instance_key::load_or_adopt(&db, "a-sufficiently-long-jwt-secret", key)
+        use crate::cli::InstanceKeyRotationReason::{Compromised, Routine};
+        for (reason, effect) in [(Routine, "retired"), (Compromised, "revoked")] {
+            let message = format!(
+                "{:#}",
+                cmd_rotate_instance_key(None, config.as_ref(), None, None, reason, false)
+                    .await
+                    .expect_err("rotating without --yes must refuse")
+            );
+            assert!(message.contains(&active), "{message}");
+            assert!(message.contains(effect), "{message}");
+        }
+
+        cmd_rotate_instance_key(None, config.as_ref(), None, None, Routine, true)
             .await
             .unwrap();
-        let message = format!(
-            "{:#}",
-            cmd_rotate_instance_key(None, config.as_ref(), None, None, false)
-                .await
-                .expect_err("rotating without --yes must refuse")
-        );
-        assert!(
-            message.contains("never rotated"),
-            "a key that has never been replaced must say so: {message}"
-        );
+        let after = rg_core::auth::instance_key::load(&db, key).await.unwrap();
+        assert_ne!(after.active().kid(), active);
 
-        // And after a real rotation the refusal carries the instant it happened.
-        rg_core::auth::instance_key::rotate(&db, key).await.unwrap();
-        let rotated_at = rg_db::ops::instance_signing_key_ops::find(&db)
-            .await
-            .unwrap()
-            .expect("the rotated key row")
-            .rotated_at
-            .expect("a rotation stamps `rotated_at`");
-        let message = format!(
+        // The new active key cannot be revoked in place; the old one can.
+        let refusal = format!(
             "{:#}",
-            cmd_rotate_instance_key(None, config.as_ref(), None, None, false)
-                .await
-                .expect_err("rotating without --yes must refuse")
+            cmd_revoke_instance_key(
+                after.active().kid().to_owned(),
+                None,
+                config.as_ref(),
+                None,
+                None
+            )
+            .await
+            .expect_err("the active key must not be revoked without a replacement")
         );
-        assert!(
-            message.contains(&format!("last rotated {}", rotated_at.to_rfc3339())),
-            "the refusal must name when the key was last replaced: {message}"
+        assert!(refusal.contains("--reason compromised"), "{refusal}");
+        cmd_revoke_instance_key(active.clone(), None, config.as_ref(), None, None)
+            .await
+            .unwrap();
+        let after = rg_core::auth::instance_key::load(&db, key).await.unwrap();
+        assert_eq!(
+            after.find(&active).unwrap().status,
+            rg_core::auth::instance_key::KeyStatus::Revoked
         );
     }
 
