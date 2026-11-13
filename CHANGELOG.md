@@ -6,6 +6,12 @@ This project records user-facing changes here. The format follows
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-13
+
+Read the [v0.4.3 upgrade notes](docs/releases/v0.4.3.md) before deploying: the
+instance signing key changes on the first start when it was derived from
+`jwt_secret`, and the two new migrations make a rollback a restore from backup.
+
 ### Security
 
 - Record only the origin (`scheme://host[:port]`, without userinfo) and the
@@ -1192,7 +1198,8 @@ See the [v0.1.1 release notes](docs/releases/v0.1.1.md) for upgrade and
 rollback guidance. Publication of a release does not establish that a registry
 package is publicly accessible.
 
-[Unreleased]: https://github.com/Nettechnologys/plombir-git/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/Nettechnologys/plombir-git/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.4.3
 [0.4.2]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.4.2
 [0.4.1]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.4.1
 [0.4.0]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.4.0
