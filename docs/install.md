@@ -266,6 +266,10 @@ UPDATE instance_signing_keys
  WHERE status = 'active';
 ```
 
+Timestamps are stored in UTC. On PostgreSQL with a session time zone other
+than UTC, write `CURRENT_TIMESTAMP AT TIME ZONE 'UTC'` instead; otherwise only
+how long the retired key stays in the JWKS shifts by the zone offset.
+
 ### Create a repository and clone it
 
 Back in the first terminal, register a local test user, create a repository

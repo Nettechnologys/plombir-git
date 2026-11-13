@@ -122,7 +122,9 @@ async fn exercise(db: &DatabaseConnection) {
     assert!(refused(insert("active", "1", "'sealed-x'", "aaaaaaaaaaaaaaaa")).await);
     // An active status without the slot, a slot without the active status.
     assert!(refused(insert("active", "NULL", "'sealed-x'", "aaaaaaaaaaaaaaab")).await);
-    assert!(refused(insert("retired", "1", "NULL", "aaaaaaaaaaaaaaac")).await);
+    // Slot 2, not 1: with 1 the unique index would refuse it before the CHECK
+    // is ever asked.
+    assert!(refused(insert("retired", "2", "NULL", "aaaaaaaaaaaaaaac")).await);
     // A retired key that kept its private half.
     assert!(refused(insert("retired", "NULL", "'sealed-x'", "aaaaaaaaaaaaaaad")).await);
     // An unknown status.

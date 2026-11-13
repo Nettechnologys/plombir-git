@@ -494,7 +494,8 @@ async fn server_instance_key_lifecycle_holds_on_a_server_database() {
     );
     for (status, slot, seed, origin) in [
         ("active", "NULL", "'sealed'", "generated"),
-        ("retired", "1", "NULL", "generated"),
+        // Slot 2: slot 1 is taken, so 1 would test the unique index instead.
+        ("retired", "2", "NULL", "generated"),
         ("retired", "NULL", "'sealed'", "generated"),
         ("paused", "NULL", "NULL", "generated"),
         ("retired", "NULL", "NULL", "imported"),

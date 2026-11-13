@@ -1140,7 +1140,9 @@ const AFTER: &str = "after";
             "--email",
             "alice@example.com",
         ],
-        &["plombir-git", "rotate-instance-key"],
+        &["plombir-git", "rotate-instance-key", "--reason", "routine"],
+        &["plombir-git", "revoke-instance-key", "0123456789abcdef"],
+        &["plombir-git", "instance-key-status"],
         &[
             "plombir-git",
             "rotate-encryption-key",
