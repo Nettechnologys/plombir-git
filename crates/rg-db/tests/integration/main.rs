@@ -51,3 +51,4 @@ mod webauthn_ceremony_single_use;
 mod write_pool_readers;
 
 mod notification_channels_schema;
+mod notification_due_order;
