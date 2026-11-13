@@ -884,6 +884,7 @@ async fn deactivating_an_account_revokes_its_unexpired_oci_token() {
         "the token never granted a push, so it failing later would prove nothing"
     );
 
+    crate::common::standby_administrator(&db).await;
     rg_db::ops::user_ops::update_by_id(&db, owner_id, None, None, None, Some(false))
         .await
         .expect("deactivate user")

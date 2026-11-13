@@ -61,6 +61,19 @@ This project records user-facing changes here. The format follows
   repository, or outside a repository that became private. Such a vote still
   counted while the approver stayed on the allow-list, and could complete the
   threshold that releases the deployment.
+- Record `PATCH /admin/settings` in the audit log (`admin.update_settings`,
+  with the values before and after) and notify every administrator when
+  maintenance mode or the banner changes; the notice does not include the
+  banner text. An administrator, or anyone holding an administrator's token,
+  could switch maintenance mode or show a banner to every user without a trace.
+- Let credentials be revoked while maintenance mode is on: personal and bot
+  tokens, SSH and deploy keys, and signing out everywhere. Maintenance mode
+  refused these requests, so a leaked token kept working until it ended.
+- Refuse with `409` a change that would leave the instance without an active
+  administrator: demoting or deactivating the last one through
+  `PATCH /admin/users/{id}`, or deleting their account — also when two such
+  changes race. The way back from no usable administrator remains
+  `plombir-git create-admin` on the host.
 
 ## [0.4.2] - 2026-11-11
 

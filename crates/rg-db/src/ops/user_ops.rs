@@ -6,6 +6,80 @@ use sea_orm::*;
 
 use crate::entities::user::{self, ActiveModel, Entity as UserEntity, Model as User};
 
+/// The change would leave the instance without an open administrator account
+/// (card_e49592b4fd03). Typed, so a caller maps it to a conflict rather than
+/// matching text.
+#[derive(Debug)]
+pub struct LastAdministrator;
+
+impl std::fmt::Display for LastAdministrator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the instance would be left without an active administrator")
+    }
+}
+
+impl std::error::Error for LastAdministrator {}
+
+/// Lock the open administrator accounts and touch `target`, and return the
+/// administrators as locked.
+///
+/// Every write that can take an administrator out of that set goes through
+/// here first, so two of them — two administrators demoting each other, one
+/// deleting the other — run one after the other and the second sees the first.
+/// The order differs by backend on purpose. PostgreSQL and MySQL lock the set
+/// first, ordered by id, so two such writes cannot deadlock on each other's
+/// target. SQLite has no row locks (SeaQuery omits `FOR UPDATE`) and serializes
+/// writers instead, but only from a transaction's first write. So there the
+/// touch comes first and the read happens under the write lock. With the read
+/// first, both would read "two administrators"; the loser would then be refused
+/// at its write with `SQLITE_BUSY_SNAPSHOT` and saved only by the callers'
+/// `retry_transaction` — the race test stays green that way too, so this order
+/// is what keeps the guarantee from resting on the retry.
+///
+/// The set is "open" as everywhere else: administrator, active, not being
+/// retired, not a bot. A locked-out administrator still counts; the lock is
+/// temporary and an administrator can lift it.
+async fn lock_administrators_and_touch(
+    transaction: &DatabaseTransaction,
+    target: i64,
+) -> Result<Vec<i64>> {
+    let lock = || {
+        UserEntity::find()
+            .select_only()
+            .column(user::Column::Id)
+            .filter(user::Column::IsAdmin.eq(true))
+            .filter(user::Column::IsActive.eq(true))
+            .filter(user::Column::DeletedAt.is_null())
+            .filter(user::Column::BotOwnerId.is_null())
+            .order_by_asc(user::Column::Id)
+            .lock_exclusive()
+            .into_tuple::<i64>()
+            .all(transaction)
+    };
+    let touch = || {
+        UserEntity::update_many()
+            .col_expr(
+                user::Column::SessionVersion,
+                Expr::col(user::Column::SessionVersion).into(),
+            )
+            .filter(user::Column::Id.eq(target))
+            .exec(transaction)
+    };
+    if transaction.get_database_backend() == DbBackend::Sqlite {
+        touch().await.context("db: touch the account")?;
+        lock().await.context("db: read administrators")
+    } else {
+        let administrators = lock().await.context("db: lock administrators")?;
+        touch().await.context("db: touch the account")?;
+        Ok(administrators)
+    }
+}
+
+/// Whether `target`, about to stop being an open administrator, is the last.
+fn is_last_administrator(administrators: &[i64], target: i64) -> bool {
+    administrators.len() == 1 && administrators[0] == target
+}
+
 /// Find a user by username, exactly as spelled.
 ///
 /// The comparison is the backend's own: case-sensitive on SQLite and
@@ -60,8 +134,21 @@ pub async fn find_active_by_username(
 /// the account is already being retired by somebody else (or is already gone),
 /// so this caller does not own the deletion and must not start retiring storage
 /// a concurrent deleter is also retiring.
+///
+/// Refused with [`LastAdministrator`] when the account is the instance's last
+/// open administrator, decided under the lock every demotion takes too.
 pub async fn begin_user_retirement(db: &DatabaseConnection, id: i64) -> Result<bool> {
+    crate::contention::retry_transaction("begin user retirement", || claim_user_retirement(db, id))
+        .await
+}
+
+async fn claim_user_retirement(db: &DatabaseConnection, id: i64) -> Result<bool> {
     let txn = db.begin().await?;
+    let administrators = lock_administrators_and_touch(&txn, id).await?;
+    if is_last_administrator(&administrators, id) {
+        txn.rollback().await?;
+        return Err(LastAdministrator.into());
+    }
     let now = chrono::Utc::now();
     let result = UserEntity::update_many()
         .col_expr(user::Column::DeletedAt, Expr::value(Some(now)))
@@ -309,6 +396,9 @@ pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<User>
 /// same retryable transaction so a later retirement cannot turn a committed
 /// admin update into a false 404, and it also distinguishes a MySQL no-op update
 /// from an absent row.
+///
+/// Refused with [`LastAdministrator`] when it would demote or deactivate the
+/// instance's last open administrator, the account itself included.
 pub async fn update_by_id(
     db: &DatabaseConnection,
     id: i64,
@@ -321,16 +411,24 @@ pub async fn update_by_id(
     let bio = &bio;
     let is_admin = &is_admin;
     let is_active = &is_active;
+    // Only a change that can take an administrator out of the open set waits
+    // for the others; a display-name edit does not serialize behind them.
+    let removes_authority = *is_admin == Some(false) || *is_active == Some(false);
     crate::contention::retry_transaction("admin user update", || async move {
         let transaction = db.begin().await.context("db: begin admin user update")?;
-        UserEntity::update_many()
-            .col_expr(
-                user::Column::SessionVersion,
-                Expr::col(user::Column::SessionVersion).into(),
-            )
-            .filter(user::Column::Id.eq(id))
-            .exec(&transaction)
-            .await?;
+        let administrators = if removes_authority {
+            Some(lock_administrators_and_touch(&transaction, id).await?)
+        } else {
+            UserEntity::update_many()
+                .col_expr(
+                    user::Column::SessionVersion,
+                    Expr::col(user::Column::SessionVersion).into(),
+                )
+                .filter(user::Column::Id.eq(id))
+                .exec(&transaction)
+                .await?;
+            None
+        };
         let previous = UserEntity::find_by_id(id).one(&transaction).await?;
         let result: Result<Option<User>> = async {
             let mut update = UserEntity::update_many();
@@ -377,6 +475,21 @@ pub async fn update_by_id(
             open_user_after_update(&transaction, id, rows_affected, "admin user update").await
         }
         .await;
+        // Decided on the set as locked, not on a fresh COUNT: on MySQL a plain
+        // read later in this transaction may still see its older snapshot.
+        let result = result.and_then(|updated| {
+            let stays_open = updated
+                .as_ref()
+                .is_none_or(|current| current.is_admin && current.is_active);
+            match &administrators {
+                Some(administrators)
+                    if is_last_administrator(administrators, id) && !stays_open =>
+                {
+                    Err(LastAdministrator.into())
+                }
+                _ => Ok(updated),
+            }
+        });
         match result {
             Ok(updated) => {
                 if let (Some(old), Some(current)) = (&previous, &updated) {

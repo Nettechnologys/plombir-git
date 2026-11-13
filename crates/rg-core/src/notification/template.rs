@@ -335,6 +335,12 @@ fn field_label(field: &str, locale: Locale) -> String {
             "Аккаунт разблокирован",
             "账户已解锁",
         ),
+        "instance_settings_changed" => translated(
+            locale,
+            "Maintenance mode or the site banner changed",
+            "Изменены режим обслуживания или баннер сайта",
+            "维护模式或站点横幅已更改",
+        ),
         "team_created" => translated(locale, "Team created", "Команда: создание", "团队：创建"),
         "team_updated" => translated(locale, "Team updated", "Команда: изменение", "团队：更改"),
         "team_deleted" => translated(locale, "Team deleted", "Команда: удаление", "团队：删除"),

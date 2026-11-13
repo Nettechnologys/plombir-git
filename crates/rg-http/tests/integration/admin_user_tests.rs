@@ -546,3 +546,55 @@ async fn admin_unlock_losing_to_retirement_or_delete_is_404_without_audit() {
         "a losing admin unlock queued a success notification"
     );
 }
+
+/// card_e49592b4fd03: the instance's last open administrator can neither demote
+/// nor deactivate themselves — the refusal is a 409 and changes nothing. With a
+/// second administrator, stepping down works.
+#[tokio::test]
+async fn the_last_administrator_cannot_step_down() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    // The first account on an empty instance is its administrator.
+    let (admin_token, admin_id) = register_full(&base, "lastadmin", "lastadmin@example.com").await;
+    let (_, other_id) = register_full(&base, "nextadmin", "nextadmin@example.com").await;
+    let patch = |id: i64, body: serde_json::Value| {
+        client
+            .patch(format!("{base}/api/v1/admin/users/{id}"))
+            .bearer_auth(&admin_token)
+            .json(&body)
+            .send()
+    };
+
+    for body in [
+        serde_json::json!({ "is_admin": false }),
+        serde_json::json!({ "is_active": false }),
+        serde_json::json!({ "is_admin": false, "is_active": false }),
+    ] {
+        let refused = patch(admin_id, body.clone()).await.unwrap();
+        let status = refused.status();
+        let text = refused.text().await.unwrap();
+        assert_eq!(status, 409, "{body}: {text}");
+        assert!(text.contains("only active administrator"), "{body}: {text}");
+    }
+    let row = rg_db::ops::user_ops::find_by_id(&db, admin_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.is_admin && row.is_active,
+        "a refused change changes nothing"
+    );
+
+    let promoted = patch(other_id, serde_json::json!({ "is_admin": true }))
+        .await
+        .unwrap();
+    assert_eq!(promoted.status(), 200);
+    let stepped_down = patch(admin_id, serde_json::json!({ "is_admin": false }))
+        .await
+        .unwrap();
+    assert_eq!(stepped_down.status(), 200);
+    assert_eq!(
+        stepped_down.json::<serde_json::Value>().await.unwrap()["is_admin"],
+        false
+    );
+}

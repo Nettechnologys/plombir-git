@@ -91,5 +91,27 @@ PATs are rejected on these writes regardless of scope; clients must not retry wi
 PAT or treat the refusal as success. Ordinary operations, CI variables and emergency
 credential revocation retain their existing role/scope contract.
 
+### Instance administration (0.4.3)
+
+`PATCH /admin/settings` keeps its contract: an instance administrator, an
+admin-scope PAT included. A change is now recorded in the audit log as
+`admin.update_settings` with the values before and after, and every
+administrator is notified that maintenance mode or the banner changed; the
+notice does not carry the banner text. A PATCH that changes nothing records
+nothing.
+
+While maintenance mode is on, a leaked credential can still be withdrawn:
+`DELETE /users/tokens/{id}`, `DELETE /users/bots/{bot}/tokens/{id}`,
+`DELETE /users/ssh-keys/{id}`, `DELETE /repos/{owner}/{name}/keys/{id}` and
+`POST /users/logout` (which ends every session of the caller) pass, with their
+usual authorization. Every other write, sign-in included, still answers `503`.
+
+`PATCH /admin/users/{id}` and account deletion answer `409` when they would
+leave the instance without an active administrator — an administrator account
+that is active, not being deleted and not a bot. That holds for two such
+requests at the same time as well. An administrator locked out after failed
+sign-ins still counts. If the only administrator is locked out or cannot sign
+in, run `plombir-git create-admin` on the host to promote or create another.
+
 Team membership creation now rejects a user who is not a current organization
 member with `400`; removal from the organization deletes its team grants atomically.

@@ -871,6 +871,38 @@ pub async fn register_full(base: &str, username: &str, email: &str) -> (String, 
     (token, body["id"].as_i64().unwrap())
 }
 
+/// One more open administrator, for a test that deactivates the account it
+/// registered first: that account is the instance's administrator, and the
+/// instance refuses to deactivate or demote its last one (card_e49592b4fd03).
+/// Written as plain rows — promoting through `update_by_id` would queue an
+/// authority notice the test never asked for.
+#[allow(dead_code)]
+pub async fn standby_administrator(db: &rg_db::DatabaseConnection) {
+    use rg_db::sea_orm::{ActiveModelTrait, Set};
+
+    let name = format!(
+        "standby{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let user = rg_db::ops::user_ops::create_user(
+        db,
+        &name,
+        &format!("{name}@example.invalid"),
+        "",
+        "Standby administrator",
+    )
+    .await
+    .expect("create a standby administrator");
+    rg_db::entities::user::ActiveModel {
+        id: Set(user.id),
+        is_admin: Set(true),
+        ..Default::default()
+    }
+    .update(db)
+    .await
+    .expect("make the standby account an administrator");
+}
+
 /// Create a repo and return its id.
 #[allow(dead_code)]
 pub async fn create_repo(base: &str, token: &str, name: &str) -> i64 {

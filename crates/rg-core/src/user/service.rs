@@ -1051,11 +1051,29 @@ pub async fn update_user_admin(
     // Absence crosses the rg-db boundary as a value; this layer can give it the
     // typed domain meaning that the HTTP error classifier maps to a safe 404.
     let Some(updated) =
-        user_ops::update_by_id(db, target_user_id, display_name, bio, is_admin, is_active).await?
+        user_ops::update_by_id(db, target_user_id, display_name, bio, is_admin, is_active)
+            .await
+            .map_err(last_administrator_is_a_conflict)?
     else {
         return Err(crate::error::not_found("user"));
     };
     Ok(updated.into())
+}
+
+/// [`user_ops::LastAdministrator`] as what it is to the caller: a state that
+/// refuses the request until somebody else is made an administrator.
+fn last_administrator_is_a_conflict(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<user_ops::LastAdministrator>()
+        .is_some()
+    {
+        crate::error::conflict(
+            "this is the instance's only active administrator; make someone else an \
+             administrator first",
+        )
+    } else {
+        error
+    }
 }
 
 /// Delete a user (admin only), together with the storage of every repository
@@ -1121,7 +1139,10 @@ pub async fn delete_user(
     // `DELETE FROM users` would then *destroy* that row through
     // `repositories.owner_id ON DELETE CASCADE`, leaving Git, blob, CI and
     // registry bytes with nothing naming them at all (card_da1abc6074ac).
-    if !user_ops::begin_user_retirement(db, user_id).await? {
+    if !user_ops::begin_user_retirement(db, user_id)
+        .await
+        .map_err(last_administrator_is_a_conflict)?
+    {
         return Err(crate::error::not_found("user"));
     }
 

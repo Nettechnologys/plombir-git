@@ -46,6 +46,7 @@ async fn reactivation_does_not_revive_sessions_from_before_deactivation() {
         .await
         .unwrap()
         .unwrap();
+    crate::common::standby_administrator(&db).await;
     let disabled = user_ops::update_by_id(&db, user_id, None, None, None, Some(false))
         .await
         .unwrap()

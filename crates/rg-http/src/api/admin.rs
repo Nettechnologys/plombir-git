@@ -176,6 +176,7 @@ pub async fn get_user(
         (status = 200, description = "Updated", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
         (status = 403, description = "Admin required, or a session outside its sudo window (`reason: sudo_required`)", body = serde_json::Value),
+        (status = 409, description = "The change would leave the instance without an active administrator", body = serde_json::Value),
     ),
 )]
 pub async fn update_user(
@@ -1648,9 +1649,16 @@ pub async fn get_settings(
 )]
 pub async fn update_settings(
     State(state): State<AppState>,
-    _admin: InstanceAdmin,
+    InstanceAdmin(current_id): InstanceAdmin,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // Resolved before the change, as in `update_user`: a database failure
+    // refuses the request rather than applying it with nobody to record.
+    let audit_actor = match rg_core::audit::AuditActor::resolve(&state.db, current_id).await {
+        Ok(actor) => actor,
+        Err(error) => return AppError::from(error).into_response(),
+    };
     let updated = state
         .instance_settings
         .update(&state.db, |s| {
@@ -1670,7 +1678,29 @@ pub async fn update_settings(
     // applied is how maintenance mode used to survive exactly until the next
     // restart, so the failure is surfaced instead.
     match updated {
-        Ok(settings) => (StatusCode::OK, Json(serde_json::json!(settings))).into_response(),
+        Ok(change) => {
+            // A PATCH that changed nothing has nothing to record. The banner is
+            // written whole: it is not a secret, and it is what an
+            // investigation of a misleading banner needs to see
+            // (card_e49592b4fd03).
+            if change.previous != change.current {
+                rg_core::audit::record(
+                    &state.db,
+                    &audit_actor,
+                    "admin.update_settings",
+                    Some("instance_settings"),
+                    None,
+                    None,
+                    Some(&headers),
+                    Some(serde_json::json!({
+                        "before": &change.previous,
+                        "after": &change.current,
+                    })),
+                )
+                .await;
+            }
+            (StatusCode::OK, Json(serde_json::json!(change.current))).into_response()
+        }
         Err(e) => {
             tracing::error!(error = %e, "failed to persist instance settings");
             AppError::internal("failed to persist instance settings").into_response()

@@ -21,6 +21,7 @@ mod issue_label_duplicates;
 mod job_assignment_race;
 mod job_liveness;
 mod job_log_chunks;
+mod last_administrator_guard;
 mod legacy_column_upgrade;
 mod mfa_backup_code_set_atomicity;
 mod mfa_backup_code_single_use;

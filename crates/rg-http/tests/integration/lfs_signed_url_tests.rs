@@ -496,6 +496,7 @@ async fn deactivating_an_account_revokes_its_outstanding_lfs_urls() {
         .unwrap();
     assert_eq!(before.status(), 200);
 
+    crate::common::standby_administrator(&db).await;
     rg_db::ops::user_ops::update_by_id(&db, owner_id, None, None, None, Some(false))
         .await
         .expect("deactivate user")
