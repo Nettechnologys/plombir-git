@@ -22,6 +22,10 @@ This project records user-facing changes here. The format follows
   seconds instead of signing with the old key until restart. Retired and
   revoked keys no longer keep their private seed in the database. The JWKS is
   served with `Cache-Control: public, max-age=300`.
+- Keep pending notifications, including the warning to a previous
+  destination, while an account deletion is in progress, and deliver them if
+  the deletion fails and is rolled back. They were cancelled when the deletion
+  began, so a deletion made to fail erased them while the account lived on.
 - Deliver security notifications ahead of activity. Queued notifications have
   a class: the account's own credentials and factors first, then security of
   shared resources, then activity. One recipient takes at most five rows of a

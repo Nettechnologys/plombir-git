@@ -107,6 +107,8 @@ pub struct Config<'a> {
 enum Prepared {
     Send(Target, template::Message),
     Stop(&'static str, &'static str),
+    /// Hand the row back untouched: its account began retiring after the claim.
+    Release,
 }
 
 fn decrypt(value: Option<&str>, key: &[u8; 32]) -> Option<String> {
@@ -118,13 +120,21 @@ async fn prepare(
     held: &notification_delivery::Model,
     config: &Config<'_>,
 ) -> Result<Prepared> {
-    let Some(user) = user::Entity::find_by_id(held.user_id)
-        .one(db)
-        .await?
-        .filter(|u| u.is_usable() && !u.is_bot())
-    else {
+    // In this order: a missing account or a bot has nobody to tell; an account
+    // whose retirement began keeps its rows for an aborted retirement; a
+    // deactivated account is closed by an administrator.
+    let Some(user) = user::Entity::find_by_id(held.user_id).one(db).await? else {
         return Ok(Prepared::Stop("cancelled", "account_unavailable"));
     };
+    if user.is_bot() {
+        return Ok(Prepared::Stop("cancelled", "account_unavailable"));
+    }
+    if user.deleted_at.is_some() {
+        return Ok(Prepared::Release);
+    }
+    if !user.is_active {
+        return Ok(Prepared::Stop("cancelled", "account_unavailable"));
+    }
     let Some(event) = Event::parse(&held.event_key) else {
         return Ok(Prepared::Stop("failed", "unknown_event"));
     };
@@ -335,7 +345,25 @@ pub async fn deliver_one(
     let Some(held) = queue::claim(db, id).await? else {
         return Ok(false);
     };
+    settle(db, held, config, sender).await
+}
+
+/// Prepare, send and record one row this worker holds the lease of.
+async fn settle(
+    db: &DatabaseConnection,
+    held: notification_delivery::Model,
+    config: &Config<'_>,
+    sender: &dyn Sender,
+) -> Result<bool> {
     match prepare(db, &held, config).await? {
+        Prepared::Release => {
+            queue::release(
+                db,
+                &held,
+                chrono::Utc::now() + chrono::Duration::seconds(60),
+            )
+            .await?
+        }
         Prepared::Stop(status, code) => queue::finish(db, &held, status, Some(code), None).await?,
         Prepared::Send(target, message) => match sender.send(&target, &message).await {
             Ok(()) => {

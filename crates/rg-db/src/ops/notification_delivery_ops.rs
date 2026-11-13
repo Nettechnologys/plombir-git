@@ -355,6 +355,21 @@ pub async fn test_allowed(db: &impl ConnectionTrait, user_id: i64, event: Event)
         .is_some())
 }
 
+/// Rows of an account whose retirement has begun are left alone: delivering
+/// would write to a closing account, cancelling would let a retirement that is
+/// then aborted erase a pending security warning. A completed retirement
+/// removes them with the account; an aborted one makes them due again.
+fn not_retiring() -> sea_orm::sea_query::SimpleExpr {
+    use sea_orm::sea_query::Query;
+    delivery::Column::UserId.not_in_subquery(
+        Query::select()
+            .column(user::Column::Id)
+            .from(user::Entity)
+            .and_where(user::Column::DeletedAt.is_not_null())
+            .to_owned(),
+    )
+}
+
 fn claimable(now: chrono::DateTime<chrono::Utc>) -> Condition {
     Condition::any()
         .add(delivery::Column::Status.eq("queued"))
@@ -382,6 +397,7 @@ pub async fn claim(db: &impl ConnectionTrait, id: i64) -> Result<Option<delivery
         )
         .filter(delivery::Column::Id.eq(id))
         .filter(claimable(now))
+        .filter(not_retiring())
         .filter(delivery::Column::NextAttemptAt.lte(now))
         .filter(delivery::Column::ExpiresAt.gt(now))
         .filter(delivery::Column::Attempts.lt(6))
@@ -442,6 +458,7 @@ fn due_now(class: i16, now: chrono::DateTime<chrono::Utc>) -> Condition {
     Condition::all()
         .add(delivery::Column::Priority.eq(class))
         .add(claimable(now))
+        .add(not_retiring())
         .add(delivery::Column::NextAttemptAt.lte(now))
         .add(delivery::Column::ExpiresAt.gt(now))
         .add(delivery::Column::Attempts.lt(6))
@@ -482,6 +499,10 @@ async fn due_per_recipient(
 }
 
 /// Lay out one page from the three classes' candidates.
+///
+/// Meant for `limit >= 2 * CLASS_FLOOR` (the dispatcher asks for 50): below
+/// that the floors of classes 1 and 2 take the whole page, and activity can
+/// come before security.
 fn allocate(limit: usize, account: Vec<i64>, shared: Vec<i64>, activity: Vec<i64>) -> Vec<i64> {
     let shared_floor = shared.len().min(CLASS_FLOOR);
     let activity_floor = activity.len().min(CLASS_FLOOR);
@@ -537,6 +558,40 @@ pub async fn finish(
         );
     }
     update
+        .filter(delivery::Column::Id.eq(held.id))
+        .filter(delivery::Column::LeaseToken.eq(lease))
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
+/// Hand a claimed row back untouched: its account began retiring after the
+/// claim. The attempt the claim counted is returned too, so retirements that
+/// start and abort around a pending warning cannot spend its six attempts.
+/// Compare-and-set on the lease, like [`finish`].
+pub async fn release(
+    db: &impl ConnectionTrait,
+    held: &delivery::Model,
+    retry_at: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let Some(lease) = held.lease_token.as_deref() else {
+        anyhow::bail!("notification delivery has no lease");
+    };
+    delivery::Entity::update_many()
+        .col_expr(delivery::Column::Status, Expr::value("queued"))
+        .col_expr(
+            delivery::Column::Attempts,
+            Expr::col(delivery::Column::Attempts).sub(1),
+        )
+        .col_expr(delivery::Column::NextAttemptAt, Expr::value(retry_at))
+        .col_expr(
+            delivery::Column::LeaseToken,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            delivery::Column::LeaseUntil,
+            Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+        )
         .filter(delivery::Column::Id.eq(held.id))
         .filter(delivery::Column::LeaseToken.eq(lease))
         .exec(db)
@@ -660,22 +715,6 @@ pub async fn confirm_telegram(
         .filter(profile::Column::UserId.eq(user_id))
         .filter(profile::Column::Generation.eq(generation))
         .filter(profile::Column::TelegramTokenEncrypted.is_not_null())
-        .exec(db)
-        .await?;
-    Ok(())
-}
-
-/// Account retirement must destroy retained destinations even while a worker
-/// is down. Logout/session revocation deliberately does not call this.
-pub async fn cancel_account(db: &impl ConnectionTrait, user_id: i64) -> Result<()> {
-    clear_payload(delivery::Entity::update_many())
-        .col_expr(delivery::Column::Status, Expr::value("cancelled"))
-        .col_expr(
-            delivery::Column::CompletedAt,
-            Expr::value(chrono::Utc::now()),
-        )
-        .filter(delivery::Column::UserId.eq(user_id))
-        .filter(delivery::Column::Status.is_in(["queued", "inflight"]))
         .exec(db)
         .await?;
     Ok(())

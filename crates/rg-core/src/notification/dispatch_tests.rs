@@ -939,3 +939,122 @@ async fn a_warning_arriving_mid_page_waits_for_at_most_one_activity_page() {
         "the warning waited behind {first_warning} activity sends"
     );
 }
+
+/// L28: rows of an account whose retirement has begun are neither sent nor
+/// cancelled; an aborted retirement delivers them.
+#[tokio::test]
+async fn a_retiring_account_keeps_its_rows_and_an_abort_delivers_them() {
+    let (db, user) = fixture().await;
+    let rows = enqueue(&db, user.id, Event::NewDevice).await;
+    assert!(rg_db::ops::user_ops::begin_user_retirement(&db, user.id)
+        .await
+        .unwrap());
+    let out = Recorder::default();
+    assert_eq!(pass(&db, &config(true), &out).await.unwrap(), 0);
+    assert!(out.sent.lock().unwrap().is_empty());
+    assert_eq!(status_of(&db, &rows).await, vec!["queued", "queued"]);
+
+    rg_db::ops::user_ops::abort_user_retirement(&db, user.id)
+        .await
+        .unwrap();
+    pass(&db, &config(true), &out).await.unwrap();
+    assert_eq!(status_of(&db, &rows).await, vec!["sent", "sent"]);
+}
+
+/// A retirement that begins between claim and send hands the row back with
+/// the attempt the claim counted, so retirements started and aborted around a
+/// warning cannot spend its six attempts.
+#[tokio::test]
+async fn a_row_claimed_before_retirement_is_handed_back_with_its_attempt() {
+    let (db, user) = fixture().await;
+    let row = enqueue(&db, user.id, Event::NewDevice).await.remove(0);
+    let held = queue::claim(&db, row.id).await.unwrap().expect("claimed");
+    assert_eq!(held.attempts, row.attempts + 1);
+    assert!(rg_db::ops::user_ops::begin_user_retirement(&db, user.id)
+        .await
+        .unwrap());
+
+    let before = chrono::Utc::now();
+    assert!(settle(&db, held, &config(true), &Recorder::default())
+        .await
+        .unwrap());
+    let back = notification_delivery::Entity::find_by_id(row.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(back.status, "queued");
+    assert_eq!(back.attempts, row.attempts);
+    assert!(back.lease_token.is_none());
+    assert!(back.next_attempt_at >= before + chrono::Duration::seconds(55));
+    assert!(back.next_attempt_at <= chrono::Utc::now() + chrono::Duration::seconds(65));
+}
+
+/// The other branches stay terminal: no account, a bot, a deactivated account.
+#[tokio::test]
+async fn missing_bot_and_deactivated_accounts_are_cancelled() {
+    let (db, user) = fixture().await;
+    let out = Recorder::default();
+
+    let deactivated = enqueue(&db, user.id, Event::NewDevice).await;
+    let mut account: user::ActiveModel = user::Entity::find_by_id(user.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .into();
+    account.is_active = Set(false);
+    account.update(&db).await.unwrap();
+    pass(&db, &config(true), &out).await.unwrap();
+    assert_eq!(
+        status_of(&db, &deactivated).await,
+        vec!["cancelled", "cancelled"]
+    );
+
+    let owner = second_user(&db, "bot-owner").await;
+    let bot = second_user(&db, "a-bot").await;
+    let to_bot = enqueue(&db, bot.id, Event::NewDevice).await;
+    let mut as_bot: user::ActiveModel = bot.clone().into();
+    as_bot.bot_owner_id = Set(Some(owner.id));
+    as_bot.update(&db).await.unwrap();
+    pass(&db, &config(true), &out).await.unwrap();
+    assert_eq!(status_of(&db, &to_bot).await, vec!["cancelled"]);
+
+    // An account row gone between claim and send (a race with the final
+    // delete, whose cascade then removes the row): stop it, there is nobody to
+    // tell. The held copy points at an id no account has; the outcome is
+    // written to the real row through its lease.
+    let gone = second_user(&db, "gone").await;
+    let orphan = enqueue(&db, gone.id, Event::NewDevice).await;
+    let mut held = queue::claim(&db, orphan[0].id)
+        .await
+        .unwrap()
+        .expect("claimed");
+    held.user_id = i64::MAX;
+    assert!(settle(&db, held, &config(true), &out).await.unwrap());
+    let stopped = notification_delivery::Entity::find_by_id(orphan[0].id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.status, "cancelled");
+    assert_eq!(stopped.last_error.as_deref(), Some("account_unavailable"));
+    assert!(out.sent.lock().unwrap().is_empty());
+}
+
+/// A completed deletion removes the account's rows, warnings included.
+#[tokio::test]
+async fn a_completed_deletion_removes_the_rows_with_the_account() {
+    use sea_orm::ConnectionTrait;
+    let (db, _) = fixture().await;
+    let leaving = second_user(&db, "leaving").await;
+    let rows = enqueue(&db, leaving.id, Event::NewDevice).await;
+    db.execute_unprepared(&format!("DELETE FROM users WHERE id = {}", leaving.id))
+        .await
+        .unwrap();
+    assert!(notification_delivery::Entity::find_by_id(rows[0].id)
+        .one(&db)
+        .await
+        .unwrap()
+        .is_none());
+}

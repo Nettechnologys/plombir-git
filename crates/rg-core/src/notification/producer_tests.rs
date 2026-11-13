@@ -438,7 +438,7 @@ async fn deploy_and_runner_credential_events_target_only_the_actor_and_keep_scop
 }
 
 #[tokio::test]
-async fn outbox_failure_rolls_back_credential_creation_and_retirement_erases_snapshots() {
+async fn outbox_failure_rolls_back_credential_creation_and_aborted_retirement_keeps_warnings() {
     let (db, user) = fixture().await;
     let ctx = super::settings::SaveContext {
         encryption_secret: "fixture-key",
@@ -484,16 +484,17 @@ async fn outbox_failure_rolls_back_credential_creation_and_retirement_erases_sna
             .unwrap(),
         1
     );
+    // L28: a retirement that is then aborted must not have erased the
+    // mandatory warning to the previous destination.
     assert!(user_ops::begin_user_retirement(&db, user.id).await.unwrap());
-    assert_eq!(
-        notification_delivery::Entity::find()
-            .filter(notification_delivery::Column::PreviousDestinationEncrypted.is_not_null())
-            .count(&db)
-            .await
-            .unwrap(),
-        0
-    );
     user_ops::abort_user_retirement(&db, user.id).await.unwrap();
+    let warning = notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::PreviousDestinationEncrypted.is_not_null())
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("the warning to the previous destination survives");
+    assert_eq!(warning.status, "queued");
     db.execute(Statement::from_string(
         DatabaseBackend::Sqlite,
         "DROP TABLE notification_deliveries".to_owned(),

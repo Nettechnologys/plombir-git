@@ -71,9 +71,11 @@ pub async fn begin_user_retirement(db: &DatabaseConnection, id: i64) -> Result<b
         .exec(&txn)
         .await
         .context("db: begin user retirement")?;
-    if result.rows_affected > 0 {
-        super::notification_delivery_ops::cancel_account(&txn, id).await?;
-    }
+    // Pending notifications stay queued: the dispatcher does not touch an
+    // account being retired, an aborted retirement delivers them, and a
+    // completed one removes them with the account (ON DELETE CASCADE).
+    // Cancelling here let a deletion that was made to fail erase a pending
+    // security warning while the account lived on.
     txn.commit().await?;
     Ok(result.rows_affected > 0)
 }
