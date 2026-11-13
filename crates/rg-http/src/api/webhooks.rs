@@ -86,6 +86,30 @@ impl From<rg_db::entities::webhook::Model> for WebhookResponse {
     }
 }
 
+/// The part of a webhook URL the audit log keeps: `scheme://host[:port]`,
+/// with a default port left out and no userinfo. The path and query are not
+/// kept because they can be the receiver's bearer secret (incoming-webhook
+/// URLs, `?token=`), and an audit row outlives the hook and goes into backups
+/// and exports. `None` when the URL does not parse.
+fn audit_origin(url: &str) -> Option<String> {
+    let uri: axum::http::Uri = url.trim().parse().ok()?;
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    // `host()` is the authority without userinfo; an IPv6 host keeps its
+    // brackets.
+    let host = uri.host()?.to_ascii_lowercase();
+    let default_port = matches!(
+        (scheme.as_str(), uri.port_u16()),
+        ("https", Some(443)) | ("http", Some(80))
+    );
+    Some(match uri.port_u16() {
+        Some(port) if !default_port => format!("{scheme}://{host}:{port}"),
+        _ => format!("{scheme}://{host}"),
+    })
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────
 
 /// List webhooks for a repo.
@@ -161,9 +185,10 @@ pub async fn create_webhook(
     {
         Ok(hook) => {
             // Where deliveries go, what they are sent for, and whether they
-            // carry a signature at all. Never the secret and never
-            // `secret_encrypted`: the ciphertext is the secret to anyone
-            // holding the instance key.
+            // carry a signature at all. Never the secret, never
+            // `secret_encrypted` (the ciphertext is the secret to anyone
+            // holding the instance key), and only the origin of the URL: its
+            // path or query can be the bearer secret of the receiver.
             record_grant(
                 &state,
                 &audit_actor,
@@ -172,7 +197,8 @@ pub async fn create_webhook(
                 &repo,
                 &headers,
                 serde_json::json!({
-                    "webhook_url": hook.url,
+                    "webhook_id": hook.id,
+                    "webhook_origin": audit_origin(&hook.url),
                     "events": hook.events,
                     "has_secret": hook.secret_encrypted.is_some(),
                 }),
@@ -269,7 +295,13 @@ pub async fn update_webhook(
                 &repo,
                 &headers,
                 serde_json::json!({
-                    "webhook_url": hook.url,
+                    "webhook_id": hook.id,
+                    "webhook_origin": audit_origin(&hook.url),
+                    // Moving deliveries elsewhere is what a review looks for.
+                    "url_changed": hook.url != existing.url,
+                    "previous_webhook_origin": (hook.url != existing.url)
+                        .then(|| audit_origin(&existing.url))
+                        .flatten(),
                     "events": hook.events,
                     "has_secret": hook.secret_encrypted.is_some(),
                     "secret": secret,
@@ -328,7 +360,8 @@ pub async fn delete_webhook(
                 &repo,
                 &headers,
                 serde_json::json!({
-                    "webhook_url": existing.url,
+                    "webhook_id": existing.id,
+                    "webhook_origin": audit_origin(&existing.url),
                     "events": existing.events,
                     "has_secret": existing.secret_encrypted.is_some(),
                 }),
@@ -461,7 +494,20 @@ async fn record_scope_change(
     action: &str,
     headers: &HeaderMap,
     hook: &rg_db::entities::webhook::Model,
+    previous: Option<&rg_db::entities::webhook::Model>,
 ) {
+    let mut details = serde_json::json!({
+        "webhook_id": hook.id,
+        "webhook_origin": audit_origin(&hook.url),
+        "events": hook.events,
+        "has_secret": hook.secret_encrypted.is_some(),
+    });
+    if let Some(previous) = previous {
+        let moved = previous.url != hook.url;
+        details["url_changed"] = moved.into();
+        details["previous_webhook_origin"] =
+            moved.then(|| audit_origin(&previous.url)).flatten().into();
+    }
     rg_core::audit::record(
         &state.db,
         actor,
@@ -470,12 +516,7 @@ async fn record_scope_change(
         Some(scope.id),
         Some(scope.name),
         Some(headers),
-        Some(serde_json::json!({
-            "webhook_id": hook.id,
-            "webhook_url": hook.url,
-            "events": hook.events,
-            "has_secret": hook.secret_encrypted.is_some(),
-        })),
+        Some(details),
     )
     .await;
 }
@@ -511,6 +552,7 @@ async fn create_scope(
                 "webhook.create",
                 headers,
                 &hook,
+                None,
             )
             .await;
             (StatusCode::CREATED, Json(WebhookResponse::from(hook))).into_response()
@@ -545,7 +587,16 @@ async fn update_scope(
     .await
     {
         Ok(hook) => {
-            record_scope_change(state, &actor, scope, "webhook.update", headers, &hook).await;
+            record_scope_change(
+                state,
+                &actor,
+                scope,
+                "webhook.update",
+                headers,
+                &hook,
+                Some(&existing),
+            )
+            .await;
             (StatusCode::OK, Json(WebhookResponse::from(hook))).into_response()
         }
         Err(error) => AppError::from(error).into_response(),
@@ -582,6 +633,7 @@ async fn delete_scope(
                 "webhook.delete",
                 headers,
                 &hook,
+                None,
             )
             .await;
             (
@@ -850,5 +902,44 @@ async fn delivery_in_webhook(
         Ok(Some(delivery)) if delivery.webhook_id == webhook_id => Ok(delivery),
         Ok(Some(_)) | Ok(None) => Err(AppError::not_found("delivery not found")),
         Err(e) => Err(AppError::from(e)),
+    }
+}
+
+#[cfg(test)]
+mod audit_origin_tests {
+    use super::audit_origin;
+
+    /// L31: the audit log keeps where deliveries go, never what in the URL can
+    /// be a credential.
+    #[test]
+    fn the_origin_drops_userinfo_path_query_and_default_ports() {
+        assert_eq!(
+            audit_origin("https://user:pass@hooks.example.com/services/T/B/SECRET?token=X")
+                .as_deref(),
+            Some("https://hooks.example.com")
+        );
+        assert_eq!(
+            audit_origin("https://hooks.example.com:443/a").as_deref(),
+            Some("https://hooks.example.com")
+        );
+        assert_eq!(
+            audit_origin("http://hooks.example.com:8080/a?b=c").as_deref(),
+            Some("http://hooks.example.com:8080")
+        );
+        assert_eq!(
+            audit_origin("https://[2001:db8::1]:8443/x").as_deref(),
+            Some("https://[2001:db8::1]:8443")
+        );
+        assert_eq!(audit_origin("not a url"), None);
+        assert_eq!(audit_origin("https:///no-host"), None);
+        assert_eq!(audit_origin("ftp://files.example.com/x"), None);
+        assert_eq!(
+            audit_origin("HTTPS://User:Pass@Hooks.Example.com:8443/T?token=X").as_deref(),
+            Some("https://hooks.example.com:8443")
+        );
+        assert_eq!(
+            audit_origin("http://[::1]/hook").as_deref(),
+            Some("http://[::1]")
+        );
     }
 }

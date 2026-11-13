@@ -8,6 +8,15 @@ This project records user-facing changes here. The format follows
 
 ### Security
 
+- Record only the origin (`scheme://host[:port]`, without userinfo) and the
+  id of a webhook in the audit log, plus `url_changed` and the previous origin
+  when an update moves it. The full URL was recorded, and its path or query can
+  be the receiver's bearer secret; administrators could read it in the audit
+  log without sudo, and it outlived the hook. Rows written before this release
+  still contain full URLs and are not rewritten; find them with
+  `SELECT id, action, created_at FROM audit_log WHERE details LIKE '%"webhook_url"%'`
+  and decide whether to redact them or rotate the receivers' secrets.
+
 - Tell every administrator when an administrator account is created through
   `POST /admin/users` or `plombir-git create-admin`, or when `create-admin`
   promotes an existing account. Only changes of an existing account's flag
