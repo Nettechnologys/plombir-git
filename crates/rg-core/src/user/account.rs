@@ -290,7 +290,7 @@ pub async fn promote_to_admin(
     expected_email: Option<&str>,
 ) -> Result<AdminBootstrap> {
     use rg_db::entities::user::{Column, Entity};
-    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, TransactionTrait};
 
     if user.deleted_at.is_some() {
         return Err(crate::error::conflict(format!(
@@ -323,6 +323,10 @@ pub async fn promote_to_admin(
         return Ok(AdminBootstrap::AlreadyAdmin);
     }
 
+    // The promotion and the notice to the other administrators commit
+    // together: a new administrator made from the host must not be silent
+    // (L25), and a failed notice must not leave a silent administrator.
+    let txn = db.begin().await.context("begin the promotion")?;
     let promoted = Entity::update_many()
         .col_expr(Column::IsAdmin, sea_orm::sea_query::Expr::value(true))
         .col_expr(
@@ -333,15 +337,23 @@ pub async fn promote_to_admin(
         .filter(Column::DeletedAt.is_null())
         .filter(Column::IsActive.eq(true))
         .filter(Column::BotOwnerId.is_null())
-        .exec(db)
+        .exec(&txn)
         .await
         .context("promote the account to instance admin")?;
     if promoted.rows_affected == 0 {
+        txn.rollback().await.ok();
         return Err(crate::error::conflict(format!(
             "the account '{}' changed while it was being promoted; look at it and run again",
             user.username
         )));
     }
+    rg_db::ops::security_notification_ops::system_event(
+        &txn,
+        "account_authority_changed",
+        Some(user.id),
+    )
+    .await?;
+    txn.commit().await.context("commit the promotion")?;
     Ok(AdminBootstrap::Promoted)
 }
 

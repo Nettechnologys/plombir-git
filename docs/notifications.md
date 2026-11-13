@@ -67,6 +67,11 @@ The notification panel adds eight individually selectable email/Telegram categor
 They cover collaborator grants/changes/removals and private copies, organization
 membership/teams, visibility/transfer/deletion, hook and mirror configuration,
 branch/tag protection, CI secrets/variables/environments, and administrator trust changes.
+An administrator trust change includes granting or revoking the administrator
+flag or deactivating an account, creating an administrator through the admin
+API or `plombir-git create-admin`, and promoting an existing account with
+`create-admin`. Every active administrator is told, the affected account
+included; on first-run bootstrap the new administrator is the only recipient.
 
 On upgrade, a missing new category defaults to email enabled. Its Telegram choice
 inherits the saved `notification_settings_changed` Telegram choice only for a

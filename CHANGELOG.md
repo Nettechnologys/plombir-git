@@ -8,6 +8,11 @@ This project records user-facing changes here. The format follows
 
 ### Security
 
+- Tell every administrator when an administrator account is created through
+  `POST /admin/users` or `plombir-git create-admin`, or when `create-admin`
+  promotes an existing account. Only changes of an existing account's flag
+  were announced; the CLI promotion now commits together with its notice.
+
 - Generate the instance signing key (release attestations, CI OIDC tokens and
   the JWKS) at random instead of adopting a key derived from `jwt_secret`.
   An instance upgraded with a derived key retires it on its first start: its

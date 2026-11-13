@@ -272,6 +272,18 @@ pub async fn list_users(
 pub async fn create(db: &DatabaseConnection, model: ActiveModel) -> Result<User> {
     let txn = db.begin().await?;
     let user = model.insert(&txn).await.context("db: create user")?;
+    // A new administrator is an instance trust change like a promotion: the
+    // other administrators hear of it, whether it came from the admin API, the
+    // CLI or the first-run bootstrap (where the only recipient is the new
+    // administrator).
+    if user.is_admin && !user.is_bot() {
+        super::security_notification_ops::system_event(
+            &txn,
+            "account_authority_changed",
+            Some(user.id),
+        )
+        .await?;
+    }
     if user.is_bot() {
         super::notification_delivery_ops::account_event(
             &txn,

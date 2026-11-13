@@ -1252,3 +1252,105 @@ async fn anonymous_account_proof_keeps_its_context_but_admin_action_hides_it_fro
     assert_eq!(foreign.ip, None);
     assert_eq!(foreign.device, None);
 }
+
+/// L25: a new administrator — created through the API or the CLI, or an
+/// existing account promoted from the CLI — is an instance trust change the
+/// other administrators hear of. Refused promotions and ordinary accounts are
+/// not.
+#[tokio::test]
+async fn creating_or_promoting_an_administrator_tells_the_other_administrators() {
+    let (db, admin) = fixture().await;
+    let mut promoted: user::ActiveModel = admin.clone().into();
+    promoted.is_admin = Set(true);
+    promoted.update(&db).await.unwrap();
+    let notices = |db: DatabaseConnection| async move {
+        notification_delivery::Entity::find()
+            .filter(notification_delivery::Column::UserId.eq(admin.id))
+            .filter(notification_delivery::Column::EventKey.eq("admin_security_changed"))
+            .count(&db)
+            .await
+            .unwrap()
+    };
+    let mut seen = notices(db.clone()).await;
+
+    crate::user::account::create_admin_account(
+        &db,
+        "second-admin",
+        "second@example.invalid",
+        "A-long-enough-Admin-passphrase-42",
+    )
+    .await
+    .unwrap();
+    let after = notices(db.clone()).await;
+    assert!(
+        after > seen,
+        "creating an administrator notifies the others"
+    );
+    seen = after;
+
+    user_ops::create_user(&db, "plain", "plain@example.invalid", "x", "Plain")
+        .await
+        .unwrap();
+    assert_eq!(
+        notices(db.clone()).await,
+        seen,
+        "an ordinary account is not"
+    );
+
+    let third = user_ops::create_user(&db, "third", "third@example.invalid", "x", "Third")
+        .await
+        .unwrap();
+    assert!(matches!(
+        crate::user::account::promote_to_admin(&db, third.clone(), None)
+            .await
+            .unwrap(),
+        crate::user::account::AdminBootstrap::Promoted
+    ));
+    let after = notices(db.clone()).await;
+    assert!(after > seen, "a CLI promotion notifies the others");
+    seen = after;
+
+    let again = user::Entity::find_by_id(third.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        crate::user::account::promote_to_admin(&db, again, None)
+            .await
+            .unwrap(),
+        crate::user::account::AdminBootstrap::AlreadyAdmin
+    ));
+    assert_eq!(notices(db.clone()).await, seen, "already an administrator");
+
+    let stranger = user_ops::create_user(&db, "stranger", "stranger@example.invalid", "x", "S")
+        .await
+        .unwrap();
+    assert!(crate::user::account::promote_to_admin(
+        &db,
+        stranger.clone(),
+        Some("someone-else@example.invalid")
+    )
+    .await
+    .is_err());
+    let mut inactive: user::ActiveModel = stranger.into();
+    inactive.is_active = Set(false);
+    let inactive = inactive.update(&db).await.unwrap();
+    assert!(crate::user::account::promote_to_admin(&db, inactive, None)
+        .await
+        .is_err());
+    let bot = user_ops::create_user(&db, "a-bot", "a-bot@example.invalid", "x", "B")
+        .await
+        .unwrap();
+    let mut as_bot: user::ActiveModel = bot.into();
+    as_bot.bot_owner_id = Set(Some(admin.id));
+    let bot = as_bot.update(&db).await.unwrap();
+    assert!(crate::user::account::promote_to_admin(&db, bot, None)
+        .await
+        .is_err());
+    assert_eq!(
+        notices(db.clone()).await,
+        seen,
+        "refused promotions notify nobody"
+    );
+}
