@@ -10,11 +10,12 @@
 //!   bytes are reproducible across languages (deterministic provenance).
 //! - **Signature**: Ed25519 over the [DSSE] Pre-Authentication Encoding (PAE),
 //!   which domain-separates the payload with its `payloadType` and length
-//!   prefixes. The signing key is the [instance
-//!   key](crate::auth::instance_key) — its public half is already served at
-//!   `/api/v1/ci/oidc/jwks`, so no new key has to be distributed to verifiers,
-//!   and it is stored rather than derived from `jwt_secret` so that rotating
-//!   the signing secret does not invalidate every envelope ever issued.
+//!   prefixes. The signing key is the active [instance
+//!   key](crate::auth::instance_key) — its public half is served at
+//!   `/api/v1/ci/oidc/jwks`, so no new key has to be distributed to verifiers.
+//!   After a rotation the old key leaves that document about 10 minutes later;
+//!   the server keeps verifying what it signed against the recorded public
+//!   half, and refuses a signature under a revoked key.
 //! - **Wrapper**: a [DSSE envelope](types::Envelope) stored detached from the
 //!   asset bytes.
 //! - **Verification**: signature + digest binding first, then a pluggable
@@ -266,14 +267,16 @@ pub fn verify_envelope(
             Err(_) => continue,
         };
         if known.verifying.verify(&msg, &signature).is_ok() {
-            verified = Some(known);
-            break;
+            // A signature under a revoked key decides the answer whatever
+            // order the signatures come in: an envelope a compromised key
+            // could have produced proves nothing, even next to a valid one.
+            if known.status == KeyStatus::Revoked {
+                return Err(VerifyError::revoked(known.kid.clone()));
+            }
+            verified = verified.or(Some(known));
         }
     }
     let keyid = match verified {
-        Some(known) if known.status == KeyStatus::Revoked => {
-            return Err(VerifyError::revoked(known.kid.clone()))
-        }
         Some(known) => known.kid.clone(),
         // Naming the gap is the difference between "your asset is suspect"
         // and "this instance never held the key that signed it" — the second
@@ -485,6 +488,40 @@ mod tests {
         let error = verify_envelope(&ring(), &env, EMPTY_SHA256, &reg)
             .expect_err("a corrupted signature must not verify");
         assert_eq!(error.status(), VerificationStatus::Mismatch);
+    }
+
+    #[test]
+    fn a_revoked_signature_wins_in_either_order() {
+        use crate::auth::instance_key::{KeyOrigin, PublicKey};
+        let revoked = InstanceKey::derived_from_secret("a-leaked-instance");
+        let active = instance_key();
+        let public = |key: &InstanceKey, status| PublicKey {
+            kid: key.kid().to_owned(),
+            verifying: key.verifying_key(),
+            status,
+            origin: KeyOrigin::Generated,
+            created_at: chrono::Utc::now(),
+            retired_at: None,
+            revoked_at: None,
+        };
+        let keys = KeyRing::from_parts(
+            active.clone(),
+            vec![
+                public(&revoked, KeyStatus::Revoked),
+                public(&active, KeyStatus::Active),
+            ],
+        );
+        let by_revoked = sign_statement(&revoked, &sample_statement()).unwrap();
+        let by_active = sign_statement(&active, &sample_statement()).unwrap();
+        let reg = VerifierRegistry::with_defaults();
+        for pair in [[&by_revoked, &by_active], [&by_active, &by_revoked]] {
+            let mut env = pair[0].clone();
+            env.signatures.extend(pair[1].signatures.iter().cloned());
+            let error = verify_envelope(&keys, &env, EMPTY_SHA256, &reg)
+                .expect_err("a signature under a revoked key must not verify");
+            assert_eq!(error.status(), VerificationStatus::Revoked);
+            assert_eq!(error.keyid(), Some(revoked.kid()));
+        }
     }
 
     #[test]

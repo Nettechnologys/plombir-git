@@ -15,7 +15,18 @@
 //!
 //! Every step is safe to repeat. MySQL commits DDL implicitly, so a crash between
 //! the CREATE, the copy, the DROP and the migration record must leave a state the
-//! next `up` completes rather than trips over.
+//! next `up` completes rather than trips over. One edge stays: if `up` stops
+//! after the copy, the operator goes back to a binary that still uses the old
+//! table and rotates the key there, and then upgrades again, the copy is not
+//! repeated (the new table is not empty) and the DROP discards the newer key.
+//! Rotate again after that upgrade.
+//!
+//! `down` carries the active key back to the singleton. The retired and revoked
+//! history is lost with the table: attestations those keys signed become
+//! signed by a key the instance never held.
+//!
+//! CHECK constraints spell out the row states the code relies on; MySQL
+//! enforces them from 8.0.16.
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::{ConnectionTrait, Statement};
 
@@ -97,6 +108,20 @@ impl MigrationTrait for Migration {
                     .col(timestamp("created_at").not_null())
                     .col(timestamp("retired_at").null())
                     .col(timestamp("revoked_at").null())
+                    .check(Expr::cust(
+                        "status IN ('active', 'retired', 'revoked') \
+                         AND origin IN ('generated', 'legacy_derived')",
+                    ))
+                    // The slot marks the active row and nothing else. Spelled
+                    // so that no branch can evaluate to NULL: a CHECK refuses
+                    // a row only on FALSE, and `active_slot = 1` with a NULL
+                    // slot is NULL.
+                    .check(Expr::cust(
+                        "(status = 'active' AND active_slot IS NOT NULL AND active_slot = 1) \
+                         OR (status <> 'active' AND active_slot IS NULL)",
+                    ))
+                    // A key out of service keeps no private half.
+                    .check(Expr::cust("status = 'active' OR seed_encrypted IS NULL"))
                     .to_owned(),
             )
             .await?;

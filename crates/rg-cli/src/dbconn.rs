@@ -81,6 +81,11 @@ pub(crate) enum OnlineAccess {
     /// The command never asks for the source's write lock at all — it reads the
     /// database and writes somewhere else.
     NoWriteLockOnTheSource,
+    /// The command reads the instance signing keys and writes at most a few of
+    /// their rows in one short transaction (a rotation retires one row and
+    /// inserts another). It has to work against a running server, which is
+    /// where a compromised key is replaced.
+    ShortKeyTransaction,
 }
 
 impl OnlineAccess {
@@ -92,6 +97,7 @@ impl OnlineAccess {
             Self::SingleRowWrite => "writes a single row",
             Self::SameWorkAsALiveHandler => "same work as a live handler",
             Self::NoWriteLockOnTheSource => "takes no write lock on the source",
+            Self::ShortKeyTransaction => "writes a few key rows in one short transaction",
         }
     }
 }

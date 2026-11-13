@@ -12,6 +12,7 @@ vi.mock('./_base.svelte', () => base);
 
 import ReleasesPage from '../../routes/[owner]/[repo]/releases/+page.svelte';
 import en from '../i18n/translations/en.json';
+import ru from '../i18n/translations/ru.json';
 import zhCN from '../i18n/translations/zh-CN.json';
 import { releases } from './releases';
 import { setTestPage } from '../test/app';
@@ -216,8 +217,9 @@ describe('release attestation production wiring', () => {
     'verify',
     'verifying',
     'error',
-  ])('has a real label in both catalogs: releases.attestation.%s', (key) => {
+  ])('has a real label in every catalog: releases.attestation.%s', (key) => {
     expect(en.releases.attestation).toHaveProperty(key);
+    expect(ru.releases.attestation).toHaveProperty(key);
     expect(zhCN.releases.attestation).toHaveProperty(key);
   });
 });

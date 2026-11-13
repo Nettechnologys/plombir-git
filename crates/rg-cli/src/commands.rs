@@ -288,11 +288,9 @@ fn read_line_without_echo() -> anyhow::Result<String> {
 /// Open the database for an instance-key command and prove the configured
 /// encryption key opens it.
 ///
-/// An ordinary pool, unlike `rotate-encryption-key`: each command writes a
-/// handful of rows in one short transaction, so it holds SQLite's write lock
-/// for a moment, not for a whole-database pass (card_74c8b8754e97). And it
-/// has to work against a running server — that is where a compromised key is
-/// rotated.
+/// An ordinary pool, unlike `rotate-encryption-key`: see
+/// [`dbconn::OnlineAccess::ShortKeyTransaction`]. And it has to work against
+/// a running server — that is where a compromised key is rotated.
 async fn open_instance_key_db(
     command: &'static str,
     db_url: Option<String>,
@@ -308,7 +306,8 @@ async fn open_instance_key_db(
     let encryption_key =
         crate::serve::resolve_auth_secrets(cfg, jwt_secret, encryption_key, &key_file)?
             .encryption_key;
-    let db = dbconn::connect_online(&db_url, command, dbconn::OnlineAccess::SingleRowWrite).await?;
+    let db =
+        dbconn::connect_online(&db_url, command, dbconn::OnlineAccess::ShortKeyTransaction).await?;
     rg_core::auth::key_check::verify_encryption_key(&db, &encryption_key).await?;
     Ok((db, encryption_key))
 }
@@ -396,13 +395,14 @@ pub(crate) async fn cmd_rotate_instance_key(
     Ok(())
 }
 
-/// `plombir-git revoke-instance-key <kid>` — revoke a retired key.
+/// `plombir-git revoke-instance-key <kid> --yes` — revoke a retired key.
 pub(crate) async fn cmd_revoke_instance_key(
     kid: String,
     db_url: Option<String>,
     cfg: Option<&config::ConfigFile>,
     jwt_secret: Option<String>,
     encryption_key: Option<String>,
+    yes: bool,
 ) -> anyhow::Result<()> {
     init_cli_logging();
     let (db, encryption_key) = open_instance_key_db(
@@ -413,8 +413,24 @@ pub(crate) async fn cmd_revoke_instance_key(
         encryption_key,
     )
     .await?;
+    if !yes {
+        let ring = rg_core::auth::instance_key::load(&db, &encryption_key).await?;
+        let key = ring
+            .find(&kid.trim().to_ascii_lowercase())
+            .map(describe_instance_key)
+            .unwrap_or_else(|| format!("{kid} (not recorded on this instance)"));
+        anyhow::bail!(
+            "refusing to revoke an instance signing key without --yes.\n\
+             \n\
+             Key: {key}\n\
+             \n\
+             Revocation cannot be undone: the key leaves /api/v1/ci/oidc/jwks within 30 \
+             seconds and every attestation it signed is reported as signed by a revoked key. \
+             Re-sign the assets that still need an attestation."
+        );
+    }
     rg_core::auth::instance_key::revoke(&db, &encryption_key, &kid).await?;
-    println!("{kid} revoked");
+    println!("{} revoked", kid.trim().to_ascii_lowercase());
     Ok(())
 }
 
@@ -2027,15 +2043,40 @@ mod tests {
                 None,
                 config.as_ref(),
                 None,
-                None
+                None,
+                true
             )
             .await
             .expect_err("the active key must not be revoked without a replacement")
         );
         assert!(refusal.contains("--reason compromised"), "{refusal}");
-        cmd_revoke_instance_key(active.clone(), None, config.as_ref(), None, None)
+        // Without --yes it names the key and refuses; the key stays retired.
+        let refusal = format!(
+            "{:#}",
+            cmd_revoke_instance_key(
+                active.to_uppercase(),
+                None,
+                config.as_ref(),
+                None,
+                None,
+                false
+            )
             .await
-            .unwrap();
+            .expect_err("revoking without --yes must refuse")
+        );
+        assert!(refusal.contains(&active), "{refusal}");
+        assert!(refusal.contains("cannot be undone"), "{refusal}");
+        // An upper-case kid is the same kid on every database.
+        cmd_revoke_instance_key(
+            active.to_uppercase(),
+            None,
+            config.as_ref(),
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
         let after = rg_core::auth::instance_key::load(&db, key).await.unwrap();
         assert_eq!(
             after.find(&active).unwrap().status,

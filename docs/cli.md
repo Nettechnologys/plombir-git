@@ -16,7 +16,7 @@ Beyond `serve`, the `plombir-git` binary offers:
 | `backup-db` / `restore-db` | Create / restore a consistent SQLite backup by hand (for a schedule, use `[backup]` — the server snapshots itself) |
 | `rotate-encryption-key` | Re-encrypt every at-rest secret onto a new encryption key (file-backed SQLite requires the server to be stopped, `--dry-run` included; this is enforced) |
 | `rotate-instance-key --reason routine\|compromised` | Replace the active instance signing key; `routine` retires the old key (it keeps verifying), `compromised` revokes it |
-| `revoke-instance-key <kid>` | Revoke a retired instance signing key |
+| `revoke-instance-key <kid> --yes` | Revoke a retired instance signing key (irreversible: its attestations report `revoked`) |
 | `instance-key-status` | List instance signing keys with kid, status and origin |
 | `create-admin --username <name> --email <address>` | Create the first instance administrator from the host (no setup token needed), or promote an existing account; the password is prompted for, or read with `--password-stdin` |
 | `create-repo` | Create a bare repository (no DB record — quick testing) |

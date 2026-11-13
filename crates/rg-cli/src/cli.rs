@@ -343,6 +343,11 @@ pub(crate) enum Commands {
         /// The key's `kid`, as `instance-key-status` prints it.
         kid: String,
 
+        /// Confirm the revocation. It cannot be undone: every attestation the
+        /// key signed is reported as signed by a revoked key from then on.
+        #[arg(long)]
+        yes: bool,
+
         /// Database URL (sqlite://, postgres://, or mysql://)
         /// [config: [database].url] [default: sqlite://./plombir-git.db?mode=rwc]
         #[arg(long)]

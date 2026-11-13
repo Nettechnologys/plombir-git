@@ -168,13 +168,21 @@ async fn run() -> anyhow::Result<()> {
 
         Commands::RevokeInstanceKey {
             kid,
+            yes,
             db_url,
             config: _,
             jwt_secret,
             encryption_key,
         } => {
-            commands::cmd_revoke_instance_key(kid, db_url, state_cfg(), jwt_secret, encryption_key)
-                .await?
+            commands::cmd_revoke_instance_key(
+                kid,
+                db_url,
+                state_cfg(),
+                jwt_secret,
+                encryption_key,
+                yes,
+            )
+            .await?
         }
 
         Commands::InstanceKeyStatus {

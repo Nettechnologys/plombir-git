@@ -47,6 +47,10 @@ pub const CACHE_TTL: Duration = Duration::from_secs(30);
 /// How long a retired key stays in the JWKS: the 5-minute lifetime of a CI OIDC
 /// token it may have signed, clock skew, and [`CACHE_TTL`] on a replica that
 /// had not yet noticed the rotation. A revoked key is never published.
+///
+/// Seen from outside, a retired key can stay in a relying party's copy of the
+/// JWKS for this overlap, plus [`CACHE_TTL`] and one read on the slowest
+/// replica, plus the response's `max-age` of 300 seconds.
 pub const JWKS_OVERLAP: chrono::Duration = chrono::Duration::minutes(10);
 
 /// The instance's signing key pair plus the `kid` its public half advertises.
@@ -193,6 +197,12 @@ impl KeyRing {
         Self { active, keys }
     }
 
+    /// A ring with arbitrary statuses, for tests of the code that reads one.
+    #[cfg(test)]
+    pub(crate) fn from_parts(active: InstanceKey, keys: Vec<PublicKey>) -> Self {
+        Self { active, keys }
+    }
+
     /// The key that signs.
     pub fn active(&self) -> &InstanceKey {
         &self.active
@@ -278,19 +288,31 @@ impl InstanceKeys {
                 .1
                 .clone());
         };
+        // Stamped before the read, so the TTL bound is honest (TTL plus one
+        // read), and a slow read that started earlier never replaces a
+        // snapshot taken after it.
+        let started = Instant::now();
         let ring = Arc::new(load_ring(db, cipher_key).await?);
-        *self.cached.lock().expect("instance key cache poisoned") = (Instant::now(), ring.clone());
-        Ok(ring)
+        let mut cached = self.cached.lock().expect("instance key cache poisoned");
+        if started >= cached.0 {
+            *cached = (started, ring.clone());
+            Ok(ring)
+        } else {
+            Ok(cached.1.clone())
+        }
     }
 }
 
 /// Load the ring on server start, establishing a key on first use and retiring
 /// a key derived from `jwt_secret`.
 ///
-/// - No key yet and nothing signed → a random key.
-/// - No key yet but attestations are stored (an instance upgraded from before
-///   keys were stored) → adopt the derived key so they keep verifying, then
-///   retire it below.
+/// - No key recorded and nothing signed by the derived key → a random key.
+/// - No key recorded, but a stored attestation is signed by the key derived
+///   from the current `jwt_secret` (an instance upgraded from before keys were
+///   stored) → adopt that key so it keeps verifying, then retire it below.
+/// - Keys recorded but none active (an operator retired the active key, e.g.
+///   after losing the encryption key) → always a random key: the derived key
+///   may already be recorded and must never sign again.
 /// - Active key `legacy_derived` → routine rotation: the derived key keeps
 ///   verifying its attestations here and leaves the JWKS after
 ///   [`JWKS_OVERLAP`], a random key signs from now on.
@@ -306,12 +328,10 @@ pub async fn establish(
     fill_missing_identities(db, &cipher_key).await?;
 
     if ops::find_active(db).await?.is_none() {
-        let attested = has_stored_attestations(db).await?;
+        let derived = InstanceKey::derived_from_secret(jwt_secret);
+        let attested = ops::all(db).await?.is_empty() && attested_by(db, derived.kid()).await?;
         let (candidate, origin) = if attested {
-            (
-                InstanceKey::derived_from_secret(jwt_secret),
-                ORIGIN_LEGACY_DERIVED,
-            )
+            (derived, ORIGIN_LEGACY_DERIVED)
         } else {
             (InstanceKey::generate(), ORIGIN_GENERATED)
         };
@@ -403,6 +423,13 @@ pub async fn rotate(
 /// out the JWT secret leaked. The active key is refused: revoking it would
 /// leave nothing to sign with.
 pub async fn revoke(db: &DatabaseConnection, encryption_key: &str, kid: &str) -> Result<()> {
+    // MySQL compares the kid column case-insensitively, PostgreSQL and SQLite
+    // exactly; a kid is 16 lowercase hex digits everywhere it is written.
+    let kid = kid.trim().to_ascii_lowercase();
+    if kid.len() != 16 || !kid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("a kid is 16 hexadecimal digits, as `instance-key-status` prints it");
+    }
+    let kid = kid.as_str();
     fill_missing_identities(db, &encryption::derive_key(encryption_key)).await?;
     let Some(key) = ops::find_by_kid(db, kid).await? else {
         bail!("this instance has no signing key with kid {kid}");
@@ -531,6 +558,9 @@ async fn load_ring(db: &DatabaseConnection, cipher_key: &[u8; 32]) -> Result<Key
             if opened.kid() != kid {
                 bail!("the active instance signing key does not match its recorded kid {kid}");
             }
+            if active.is_some() {
+                bail!("more than one active instance signing key is recorded");
+            }
             active = Some(opened);
         }
         keys.push(PublicKey {
@@ -547,17 +577,21 @@ async fn load_ring(db: &DatabaseConnection, cipher_key: &[u8; 32]) -> Result<Key
     Ok(KeyRing { active, keys })
 }
 
-async fn has_stored_attestations(db: &DatabaseConnection) -> Result<bool> {
+/// Whether a stored attestation carries a signature under `kid`. The text
+/// match narrows the scan; the parse decides.
+async fn attested_by(db: &DatabaseConnection, kid: &str) -> Result<bool> {
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
-    Ok(rg_db::entities::release_asset::Entity::find()
-        .filter(rg_db::entities::release_asset::Column::Attestation.is_not_null())
-        .limit(1)
+    let rows = rg_db::entities::release_asset::Entity::find()
+        .filter(rg_db::entities::release_asset::Column::Attestation.contains(kid))
+        .limit(20)
         .all(db)
         .await
-        .context("look for stored release attestations")?
-        .into_iter()
-        .next()
-        .is_some())
+        .context("look for stored release attestations")?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| row.attestation.as_deref())
+        .filter_map(|json| serde_json::from_str::<crate::attestation::Envelope>(json).ok())
+        .any(|envelope| envelope.signatures.iter().any(|sig| sig.keyid == kid)))
 }
 
 /// Name, once per start, attestations signed by a key this instance never

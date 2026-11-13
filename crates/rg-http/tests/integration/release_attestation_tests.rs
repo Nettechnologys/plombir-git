@@ -708,3 +708,83 @@ async fn a_rotation_reaches_the_running_server_without_a_restart() {
     assert_eq!(kids, vec![third]);
     drop(dir);
 }
+
+/// Release signing reads the ring past the cache: with a TTL far longer than
+/// the test, the JWKS still serves the cached old key while a new attestation
+/// is already signed by the key rotated in a moment ago.
+#[tokio::test]
+async fn release_signing_reads_the_keys_past_the_cache() {
+    use rg_core::auth::instance_key::{rotate, InstanceKeys, RotationReason};
+
+    let (db, dir) = setup_test_db().await;
+    let ring = rg_core::auth::instance_key::establish(&db, "s11-cache", TEST_ENCRYPTION_KEY)
+        .await
+        .unwrap();
+    let first = ring.active().kid().to_owned();
+    let keys = InstanceKeys::new(db.clone(), TEST_ENCRYPTION_KEY, ring)
+        .with_ttl(std::time::Duration::from_secs(3600));
+    let base = spawn_test_app_over_db_with(
+        db.clone(),
+        dir.path().join("repos"),
+        StateOverrides {
+            instance_keys: Some(std::sync::Arc::new(keys)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let owner = "s11cache".to_string();
+    let token = register_user(&base, &owner, "s11cache@example.com", PW).await;
+    let repo = "s11cacherepo".to_string();
+    create_initialised_repo(&base, &token, &repo).await;
+    let release_id = create_release(&base, &token, &owner, &repo).await;
+    let asset_id = upload_asset(&base, &token, &owner, &repo, release_id).await;
+
+    let second = rotate(&db, TEST_ENCRYPTION_KEY, RotationReason::Compromised)
+        .await
+        .unwrap()
+        .key
+        .kid()
+        .to_owned();
+    let (kids, _) = published_kids(&base).await;
+    assert_eq!(kids, vec![first], "the JWKS is served from the cache");
+    let (status, envelope) = post_json(
+        format!("{base}/api/v1/repos/{owner}/{repo}/releases/assets/{asset_id}/attestation"),
+        &token,
+    )
+    .await;
+    assert_eq!(status, 201);
+    assert_eq!(envelope["signatures"][0]["keyid"], second.as_str());
+    drop(dir);
+}
+
+/// A ring that cannot be read is an error, never the last ring that could:
+/// here the configured encryption key no longer opens the active seed.
+#[tokio::test]
+async fn an_unreadable_key_ring_fails_the_request() {
+    use rg_core::auth::instance_key::InstanceKeys;
+
+    let (db, dir) = setup_test_db().await;
+    let ring = rg_core::auth::instance_key::establish(&db, "s11-unreadable", TEST_ENCRYPTION_KEY)
+        .await
+        .unwrap();
+    let keys = InstanceKeys::new(db.clone(), "not-the-key-the-seed-is-sealed-with", ring)
+        .with_ttl(std::time::Duration::ZERO);
+    let base = spawn_test_app_over_db_with(
+        db.clone(),
+        dir.path().join("repos"),
+        StateOverrides {
+            instance_keys: Some(std::sync::Arc::new(keys)),
+            ..Default::default()
+        },
+    )
+    .await;
+    let response = reqwest::get(format!("{base}/api/v1/ci/oidc/jwks"))
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_server_error(),
+        "status {}",
+        response.status()
+    );
+    drop(dir);
+}

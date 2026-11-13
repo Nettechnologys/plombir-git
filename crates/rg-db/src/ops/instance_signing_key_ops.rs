@@ -17,12 +17,13 @@ pub async fn all(db: &impl ConnectionTrait) -> Result<Vec<instance_signing_key::
         .await
 }
 
-/// The key that signs, if one has been established.
+/// The key that signs, if one has been established — read by the slot the
+/// unique index guards, so "the active key" has exactly one meaning.
 pub async fn find_active(
     db: &impl ConnectionTrait,
 ) -> Result<Option<instance_signing_key::Model>, DbErr> {
     Entity::find()
-        .filter(instance_signing_key::Column::Status.eq(STATUS_ACTIVE))
+        .filter(instance_signing_key::Column::ActiveSlot.eq(ACTIVE_SLOT))
         .one(db)
         .await
 }

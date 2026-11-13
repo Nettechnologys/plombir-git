@@ -507,6 +507,8 @@ jobs:
         run: cargo test -p rg-db-migration -j 6 server_up_converges_after_an_interrupted_run_and_down_reverses_it -- --ignored --nocapture
       - name: Instance signing keys migration (carry-over, resumption, single active key)
         run: cargo test -p rg-db-migration -j 6 server_instance_signing_keys_carry_over_and_resume -- --ignored --nocapture
+      - name: Instance signing key lifecycle (rotation CAS, single active key, row checks)
+        run: cargo test -p rg-core -j 6 --lib server_instance_key_lifecycle_holds_on_a_server_database -- --ignored --nocapture
 
       - name: Prove PostgreSQL code index refresh boundary
         run: cargo test -p rg-core -j 6 server_code_index_rebuild_publishes_atomically_without_holding_writers -- --ignored --nocapture
@@ -639,6 +641,8 @@ jobs:
         run: cargo test -p rg-db-migration -j 6 server_up_converges_after_an_interrupted_run_and_down_reverses_it -- --ignored --nocapture
       - name: Instance signing keys migration (carry-over, resumption, single active key)
         run: cargo test -p rg-db-migration -j 6 server_instance_signing_keys_carry_over_and_resume -- --ignored --nocapture
+      - name: Instance signing key lifecycle (rotation CAS, single active key, row checks)
+        run: cargo test -p rg-core -j 6 --lib server_instance_key_lifecycle_holds_on_a_server_database -- --ignored --nocapture
 
       - name: Prove MySQL code index refresh boundary
         run: cargo test -p rg-core -j 6 server_code_index_rebuild_publishes_atomically_without_holding_writers -- --ignored --nocapture

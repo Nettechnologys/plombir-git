@@ -22,6 +22,10 @@ This project records user-facing changes here. The format follows
   seconds instead of signing with the old key until restart. Retired and
   revoked keys no longer keep their private seed in the database. The JWKS is
   served with `Cache-Control: public, max-age=300`.
+- `POST …/attestation/verify` reports the new status `revoked` for a signature
+  under a revoked key, and the fields `key_status` and `key_origin` for the key
+  that signed. A retired key verifies on the server only; re-sign an asset that
+  needs external verification.
 
 ## [0.4.2] - 2026-11-11
 

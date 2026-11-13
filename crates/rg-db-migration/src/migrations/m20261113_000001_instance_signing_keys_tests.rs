@@ -67,10 +67,10 @@ async fn rows(db: &DatabaseConnection) -> Vec<keys::Model> {
 
 /// The whole contract on one connection: carry-over with the exact origin,
 /// resumption after an interruption at every step MySQL can stop at, and the
-/// single-active-key index. Leaves the key rows as it found them, because on a
-/// server database the table is shared with the rest of the job.
+/// single-active-key index and row-state checks. Leaves the table empty: on a
+/// server database later steps of the job establish their own keys, and
+/// restoring rows under explicit ids would leave PostgreSQL's sequence behind.
 async fn exercise(db: &DatabaseConnection) {
-    let saved = rows(db).await;
     let manager = SchemaManager::new(db);
     db.execute_unprepared(&format!("DELETE FROM {NEW}"))
         .await
@@ -110,27 +110,31 @@ async fn exercise(db: &DatabaseConnection) {
     assert_eq!(carried[0].origin, keys::ORIGIN_GENERATED);
 
     // At most one active key, enforced by the database; any number of
-    // retired keys.
-    let insert = |slot: &str, kid: &str| {
+    // retired keys; and only the states the code relies on.
+    let insert = |status: &str, slot: &str, seed: &str, kid: &str| {
         format!(
-            "INSERT INTO {NEW} (kid, origin, status, active_slot, created_at) \
-             VALUES ('{kid}', 'generated', 'retired', {slot}, CURRENT_TIMESTAMP)"
+            "INSERT INTO {NEW} (kid, seed_encrypted, origin, status, active_slot, created_at) \
+             VALUES ('{kid}', {seed}, 'generated', '{status}', {slot}, CURRENT_TIMESTAMP)"
         )
     };
-    assert!(db
-        .execute_unprepared(&insert("1", "aaaaaaaaaaaaaaaa"))
-        .await
-        .is_err());
-    db.execute_unprepared(&insert("NULL", "bbbbbbbbbbbbbbbb"))
+    let refused = |sql: String| async move { db.execute_unprepared(&sql).await.is_err() };
+    // A second active key: the slot is taken.
+    assert!(refused(insert("active", "1", "'sealed-x'", "aaaaaaaaaaaaaaaa")).await);
+    // An active status without the slot, a slot without the active status.
+    assert!(refused(insert("active", "NULL", "'sealed-x'", "aaaaaaaaaaaaaaab")).await);
+    assert!(refused(insert("retired", "1", "NULL", "aaaaaaaaaaaaaaac")).await);
+    // A retired key that kept its private half.
+    assert!(refused(insert("retired", "NULL", "'sealed-x'", "aaaaaaaaaaaaaaad")).await);
+    // An unknown status.
+    assert!(refused(insert("paused", "NULL", "NULL", "aaaaaaaaaaaaaaae")).await);
+    db.execute_unprepared(&insert("retired", "NULL", "NULL", "bbbbbbbbbbbbbbbb"))
         .await
         .unwrap();
-    db.execute_unprepared(&insert("NULL", "cccccccccccccccc"))
+    db.execute_unprepared(&insert("revoked", "NULL", "NULL", "cccccccccccccccc"))
         .await
         .unwrap();
-    assert!(db
-        .execute_unprepared(&insert("NULL", "cccccccccccccccc"))
-        .await
-        .is_err());
+    // The same kid twice.
+    assert!(refused(insert("retired", "NULL", "NULL", "cccccccccccccccc")).await);
 
     // Down carries the active key back; up brings it forward again.
     Migration.down(&manager).await.unwrap();
@@ -156,14 +160,6 @@ async fn exercise(db: &DatabaseConnection) {
     db.execute_unprepared(&format!("DELETE FROM {NEW}"))
         .await
         .unwrap();
-    if !saved.is_empty() {
-        // Back under their own ids, so the job's later steps find the keys
-        // they established.
-        keys::Entity::insert_many(saved.into_iter().map(keys::ActiveModel::from))
-            .exec_without_returning(db)
-            .await
-            .unwrap();
-    }
 }
 
 #[tokio::test]

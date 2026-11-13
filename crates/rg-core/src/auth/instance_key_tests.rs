@@ -141,6 +141,58 @@ async fn an_upgrade_with_attestations_adopts_then_retires_the_derived_key() {
     );
 }
 
+/// The statement `docs/install.md` tells an operator who lost the encryption
+/// key to run before starting the server, so the documented step is the
+/// tested one.
+const RETIRE_LOST_ACTIVE_KEY: &str = "UPDATE instance_signing_keys \
+     SET status = 'retired', active_slot = NULL, seed_encrypted = NULL, \
+         retired_at = CURRENT_TIMESTAMP \
+     WHERE status = 'active'";
+
+/// B1: keys recorded but none active, attestations stored — the derived key
+/// must not come back. It may already be recorded (here it is, retired on
+/// upgrade), so adopting it would either collide with its row or put a key
+/// computable from `jwt_secret` back into service.
+#[tokio::test]
+async fn a_retired_active_key_is_replaced_by_a_generated_key_never_the_derived_one() {
+    let db = migrated_memory_database().await;
+    let derived = InstanceKey::derived_from_secret(JWT);
+    let envelope = store_attestation(&db, &derived).await;
+    let upgraded = establish(&db, JWT, ENC).await.unwrap();
+
+    sea_orm::ConnectionTrait::execute_unprepared(&db, RETIRE_LOST_ACTIVE_KEY)
+        .await
+        .unwrap();
+    let ring = establish(&db, JWT, ENC).await.unwrap();
+    assert_ne!(ring.active().kid(), derived.kid());
+    assert_ne!(ring.active().kid(), upgraded.active().kid());
+    assert_eq!(
+        ring.find(ring.active().kid()).unwrap().origin,
+        KeyOrigin::Generated
+    );
+    assert_eq!(ring.find(derived.kid()).unwrap().status, KeyStatus::Retired);
+    assert_eq!(
+        verify(&ring, &envelope),
+        crate::attestation::VerificationStatus::Verified
+    );
+}
+
+/// An empty table adopts the derived key only if a stored attestation was
+/// signed by it; attestations under some other key do not make the derived
+/// key worth reviving.
+#[tokio::test]
+async fn attestations_under_another_key_do_not_adopt_the_derived_key() {
+    let db = migrated_memory_database().await;
+    store_attestation(&db, &InstanceKey::derived_from_secret("an-older-secret")).await;
+    let ring = establish(&db, JWT, ENC).await.unwrap();
+    assert_ne!(
+        ring.active().kid(),
+        InstanceKey::derived_from_secret(JWT).kid()
+    );
+    assert_eq!(ring.keys().len(), 1);
+    assert_eq!(ring.keys()[0].origin, KeyOrigin::Generated);
+}
+
 /// The migrated row of an instance whose `jwt_secret` changed since adoption:
 /// its origin comes from the old table, not from comparing with today's secret.
 #[tokio::test]
@@ -375,4 +427,92 @@ fn debug_shows_the_kid_and_nothing_secret() {
     let rendered = format!("{key:?}");
     assert!(rendered.contains(key.kid()));
     assert!(!rendered.contains(&hex::encode(key.seed())));
+}
+
+/// The lifecycle on PostgreSQL or MySQL: the compare-and-set, the rotation
+/// transaction, the single-active slot and the row-state CHECKs are dialect
+/// behaviour, and every test above runs on SQLite. Leaves the table empty.
+#[tokio::test]
+#[ignore = "needs PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable server database"]
+async fn server_instance_key_lifecycle_holds_on_a_server_database() {
+    use sea_orm::ConnectionTrait;
+
+    let url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    assert!(!url.starts_with("sqlite"), "SQLite is covered above");
+    let db = rg_db::connect_with_pool(&url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+        .await
+        .expect("connect to the disposable server database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+    db.execute_unprepared("DELETE FROM instance_signing_keys")
+        .await
+        .unwrap();
+    // A secret no other step of the job uses, so no stored attestation there
+    // is signed by its derived key.
+    let jwt = format!(
+        "server-lifecycle-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+
+    let first = establish(&db, &jwt, ENC).await.unwrap();
+    assert_eq!(first.keys().len(), 1);
+    assert_eq!(first.keys()[0].origin, KeyOrigin::Generated);
+    let first = first.active().kid().to_owned();
+
+    let second = rotate(&db, ENC, RotationReason::Routine).await.unwrap();
+    let retired = ops::find_by_kid(&db, &first).await.unwrap().unwrap();
+    assert_eq!(retired.status, STATUS_RETIRED);
+    assert!(retired.seed_encrypted.is_none() && retired.active_slot.is_none());
+
+    revoke(&db, ENC, &first).await.unwrap();
+    let third = rotate(&db, ENC, RotationReason::Compromised).await.unwrap();
+    let ring = load(&db, ENC).await.unwrap();
+    assert_eq!(ring.active().kid(), third.key.kid());
+    assert_eq!(ring.find(&first).unwrap().status, KeyStatus::Revoked);
+    assert_eq!(
+        ring.find(second.key.kid()).unwrap().status,
+        KeyStatus::Revoked
+    );
+
+    // Two replicas rotating the same key at once, on separate connections.
+    let active = ops::find_active(&db).await.unwrap().unwrap();
+    let key = cipher();
+    let (a, b) = tokio::join!(
+        rotate_row(&db, &key, &active, RotationReason::Routine),
+        rotate_row(&db, &key, &active, RotationReason::Routine),
+    );
+    assert_eq!([a.unwrap(), b.unwrap()].into_iter().flatten().count(), 1);
+    let rows = stored(&db).await;
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.iter().filter(|r| r.status == STATUS_ACTIVE).count(), 1);
+
+    // A second active key, and every row state the code does not expect.
+    assert!(
+        insert_key(&db, &InstanceKey::generate(), ORIGIN_GENERATED, &key)
+            .await
+            .is_err()
+    );
+    for (status, slot, seed, origin) in [
+        ("active", "NULL", "'sealed'", "generated"),
+        ("retired", "1", "NULL", "generated"),
+        ("retired", "NULL", "'sealed'", "generated"),
+        ("paused", "NULL", "NULL", "generated"),
+        ("retired", "NULL", "NULL", "imported"),
+    ] {
+        let sql = format!(
+            "INSERT INTO instance_signing_keys \
+             (kid, seed_encrypted, origin, status, active_slot, created_at) \
+             VALUES ('ffffffffffffffff', {seed}, '{origin}', '{status}', {slot}, \
+             CURRENT_TIMESTAMP)"
+        );
+        assert!(
+            db.execute_unprepared(&sql).await.is_err(),
+            "accepted: {status} slot={slot} seed={seed} origin={origin}"
+        );
+    }
+    assert_eq!(stored(&db).await.len(), 4);
+
+    db.execute_unprepared("DELETE FROM instance_signing_keys")
+        .await
+        .unwrap();
 }

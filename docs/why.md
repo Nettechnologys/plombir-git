@@ -47,9 +47,10 @@ can have a release asset signed: `POST …/releases/assets/{id}/attestation` pro
 [DSSE](https://github.com/secure-systems-lab/dsse) envelope, canonicalised with
 RFC 8785 and signed with the instance's active Ed25519 key. That key is the one
 published at `/api/v1/ci/oidc/jwks`, and `…/attestation/verify` checks an
-envelope on the server against every key the instance has held. After a key
-rotation only the current key stays in the JWKS, so an older attestation is
-verified on the server, or re-signed for external verification. The statement's `predicateType` is
+envelope on the server against every key the instance has recorded. After a
+key rotation the old key leaves the JWKS about 10 minutes later, so an older
+attestation is verified on the server, or re-signed for external
+verification. The statement's `predicateType` is
 `https://plombir.com/git/provenance/v1`. It names the format, not the signer:
 `predicate.builder.id` is the issuing instance's URL. Envelopes issued before
 the rename carry `https://forgekeep.dev/provenance/v1`, the same format under
