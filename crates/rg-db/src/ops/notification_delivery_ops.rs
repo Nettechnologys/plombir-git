@@ -165,6 +165,7 @@ pub fn row(
         prior_locale: Set(None),
         is_test: Set(event.is_test),
         status: Set("queued".into()),
+        priority: Set(event.event.priority()),
         attempts: Set(0),
         next_attempt_at: Set(now),
         lease_token: Set(None),
@@ -395,21 +396,110 @@ pub async fn claim(db: &impl ConnectionTrait, id: i64) -> Result<Option<delivery
         .await?)
 }
 
+/// Rows one recipient may take in a page of class 0 or 1.
+pub const PER_RECIPIENT: u64 = 5;
+/// Activity rows per page. Rows of a page are sent one after another, so this
+/// bounds how many activity sends a security row that arrives mid-page waits
+/// behind.
+pub const ACTIVITY_PAGE: u64 = 10;
+/// Places a class keeps in a page while it has due rows, so class 0 can never
+/// take the whole page from classes 1 and 2.
+pub const CLASS_FLOOR: usize = 5;
+
+/// The ids to deliver next, at most `limit`, in delivery order.
+///
+/// Classes from [`Event::priority`]: the account's own credentials (0) before
+/// shared-resource security (1) before activity (2). Within classes 0 and 1 one
+/// recipient takes at most [`PER_RECIPIENT`] rows per page, so an account
+/// flooding its own events, or a flood aimed at one victim, cannot hold the
+/// class for everybody else. Classes 1 and 2 keep [`CLASS_FLOOR`] places each
+/// while they have due rows. What remains unbounded is a flood spread over many
+/// recipients; that needs a per-actor budget.
 pub async fn due(db: &impl ConnectionTrait, limit: u64) -> Result<Vec<i64>> {
+    use crate::notification::{PRIORITY_ACCOUNT, PRIORITY_ACTIVITY, PRIORITY_SHARED};
     let now = chrono::Utc::now();
-    Ok(delivery::Entity::find()
-        .filter(claimable(now))
-        .filter(delivery::Column::NextAttemptAt.lte(now))
-        .filter(delivery::Column::ExpiresAt.gt(now))
-        .filter(delivery::Column::Attempts.lt(6))
+    let account = due_per_recipient(db, PRIORITY_ACCOUNT, now, limit).await?;
+    let shared = due_per_recipient(db, PRIORITY_SHARED, now, limit).await?;
+    let activity = delivery::Entity::find()
+        .select_only()
+        .column(delivery::Column::Id)
+        .filter(due_now(PRIORITY_ACTIVITY, now))
         .order_by_asc(delivery::Column::NextAttemptAt)
         .order_by_asc(delivery::Column::Id)
-        .limit(limit)
+        .limit(ACTIVITY_PAGE.min(limit))
+        .into_tuple::<i64>()
         .all(db)
-        .await?
+        .await?;
+    Ok(allocate(
+        usize::try_from(limit).unwrap_or(usize::MAX),
+        account,
+        shared,
+        activity,
+    ))
+}
+
+fn due_now(class: i16, now: chrono::DateTime<chrono::Utc>) -> Condition {
+    Condition::all()
+        .add(delivery::Column::Priority.eq(class))
+        .add(claimable(now))
+        .add(delivery::Column::NextAttemptAt.lte(now))
+        .add(delivery::Column::ExpiresAt.gt(now))
+        .add(delivery::Column::Attempts.lt(6))
+}
+
+/// Due rows of one class, oldest first, at most [`PER_RECIPIENT`] per user.
+/// The window ranks every due row of the class, not a prefix of them: cutting
+/// the input first would let one recipient's backlog fill the prefix and keep
+/// everybody else out of the page.
+async fn due_per_recipient(
+    db: &impl ConnectionTrait,
+    class: i16,
+    now: chrono::DateTime<chrono::Utc>,
+    limit: u64,
+) -> Result<Vec<i64>> {
+    use sea_orm::sea_query::{Alias, Order, Query};
+    let mut ranked = Query::select();
+    ranked
+        .column(delivery::Column::Id)
+        .column(delivery::Column::NextAttemptAt)
+        .expr_as(
+            Expr::cust("ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY next_attempt_at, id)"),
+            Alias::new("recipient_rank"),
+        )
+        .from(delivery::Entity)
+        .cond_where(due_now(class, now));
+    let mut page = Query::select();
+    page.column(Alias::new("id"))
+        .from_subquery(ranked, Alias::new("ranked"))
+        .and_where(Expr::col(Alias::new("recipient_rank")).lte(PER_RECIPIENT))
+        .order_by(Alias::new("next_attempt_at"), Order::Asc)
+        .order_by(Alias::new("id"), Order::Asc)
+        .limit(limit);
+    let rows = db.query_all(db.get_database_backend().build(&page)).await?;
+    rows.iter()
+        .map(|row| row.try_get::<i64>("", "id").map_err(Into::into))
+        .collect()
+}
+
+/// Lay out one page from the three classes' candidates.
+fn allocate(limit: usize, account: Vec<i64>, shared: Vec<i64>, activity: Vec<i64>) -> Vec<i64> {
+    let shared_floor = shared.len().min(CLASS_FLOOR);
+    let activity_floor = activity.len().min(CLASS_FLOOR);
+    let take_account = account
+        .len()
+        .min(limit.saturating_sub(shared_floor + activity_floor));
+    let take_shared = shared
+        .len()
+        .min(limit.saturating_sub(take_account + activity_floor));
+    let take_activity = activity
+        .len()
+        .min(limit.saturating_sub(take_account + take_shared));
+    account
         .into_iter()
-        .map(|row| row.id)
-        .collect())
+        .take(take_account)
+        .chain(shared.into_iter().take(take_shared))
+        .chain(activity.into_iter().take(take_activity))
+        .collect()
 }
 
 /// CAS the lease before acknowledging a result; a late expired worker cannot
@@ -466,6 +556,60 @@ fn clear_payload(update: UpdateMany<delivery::Entity>) -> UpdateMany<delivery::E
         )
         .col_expr(delivery::Column::Metadata, Expr::value("{}"))
         .col_expr(delivery::Column::DestinationHash, Expr::value(""))
+}
+
+/// Bind values per statement, comfortably under SQLite's 32766 and MySQL's
+/// 65535 placeholders.
+const SUPERSEDE_BATCH: usize = 300;
+
+/// Cancel queued rows of earlier versions of the given thread notifications.
+///
+/// `current` holds `(user_id, notification id, current event id)` for every
+/// notification just written. A fold rewrites the notification, so each
+/// version gets a new event id; without this the dispatcher would carry every
+/// superseded version until it reached and stopped it. Rows already in flight
+/// hold a lease and are left to `prepare`, which stops them the same way. The
+/// terminal state matches that path: `cancelled`,
+/// `thread_removed_or_superseded`, payload cleared.
+pub async fn cancel_superseded_thread_rows(
+    db: &impl ConnectionTrait,
+    current: &[(i64, i64, String)],
+) -> Result<u64> {
+    let now = chrono::Utc::now();
+    let mut cancelled = 0;
+    // Three binds per notification, plus the status filter.
+    for batch in current.chunks(SUPERSEDE_BATCH / 3) {
+        let mut versions = Condition::any();
+        for (user_id, note_id, event_id) in batch {
+            versions = versions.add(
+                Condition::all()
+                    .add(delivery::Column::UserId.eq(*user_id))
+                    .add(delivery::Column::EventId.starts_with(format!("thread:{note_id}:")))
+                    .add(delivery::Column::EventId.ne(event_id.as_str())),
+            );
+        }
+        cancelled += clear_payload(delivery::Entity::update_many())
+            .col_expr(delivery::Column::Status, Expr::value("cancelled"))
+            .col_expr(
+                delivery::Column::LastError,
+                Expr::value("thread_removed_or_superseded"),
+            )
+            .col_expr(delivery::Column::CompletedAt, Expr::value(now))
+            .col_expr(
+                delivery::Column::LeaseToken,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                delivery::Column::LeaseUntil,
+                Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+            )
+            .filter(delivery::Column::Status.eq("queued"))
+            .filter(versions)
+            .exec(db)
+            .await?
+            .rows_affected;
+    }
+    Ok(cancelled)
 }
 
 pub async fn cleanup(db: &impl ConnectionTrait) -> Result<()> {
@@ -535,4 +679,48 @@ pub async fn cancel_account(db: &impl ConnectionTrait, user_id: i64) -> Result<(
         .exec(db)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::{allocate, CLASS_FLOOR};
+
+    fn ids(from: i64, count: i64) -> Vec<i64> {
+        (from..from + count).collect()
+    }
+
+    /// Class 0 goes first, but cannot take the places classes 1 and 2 keep.
+    #[test]
+    fn account_rows_lead_without_starving_the_other_classes() {
+        let page = allocate(50, ids(0, 50), ids(100, 50), ids(200, 10));
+        assert_eq!(page.len(), 50);
+        assert_eq!(&page[..40], &ids(0, 40)[..]);
+        assert_eq!(
+            page.iter().filter(|id| (100..150).contains(*id)).count(),
+            CLASS_FLOOR
+        );
+        assert_eq!(
+            page.iter().filter(|id| (200..210).contains(*id)).count(),
+            CLASS_FLOOR
+        );
+    }
+
+    /// An empty class keeps nothing: the places go to whoever has rows.
+    #[test]
+    fn floors_apply_only_to_classes_with_due_rows() {
+        assert_eq!(allocate(50, ids(0, 60), vec![], vec![]).len(), 50);
+        let page = allocate(50, ids(0, 3), ids(100, 60), ids(200, 10));
+        assert_eq!(&page[..3], &[0, 1, 2]);
+        assert_eq!(
+            page.iter().filter(|id| (100..160).contains(*id)).count(),
+            42
+        );
+        assert_eq!(page.iter().filter(|id| (200..210).contains(*id)).count(), 5);
+    }
+
+    #[test]
+    fn a_small_limit_never_overflows() {
+        assert_eq!(allocate(3, ids(0, 10), ids(100, 10), ids(200, 10)).len(), 3);
+        assert!(allocate(0, ids(0, 10), ids(100, 10), ids(200, 10)).is_empty());
+    }
 }

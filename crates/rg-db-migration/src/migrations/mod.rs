@@ -178,6 +178,7 @@ pub mod m20261022_000003_imported_assignments;
 pub mod m20261026_000001_agent_profiles;
 pub mod m20261105_000001_notification_channels;
 pub mod m20261113_000001_instance_signing_keys;
+pub mod m20261113_000002_notification_delivery_priority;
 
 use sea_orm_migration::prelude::*;
 
@@ -446,6 +447,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261026_000001_agent_profiles::Migration),
             Box::new(m20261105_000001_notification_channels::Migration),
             Box::new(m20261113_000001_instance_signing_keys::Migration),
+            Box::new(m20261113_000002_notification_delivery_priority::Migration),
         ]
     }
 }

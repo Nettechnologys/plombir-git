@@ -628,7 +628,10 @@ async fn organization_owner_copies_recheck_role_but_personal_revocation_notice_s
     assert_eq!(team.len(), 2);
     assert_eq!(removal.len(), 2);
     let out = Recorder::default();
-    pass(&db, &config(true), &out).await.unwrap();
+    // Drain, as the dispatcher does: this recipient has more class-1 rows than
+    // one page gives a single recipient, which is the S10 limit, not this
+    // test's subject.
+    drain(&db, &config(true), &out, &|| false).await.unwrap();
     for id in team {
         let row = notification_delivery::Entity::find_by_id(id)
             .one(&db)
@@ -652,4 +655,287 @@ async fn organization_owner_copies_recheck_role_but_personal_revocation_notice_s
             "sent"
         );
     }
+}
+
+async fn status_of(db: &DatabaseConnection, rows: &[notification_delivery::Model]) -> Vec<String> {
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(
+            notification_delivery::Entity::find_by_id(row.id)
+                .one(db)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+        );
+    }
+    out
+}
+
+async fn second_user(db: &DatabaseConnection, name: &str) -> user::Model {
+    rg_db::ops::user_ops::create_user(db, name, &format!("{name}@example.invalid"), "x", name)
+        .await
+        .unwrap()
+}
+
+/// S10: a security notification queued behind a page's worth of activity is
+/// delivered by the next pass, not after the activity backlog.
+#[tokio::test]
+async fn a_security_row_is_delivered_ahead_of_queued_activity() {
+    let (db, user) = fixture().await;
+    for _ in 0..30 {
+        enqueue(&db, user.id, Event::Participating).await;
+    }
+    let rows = enqueue(&db, user.id, Event::NewDevice).await;
+    pass(&db, &config(true), &Recorder::default())
+        .await
+        .unwrap();
+    assert_eq!(status_of(&db, &rows).await, vec!["sent", "sent"]);
+}
+
+/// One recipient's backlog in a class takes at most `PER_RECIPIENT` places of
+/// a page; somebody else's row queued later is still in it.
+#[tokio::test]
+async fn one_recipient_cannot_hold_a_security_class() {
+    let (db, user) = fixture().await;
+    for _ in 0..50 {
+        enqueue(&db, user.id, Event::NewDevice).await;
+    }
+    let other = second_user(&db, "bystander").await;
+    let rows = enqueue(&db, other.id, Event::NewDevice).await;
+    let out = Recorder::default();
+    pass(&db, &config(true), &out).await.unwrap();
+    assert_eq!(status_of(&db, &rows).await, vec!["sent"]);
+    let flooder_sent = out
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(target, _)| !target.contains("bystander"))
+        .count();
+    assert!(
+        flooder_sent <= queue::PER_RECIPIENT as usize,
+        "{flooder_sent}"
+    );
+}
+
+/// V1: rows another member can cause (organization membership changes) do
+/// not delay the victim's own account warnings.
+#[tokio::test]
+async fn shared_resource_floods_do_not_delay_account_warnings() {
+    let (db, user) = fixture().await;
+    for _ in 0..100 {
+        enqueue(&db, user.id, Event::OrganizationAccessChanged).await;
+    }
+    let rows = enqueue(&db, user.id, Event::NewDevice).await;
+    pass(&db, &config(true), &Recorder::default())
+        .await
+        .unwrap();
+    assert_eq!(status_of(&db, &rows).await, vec!["sent", "sent"]);
+}
+
+/// The dispatcher keeps passing while passes settle rows instead of sleeping
+/// after each page; a row held by another worker does not keep it spinning.
+#[tokio::test]
+async fn draining_delivers_more_than_a_page_and_stops_on_held_rows() {
+    let (db, user) = fixture().await;
+    let mut rows = Vec::new();
+    for _ in 0..60 {
+        rows.extend(enqueue(&db, user.id, Event::Participating).await);
+    }
+    let held = rows.pop().unwrap();
+    let mut lease: notification_delivery::ActiveModel = held.clone().into();
+    lease.status = Set("inflight".into());
+    lease.lease_token = Set(Some("another-worker".into()));
+    lease.lease_until = Set(Some(chrono::Utc::now() + chrono::Duration::minutes(5)));
+    lease.update(&db).await.unwrap();
+
+    let settled = drain(&db, &config(true), &Recorder::default(), &|| false)
+        .await
+        .unwrap();
+    assert_eq!(settled, rows.len());
+    assert!(status_of(&db, &rows).await.iter().all(|s| s == "sent"));
+    assert_eq!(status_of(&db, &[held]).await, vec!["inflight"]);
+}
+
+fn thread_subject(repo_id: i64) -> super::super::thread::Subject {
+    super::super::thread::Subject {
+        kind: super::super::thread::SubjectKind::Issue,
+        id: 700,
+        number: 7,
+        repo_id,
+        title: "folded subject".into(),
+    }
+}
+
+async fn thread_repo(db: &DatabaseConnection, owner: &user::Model) -> i64 {
+    let now = chrono::Utc::now();
+    rg_db::ops::repo_ops::create(
+        db,
+        rg_db::entities::repository::ActiveModel {
+            owner_id: Set(owner.id),
+            name: Set("folds".into()),
+            is_private: Set(true),
+            default_branch: Set("main".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+    .id
+}
+
+async fn queued_thread_rows(db: &DatabaseConnection) -> Vec<notification_delivery::Model> {
+    notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::EventId.starts_with("thread:"))
+        .filter(notification_delivery::Column::Status.eq("queued"))
+        .all(db)
+        .await
+        .unwrap()
+}
+
+/// A fold supersedes the queued rows of earlier versions when it is
+/// enqueued: three events on one thread leave one version per channel.
+#[tokio::test]
+async fn folding_a_thread_cancels_its_queued_earlier_versions() {
+    use super::super::thread::{self, Reason, ThreadEvent};
+    let (db, user) = fixture().await;
+    let repo_id = thread_repo(&db, &user).await;
+    for action in ["first action", "second action", "third action"] {
+        thread::deliver(
+            &db,
+            &ThreadEvent::new(thread_subject(repo_id), None, action)
+                .to(user.id, Reason::Participating),
+        )
+        .await
+        .unwrap();
+    }
+    assert!(queued_thread_rows(&db).await.len() <= 2);
+    let superseded = notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::LastError.eq("thread_removed_or_superseded"))
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(superseded.len(), 4);
+    assert!(superseded
+        .iter()
+        .all(|row| row.metadata == "{}" && row.status == "cancelled"));
+}
+
+/// A version already held by a worker is not touched at enqueue; the
+/// dispatcher stops it as superseded once its lease runs out.
+#[tokio::test]
+async fn an_in_flight_version_is_left_to_the_dispatcher() {
+    use super::super::thread::{self, Reason, ThreadEvent};
+    let (db, user) = fixture().await;
+    let repo_id = thread_repo(&db, &user).await;
+    thread::deliver(
+        &db,
+        &ThreadEvent::new(thread_subject(repo_id), None, "first action")
+            .to(user.id, Reason::Participating),
+    )
+    .await
+    .unwrap();
+    let first = queued_thread_rows(&db).await;
+    for row in &first {
+        let mut held: notification_delivery::ActiveModel = row.clone().into();
+        held.status = Set("inflight".into());
+        held.lease_token = Set(Some("another-worker".into()));
+        held.lease_until = Set(Some(chrono::Utc::now() + chrono::Duration::minutes(5)));
+        held.update(&db).await.unwrap();
+    }
+    thread::deliver(
+        &db,
+        &ThreadEvent::new(thread_subject(repo_id), None, "second action")
+            .to(user.id, Reason::Participating),
+    )
+    .await
+    .unwrap();
+    assert!(status_of(&db, &first).await.iter().all(|s| s == "inflight"));
+
+    for row in &first {
+        let mut expired: notification_delivery::ActiveModel = row.clone().into();
+        expired.status = Set("inflight".into());
+        expired.lease_token = Set(Some("another-worker".into()));
+        expired.lease_until = Set(Some(chrono::Utc::now() - chrono::Duration::minutes(1)));
+        expired.update(&db).await.unwrap();
+    }
+    pass(&db, &config(true), &Recorder::default())
+        .await
+        .unwrap();
+    for row in &first {
+        let stopped = notification_delivery::Entity::find_by_id(row.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.status, "cancelled");
+        assert_eq!(
+            stopped.last_error.as_deref(),
+            Some("thread_removed_or_superseded")
+        );
+    }
+}
+
+/// Rendered into the warning's text, so the test finds it whatever the
+/// recipient's language (the fixture saves `ru`).
+const WARNING_MARKER: &str = "v3-warning-device";
+
+/// Records sends and, on the third one, enqueues a security event — a
+/// warning that arrives while a page of activity is being sent.
+struct EnqueueOnThird {
+    db: DatabaseConnection,
+    user_id: i64,
+    sent: Mutex<Vec<String>>,
+}
+impl Sender for EnqueueOnThird {
+    fn send<'a>(
+        &'a self,
+        _target: &'a Target,
+        message: &'a template::Message,
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<(), Failure>> + Send + 'a>> {
+        Box::pin(async move {
+            let count = {
+                let mut sent = self.sent.lock().unwrap();
+                sent.push(message.text.clone());
+                sent.len()
+            };
+            if count == 3 {
+                let mut event = queue::QueueEvent::security(self.user_id, Event::NewDevice, None);
+                event.metadata.device = Some(WARNING_MARKER.into());
+                queue::enqueue(&self.db, &event).await.unwrap();
+            }
+            Ok(())
+        })
+    }
+}
+
+/// V3: rows of a page go out one by one, so a warning arriving mid-page waits
+/// for at most one page of activity, not for a page sized for security.
+#[tokio::test]
+async fn a_warning_arriving_mid_page_waits_for_at_most_one_activity_page() {
+    let (db, user) = fixture().await;
+    for _ in 0..25 {
+        enqueue(&db, user.id, Event::Participating).await;
+    }
+    let out = EnqueueOnThird {
+        db: db.clone(),
+        user_id: user.id,
+        sent: Mutex::new(Vec::new()),
+    };
+    pass(&db, &config(true), &out).await.unwrap();
+    pass(&db, &config(true), &out).await.unwrap();
+    let sent = out.sent.lock().unwrap();
+    let first_warning = sent
+        .iter()
+        .position(|text| text.contains(WARNING_MARKER))
+        .expect("the warning was delivered by the second pass");
+    // The bound is the design's, written out: comparing with the constant
+    // would follow it if someone raised it back to a full page.
+    assert!(
+        first_warning <= 10,
+        "the warning waited behind {first_warning} activity sends"
+    );
 }

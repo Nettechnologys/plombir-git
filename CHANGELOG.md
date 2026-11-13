@@ -22,6 +22,15 @@ This project records user-facing changes here. The format follows
   seconds instead of signing with the old key until restart. Retired and
   revoked keys no longer keep their private seed in the database. The JWKS is
   served with `Cache-Control: public, max-age=300`.
+- Deliver security notifications ahead of activity. Queued notifications have
+  a class: the account's own credentials and factors first, then security of
+  shared resources, then activity. One recipient takes at most five rows of a
+  delivery page in the security classes, the other classes keep a share of
+  every page, the dispatcher no longer pauses five seconds after each page,
+  and folding a thread cancels the queued rows of its earlier versions.
+  Previously one account producing activity faster than about ten rows a
+  second delayed every user's security notifications and could make them
+  expire. See docs/notifications.md for the order and the remaining limits.
 - `POST …/attestation/verify` reports the new status `revoked` for a signature
   under a revoked key, and the fields `key_status` and `key_origin` for the key
   that signed. A retired key verifies on the server only; re-sign an asset that

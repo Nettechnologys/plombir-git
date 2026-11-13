@@ -41,6 +41,11 @@ events! {
     AgentProfileChanged => "agent_profile_changed", BotCreated => "bot_created", BotDeleted => "bot_deleted",
 }
 
+/// Delivery classes, see [`Event::priority`].
+pub const PRIORITY_ACCOUNT: i16 = 0;
+pub const PRIORITY_SHARED: i16 = 1;
+pub const PRIORITY_ACTIVITY: i16 = 2;
+
 impl Event {
     pub fn security(self) -> bool {
         !matches!(
@@ -52,6 +57,68 @@ impl Event {
                 | Self::Participating
                 | Self::CiTriggered
         )
+    }
+
+    /// Delivery class, by who can cause the event — not by its name — so a
+    /// flood one account can produce never delays a warning another account
+    /// depends on. Lower is delivered first; see `notification_delivery_ops::due`.
+    ///
+    /// The match is exhaustive on purpose: a new event cannot be added without
+    /// deciding its class. When in doubt, class [`PRIORITY_SHARED`]: it still
+    /// goes ahead of activity, and nobody else can fill
+    /// [`PRIORITY_ACCOUNT`] for a victim.
+    pub fn priority(self) -> i16 {
+        match self {
+            // The account's own credentials and factors. Only the holder, or an
+            // instance administrator, can cause these.
+            Self::NewDevice
+            | Self::TokenCreated
+            | Self::TokenRevoked
+            | Self::SshKeyAdded
+            | Self::SshKeyRemoved
+            | Self::SigningKeyAdded
+            | Self::SigningKeyRemoved
+            | Self::PasskeyAdded
+            | Self::PasskeyRemoved
+            | Self::MfaEnabled
+            | Self::MfaReplaced
+            | Self::MfaDisabled
+            | Self::BackupCodesRegenerated
+            | Self::PasswordChanged
+            | Self::PasswordReset
+            | Self::EmailChanged
+            | Self::ExternalLoginLinked
+            | Self::ExternalLoginUnlinked
+            | Self::AdminPasswordReset
+            | Self::AdminFactorsReset
+            | Self::NotificationSettingsChanged => PRIORITY_ACCOUNT,
+            // Security of shared resources: other members can cause these for
+            // the recipient (adding them to an organization, managing a bot,
+            // a deploy key or a runner of a repository they share).
+            Self::AgentTokenCreated
+            | Self::AgentTokenRevoked
+            | Self::DeployKeyAdded
+            | Self::DeployKeyRemoved
+            | Self::RunnerTokenCreated
+            | Self::RunnerTokenRevoked
+            | Self::RepositoryAccessChanged
+            | Self::OrganizationAccessChanged
+            | Self::RepositorySecurityChanged
+            | Self::OrganizationSecurityChanged
+            | Self::WebhookChanged
+            | Self::MirrorChanged
+            | Self::CiSecurityChanged
+            | Self::AdminSecurityChanged
+            | Self::AgentProfileChanged
+            | Self::BotCreated
+            | Self::BotDeleted => PRIORITY_SHARED,
+            Self::ReviewRequested
+            | Self::Mention
+            | Self::Assigned
+            | Self::CiFailed
+            | Self::Participating
+            | Self::CiTriggered => PRIORITY_ACTIVITY,
+        }
     }
 
     pub fn default_email(self) -> bool {

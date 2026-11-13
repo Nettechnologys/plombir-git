@@ -34,6 +34,18 @@ The dispatcher runs without SMTP as well. It rechecks the current account, prefe
 
 A crash after remote acceptance but before local acknowledgement can duplicate a message; SMTP and Telegram do not provide end-to-end exactly-once delivery.
 
+### Delivery order and limits
+
+Every queued row has a class, set from its event when it is enqueued (migration `m20261113_000002_notification_delivery_priority` classifies rows already queued):
+
+- **0 — the account's own credentials and factors** (new device, password, email, MFA, passkeys, keys and tokens of the account itself, notification settings, administrator resets). Only the account holder or an instance administrator can cause these.
+- **1 — security of shared resources** (repository and organization access and security, webhooks, mirrors, CI security, deploy keys, runners, bots and agent profiles). Other members can cause these for a recipient.
+- **2 — activity** (mentions, reviews, assignments, thread activity, CI results).
+
+Each page of up to 50 rows takes class 0 first, then class 1, then at most 10 activity rows. In classes 0 and 1 one recipient takes at most 5 rows of a page, and classes 1 and 2 each keep 5 places while they have due rows. Rows of a page are sent one after another; the dispatcher starts the next page at once while pages settle rows and sleeps 5 seconds only when there is nothing to send. A fold of a thread cancels the queued rows of its earlier versions when the new version is enqueued; a version already being sent is stopped by the dispatcher instead.
+
+Known limit: there is no per-actor budget. One account can still cause class 1 rows for many recipients (for example by adding and removing members of an organization it owns) or activity for many subscribers. That delays class 1 and activity for those recipients, never their class 0 warnings. Sends are sequential, so throughput is bounded by SMTP and Telegram latency; a row expires undelivered after 24 hours.
+
 ## API contract
 
 All personal settings and test routes require a login session; PATs cannot read the personal Telegram destination or change/test delivery. The old read/write endpoint retains its six-key `email` shape; legacy writes now share the same fresh-proof guard as the new fields. PAT clients that previously used the old email settings endpoint must use a browser login session.

@@ -323,14 +323,17 @@ fn retry_at(
     (next < held.expires_at).then_some(next)
 }
 
+/// Deliver one row if it can still be claimed. `Ok(false)` means another
+/// worker holds it or it stopped being due; `Ok(true)` that this call settled
+/// it (sent, scheduled for retry, or stopped).
 pub async fn deliver_one(
     db: &DatabaseConnection,
     id: i64,
     config: &Config<'_>,
     sender: &dyn Sender,
-) -> Result<()> {
+) -> Result<bool> {
     let Some(held) = queue::claim(db, id).await? else {
-        return Ok(());
+        return Ok(false);
     };
     match prepare(db, &held, config).await? {
         Prepared::Stop(status, code) => queue::finish(db, &held, status, Some(code), None).await?,
@@ -354,22 +357,64 @@ pub async fn deliver_one(
             }
         },
     }
-    Ok(())
+    Ok(true)
 }
 
-pub async fn pass(db: &DatabaseConnection, config: &Config<'_>, sender: &dyn Sender) -> Result<()> {
+/// One page of deliveries. Returns how many rows this pass settled.
+pub async fn pass(
+    db: &DatabaseConnection,
+    config: &Config<'_>,
+    sender: &dyn Sender,
+) -> Result<usize> {
+    pass_until(db, config, sender, &|| false).await
+}
+
+/// [`pass`], checking `stop` between rows so a shutdown does not wait for the
+/// rest of the page.
+pub async fn pass_until(
+    db: &DatabaseConnection,
+    config: &Config<'_>,
+    sender: &dyn Sender,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Result<usize> {
     queue::cleanup(db).await?;
+    let mut settled = 0;
     for id in queue::due(db, 50).await? {
-        if deliver_one(db, id, config, sender).await.is_err() {
+        if stop() {
+            break;
+        }
+        match deliver_one(db, id, config, sender).await {
+            Ok(true) => settled += 1,
+            Ok(false) => {}
             // The lease recovers on the next pass. Never log a payload/recipient
             // or database bind arguments through an arbitrary error source.
-            tracing::warn!(
+            Err(_) => tracing::warn!(
                 delivery_id = id,
                 "notification delivery database operation failed"
-            );
+            ),
         }
     }
-    Ok(())
+    Ok(settled)
+}
+
+/// Pass after pass while passes settle rows — what the dispatcher does between
+/// its idle sleeps. A row that fails is rescheduled at least 30 seconds out and
+/// a database error leaves its lease to expire, so this always ends.
+pub async fn drain(
+    db: &DatabaseConnection,
+    config: &Config<'_>,
+    sender: &dyn Sender,
+    stop: &(dyn Fn() -> bool + Sync),
+) -> Result<usize> {
+    let mut settled = 0;
+    loop {
+        let page = pass_until(db, config, sender, stop).await?;
+        settled += page;
+        if page == 0 || stop() {
+            return Ok(settled);
+        }
+        tokio::task::yield_now().await;
+    }
 }
 
 pub fn spawn_dispatcher(
@@ -391,7 +436,14 @@ pub fn spawn_dispatcher(
             if *shutdown.borrow() {
                 break;
             }
-            if pass(&db, &config, &sender).await.is_err() {
+            // Sleep only once a pass finds nothing to settle: a fixed pause
+            // after every page capped delivery at ten rows a second, below
+            // what one account can enqueue.
+            let drained = {
+                let stop = || *shutdown.borrow();
+                drain(&db, &config, &sender, &stop).await
+            };
+            if drained.is_err() {
                 tracing::warn!("notification delivery queue pass failed");
             }
             tokio::select! {

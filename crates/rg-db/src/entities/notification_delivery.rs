@@ -21,6 +21,9 @@ pub struct Model {
     pub prior_locale: Option<String>,
     pub is_test: bool,
     pub status: String,
+    /// Delivery class from `Event::priority`: 0 = the account's own
+    /// credentials, 1 = shared-resource security, 2 = activity.
+    pub priority: i16,
     pub attempts: i32,
     pub next_attempt_at: DateTimeUtc,
     pub lease_token: Option<String>,
