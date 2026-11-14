@@ -497,6 +497,13 @@ jobs:
       - name: Prove notification channels and queue state on PostgreSQL
         run: "cargo test -p rg-db -j 6 --test integration notification_channels_schema:: -- --nocapture"
 
+      # The page query is a window function over a subquery with a bound rank;
+      # a dialect that rejected it would stop every notification. The test
+      # dates its rows ten years back, so the job's other rows do not reorder
+      # them.
+      - name: Prove the notification page query on PostgreSQL
+        run: "cargo test -p rg-db -j 6 --test integration notification_due_order:: -- --nocapture"
+
       - name: Prove single-use credentials hold on PostgreSQL
         run: >-
           cargo test -p rg-db -j 6 --test integration -- --nocapture
@@ -632,6 +639,13 @@ jobs:
 
       - name: Prove notification channels and queue state on MySQL
         run: "cargo test -p rg-db -j 6 --test integration notification_channels_schema:: -- --nocapture"
+
+      # The page query is a window function over a subquery with a bound rank;
+      # a dialect that rejected it would stop every notification. The test
+      # dates its rows ten years back, so the job's other rows do not reorder
+      # them.
+      - name: Prove the notification page query on MySQL
+        run: "cargo test -p rg-db -j 6 --test integration notification_due_order:: -- --nocapture"
 
       - name: Prove single-use credentials hold on MySQL
         run: >-
