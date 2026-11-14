@@ -915,26 +915,26 @@ async fn a_pre_push_hook_longer_than_the_idle_window_does_not_kill_the_push() {
         "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes",
         client_key.display()
     );
-    // Plain `git`, not the gateway: the gateway pins `core.hooksPath=/dev/null`,
-    // which is right for the server and would skip the very hook under test.
-    let client_home = tempfile::tempdir().unwrap();
+    // The plain gateway disarms the host's configuration but leaves the
+    // repository's own hooks alone (only `invocation::local` pins
+    // `core.hooksPath`), so this hook runs. The elapsed-time check proves it did.
+    let gateway = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
     let started = std::time::Instant::now();
-    let pushed = Command::new("git")
-        .args(["push", "origin", "main"])
-        .current_dir(worktree.path())
-        .env("HOME", client_home.path())
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_SSH_COMMAND", &ssh_command)
-        .output()
+    let pushed = gateway
+        .run_with_env(
+            &["push", "origin", "main"],
+            Some(worktree.path()),
+            &[("GIT_SSH_COMMAND", ssh_command.as_str())],
+        )
         .unwrap();
     assert!(
         started.elapsed() >= std::time::Duration::from_secs(5),
         "the hook must actually have held the channel silent past the idle window"
     );
     assert!(
-        pushed.status.success(),
+        pushed.success(),
         "SSH push behind a slow pre-push hook failed: {}",
-        String::from_utf8_lossy(&pushed.stderr)
+        pushed.stderr_str()
     );
     assert_eq!(
         git(&["rev-parse", "refs/heads/main"], Some(&bare_path)),
