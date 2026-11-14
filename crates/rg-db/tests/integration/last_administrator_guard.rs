@@ -49,7 +49,7 @@ impl Drop for TempDb {
 
 /// A migrated database with several pooled connections, so racing tasks run
 /// on separate connections.
-async fn connect(url: &str) -> DatabaseConnection {
+async fn open_database(url: &str) -> DatabaseConnection {
     let db = rg_db::connect_with_pool(url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
         .await
         .expect("connect to the test database");
@@ -93,7 +93,7 @@ fn is_last_administrator(error: &anyhow::Error) -> bool {
 #[tokio::test]
 async fn the_last_open_administrator_is_neither_demoted_deactivated_nor_retired() {
     let temp = TempDb::new();
-    let db = connect(&temp.url()).await;
+    let db = open_database(&temp.url()).await;
     let only = administrator(&db, "only").await;
 
     let demoted = user_ops::update_by_id(&db, only, None, None, Some(false), None).await;
@@ -164,7 +164,7 @@ async fn the_last_open_administrator_is_neither_demoted_deactivated_nor_retired(
 /// round. Without the shared lock both read "two administrators" and both
 /// commit.
 async fn racing_removals_leave_one_administrator(url: &str) {
-    let db = connect(url).await;
+    let db = open_database(url).await;
     assert_eq!(
         open_administrators(&db).await,
         0,

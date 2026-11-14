@@ -47,7 +47,7 @@ impl Drop for TempDb {
     }
 }
 
-async fn connect() -> (DatabaseConnection, Option<TempDb>) {
+async fn open_database() -> (DatabaseConnection, Option<TempDb>) {
     let (url, temp) = match std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL") {
         Ok(url) if !url.is_empty() => (url, None),
         _ => {
@@ -88,7 +88,7 @@ async fn queue_rows(
 
 #[tokio::test]
 async fn due_serves_classes_in_order_caps_recipients_and_skips_retiring_accounts() {
-    let (db, _temp) = connect().await;
+    let (db, _temp) = open_database().await;
     let suffix = uuid::Uuid::new_v4().simple().to_string()[..10].to_string();
     let mut users = Vec::new();
     for role in ["flood", "other", "activity", "leaving"] {
