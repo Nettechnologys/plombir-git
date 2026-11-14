@@ -388,8 +388,11 @@ async fn settle(
     Ok(true)
 }
 
-/// One page of deliveries. Returns how many rows this pass settled.
-pub async fn pass(
+/// One page of deliveries, with the cleanup. Returns how many rows this pass
+/// settled. The dispatcher itself runs [`drain`]; this one-page form is what
+/// the tests step the queue with.
+#[cfg(test)]
+pub(crate) async fn pass(
     db: &DatabaseConnection,
     config: &Config<'_>,
     sender: &dyn Sender,

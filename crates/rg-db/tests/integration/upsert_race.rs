@@ -12,7 +12,8 @@
 //! * `ci_secret_ops::upsert` — two admins saving the settings form.
 //! * `ci_retention_ops::upsert_policy` — the same, for retention.
 //! * `ci_retention_ops::upsert_cache_entry` — parallel jobs uploading one cache key.
-//! * `instance_settings_ops::save` — the singleton on a never-configured instance.
+//! * `instance_settings_ops::ensure_exists` — the singleton on a never-configured
+//!   instance, which every settings change creates before it locks the row.
 //! * `repo_watch_ops::set_watch_state` — a double-clicked watch button.
 //! * `repo_star_ops::toggle_star` — a double-clicked star button.
 //!
@@ -572,24 +573,16 @@ async fn stale_cache_refresh_and_eviction_cannot_replace_or_delete_a_new_publica
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_first_instance_settings_saves_all_succeed_and_leave_one_coherent_row() {
+async fn concurrent_first_instance_settings_creations_all_succeed_and_leave_one_row() {
     let (db, _temp) = setup("settings").await;
 
-    let attempts = (0..ATTEMPTS).map(|i| {
+    let attempts = (0..ATTEMPTS).map(|_| {
         let db = db.clone();
-        async move {
-            rg_db::ops::instance_settings_ops::save(
-                &db,
-                true,
-                Some(&format!("banner-{i}")),
-                &format!("type-{i}"),
-            )
-            .await
-        }
+        async move { rg_db::ops::instance_settings_ops::ensure_exists(&db).await }
     });
 
     let results = futures_join_all(attempts).await;
-    assert_all_ok(&results, "instance settings save");
+    assert_all_ok(&results, "instance settings creation");
 
     assert_eq!(
         scalar(&db, "SELECT COUNT(*) AS n FROM instance_settings").await,
@@ -601,15 +594,9 @@ async fn concurrent_first_instance_settings_saves_all_succeed_and_leave_one_cohe
         .await
         .expect("read the settings back")
         .expect("the row exists");
-    assert!(settings.maintenance_mode);
-    let admin = settings
-        .banner_type
-        .strip_prefix("type-")
-        .expect("the banner type came from one of the callers");
-    assert_eq!(
-        settings.banner_message.as_deref(),
-        Some(format!("banner-{admin}").as_str()),
-        "banner text and type must come from the same submission",
+    assert!(
+        !settings.maintenance_mode && settings.banner_message.is_none(),
+        "a created row holds the defaults, as no row did"
     );
 }
 

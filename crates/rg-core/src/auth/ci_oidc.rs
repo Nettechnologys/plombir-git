@@ -58,7 +58,7 @@ pub struct CiOidcJwk {
 /// attestation without a second key to distribute. Keys stay published only
 /// while they may still sign a valid token: see
 /// [`crate::auth::instance_key::KeyRing::published`].
-pub fn jwk(key: &PublicKey) -> CiOidcJwk {
+fn jwk(key: &PublicKey) -> CiOidcJwk {
     CiOidcJwk {
         kty: "OKP",
         crv: "Ed25519",

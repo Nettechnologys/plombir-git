@@ -388,9 +388,23 @@ async fn maintenance_mode_rejects_push_but_allows_clone_and_fetch_over_ssh() {
     .await
     .unwrap();
 
-    rg_db::ops::instance_settings_ops::save(&db, true, None, "warning")
+    rg_db::ops::instance_settings_ops::ensure_exists(&db)
         .await
         .unwrap();
+    let settings = rg_db::ops::instance_settings_ops::find(&db)
+        .await
+        .unwrap()
+        .expect("the settings row exists");
+    rg_db::ops::instance_settings_ops::apply_settings(
+        &db,
+        settings,
+        true,
+        None,
+        "warning",
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
 
     let server_config = rg_ssh::SshServerConfig {
         host_key_path: app_dir.path().join("host_ed25519"),
