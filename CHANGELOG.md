@@ -81,6 +81,15 @@ instance signing key changes on the first start when it was derived from
   changes race. The way back from no usable administrator remains
   `plombir-git create-admin` on the host.
 
+### Fixed
+
+- SSH pushes carrying Git LFS objects no longer fail when the upload outlasts
+  `[timeouts].git_idle_secs` (30 s by default). The client runs its `pre-push`
+  hook — where Git LFS uploads — with the push channel open and silent, and
+  the idle watchdog killed the push after its objects had already landed. That
+  wait now has its own `git_stream_secs` budget, and the transfer after it
+  gets a fresh one.
+
 ## [0.4.2] - 2026-11-11
 
 Read the [v0.4.2 upgrade notes](docs/releases/v0.4.2.md) before deploying,

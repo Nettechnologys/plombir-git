@@ -32,14 +32,27 @@
 //! an independent timer, so a quiet read direction can't trip a busy write one.
 //! An idle window of `None` (constructed from `secs == 0`) is a transparent
 //! pass-through — the wrapper adds no timer and never trips.
+//!
+//! ## Waiting for the peer to speak
+//!
+//! [`IdleTimeout::idle_after_first_read`] leaves the read direction unwatched
+//! until the peer's first byte. That is the shape of an SSH push: the server
+//! advertises its refs and then waits while the client runs its `pre-push`
+//! hook — Git LFS uploads every new object from there, over connections of its
+//! own, and the receive-pack channel stays silent for as long as that takes.
+//! The silence is the client working, not a slow drip, so an idle trip there
+//! killed every push whose LFS upload outlasted the window (card_627912af0312).
+//! The caller still bounds that wait; the signal tells it when the peer spoke.
 
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::Notify;
 use tokio::time::Sleep;
 
 /// See the [module docs](self). `T` must be `Unpin` (every transport we wrap —
@@ -53,6 +66,9 @@ pub struct IdleTimeout<T> {
     read_sleep: Option<Pin<Box<Sleep>>>,
     /// Independent write-direction timer (shared by write + flush).
     write_sleep: Option<Pin<Box<Sleep>>>,
+    /// Set by [`Self::idle_after_first_read`]: notified once, when the first
+    /// read completes. While it is still here the read direction has no timer.
+    first_read: Option<Arc<Notify>>,
 }
 
 impl<T> IdleTimeout<T> {
@@ -63,7 +79,19 @@ impl<T> IdleTimeout<T> {
             idle,
             read_sleep: None,
             write_sleep: None,
+            first_read: None,
         }
+    }
+
+    /// Do not watch the read direction until the peer's first read completes
+    /// (bytes, a clean EOF or an error), then notify `spoke` once and guard
+    /// every later read as usual. The write direction is unaffected.
+    ///
+    /// The wait itself is unbounded here: the caller owns that bound, and
+    /// `spoke` is how it learns the wait is over. See the [module docs](self).
+    pub fn idle_after_first_read(mut self, spoke: Arc<Notify>) -> Self {
+        self.first_read = Some(spoke);
+        self
     }
 
     /// Wrap `inner` with an idle window given in whole seconds. `secs == 0`
@@ -117,8 +145,13 @@ impl<T: AsyncRead + Unpin> AsyncRead for IdleTimeout<T> {
             // Progress (bytes read, or a clean EOF) → disarm the idle timer.
             Poll::Ready(res) => {
                 this.read_sleep = None;
+                if let Some(spoke) = this.first_read.take() {
+                    spoke.notify_one();
+                }
                 Poll::Ready(res)
             }
+            // The peer has not spoken yet: its silence is the caller's to bound.
+            Poll::Pending if this.first_read.is_some() => Poll::Pending,
             Poll::Pending => {
                 if idle_elapsed(&mut this.read_sleep, this.idle, cx) {
                     this.read_sleep = None;
@@ -267,6 +300,55 @@ mod tests {
         // Even after an hour of silence the read eventually succeeds (no trip).
         reader.read_exact(&mut byte).await.unwrap();
         assert_eq!(byte[0], 0x99);
+    }
+
+    /// The peer stays silent for ten idle windows before its first byte — an
+    /// SSH client running its `pre-push` hook — and the read does not trip.
+    /// The signal fires on that byte, and the silence after it is watched again.
+    #[tokio::test(start_paused = true)]
+    async fn silence_before_the_first_byte_is_not_idle_but_silence_after_it_is() {
+        let (client, mut server) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            server.write_all(&[0x42]).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            if server.write_all(&[0x43]).await.is_err() {
+                // The reader timed out and closed first, which is the test case.
+            }
+        });
+
+        let spoke = Arc::new(Notify::new());
+        let mut reader = IdleTimeout::from_secs(client, 1).idle_after_first_read(spoke.clone());
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte).await.unwrap();
+        assert_eq!(byte[0], 0x42);
+        tokio::time::timeout(Duration::from_millis(1), spoke.notified())
+            .await
+            .expect("the first byte must signal that the peer spoke");
+
+        let err = reader.read_exact(&mut byte).await.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::TimedOut,
+            "after the first byte a stall is a slow drip again"
+        );
+    }
+
+    /// Without the opt-in the same initial silence trips, which is what the
+    /// test above would read as green if the opt-in did nothing.
+    #[tokio::test(start_paused = true)]
+    async fn silence_before_the_first_byte_trips_without_the_opt_in() {
+        let (client, mut server) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            if server.write_all(&[0x42]).await.is_err() {
+                // The reader timed out and closed first, which is the test case.
+            }
+        });
+        let mut reader = IdleTimeout::from_secs(client, 1);
+        let mut byte = [0u8; 1];
+        let err = reader.read_exact(&mut byte).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 
     /// A stalled writer (peer never drains) trips the write-direction timer.

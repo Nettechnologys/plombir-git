@@ -48,6 +48,52 @@ async fn with_git_timeout<T>(
     tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await
 }
 
+/// Which part of a git session ran out of its wall-clock budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitBudgetElapsed {
+    /// A push whose client never sent its commands: the ref advertisement went
+    /// out and the client stayed silent for the whole budget.
+    AwaitingClient,
+    /// The exchange itself — every other session, and a push once its client
+    /// has spoken.
+    Transfer,
+}
+
+/// Wall-clock guard around an SSH push, in two budgets of `secs` each.
+///
+/// After the ref advertisement a stock client runs its `pre-push` hook before
+/// it sends a single command, and Git LFS uploads every new object from that
+/// hook over connections of its own. The receive-pack channel is silent all
+/// that time. [`with_git_timeout`] counted that silence against the transfer
+/// budget, and the idle watchdog killed it outright after `git_idle_timeout_secs`
+/// — 30 s by default — so a push carrying more LFS data than that failed after
+/// its objects had landed (card_627912af0312).
+///
+/// The wait for the client's first byte (`spoke`, notified by
+/// [`IdleTimeout::idle_after_first_read`]) gets its own `secs`, and the
+/// exchange that follows gets a fresh `secs`. `secs == 0` leaves both unbounded,
+/// as it does for [`with_git_timeout`].
+async fn with_push_timeout<T>(
+    secs: u64,
+    spoke: Arc<tokio::sync::Notify>,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, GitBudgetElapsed> {
+    if secs == 0 {
+        return Ok(fut.await);
+    }
+    let budget = std::time::Duration::from_secs(secs);
+    tokio::pin!(fut);
+    tokio::select! {
+        biased;
+        out = &mut fut => return Ok(out),
+        () = spoke.notified() => {}
+        () = tokio::time::sleep(budget) => return Err(GitBudgetElapsed::AwaitingClient),
+    }
+    tokio::time::timeout(budget, fut)
+        .await
+        .map_err(|_| GitBudgetElapsed::Transfer)
+}
+
 /// Split a finished git session into what the client hears and what the
 /// post-push hooks are owed.
 ///
@@ -1546,10 +1592,20 @@ impl Handler for SshHandler {
             //      the `git` child → `kill_on_drop` reaps it.
             //   2. Wall-clock bound — `with_git_timeout` around the whole handler
             //      (below), capping *total* time.
+            // A push differs in one place: after the ref advertisement the
+            // client is silent while its `pre-push` hook runs (Git LFS uploads
+            // from there), so neither watchdog may count that wait as the
+            // transfer — `idle_after_first_read` + `with_push_timeout`
+            // (card_627912af0312).
             // `stream` stays wrapped throughout; the wrapper forwards
             // `shutdown()` to the channel, so exit-status + close still work.
+            let is_push = service_name == "git-receive-pack";
+            let client_spoke = Arc::new(tokio::sync::Notify::new());
             let mut stream: IdleTimeout<ChannelStream<Msg>> =
                 IdleTimeout::from_secs(ch.into_stream(), git_idle_timeout_secs);
+            if is_push {
+                stream = stream.idle_after_first_read(client_spoke.clone());
+            }
 
             // The `git` child lives *inside* this future (spawned via
             // `spawn_async`'s `kill_on_drop(true)`), so an elapsed wall-clock
@@ -1609,9 +1665,23 @@ impl Handler for SshHandler {
 
             let (result, applied_ref_updates): (Result<(), anyhow::Error>, Option<Vec<RefUpdate>>) =
                 split_git_session(
-                    match with_git_timeout(git_stream_timeout_secs, handler_fut).await {
+                    match if is_push {
+                        with_push_timeout(git_stream_timeout_secs, client_spoke, handler_fut).await
+                    } else {
+                        with_git_timeout(git_stream_timeout_secs, handler_fut)
+                            .await
+                            .map_err(|_| GitBudgetElapsed::Transfer)
+                    } {
                         Ok(session) => session,
-                        Err(_elapsed) => {
+                        Err(GitBudgetElapsed::AwaitingClient) => {
+                            tracing::warn!(
+                                %service_name,
+                                timeout_secs = git_stream_timeout_secs,
+                                "git SSH push: client sent no commands within the wall-clock budget — killed git, closing channel"
+                            );
+                            Err(anyhow::anyhow!("git operation timed out"))
+                        }
+                        Err(GitBudgetElapsed::Transfer) => {
                             tracing::warn!(
                                 %service_name,
                                 timeout_secs = git_stream_timeout_secs,
@@ -2488,9 +2558,10 @@ mod tests {
     use super::{
         check_host_key_readable, deploy_key_allows, drain_git_sessions, ensure_host_key,
         parse_exec_command, parse_repo_owner_name, split_git_session, with_git_timeout,
-        write_new_host_key, AppliedRefUpdates, ExecCommand, GitServiceError, ReceivePackOutcome,
-        RefUpdate,
+        with_push_timeout, write_new_host_key, AppliedRefUpdates, ExecCommand, GitBudgetElapsed,
+        GitServiceError, ReceivePackOutcome, RefUpdate,
     };
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[allow(dead_code)]
@@ -2958,6 +3029,49 @@ mod tests {
         assert!(!deploy_key_allows(&key(false), 8, "git-upload-pack"));
         assert!(!deploy_key_allows(&key(false), 8, "git-receive-pack"));
         assert!(!deploy_key_allows(&key(false), 7, "git-lfs-authenticate"));
+    }
+
+    /// The client speaks at 0.7 s of a 1 s budget and the exchange after it
+    /// takes another 0.7 s: 1.4 s in all, which one shared budget would have
+    /// killed. The wait for a `pre-push` hook is its own budget.
+    #[tokio::test]
+    async fn a_push_gets_a_fresh_budget_once_its_client_speaks() {
+        let spoke = Arc::new(tokio::sync::Notify::new());
+        let signal = spoke.clone();
+        let res = with_push_timeout(1, spoke, async move {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            signal.notify_one();
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            42
+        })
+        .await;
+        assert_eq!(res, Ok(42));
+    }
+
+    /// A client that never sends its commands is still bounded, and the
+    /// verdict says which wait ran out.
+    #[tokio::test]
+    async fn a_push_whose_client_never_speaks_elapses_awaiting_it() {
+        let res = with_push_timeout(1, Arc::new(tokio::sync::Notify::new()), async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            42
+        })
+        .await;
+        assert_eq!(res, Err(GitBudgetElapsed::AwaitingClient));
+    }
+
+    /// Once the client has spoken, the exchange is held to the budget as before.
+    #[tokio::test]
+    async fn a_push_that_outruns_its_transfer_budget_elapses() {
+        let spoke = Arc::new(tokio::sync::Notify::new());
+        let signal = spoke.clone();
+        let res = with_push_timeout(1, spoke, async move {
+            signal.notify_one();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            42
+        })
+        .await;
+        assert_eq!(res, Err(GitBudgetElapsed::Transfer));
     }
 
     #[tokio::test]
