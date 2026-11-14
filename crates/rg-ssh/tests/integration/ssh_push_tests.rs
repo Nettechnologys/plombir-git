@@ -806,3 +806,140 @@ async fn a_protocol_v0_client_clones_shallow_and_deepens_over_ssh() {
 
     server.abort();
 }
+
+/// A stock client's `pre-push` hook runs after the ref advertisement and before
+/// the first command, with the receive-pack channel open and silent — Git LFS
+/// uploads every new object from that hook. The idle watchdog used to count
+/// that silence as a slow drip: on git.bearby.io 14 of 20 LFS pushes died
+/// exactly `git_idle_timeout_secs` after they started, objects already uploaded
+/// (card_627912af0312). Here the hook outlasts a 2 s idle window by 3 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pre_push_hook_longer_than_the_idle_window_does_not_kill_the_push() {
+    let app_dir = tempfile::tempdir().unwrap();
+    let db_path = app_dir.path().join("test.db");
+    let db = rg_db::connect_with_pool(
+        &format!("sqlite://{}?mode=rwc", db_path.display()),
+        rg_db::TEST_CONNECT_TIMEOUT_SECS,
+        60,
+        2,
+    )
+    .await
+    .unwrap();
+    rg_db::run_migrations(&db).await.unwrap();
+
+    let user =
+        rg_db::ops::user_ops::create_user(&db, "hook-owner", "hook-owner@example.com", "", "Hook")
+            .await
+            .unwrap();
+    let repo_root = app_dir.path().join("repos");
+    rg_core::repo::service::create_repo(&db, user.id, "hook-repo", None, true, &repo_root, None)
+        .await
+        .unwrap();
+    let bare_path = repo_root.join("hook-owner/hook-repo.git");
+
+    let client_key = app_dir.path().join("client_ed25519");
+    let keygen = Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&client_key)
+        .status()
+        .expect("ssh-keygen must be installed for SSH integration tests");
+    assert!(keygen.success());
+    let public_key = std::fs::read_to_string(client_key.with_extension("pub")).unwrap();
+    let public_key = public_key.trim();
+    rg_db::ops::ssh_key_ops::create(
+        &db,
+        rg_db::entities::ssh_key::ActiveModel {
+            id: sea_orm::NotSet,
+            user_id: Set(user.id),
+            title: Set("pre-push hook test".to_string()),
+            public_key: Set(public_key.to_string()),
+            fingerprint: Set(rg_core::auth::ssh_key::fingerprint_from_openssh(public_key).unwrap()),
+            created_at: Set(chrono::Utc::now()),
+            last_used_at: Set(None),
+        },
+    )
+    .await
+    .unwrap();
+
+    let server = common::spawn_ssh_server(rg_ssh::SshServerConfig {
+        host_key_path: app_dir.path().join("host_ed25519"),
+        listen_addr: "127.0.0.1:0".to_string(),
+        repo_root: repo_root.clone(),
+        db: db.clone(),
+        db_write: db.clone(),
+        instance_settings: Default::default(),
+        git_stream_timeout_secs: 300,
+        git_idle_timeout_secs: 2,
+        post_push: None,
+        lfs: None,
+        storage_limits: Default::default(),
+        shutdown: None,
+        shutdown_grace_secs: 5,
+    })
+    .await;
+
+    let worktree = tempfile::tempdir().unwrap();
+    git(
+        &[
+            "init",
+            "--initial-branch=main",
+            &worktree.path().to_string_lossy(),
+        ],
+        None,
+    );
+    git(&["config", "user.name", "Hook"], Some(worktree.path()));
+    git(
+        &["config", "user.email", "hook@example.com"],
+        Some(worktree.path()),
+    );
+    std::fs::write(worktree.path().join("README.md"), "slow hook\n").unwrap();
+    git(&["add", "."], Some(worktree.path()));
+    git(
+        &["commit", "-m", "pushed past a slow hook"],
+        Some(worktree.path()),
+    );
+    let expected_sha = git(&["rev-parse", "HEAD"], Some(worktree.path()));
+
+    // What `git lfs pre-push` looks like from the server: nothing, for longer
+    // than the idle window.
+    let hook = worktree.path().join(".git/hooks/pre-push");
+    std::fs::write(&hook, "#!/bin/sh\nsleep 5\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let remote = format!("ssh://git@{}/hook-owner/hook-repo.git", server.addr());
+    git(&["remote", "add", "origin", &remote], Some(worktree.path()));
+    let ssh_command = format!(
+        "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes",
+        client_key.display()
+    );
+    // Plain `git`, not the gateway: the gateway pins `core.hooksPath=/dev/null`,
+    // which is right for the server and would skip the very hook under test.
+    let client_home = tempfile::tempdir().unwrap();
+    let started = std::time::Instant::now();
+    let pushed = Command::new("git")
+        .args(["push", "origin", "main"])
+        .current_dir(worktree.path())
+        .env("HOME", client_home.path())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_SSH_COMMAND", &ssh_command)
+        .output()
+        .unwrap();
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(5),
+        "the hook must actually have held the channel silent past the idle window"
+    );
+    assert!(
+        pushed.status.success(),
+        "SSH push behind a slow pre-push hook failed: {}",
+        String::from_utf8_lossy(&pushed.stderr)
+    );
+    assert_eq!(
+        git(&["rev-parse", "refs/heads/main"], Some(&bare_path)),
+        expected_sha
+    );
+
+    server.abort();
+}
