@@ -6,7 +6,7 @@ This project records user-facing changes here. The format follows
 
 ## [Unreleased]
 
-## [0.4.3] - 2026-11-13
+## [0.4.3] - 2026-11-15
 
 Read the [v0.4.3 upgrade notes](docs/releases/v0.4.3.md) before deploying: the
 instance signing key changes on the first start when it was derived from
