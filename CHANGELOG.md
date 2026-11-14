@@ -88,7 +88,8 @@ instance signing key changes on the first start when it was derived from
   hook — where Git LFS uploads — with the push channel open and silent, and
   the idle watchdog killed the push after its objects had already landed. That
   wait now has its own `git_stream_secs` budget, and the transfer after it
-  gets a fresh one.
+  gets a fresh one. With `git_stream_secs = 0` the wait is still bounded, at
+  300 s; only the transfer is unbounded.
 
 ## [0.4.2] - 2026-11-11
 

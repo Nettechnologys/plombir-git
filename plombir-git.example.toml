@@ -440,7 +440,8 @@ batch_size = 10
 # An SSH push gets this budget twice: once for the wait between the ref
 # advertisement and the client's first command — the client runs its pre-push
 # hook there, and Git LFS uploads every new object from it — and once more for
-# the exchange that follows. Raise it if LFS pushes upload for longer.
+# the exchange that follows. Raise it if LFS pushes upload for longer. With 0
+# the wait for the first command is still bounded, at 300 s.
 # git_stream_secs = 300
 # Idle watchdog layered on top of git_stream_secs: the stream is killed when it
 # makes no read/write progress for this long, which is what catches a slow-drip

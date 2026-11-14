@@ -71,25 +71,58 @@ enum GitBudgetElapsed {
 ///
 /// The wait for the client's first byte (`spoke`, notified by
 /// [`IdleTimeout::idle_after_first_read`]) gets its own `secs`, and the
-/// exchange that follows gets a fresh `secs`. `secs == 0` leaves both unbounded,
-/// as it does for [`with_git_timeout`].
+/// exchange that follows gets a fresh `secs`. `secs == 0` leaves the exchange
+/// unbounded, as it does for [`with_git_timeout`], but not the wait: see
+/// [`PUSH_WAIT_WITHOUT_BUDGET_SECS`].
 async fn with_push_timeout<T>(
     secs: u64,
     spoke: Arc<tokio::sync::Notify>,
     fut: impl std::future::Future<Output = T>,
 ) -> Result<T, GitBudgetElapsed> {
-    if secs == 0 {
-        return Ok(fut.await);
-    }
-    let budget = std::time::Duration::from_secs(secs);
+    push_timeout_falling_back_to(
+        std::time::Duration::from_secs(PUSH_WAIT_WITHOUT_BUDGET_SECS),
+        secs,
+        spoke,
+        fut,
+    )
+    .await
+}
+
+/// How long a push waits for its client's first command when
+/// `git_stream_secs` is 0.
+///
+/// The idle watchdog does not watch that wait
+/// ([`IdleTimeout::idle_after_first_read`]); before it stopped, it was what
+/// ended a silent push when the wall-clock budget was off. With nothing in its
+/// place, a client holding a push channel open in silence would keep its share
+/// of the session limiter and a `git` process for ever. 300 s is the default of
+/// `git_stream_secs`, long enough for an LFS upload from the `pre-push` hook.
+const PUSH_WAIT_WITHOUT_BUDGET_SECS: u64 = 300;
+
+/// [`with_push_timeout`] with the wait bound for `secs == 0` given, so a test
+/// can observe it without waiting the production five minutes.
+async fn push_timeout_falling_back_to<T>(
+    wait_without_budget: std::time::Duration,
+    secs: u64,
+    spoke: Arc<tokio::sync::Notify>,
+    fut: impl std::future::Future<Output = T>,
+) -> Result<T, GitBudgetElapsed> {
+    let wait = if secs == 0 {
+        wait_without_budget
+    } else {
+        std::time::Duration::from_secs(secs)
+    };
     tokio::pin!(fut);
     tokio::select! {
         biased;
         out = &mut fut => return Ok(out),
         () = spoke.notified() => {}
-        () = tokio::time::sleep(budget) => return Err(GitBudgetElapsed::AwaitingClient),
+        () = tokio::time::sleep(wait) => return Err(GitBudgetElapsed::AwaitingClient),
     }
-    tokio::time::timeout(budget, fut)
+    if secs == 0 {
+        return Ok(fut.await);
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(secs), fut)
         .await
         .map_err(|_| GitBudgetElapsed::Transfer)
 }
@@ -2557,9 +2590,9 @@ pub async fn start_ssh_server_on_listener(
 mod tests {
     use super::{
         check_host_key_readable, deploy_key_allows, drain_git_sessions, ensure_host_key,
-        parse_exec_command, parse_repo_owner_name, split_git_session, with_git_timeout,
-        with_push_timeout, write_new_host_key, AppliedRefUpdates, ExecCommand, GitBudgetElapsed,
-        GitServiceError, ReceivePackOutcome, RefUpdate,
+        parse_exec_command, parse_repo_owner_name, push_timeout_falling_back_to, split_git_session,
+        with_git_timeout, with_push_timeout, write_new_host_key, AppliedRefUpdates, ExecCommand,
+        GitBudgetElapsed, GitServiceError, ReceivePackOutcome, RefUpdate,
     };
     use std::sync::Arc;
     use std::time::Duration;
@@ -3072,6 +3105,40 @@ mod tests {
         })
         .await;
         assert_eq!(res, Err(GitBudgetElapsed::Transfer));
+    }
+
+    /// With `git_stream_secs` off, a client that never sends its commands is
+    /// still cut off: the idle watchdog no longer watches that wait, so without
+    /// a bound of its own the push would hold its session for ever.
+    #[tokio::test]
+    async fn with_the_budget_off_a_silent_push_still_elapses_awaiting_it() {
+        let res = push_timeout_falling_back_to(
+            Duration::from_millis(300),
+            0,
+            Arc::new(tokio::sync::Notify::new()),
+            async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                42
+            },
+        )
+        .await;
+        assert_eq!(res, Err(GitBudgetElapsed::AwaitingClient));
+    }
+
+    /// With `git_stream_secs` off, only the wait is bounded: once the client
+    /// has spoken, the exchange may run past that bound, as an unbounded
+    /// transfer always could.
+    #[tokio::test]
+    async fn with_the_budget_off_the_exchange_after_the_first_command_is_unbounded() {
+        let spoke = Arc::new(tokio::sync::Notify::new());
+        let signal = spoke.clone();
+        let res = push_timeout_falling_back_to(Duration::from_millis(300), 0, spoke, async move {
+            signal.notify_one();
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            42
+        })
+        .await;
+        assert_eq!(res, Ok(42));
     }
 
     #[tokio::test]
