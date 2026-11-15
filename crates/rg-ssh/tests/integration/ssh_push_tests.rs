@@ -824,7 +824,7 @@ async fn a_protocol_v0_client_clones_shallow_and_deepens_over_ssh() {
 /// A stock client's `pre-push` hook runs after the ref advertisement and before
 /// the first command, with the receive-pack channel open and silent — Git LFS
 /// uploads every new object from that hook. The idle watchdog used to count
-/// that silence as a slow drip: on git.bearby.io 14 of 20 LFS pushes died
+/// that silence as a slow drip: on one instance 14 of 20 LFS pushes died
 /// exactly `git_idle_timeout_secs` after they started, objects already uploaded
 /// (card_627912af0312). Here the hook outlasts a 2 s idle window by 3 s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
