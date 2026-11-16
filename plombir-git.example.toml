@@ -81,11 +81,12 @@ jwt_secret = "change-me-in-production"
 # --old <current> --new <fresh> --dry-run`; re-run with --yes to apply it.
 #
 # There is no third key to configure here: the Ed25519 key that signs release
-# attestations and backs /api/v1/ci/oidc/jwks is established on first start and
-# kept in the database, precisely so that rotating `jwt_secret` cannot change
-# this instance's public identity. Replace it only with
-# `plombir-git rotate-instance-key --yes`, which permanently invalidates every
-# attestation signed with the previous key.
+# attestations and CI OIDC tokens (published at /api/v1/ci/oidc/jwks) is
+# generated on first start and kept in the database, so rotating `jwt_secret`
+# does not change it. Replace it with
+# `plombir-git rotate-instance-key --reason routine|compromised --yes`; earlier
+# attestations keep verifying on this server unless the key is revoked. See
+# docs/install.md for which command answers which leak.
 
 # Whether POST /api/v1/users/register accepts new accounts from outside:
 #   "open"   — anyone who can reach the endpoint may sign up (the default).
@@ -439,7 +440,8 @@ batch_size = 10
 # An SSH push gets this budget twice: once for the wait between the ref
 # advertisement and the client's first command — the client runs its pre-push
 # hook there, and Git LFS uploads every new object from it — and once more for
-# the exchange that follows. Raise it if LFS pushes upload for longer.
+# the exchange that follows. Raise it if LFS pushes upload for longer. With 0
+# the wait for the first command is still bounded, at 300 s.
 # git_stream_secs = 300
 # Idle watchdog layered on top of git_stream_secs: the stream is killed when it
 # makes no read/write progress for this long, which is what catches a slow-drip

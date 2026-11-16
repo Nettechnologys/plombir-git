@@ -388,9 +388,23 @@ async fn maintenance_mode_rejects_push_but_allows_clone_and_fetch_over_ssh() {
     .await
     .unwrap();
 
-    rg_db::ops::instance_settings_ops::save(&db, true, None, "warning")
+    rg_db::ops::instance_settings_ops::ensure_exists(&db)
         .await
         .unwrap();
+    let settings = rg_db::ops::instance_settings_ops::find(&db)
+        .await
+        .unwrap()
+        .expect("the settings row exists");
+    rg_db::ops::instance_settings_ops::apply_settings(
+        &db,
+        settings,
+        true,
+        None,
+        "warning",
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
 
     let server_config = rg_ssh::SshServerConfig {
         host_key_path: app_dir.path().join("host_ed25519"),
@@ -810,7 +824,7 @@ async fn a_protocol_v0_client_clones_shallow_and_deepens_over_ssh() {
 /// A stock client's `pre-push` hook runs after the ref advertisement and before
 /// the first command, with the receive-pack channel open and silent — Git LFS
 /// uploads every new object from that hook. The idle watchdog used to count
-/// that silence as a slow drip: on git.bearby.io 14 of 20 LFS pushes died
+/// that silence as a slow drip: on one instance 14 of 20 LFS pushes died
 /// exactly `git_idle_timeout_secs` after they started, objects already uploaded
 /// (card_627912af0312). Here the hook outlasts a 2 s idle window by 3 s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

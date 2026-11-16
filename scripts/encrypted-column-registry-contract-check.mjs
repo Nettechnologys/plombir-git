@@ -100,8 +100,8 @@ const CIPHERTEXT_PRODUCERS = [
   {
     file: 'crates/rg-core/src/auth/instance_key.rs',
     sites: 1,
-    writes: ['instance_signing_key.seed_encrypted'],
-    why: 'the instance signing key is stored sealed, so it survives a jwt-secret rotation',
+    writes: ['instance_signing_keys.seed_encrypted'],
+    why: 'the active instance signing key is stored sealed; retired and revoked keys keep only their public half',
   },
   {
     file: 'crates/rg-core/src/mirror/service.rs',

@@ -350,7 +350,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
- "untrusted 0.7.1",
  "zeroize",
 ]
 
@@ -1813,7 +1812,6 @@ version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fb130435a959a8d525e6bca66ff6c40981a300ee96d70e3ef56f046556d614a3"
 dependencies = [
- "generic-array 0.14.7",
  "rustversion",
  "typenum",
 ]
@@ -5032,7 +5030,7 @@ dependencies = [
 
 [[package]]
 name = "rg-ci"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5055,7 +5053,7 @@ dependencies = [
 
 [[package]]
 name = "rg-cli"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5089,7 +5087,7 @@ dependencies = [
 
 [[package]]
 name = "rg-core"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "aes-gcm 0.10.3",
  "anyhow",
@@ -5145,7 +5143,7 @@ dependencies = [
 
 [[package]]
 name = "rg-db"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5165,7 +5163,7 @@ dependencies = [
 
 [[package]]
 name = "rg-db-migration"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5186,7 +5184,7 @@ dependencies = [
 
 [[package]]
 name = "rg-git"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "gix",
@@ -5201,7 +5199,7 @@ dependencies = [
 
 [[package]]
 name = "rg-http"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -5257,7 +5255,7 @@ dependencies = [
 
 [[package]]
 name = "rg-mcp"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",
@@ -5273,7 +5271,7 @@ dependencies = [
 
 [[package]]
 name = "rg-process"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5289,7 +5287,7 @@ dependencies = [
 
 [[package]]
 name = "rg-runner"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5312,7 +5310,7 @@ dependencies = [
 
 [[package]]
 name = "rg-ssh"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5341,7 +5339,7 @@ dependencies = [
  "cfg-if",
  "getrandom 0.2.17",
  "libc",
- "untrusted 0.9.0",
+ "untrusted",
  "windows-sys 0.52.0",
 ]
 
@@ -5386,9 +5384,9 @@ dependencies = [
 
 [[package]]
 name = "russh"
-version = "0.65.0"
+version = "0.65.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bb77a4b259312b2abbc541bca1c13cb4e9b61c560a7fd894068c3b92e0c9dc3"
+checksum = "94be3d86c71b9ed220a675c405e35c7a02565a009bf8da2e9cc13a700320a5c5"
 dependencies = [
  "aes 0.9.1",
  "aws-lc-rs",
@@ -5607,7 +5605,7 @@ dependencies = [
  "aws-lc-rs",
  "ring",
  "rustls-pki-types",
- "untrusted 0.9.0",
+ "untrusted",
 ]
 
 [[package]]
@@ -7152,12 +7150,6 @@ dependencies = [
  "crypto-common 0.2.2",
  "ctutils",
 ]
-
-[[package]]
-name = "untrusted"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
 
 [[package]]
 name = "untrusted"

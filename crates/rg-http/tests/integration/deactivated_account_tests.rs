@@ -21,6 +21,7 @@ const INFO_REFS: &str = "info/refs?service=git-upload-pack";
 const PASSWORD: &str = "Qz7$wRtm";
 
 async fn deactivate(db: &rg_db::DatabaseConnection, user_id: i64) {
+    crate::common::standby_administrator(db).await;
     rg_db::ops::user_ops::update_by_id(db, user_id, None, None, None, Some(false))
         .await
         .expect("deactivate user")

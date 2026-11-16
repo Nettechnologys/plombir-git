@@ -17448,7 +17448,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.attestation.verifying",
-          "line": 613,
+          "line": 619,
           "via": null,
           "href": null,
           "handler": "() => handleVerifyAsset(asset)",
@@ -17473,7 +17473,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.attestation.signing",
-          "line": 624,
+          "line": 630,
           "via": null,
           "href": null,
           "handler": "() => handleSignAsset(asset)",
@@ -17498,7 +17498,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 650,
+          "line": 656,
           "via": null,
           "href": null,
           "handler": "() => handleAssetDelete(release.id, asset.id)",
@@ -17527,7 +17527,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 658,
+          "line": 664,
           "via": null,
           "href": null,
           "handler": "() => (confirmDeleteAssetId = null)",
@@ -17537,7 +17537,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.asset_delete",
-          "line": 663,
+          "line": 669,
           "via": null,
           "href": null,
           "handler": "() => (confirmDeleteAssetId = asset.id)",
@@ -17547,7 +17547,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.browse_files",
-          "line": 679,
+          "line": 685,
           "via": null,
           "href": "buildBrowseLink(release.tag_name)",
           "handler": null,
@@ -17557,7 +17557,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.edit",
-          "line": 681,
+          "line": 687,
           "via": null,
           "href": "buildEditReleaseLink(release.id)",
           "handler": null,
@@ -17567,7 +17567,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 687,
+          "line": 693,
           "via": null,
           "href": null,
           "handler": "() => handleDelete(release.id)",
@@ -17667,7 +17667,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 690,
+          "line": 696,
           "via": null,
           "href": null,
           "handler": "cancelDelete",
@@ -17677,7 +17677,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.delete",
-          "line": 693,
+          "line": 699,
           "via": null,
           "href": null,
           "handler": "() => showConfirm(release.id)",
@@ -17687,7 +17687,7 @@
         {
           "tag": "button",
           "label": "i18n:common.previous",
-          "line": 702,
+          "line": 708,
           "via": null,
           "href": null,
           "handler": "() => changePage(currentPage - 1)",
@@ -17769,7 +17769,7 @@
         {
           "tag": "button",
           "label": "i18n:common.next",
-          "line": 710,
+          "line": 716,
           "via": null,
           "href": null,
           "handler": "() => changePage(currentPage + 1)",
@@ -23618,7 +23618,7 @@
         {
           "tag": "a",
           "label": "←",
-          "line": 168,
+          "line": 169,
           "via": null,
           "href": "/admin",
           "handler": null,
@@ -23628,7 +23628,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 175,
+          "line": 176,
           "via": null,
           "href": null,
           "handler": "applyFilter",
@@ -23658,7 +23658,7 @@
         {
           "tag": "select",
           "label": ")}",
-          "line": 180,
+          "line": 181,
           "via": null,
           "href": null,
           "handler": "applyFilter",
@@ -23684,7 +23684,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.audit.clear_filters",
-          "line": 187,
+          "line": 188,
           "via": null,
           "href": null,
           "handler": "clearFilters",
@@ -23710,7 +23710,7 @@
         {
           "tag": "button",
           "label": "i18n:admin.audit.fields.details",
-          "line": 243,
+          "line": 244,
           "via": null,
           "href": null,
           "handler": "() => openDetail(log)",
@@ -23740,7 +23740,7 @@
         {
           "tag": "button",
           "label": "i18n:common.prev_arrow",
-          "line": 256,
+          "line": 257,
           "via": null,
           "href": null,
           "handler": "prevPage",
@@ -23766,7 +23766,7 @@
         {
           "tag": "button",
           "label": "i18n:common.next_arrow",
-          "line": 258,
+          "line": 259,
           "via": null,
           "href": null,
           "handler": "nextPage",
@@ -23792,7 +23792,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 316,
+          "line": 317,
           "via": null,
           "href": null,
           "handler": "closeDetail",

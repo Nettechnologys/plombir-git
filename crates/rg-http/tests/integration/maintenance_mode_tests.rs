@@ -598,3 +598,180 @@ async fn the_instance_advertises_its_configured_ssh_clone_port() {
         "{default_info}"
     );
 }
+
+/// card_e49592b4fd03: maintenance mode must not keep a leaked credential alive.
+/// Revoking a personal or bot token, an SSH key or a deploy key, and signing out
+/// everywhere, still go through; creating, editing and every neighbouring path
+/// stay closed; and the handler behind a revocation still decides who may make
+/// it — a stranger gets the refusal they always got, not a 503.
+#[tokio::test]
+async fn maintenance_mode_still_lets_credentials_be_revoked() {
+    const USER_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA maint-user";
+    const DEPLOY_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA maint-deploy";
+
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let api = format!("{base}/api/v1");
+    // Everything the test revokes has to exist before the gate closes.
+    let admin = admin_token(&base, &db, "mrevoke_admin").await;
+    let (owner, _) = register_full(&base, "mrevoke", "mrevoke@example.com").await;
+    let (stranger, _) = register_full(&base, "mrevoke_other", "mrevoke_other@example.com").await;
+    let create = |path: String, body: serde_json::Value| {
+        let request = client
+            .post(format!("{api}{path}"))
+            .bearer_auth(&owner)
+            .json(&body);
+        async move {
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(status, 201, "{path}: {body}");
+            body
+        }
+    };
+    let pat = create(
+        "/users/tokens".into(),
+        serde_json::json!({ "name": "leaked" }),
+    )
+    .await;
+    let pat_id = pat["id"].as_i64().unwrap();
+    let pat_secret = pat["token"].as_str().unwrap().to_string();
+    create(
+        "/users/bots".into(),
+        serde_json::json!({ "username": "mrevoke-agent", "display_name": "Agent" }),
+    )
+    .await;
+    let bot_token_id = create(
+        "/users/bots/mrevoke-agent/tokens".into(),
+        serde_json::json!({ "name": "leaked-bot" }),
+    )
+    .await["id"]
+        .as_i64()
+        .unwrap();
+    let ssh_key_id = create(
+        "/users/ssh-keys".into(),
+        serde_json::json!({ "title": "leaked", "key": USER_KEY }),
+    )
+    .await["id"]
+        .as_i64()
+        .unwrap();
+    crate::common::create_repo(&base, &owner, "mrevoke-repo").await;
+    let deploy_key_id = create(
+        "/repos/mrevoke/mrevoke-repo/keys".into(),
+        serde_json::json!({ "title": "leaked deploy", "key": DEPLOY_KEY, "read_only": true }),
+    )
+    .await["id"]
+        .as_i64()
+        .unwrap();
+
+    assert_eq!(set_maintenance(&base, &admin, true).await.status(), 200);
+
+    // Creating, editing and the neighbouring paths stay closed.
+    for (method, path) in [
+        (reqwest::Method::POST, "/users/tokens".to_string()),
+        (reqwest::Method::PATCH, format!("/users/tokens/{pat_id}")),
+        (reqwest::Method::POST, format!("/users/tokens/{pat_id}")),
+        (
+            reqwest::Method::DELETE,
+            format!("/users/tokens/{pat_id}/extra"),
+        ),
+        (
+            reqwest::Method::DELETE,
+            "/users/bots/mrevoke-agent".to_string(),
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("/users/ssh-keys/{ssh_key_id}/extra"),
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("/repos/mrevoke/mrevoke-repo/keys/{deploy_key_id}/extra"),
+        ),
+        (
+            reqwest::Method::POST,
+            "/users/me/session/refresh".to_string(),
+        ),
+    ] {
+        let response = client
+            .request(method.clone(), format!("{api}{path}"))
+            .bearer_auth(&owner)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503, "{method} {path} must stay closed");
+    }
+
+    // Another account still gets the handler's own refusal.
+    let refused = client
+        .delete(format!(
+            "{api}/repos/mrevoke/mrevoke-repo/keys/{deploy_key_id}"
+        ))
+        .bearer_auth(&stranger)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        matches!(refused.status().as_u16(), 403 | 404),
+        "a stranger's revocation is refused by the handler, not by maintenance: {}",
+        refused.status()
+    );
+
+    // The revocations go through.
+    for path in [
+        format!("/users/tokens/{pat_id}"),
+        format!("/users/bots/mrevoke-agent/tokens/{bot_token_id}"),
+        format!("/users/ssh-keys/{ssh_key_id}"),
+        format!("/repos/mrevoke/mrevoke-repo/keys/{deploy_key_id}"),
+    ] {
+        let response = client
+            .delete(format!("{api}{path}"))
+            .bearer_auth(&owner)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        assert!(
+            status.is_success(),
+            "DELETE {path} during maintenance: {status} {}",
+            response.text().await.unwrap()
+        );
+    }
+    let revoked = client
+        .get(format!("{api}/users/me"))
+        .bearer_auth(&pat_secret)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        revoked.status(),
+        401,
+        "the revoked token no longer signs in"
+    );
+
+    // And signing out everywhere ends the session it was sent with.
+    let logout = client
+        .post(format!("{api}/users/logout"))
+        .bearer_auth(&owner)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        logout.status().is_success(),
+        "logout during maintenance: {}",
+        logout.status()
+    );
+    let after = client
+        .get(format!("{api}/users/me"))
+        .bearer_auth(&owner)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        after.status(),
+        401,
+        "the session ended by logout no longer signs in"
+    );
+}

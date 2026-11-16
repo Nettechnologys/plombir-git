@@ -6,6 +6,81 @@ This project records user-facing changes here. The format follows
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-15
+
+Read the [v0.4.3 upgrade notes](docs/releases/v0.4.3.md) before deploying: the
+instance signing key changes on the first start when it was derived from
+`jwt_secret`, and the two new migrations make a rollback a restore from backup.
+
+### Security
+
+- Record only the origin (`scheme://host[:port]`, without userinfo) and the
+  id of a webhook in the audit log, plus `url_changed` and the previous origin
+  when an update moves it. The full URL was recorded, and its path or query can
+  be the receiver's bearer secret; administrators could read it in the audit
+  log without sudo, and it outlived the hook. Rows written before this release
+  still contain full URLs and are not rewritten; find them with
+  `SELECT id, action, created_at FROM audit_log WHERE details LIKE '%"webhook_url"%'`
+  and decide whether to redact them or rotate the receivers' secrets.
+
+- Tell every administrator when an administrator account is created through
+  `POST /admin/users` or `plombir-git create-admin`, or when `create-admin`
+  promotes an existing account. Only changes of an existing account's flag
+  were announced; the CLI promotion now commits together with its notice.
+
+- Generate the instance signing key (release attestations, CI OIDC tokens and
+  the JWKS) at random instead of adopting a key derived from `jwt_secret`.
+  An instance upgraded with a derived key retires it on its first start: its
+  attestations keep verifying on the server, it leaves the JWKS after 10
+  minutes, and a random key signs from then on. Relying parties that pinned the
+  old public key instead of reading the JWKS URL must update it.
+- Keep every instance signing key as a public half. `rotate-instance-key` now
+  takes `--reason routine` (old key retired, still verifying) or
+  `--reason compromised` (old key revoked: removed from the JWKS at once and
+  its attestations reported as `revoked`); `revoke-instance-key` and
+  `instance-key-status` are new. A running server switches keys within 30
+  seconds instead of signing with the old key until restart. Retired and
+  revoked keys no longer keep their private seed in the database. The JWKS is
+  served with `Cache-Control: public, max-age=300`.
+- Keep pending notifications, including the warning to a previous
+  destination, while an account deletion is in progress, and deliver them if
+  the deletion fails and is rolled back. They were cancelled when the deletion
+  began, so a deletion made to fail erased them while the account lived on.
+- Deliver security notifications ahead of activity. Queued notifications have
+  a class: the account's own credentials and factors first, then security of
+  shared resources, then activity. One recipient takes at most five rows of a
+  delivery page in the security classes, the other classes keep a share of
+  every page, the dispatcher no longer pauses five seconds after each page,
+  and folding a thread cancels the queued rows of its earlier versions.
+  Security notifications are also bounded per recipient when queued — five of
+  one kind, fifty of one event — keeping the oldest, so a flood can neither
+  grow the queue without limit nor push out a warning already waiting.
+  Previously one account producing activity faster than about ten rows a
+  second delayed every user's security notifications and could make them
+  expire. See docs/notifications.md for the order and the remaining limits.
+- `POST …/attestation/verify` reports the new status `revoked` for a signature
+  under a revoked key, and the fields `key_status` and `key_origin` for the key
+  that signed. A retired key verifies on the server only; re-sign an asset that
+  needs external verification.
+- Stop counting an approval of a protected environment once its approver can
+  no longer read the repository: removed as a collaborator of a private
+  repository, or outside a repository that became private. Such a vote still
+  counted while the approver stayed on the allow-list, and could complete the
+  threshold that releases the deployment.
+- Record `PATCH /admin/settings` in the audit log (`admin.update_settings`,
+  with the values before and after) and notify every administrator when
+  maintenance mode or the banner changes; the notice does not include the
+  banner text. An administrator, or anyone holding an administrator's token,
+  could switch maintenance mode or show a banner to every user without a trace.
+- Let credentials be revoked while maintenance mode is on: personal and bot
+  tokens, SSH and deploy keys, and signing out everywhere. Maintenance mode
+  refused these requests, so a leaked token kept working until it ended.
+- Refuse with `409` a change that would leave the instance without an active
+  administrator: demoting or deactivating the last one through
+  `PATCH /admin/users/{id}`, or deleting their account — also when two such
+  changes race. The way back from no usable administrator remains
+  `plombir-git create-admin` on the host.
+
 ### Fixed
 
 - SSH pushes carrying Git LFS objects no longer fail when the upload outlasts
@@ -13,7 +88,8 @@ This project records user-facing changes here. The format follows
   hook — where Git LFS uploads — with the push channel open and silent, and
   the idle watchdog killed the push after its objects had already landed. That
   wait now has its own `git_stream_secs` budget, and the transfer after it
-  gets a fresh one.
+  gets a fresh one. With `git_stream_secs = 0` the wait is still bounded, at
+  300 s; only the transfer is unbounded.
 
 ## [0.4.2] - 2026-11-11
 
@@ -1132,7 +1208,8 @@ See the [v0.1.1 release notes](docs/releases/v0.1.1.md) for upgrade and
 rollback guidance. Publication of a release does not establish that a registry
 package is publicly accessible.
 
-[Unreleased]: https://github.com/Nettechnologys/plombir-git/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/Nettechnologys/plombir-git/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.4.3
 [0.4.2]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.4.2
 [0.4.1]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.4.1
 [0.4.0]: https://github.com/Nettechnologys/plombir-git/releases/tag/v0.4.0

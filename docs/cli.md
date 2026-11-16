@@ -15,7 +15,9 @@ Beyond `serve`, the `plombir-git` binary offers:
 | `gen-secret` | Print a fresh 256-bit secret for `[auth].jwt_secret` or an encryption key |
 | `backup-db` / `restore-db` | Create / restore a consistent SQLite backup by hand (for a schedule, use `[backup]` — the server snapshots itself) |
 | `rotate-encryption-key` | Re-encrypt every at-rest secret onto a new encryption key (file-backed SQLite requires the server to be stopped, `--dry-run` included; this is enforced) |
-| `rotate-instance-key` | Mint a new provenance signing identity (invalidates past attestations) |
+| `rotate-instance-key --reason routine\|compromised` | Replace the active instance signing key; `routine` retires the old key (it keeps verifying), `compromised` revokes it |
+| `revoke-instance-key <kid> --yes` | Revoke a retired instance signing key (irreversible: its attestations report `revoked`) |
+| `instance-key-status` | List instance signing keys with kid, status and origin |
 | `create-admin --username <name> --email <address>` | Create the first instance administrator from the host (no setup token needed), or promote an existing account; the password is prompted for, or read with `--password-stdin` |
 | `create-repo` | Create a bare repository (no DB record — quick testing) |
 | `runner` | Run as a CI runner (polls and executes jobs) |
@@ -36,6 +38,7 @@ from a running instance. For the latter, use the API or web UI as in the
 
 Every subcommand that touches the database or the repository directory
 (`migrate`, `rebuild-fts`, `backup-db`, `restore-db`, `rotate-instance-key`,
+`revoke-instance-key`, `instance-key-status`,
 `rotate-encryption-key`, `create-admin`, `create-repo`, `import`, `index-repo`,
 `list-tombstones`, `reset-mfa`, `package list`)
 takes the same `--config` as `serve` and resolves `--db-url` / `--repo-root` as

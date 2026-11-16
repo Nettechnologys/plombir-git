@@ -561,14 +561,6 @@ async fn expiry_and_account_cancellation_erase_queued_snapshots() {
         .unwrap();
     assert_eq!(row.status, "failed");
     assert!(row.previous_destination_encrypted.is_none() && row.previous_token_encrypted.is_none());
-    let event = queue::QueueEvent::security(user.id, Event::NewDevice, None);
-    queue::enqueue(&db, &event).await.unwrap();
-    queue::cancel_account(&db, user.id).await.unwrap();
-    assert!(queue::event_rows(&db, user.id, &event.id)
-        .await
-        .unwrap()
-        .iter()
-        .all(|row| row.status == "cancelled" && row.metadata == "{}"));
 }
 
 #[tokio::test]

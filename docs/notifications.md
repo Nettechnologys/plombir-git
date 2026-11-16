@@ -8,7 +8,7 @@ Connecting Telegram copies the current email event choices into Telegram in the 
 
 Every Telegram credential/recipient change and every reduction in delivery requires the existing fresh-proof policy. For an account with MFA this means its current second factor or a verified user-verifying passkey; a password-only sudo session is insufficient. Accounts without MFA retain the existing password/passkey/SSO policy. The ten-minute proof window is not extended by refresh or navigation. A cancelled or failed challenge leaves the settings unchanged.
 
-Disabling or redirecting delivery queues a warning to the **previously confirmed destinations**. New preferences do not suppress that warning. The old Telegram destination receives only the time, changed field/category names and a settings link. Its old encrypted token and recipient snapshot are retained only while delivery is pending, for at most six attempts and 24 hours, and erased at terminal completion or expiry. Logout-all does not cancel this warning. Account retirement/deletion destroys it. Delivery can fail if the old token has been revoked or the service is unavailable; it is not guaranteed. The existing previous-email-address warning on email changes remains a separate recovery path and is not duplicated by this outbox.
+Disabling or redirecting delivery queues a warning to the **previously confirmed destinations**. New preferences do not suppress that warning. The old Telegram destination receives only the time, changed field/category names and a settings link. Its old encrypted token and recipient snapshot are retained only while delivery is pending, for at most six attempts and 24 hours, and erased at terminal completion or expiry. Logout-all does not cancel this warning. Deleting the account destroys it with the account. While a deletion is in progress the dispatcher leaves the account's pending notifications alone, so a deletion that fails and is rolled back still delivers them; if a server stops between starting and finishing a deletion, they wait until their 24-hour lifetime ends and are then erased like any expired notification. Delivery can fail if the old token has been revoked or the service is unavailable; it is not guaranteed. The existing previous-email-address warning on email changes remains a separate recovery path and is not duplicated by this outbox.
 
 Save the page to store the current interface language (`en`, `ru`, `zh-CN`). Ordinary pending and test notifications use that saved language. The mandatory warning to a previous destination uses the language saved before the change. User-provided names are not translated. Testing uses the saved configuration and a clearly marked synthetic event: it never issues a token, changes MFA or accepts an arbitrary recipient/body. Each channel reports its own result. Pending tests are deduplicated, with one test per event per minute and at most six events per account per minute.
 
@@ -34,6 +34,22 @@ The dispatcher runs without SMTP as well. It rechecks the current account, prefe
 
 A crash after remote acceptance but before local acknowledgement can duplicate a message; SMTP and Telegram do not provide end-to-end exactly-once delivery.
 
+### Delivery order and limits
+
+Every queued row has a class, set from its event when it is enqueued (migration `m20261113_000002_notification_delivery_priority` classifies rows already queued):
+
+- **0 — the account's own credentials and factors** (new device, password, email, MFA, passkeys, keys and tokens of the account itself, notification settings, administrator resets). Only the account holder or an instance administrator can cause these.
+- **1 — security of shared resources** (repository and organization access and security, webhooks, mirrors, CI security, deploy keys, runners, bots and agent profiles). Other members can cause these for a recipient.
+- **2 — activity** (mentions, reviews, assignments, thread activity, CI results).
+
+Each page of up to 50 rows takes class 0 first, then class 1, then at most 10 activity rows. In classes 0 and 1 one recipient takes at most 5 rows of a page, and classes 1 and 2 each keep 5 places while they have due rows. Rows of a page are sent one after another; the dispatcher starts the next page at once while pages settle rows and sleeps 5 seconds only when there is nothing to send. A fold of a thread cancels the queued rows of its earlier versions when the new version is enqueued; a version already being sent is stopped by the dispatcher instead.
+
+Security rows are also bounded when they are enqueued, keeping the oldest: at most 5 rows of one kind — recipient, event, channel, destination (for a warning to a previous destination, that destination), repository and test flag — and at most 50 rows of one event for one recipient, whatever their kind, wait at a time; warnings to a previous destination have a 50-row budget of their own, so ordinary rows cannot take their place. A row past either bound is recorded as `cancelled` with `coalesced` and no payload. Rows already waiting are never displaced, so nobody who can cause an event can push out a warning somebody else caused, and the oldest rows of an event — such as the warning to the destination a takeover started from — are always kept. A flood of one event can, however, drop a simultaneous genuine event of the same kind for the same recipient. Waiting security rows are therefore bounded by 100 × the number of security events per recipient. Each dropped row still leaves a terminal row, kept for 30 days like any other, so a flood still grows the table; bounding that needs the per-actor budget.
+
+With that bound the page query takes about a millisecond for one recipient's worst case. Its cost grows with the number of recipients that have rows waiting: with 10 000 recipients holding 5 rows each (50 000 due rows of one class), measured on PostgreSQL 18 it took 25 ms, on MySQL 8.4 69 ms and on SQLite 112 ms per page.
+
+Known limit: there is no per-actor budget. One account can still cause class 1 rows for many recipients (for example by adding and removing members of an organization it owns) or activity for many subscribers. That delays class 1 and activity for those recipients, never their class 0 warnings. Sends are sequential, so throughput is bounded by SMTP and Telegram latency; a row expires undelivered after 24 hours.
+
 ## API contract
 
 All personal settings and test routes require a login session; PATs cannot read the personal Telegram destination or change/test delivery. The old read/write endpoint retains its six-key `email` shape; legacy writes now share the same fresh-proof guard as the new fields. PAT clients that previously used the old email settings endpoint must use a browser login session.
@@ -55,6 +71,11 @@ The notification panel adds eight individually selectable email/Telegram categor
 They cover collaborator grants/changes/removals and private copies, organization
 membership/teams, visibility/transfer/deletion, hook and mirror configuration,
 branch/tag protection, CI secrets/variables/environments, and administrator trust changes.
+An administrator trust change includes granting or revoking the administrator
+flag or deactivating an account, creating an administrator through the admin
+API or `plombir-git create-admin`, and promoting an existing account with
+`create-admin`. Every active administrator is told, the affected account
+included; on first-run bootstrap the new administrator is the only recipient.
 
 On upgrade, a missing new category defaults to email enabled. Its Telegram choice
 inherits the saved `notification_settings_changed` Telegram choice only for a

@@ -55,6 +55,7 @@
     { value: 'admin.unlock_user', label: 'admin.unlock_user' },
     { value: 'admin.delete_user', label: 'admin.delete_user' },
     { value: 'admin.delete_org', label: 'admin.delete_org' },
+    { value: 'admin.update_settings', label: 'admin.update_settings' },
   ];
 
   $effect(() => {

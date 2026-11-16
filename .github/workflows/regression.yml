@@ -475,6 +475,11 @@ jobs:
       - name: Prove concurrent PostgreSQL migrators are serialized
         run: "cargo test -p rg-db -j 6 --test integration server_migration_serialization:: -- --ignored --nocapture"
 
+      # Second, while no step has written an account yet: the guard reads every
+      # administrator on the instance, so the race needs a database with none.
+      - name: Prove racing removals keep a PostgreSQL instance administered
+        run: "cargo test -p rg-db -j 6 --test integration last_administrator_guard:: -- --ignored --nocapture"
+
       # The claim that the migration lock removed the need for `--test-threads=1`
       # on a server backend: this file's tests migrate the same database in
       # parallel, which is exactly what used to collide.
@@ -492,6 +497,13 @@ jobs:
       - name: Prove notification channels and queue state on PostgreSQL
         run: "cargo test -p rg-db -j 6 --test integration notification_channels_schema:: -- --nocapture"
 
+      # The page query is a window function over a subquery with a bound rank;
+      # a dialect that rejected it would stop every notification. The test
+      # dates its rows ten years back, so the job's other rows do not reorder
+      # them.
+      - name: Prove the notification page query on PostgreSQL
+        run: "cargo test -p rg-db -j 6 --test integration notification_due_order:: -- --nocapture"
+
       - name: Prove single-use credentials hold on PostgreSQL
         run: >-
           cargo test -p rg-db -j 6 --test integration -- --nocapture
@@ -505,6 +517,10 @@ jobs:
 
       - name: Prove PostgreSQL CI secret scoping converges and reverses
         run: cargo test -p rg-db-migration -j 6 server_up_converges_after_an_interrupted_run_and_down_reverses_it -- --ignored --nocapture
+      - name: Instance signing keys migration (carry-over, resumption, single active key)
+        run: cargo test -p rg-db-migration -j 6 server_instance_signing_keys_carry_over_and_resume -- --ignored --nocapture
+      - name: Instance signing key lifecycle (rotation CAS, single active key, row checks)
+        run: cargo test -p rg-core -j 6 --lib server_instance_key_lifecycle_holds_on_a_server_database -- --ignored --nocapture
 
       - name: Prove PostgreSQL code index refresh boundary
         run: cargo test -p rg-core -j 6 server_code_index_rebuild_publishes_atomically_without_holding_writers -- --ignored --nocapture
@@ -604,6 +620,11 @@ jobs:
       - name: Prove concurrent MySQL migrators are serialized
         run: "cargo test -p rg-db -j 6 --test integration server_migration_serialization:: -- --ignored --nocapture"
 
+      # Second, while no step has written an account yet: the guard reads every
+      # administrator on the instance, so the race needs a database with none.
+      - name: Prove racing removals keep a MySQL instance administered
+        run: "cargo test -p rg-db -j 6 --test integration last_administrator_guard:: -- --ignored --nocapture"
+
       - name: Prove a parallel rg-db test file migrates MySQL safely
         run: "cargo test -p rg-db -j 6 --test integration password_reset_token_single_use:: -- --nocapture"
 
@@ -618,6 +639,13 @@ jobs:
 
       - name: Prove notification channels and queue state on MySQL
         run: "cargo test -p rg-db -j 6 --test integration notification_channels_schema:: -- --nocapture"
+
+      # The page query is a window function over a subquery with a bound rank;
+      # a dialect that rejected it would stop every notification. The test
+      # dates its rows ten years back, so the job's other rows do not reorder
+      # them.
+      - name: Prove the notification page query on MySQL
+        run: "cargo test -p rg-db -j 6 --test integration notification_due_order:: -- --nocapture"
 
       - name: Prove single-use credentials hold on MySQL
         run: >-
@@ -635,6 +663,10 @@ jobs:
 
       - name: Prove MySQL CI secret scoping converges and reverses
         run: cargo test -p rg-db-migration -j 6 server_up_converges_after_an_interrupted_run_and_down_reverses_it -- --ignored --nocapture
+      - name: Instance signing keys migration (carry-over, resumption, single active key)
+        run: cargo test -p rg-db-migration -j 6 server_instance_signing_keys_carry_over_and_resume -- --ignored --nocapture
+      - name: Instance signing key lifecycle (rotation CAS, single active key, row checks)
+        run: cargo test -p rg-core -j 6 --lib server_instance_key_lifecycle_holds_on_a_server_database -- --ignored --nocapture
 
       - name: Prove MySQL code index refresh boundary
         run: cargo test -p rg-core -j 6 server_code_index_rebuild_publishes_atomically_without_holding_writers -- --ignored --nocapture

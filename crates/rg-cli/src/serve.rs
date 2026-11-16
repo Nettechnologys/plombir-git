@@ -1565,7 +1565,7 @@ struct ServeStorage {
     db: rg_db::DatabaseConnection,
     db_write: rg_db::DatabaseConnection,
     setup_token: rg_core::user::registration::SetupToken,
-    instance_key: std::sync::Arc<rg_core::auth::instance_key::InstanceKey>,
+    instance_keys: std::sync::Arc<rg_core::auth::instance_key::InstanceKeys>,
 }
 
 /// Create the repository root, finish what a previous run left half-done, open
@@ -1646,21 +1646,24 @@ async fn init_storage(settings: &mut ServeSettings) -> anyhow::Result<ServeStora
     upgrade_stored_secrets(&db, &settings.auth_secrets.encryption_key).await?;
     report_unaddressable_owners_and_repositories(&db).await;
 
-    // ── Instance provenance identity ──────────────────────────────
-    // The Ed25519 key that signs release attestations and backs the CI OIDC
-    // JWKS. Loaded from the database — on the first start it adopts exactly the
-    // key the old `jwt_secret` derivation produced, so nothing that was already
-    // signed stops verifying, and from then on the identity outlives every
-    // rotation of either secret (card_3aecf3708ebe).
-    let instance_key = std::sync::Arc::new(
-        rg_core::auth::instance_key::load_or_adopt(
-            &db,
-            &settings.auth_secrets.jwt_secret,
-            &settings.auth_secrets.encryption_key,
-        )
-        .await?,
-    );
-    tracing::info!(kid = %instance_key.kid(), "instance provenance signing key ready");
+    // ── Instance signing keys ─────────────────────────────────────
+    // The Ed25519 keys that sign release attestations and CI OIDC tokens. A
+    // fresh database gets a random key; a key derived from `jwt_secret` by an
+    // older version is retired here, on the first start after the upgrade.
+    // The running server re-reads the ring, so a rotation or revocation from
+    // the CLI takes effect without a restart.
+    let ring = rg_core::auth::instance_key::establish(
+        &db,
+        &settings.auth_secrets.jwt_secret,
+        &settings.auth_secrets.encryption_key,
+    )
+    .await?;
+    tracing::info!(kid = %ring.active().kid(), "instance signing key ready");
+    let instance_keys = std::sync::Arc::new(rg_core::auth::instance_key::InstanceKeys::new(
+        db.clone(),
+        &settings.auth_secrets.encryption_key,
+        ring,
+    ));
 
     Ok(ServeStorage {
         repo_root,
@@ -1668,7 +1671,7 @@ async fn init_storage(settings: &mut ServeSettings) -> anyhow::Result<ServeStora
         db,
         db_write,
         setup_token,
-        instance_key,
+        instance_keys,
     })
 }
 
@@ -2226,7 +2229,7 @@ fn build_transports(
         db_write: Some(storage.db_write.clone()),
         jwt_secret: settings.auth_secrets.jwt_secret,
         encryption_key: settings.auth_secrets.encryption_key,
-        instance_key: storage.instance_key.clone(),
+        instance_keys: storage.instance_keys.clone(),
         external_webhook_secret: settings.external_webhook_secret,
         docker_enabled: settings.docker,
         external_runners: settings.external_runners,

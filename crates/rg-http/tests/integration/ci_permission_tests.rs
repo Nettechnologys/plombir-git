@@ -988,8 +988,9 @@ async fn waiting_protected_job(
 }
 
 /// card_aa1d374901e3: an approval row records that somebody *was* allowed to
-/// approve. Taking the right away — off the allow-list, or out of the
-/// administration that approves without one — must take away the vote still
+/// approve. Taking the right away — off the allow-list, out of the
+/// administration that approves without one, or out of the private repository
+/// (card_d34edfc1b689) — must take away the vote still
 /// waiting for the threshold, or the revoked approver and one newcomer release
 /// a deployment neither could alone. The rows stay as history.
 #[tokio::test]
@@ -1143,6 +1144,152 @@ async fn a_revoked_approver_no_longer_counts_toward_a_protected_release() {
     assert_ci_graph_status(&db, job, stage, pipeline, "waiting_approval").await;
     assert_eq!(
         verdict(approve(&third, pipeline, job).await.unwrap()).await,
+        (2, true)
+    );
+    assert_ci_graph_status(&db, job, stage, pipeline, "pending").await;
+
+    // card_d34edfc1b689: still on the allow-list but removed from the private
+    // repository after voting — the vote stops counting as well.
+    let restored = client
+        .put(format!("{environment_url}/{environment_id}"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "name": "production",
+            "protected": true,
+            "required_approvals": 2,
+            "allowed_approver_ids": [first_id, second_id, third_id],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(restored.status(), 200, "{}", restored.text().await.unwrap());
+    let (pipeline, stage, job) = waiting_protected_job(&db, repo_id, &environment, 'd').await;
+    assert_eq!(
+        verdict(approve(&first, pipeline, job).await.unwrap()).await,
+        (1, false)
+    );
+    // The removal route takes the user's id.
+    let removed = client
+        .delete(format!("{repo_url}/collaborators/{first_id}"))
+        .bearer_auth(&owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        removed.status().is_success(),
+        "{}",
+        removed.text().await.unwrap()
+    );
+    assert_eq!(
+        verdict(approve(&second, pipeline, job).await.unwrap()).await,
+        (1, false)
+    );
+    assert_ci_graph_status(&db, job, stage, pipeline, "waiting_approval").await;
+    assert_eq!(
+        verdict(approve(&third, pipeline, job).await.unwrap()).await,
+        (2, true)
+    );
+    assert_ci_graph_status(&db, job, stage, pipeline, "pending").await;
+}
+
+/// card_d34edfc1b689, the second way to lose read access: an approver on the
+/// allow-list voted while the repository was public, then the repository became
+/// private. Nobody removed them from anything, and their vote stops counting.
+#[tokio::test]
+async fn an_approver_outside_a_repository_made_private_no_longer_counts() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (owner_token, _) = register_full(&base, "pv_owner", "pv_owner@example.com").await;
+    let created = client
+        .post(format!("{base}/api/v1/repos"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({ "name": "pv-deploy", "is_private": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let repo_id = created.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let repo_url = format!("{base}/api/v1/repos/pv_owner/pv-deploy");
+    let (outsider, outsider_id) =
+        register_full(&base, "pv_outsider", "pv_outsider@example.com").await;
+    let mut readers = Vec::new();
+    for name in ["pv_reader_a", "pv_reader_b"] {
+        let (token, id) = register_full(&base, name, &format!("{name}@example.com")).await;
+        let added = client
+            .post(format!("{repo_url}/collaborators"))
+            .bearer_auth(&owner_token)
+            .json(&serde_json::json!({ "username": name, "permission": "read" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            added.status().is_success(),
+            "{}",
+            added.text().await.unwrap()
+        );
+        readers.push((token, id));
+    }
+    let [(reader_a, reader_a_id), (reader_b, reader_b_id)] = <[_; 2]>::try_from(readers).unwrap();
+    let created = client
+        .post(format!("{repo_url}/actions/environments"))
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({
+            "name": "production",
+            "protected": true,
+            "required_approvals": 2,
+            "allowed_approver_ids": [outsider_id, reader_a_id, reader_b_id],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    let environment_id = created.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let environment = rg_db::ops::ci_environment_ops::find_by_id(&db, environment_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let approve = |token: &str, pipeline_id: i64, job_id: i64| {
+        client
+            .post(format!(
+                "{repo_url}/pipelines/{pipeline_id}/jobs/{job_id}/approve"
+            ))
+            .bearer_auth(token.to_string())
+            .send()
+    };
+    let verdict = |response: reqwest::Response| async move {
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(status, 200, "{body}");
+        (
+            body["approvals"].as_u64().unwrap(),
+            body["released"].as_bool().unwrap(),
+        )
+    };
+
+    let (pipeline, stage, job) = waiting_protected_job(&db, repo_id, &environment, 'e').await;
+    assert_eq!(
+        verdict(approve(&outsider, pipeline, job).await.unwrap()).await,
+        (1, false)
+    );
+    let hidden = client
+        .patch(&repo_url)
+        .bearer_auth(&owner_token)
+        .json(&serde_json::json!({ "is_private": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hidden.status(), 200, "{}", hidden.text().await.unwrap());
+    assert_eq!(
+        verdict(approve(&reader_a, pipeline, job).await.unwrap()).await,
+        (1, false)
+    );
+    assert_ci_graph_status(&db, job, stage, pipeline, "waiting_approval").await;
+    assert_eq!(
+        verdict(approve(&reader_b, pipeline, job).await.unwrap()).await,
         (2, true)
     );
     assert_ci_graph_status(&db, job, stage, pipeline, "pending").await;

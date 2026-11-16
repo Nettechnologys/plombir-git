@@ -219,6 +219,7 @@ async fn retire_sources(db: &sea_orm::DatabaseConnection, notes: &[Notification]
                     prior_locale: Set(None),
                     is_test: Set(false),
                     status: Set("cancelled".into()),
+                    priority: Set(rg_db::notification::PRIORITY_ACTIVITY),
                     attempts: Set(0),
                     next_attempt_at: Set(now),
                     lease_token: Set(None),

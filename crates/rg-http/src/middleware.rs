@@ -325,6 +325,34 @@ fn is_protocol_read_post(path: &str) -> bool {
     )
 }
 
+/// Requests that withdraw a way into an account that needs no interactive
+/// sign-in — a personal or bot token, an SSH key, a deploy key — or end every
+/// session of the caller.
+///
+/// They write, but refusing them is what maintenance mode must not do: a leaked
+/// token would keep working for as long as the maintenance lasted
+/// (card_e49592b4fd03). Each is matched by method and by the exact shape of its
+/// route, nothing longer or shorter; the handler behind it still decides who may
+/// make the request.
+fn is_credential_revocation(method: &Method, path: &str) -> bool {
+    let segments = path.split('/').collect::<Vec<_>>();
+    if method == Method::POST {
+        return segments == ["", "api", "v1", "users", "logout"];
+    }
+    if method != Method::DELETE {
+        return false;
+    }
+    let named = |parts: &[&str]| parts.iter().all(|part| !part.is_empty());
+    match segments.as_slice() {
+        ["", "api", "v1", "users", "tokens", id] | ["", "api", "v1", "users", "ssh-keys", id] => {
+            named(&[*id])
+        }
+        ["", "api", "v1", "users", "bots", bot, "tokens", id] => named(&[*bot, *id]),
+        ["", "api", "v1", "repos", owner, name, "keys", id] => named(&[*owner, *name, *id]),
+        _ => false,
+    }
+}
+
 /// Build the canonical response for a write rejected by maintenance mode.
 pub(crate) fn maintenance_response() -> Response {
     with_maintenance_retry_after(maintenance_api_response())
@@ -385,7 +413,7 @@ pub async fn maintenance_middleware(
 
         let is_admin = path.starts_with("/api/v1/admin/");
 
-        if !is_read_request(method, path) && !is_admin {
+        if !is_read_request(method, path) && !is_admin && !is_credential_revocation(method, path) {
             return maintenance_response_for_path(path);
         }
     }
@@ -421,6 +449,55 @@ mod tests {
             assert!(
                 !is_read_request(&Method::POST, path),
                 "{path} must remain blocked as a write"
+            );
+        }
+    }
+
+    /// card_e49592b4fd03: only the revocations themselves pass maintenance —
+    /// the same paths under another method, and their longer or shorter
+    /// neighbours, stay blocked.
+    #[test]
+    fn maintenance_admits_only_the_exact_credential_revocations() {
+        use super::is_credential_revocation;
+
+        for (method, path) in [
+            (Method::DELETE, "/api/v1/users/tokens/7"),
+            (Method::DELETE, "/api/v1/users/bots/helper/tokens/7"),
+            (Method::DELETE, "/api/v1/users/ssh-keys/7"),
+            (Method::DELETE, "/api/v1/repos/alice/repo/keys/7"),
+            (Method::POST, "/api/v1/users/logout"),
+        ] {
+            assert!(
+                is_credential_revocation(&method, path),
+                "{method} {path} must pass maintenance"
+            );
+        }
+
+        for (method, path) in [
+            (Method::POST, "/api/v1/users/tokens"),
+            (Method::PATCH, "/api/v1/users/tokens/7"),
+            (Method::POST, "/api/v1/users/tokens/7"),
+            (Method::DELETE, "/api/v1/users/tokens"),
+            (Method::DELETE, "/api/v1/users/tokens/"),
+            (Method::DELETE, "/api/v1/users/tokens/7/extra"),
+            (Method::DELETE, "/api/v1/users/bots/helper"),
+            (Method::DELETE, "/api/v1/users/bots//tokens/7"),
+            (Method::DELETE, "/api/v1/users/ssh-keys/7/extra"),
+            (Method::DELETE, "/api/v1/users/signing-keys/7"),
+            (Method::DELETE, "/api/v1/users/passkeys/7"),
+            (Method::DELETE, "/api/v1/users/me"),
+            (Method::DELETE, "/api/v1/repos/alice/repo"),
+            (Method::DELETE, "/api/v1/repos/alice/repo/keys/7/extra"),
+            (Method::DELETE, "/api/v1/repos/alice/repo/hooks/7"),
+            (Method::POST, "/api/v1/repos/alice/repo/keys"),
+            (Method::DELETE, "/api/v1/users/logout"),
+            (Method::POST, "/api/v1/users/logout/extra"),
+            (Method::POST, "/api/v1/users/me/session/refresh"),
+            (Method::DELETE, "/api/v2/users/tokens/7"),
+        ] {
+            assert!(
+                !is_credential_revocation(&method, path),
+                "{method} {path} must stay blocked"
             );
         }
     }

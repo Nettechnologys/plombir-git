@@ -39,10 +39,12 @@ export interface AttestationEnvelope {
 /// - `mismatch` — the bytes are not the bytes that were signed. The single most
 ///   important thing this feature can say, and it arrives with a 200.
 /// - `undeterminable` — the server could not reach a verdict at all (a
-///   predicate type it has no verifier for, an unreadable envelope, a rotated
-///   key). It observes nothing about the asset, so it must never be drawn as
-///   the `mismatch` alarm (card_4579598691ce).
-export type AttestationStatus = 'verified' | 'mismatch' | 'undeterminable';
+///   predicate type it has no verifier for, an unreadable envelope, a key it
+///   never held). It observes nothing about the asset, so it must never be
+///   drawn as the `mismatch` alarm (card_4579598691ce).
+/// - `revoked` — the signature holds, but under a key revoked as compromised,
+///   so it proves nothing about who signed.
+export type AttestationStatus = 'verified' | 'mismatch' | 'undeterminable' | 'revoked';
 
 /// The answer to "does this signature still hold for the bytes on disk?"
 ///
@@ -55,6 +57,10 @@ export interface AttestationReport {
   reason: string | null;
   predicate_type: string | null;
   keyid: string | null;
+  /** Status of the signing key: a `retired` key verifies only on this server. */
+  key_status?: 'active' | 'retired' | 'revoked' | null;
+  /** `legacy_derived` keys were computable from the instance's JWT secret. */
+  key_origin?: 'generated' | 'legacy_derived' | null;
   /** SHA-256 recomputed from the stored bytes at verification time. */
   asset_sha256: string;
 }

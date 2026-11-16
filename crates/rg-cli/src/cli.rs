@@ -10,7 +10,7 @@
 //! this file is a user interface that happens to be spelled in doc comments.
 #![allow(rustdoc::broken_intra_doc_links)]
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::runner::DEFAULT_RUNNER_CONFIG;
 
@@ -294,12 +294,11 @@ pub(crate) enum Commands {
     ///     PLOMBIR_GIT_JWT_SECRET="$(plombir-git gen-secret)"
     GenSecret,
 
-    /// Replace this instance's Ed25519 provenance signing key.
+    /// Replace this instance's active Ed25519 signing key.
     ///
-    /// The key signs release attestations and backs `/api/v1/ci/oidc/jwks`. It
-    /// is stored, not derived from `jwt_secret`, so rotating the signing secret
-    /// leaves it alone — use this only when the key itself is compromised.
-    /// Every attestation signed with the previous key stops verifying.
+    /// The key signs release attestations and CI OIDC tokens and is published
+    /// at `/api/v1/ci/oidc/jwks`. A running server switches to the new key
+    /// within 30 seconds, without a restart.
     RotateInstanceKey {
         /// Database URL (sqlite://, postgres://, or mysql://)
         /// [config: [database].url] [default: sqlite://./plombir-git.db?mode=rwc]
@@ -322,10 +321,80 @@ pub(crate) enum Commands {
         #[arg(long)]
         encryption_key: Option<String>,
 
+        /// `routine`: the old key keeps verifying what it signed and stays in
+        /// the JWKS for 10 minutes. `compromised`: the old key is revoked — it
+        /// leaves the JWKS at once and its attestations are refused.
+        #[arg(long, value_enum)]
+        reason: InstanceKeyRotationReason,
+
         /// Confirm the rotation. Without it the command refuses and explains
-        /// what would be invalidated.
+        /// what would change.
         #[arg(long)]
         yes: bool,
+    },
+
+    /// Revoke a retired instance signing key by its kid.
+    ///
+    /// For a key already taken out of service — e.g. the key derived from
+    /// `jwt_secret` that 0.4.3 retires on upgrade — when it turns out to be
+    /// compromised. The active key cannot be revoked this way; rotate it with
+    /// `--reason compromised`.
+    RevokeInstanceKey {
+        /// The key's `kid`, as `instance-key-status` prints it.
+        kid: String,
+
+        /// Confirm the revocation. It cannot be undone: every attestation the
+        /// key signed is reported as signed by a revoked key from then on.
+        #[arg(long)]
+        yes: bool,
+
+        /// Database URL (sqlite://, postgres://, or mysql://)
+        /// [config: [database].url] [default: sqlite://./plombir-git.db?mode=rwc]
+        #[arg(long)]
+        db_url: Option<String>,
+
+        /// Path to TOML configuration file; a flag passed on the command line
+        /// wins over the corresponding config key
+        #[arg(long)]
+        config: Option<String>,
+
+        /// JWT signing secret [config: [auth].jwt_secret]
+        /// [env: PLOMBIR_GIT_JWT_SECRET]
+        #[arg(long)]
+        jwt_secret: Option<String>,
+
+        /// At-rest encryption key, which is what the stored key material is
+        /// sealed with [config: [auth].encryption_key]
+        /// [env: PLOMBIR_GIT_ENCRYPTION_KEY]
+        #[arg(long)]
+        encryption_key: Option<String>,
+    },
+
+    /// Print every instance signing key: kid, origin, status and dates.
+    ///
+    /// Read-only apart from recording the kid of a key carried over by the
+    /// 0.4.3 migration, which needs the encryption key to compute.
+    InstanceKeyStatus {
+        /// Database URL (sqlite://, postgres://, or mysql://)
+        /// [config: [database].url] [default: sqlite://./plombir-git.db?mode=rwc]
+        #[arg(long)]
+        db_url: Option<String>,
+
+        /// Path to TOML configuration file; a flag passed on the command line
+        /// wins over the corresponding config key
+        #[arg(long)]
+        config: Option<String>,
+
+        /// JWT signing secret [config: [auth].jwt_secret]
+        /// [env: PLOMBIR_GIT_JWT_SECRET]
+        #[arg(long)]
+        jwt_secret: Option<String>,
+
+        /// At-rest encryption key, which is what the stored key material is
+        /// sealed with [config: [auth].encryption_key]
+        /// [env: PLOMBIR_GIT_ENCRYPTION_KEY]
+        #[arg(long)]
+        encryption_key: Option<String>,
     },
 
     /// Re-encrypt every at-rest secret under a new encryption key.
@@ -700,6 +769,13 @@ pub(crate) enum Commands {
     },
 }
 
+/// Why the active instance signing key is being replaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum InstanceKeyRotationReason {
+    Routine,
+    Compromised,
+}
+
 /// Ownership boundary for files a top-level CLI command may create.
 ///
 /// This match is deliberately exhaustive. Adding a subcommand now requires an
@@ -719,6 +795,8 @@ impl Commands {
         match self {
             Self::Migrate { config, .. }
             | Self::RotateInstanceKey { config, .. }
+            | Self::RevokeInstanceKey { config, .. }
+            | Self::InstanceKeyStatus { config, .. }
             | Self::RotateEncryptionKey { config, .. }
             | Self::RebuildFts { config, .. }
             | Self::RestoreDb { config, .. }
@@ -1007,6 +1085,8 @@ const AFTER: &str = "after";
             | Commands::BackupDb { db_url, config, .. }
             | Commands::RestoreDb { db_url, config, .. }
             | Commands::RotateInstanceKey { db_url, config, .. }
+            | Commands::RevokeInstanceKey { db_url, config, .. }
+            | Commands::InstanceKeyStatus { db_url, config, .. }
             | Commands::RotateEncryptionKey { db_url, config, .. }
             | Commands::ResetMfa { db_url, config, .. } => {
                 (db_url.as_deref(), None, config.as_deref())
@@ -1060,7 +1140,9 @@ const AFTER: &str = "after";
             "--email",
             "alice@example.com",
         ],
-        &["plombir-git", "rotate-instance-key"],
+        &["plombir-git", "rotate-instance-key", "--reason", "routine"],
+        &["plombir-git", "revoke-instance-key", "0123456789abcdef"],
+        &["plombir-git", "instance-key-status"],
         &[
             "plombir-git",
             "rotate-encryption-key",

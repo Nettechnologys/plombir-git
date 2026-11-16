@@ -1273,7 +1273,10 @@ async fn an_outbound_secret_is_journalled_when_it_appears_changes_and_goes() {
     };
 
     let born = details("repo.webhook_create");
-    assert_eq!(born["webhook_url"], "https://receiver.example.com/hook");
+    // Only the origin: the path or query of a webhook URL can be the
+    // receiver's bearer secret (L31). The id ties the rows together.
+    assert_eq!(born["webhook_origin"], "https://receiver.example.com");
+    assert_eq!(born["webhook_id"], hook_id);
     assert_eq!(born["has_secret"], true);
 
     let changed = details("repo.webhook_update");
@@ -1284,9 +1287,10 @@ async fn an_outbound_secret_is_journalled_when_it_appears_changes_and_goes() {
 
     let gone = details("repo.webhook_delete");
     assert_eq!(
-        gone["webhook_url"], "https://receiver.example.com/hook",
+        gone["webhook_origin"], "https://receiver.example.com",
         "read off the row before it went — `webhook #4 was removed` names nothing"
     );
+    assert_eq!(gone["webhook_id"], hook_id);
 
     let pulled = details("repo.mirror_create");
     assert_eq!(
@@ -1944,4 +1948,96 @@ async fn sso_provider_secret_events_are_journalled_and_the_secrets_are_not() {
              admin API, so a credential in it is a second credential store"
         );
     }
+}
+
+/// L31: a webhook URL can carry the receiver's bearer secret in its path or
+/// query. The journal keeps the origin and the id, and says when deliveries
+/// moved to another origin, but never the rest of the URL.
+#[tokio::test]
+async fn the_journal_keeps_a_webhook_origin_never_its_path_or_query() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let (token, actor_id) = register_full(&base, "hook-path", "hook-path@example.com").await;
+    promote_user_to_admin(&db, actor_id).await;
+    create_repo(&base, &token, "secretive").await;
+    let client = reqwest::Client::new();
+    let hooks = format!("{base}/api/v1/repos/hook-path/secretive/hooks");
+
+    let created = client
+        .post(&hooks)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "url": "https://receiver.example.com/services/T/B/PATH-MARKER?token=QUERY-MARKER",
+            "events": ["push"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
+    let hook_id = created.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    for patch in [
+        serde_json::json!({ "events": ["push", "issue.opened"] }),
+        serde_json::json!({ "url": "https://other.example.net:8443/x/PATH-MARKER-2?token=QUERY-MARKER-2" }),
+    ] {
+        let updated = client
+            .patch(format!("{hooks}/{hook_id}"))
+            .bearer_auth(&token)
+            .json(&patch)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), 200, "{}", updated.text().await.unwrap());
+    }
+    let deleted = client
+        .delete(format!("{hooks}/{hook_id}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(deleted.status().is_success());
+
+    let rows: Vec<serde_json::Value> = journal(&base, &token)
+        .await
+        .into_iter()
+        .filter(|row| {
+            row["action"]
+                .as_str()
+                .is_some_and(|action| action.starts_with("repo.webhook_"))
+        })
+        .collect();
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    for row in &rows {
+        let text = row.to_string();
+        for marker in ["PATH-MARKER", "QUERY-MARKER", "/services/", "token="] {
+            assert!(
+                !text.contains(marker),
+                "{marker} reached the journal: {text}"
+            );
+        }
+    }
+    let details = |row: &serde_json::Value| -> serde_json::Value {
+        serde_json::from_str(row["details"].as_str().unwrap()).unwrap()
+    };
+    let all: Vec<_> = rows.iter().map(details).collect();
+    assert!(all.iter().all(|d| d["webhook_id"] == hook_id));
+    let updates: Vec<_> = rows
+        .iter()
+        .filter(|row| row["action"] == "repo.webhook_update")
+        .map(details)
+        .collect();
+    let events_only = updates
+        .iter()
+        .find(|d| d["url_changed"] == false)
+        .expect("the events-only update");
+    assert!(events_only["previous_webhook_origin"].is_null());
+    let moved = updates
+        .iter()
+        .find(|d| d["url_changed"] == true)
+        .expect("the update that moved the hook");
+    assert_eq!(moved["webhook_origin"], "https://other.example.net:8443");
+    assert_eq!(
+        moved["previous_webhook_origin"],
+        "https://receiver.example.com"
+    );
 }

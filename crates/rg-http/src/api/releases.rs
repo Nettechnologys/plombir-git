@@ -1092,10 +1092,16 @@ pub async fn sign_asset_attestation(
         };
 
     let builder_id = attestation_builder_id(&state);
+    // Read without the cache: a release signed seconds after a revocation must
+    // not carry the revoked key.
+    let keys = match state.instance_keys.fresh().await {
+        Ok(keys) => keys,
+        Err(e) => return AppError::from(e).into_response(),
+    };
     match rg_core::release::service::sign_asset_attestation(
         &state.db,
         asset.id,
-        &state.instance_key,
+        keys.active(),
         &builder_id,
     )
     .await
@@ -1208,6 +1214,10 @@ pub async fn verify_asset_attestation(
             Err(e) => return e.into_response(),
         };
 
+        let keys = match state.instance_keys.current().await {
+            Ok(keys) => keys,
+            Err(e) => return AppError::from(e).into_response(),
+        };
         match rg_core::release::service::verify_asset_attestation(
             &state.db,
             asset.id,
@@ -1215,7 +1225,7 @@ pub async fn verify_asset_attestation(
             &state.repo_root,
             &owner,
             &name,
-            &state.instance_key,
+            &keys,
         )
         .await
         {

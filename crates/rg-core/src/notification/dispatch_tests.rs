@@ -628,7 +628,10 @@ async fn organization_owner_copies_recheck_role_but_personal_revocation_notice_s
     assert_eq!(team.len(), 2);
     assert_eq!(removal.len(), 2);
     let out = Recorder::default();
-    pass(&db, &config(true), &out).await.unwrap();
+    // Drain, as the dispatcher does: this recipient has more class-1 rows than
+    // one page gives a single recipient, which is the S10 limit, not this
+    // test's subject.
+    drain(&db, &config(true), &out, &|| false).await.unwrap();
     for id in team {
         let row = notification_delivery::Entity::find_by_id(id)
             .one(&db)
@@ -652,4 +655,738 @@ async fn organization_owner_copies_recheck_role_but_personal_revocation_notice_s
             "sent"
         );
     }
+}
+
+async fn status_of(db: &DatabaseConnection, rows: &[notification_delivery::Model]) -> Vec<String> {
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(
+            notification_delivery::Entity::find_by_id(row.id)
+                .one(db)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+        );
+    }
+    out
+}
+
+async fn second_user(db: &DatabaseConnection, name: &str) -> user::Model {
+    rg_db::ops::user_ops::create_user(db, name, &format!("{name}@example.invalid"), "x", name)
+        .await
+        .unwrap()
+}
+
+/// S10: a security notification queued behind a page's worth of activity is
+/// delivered by the next pass, not after the activity backlog.
+#[tokio::test]
+async fn a_security_row_is_delivered_ahead_of_queued_activity() {
+    let (db, user) = fixture().await;
+    for _ in 0..30 {
+        enqueue(&db, user.id, Event::Participating).await;
+    }
+    let rows = enqueue(&db, user.id, Event::NewDevice).await;
+    pass(&db, &config(true), &Recorder::default())
+        .await
+        .unwrap();
+    assert_eq!(status_of(&db, &rows).await, vec!["sent", "sent"]);
+}
+
+/// One recipient's backlog in a class takes at most `PER_RECIPIENT` places of
+/// a page; somebody else's row queued later is still in it.
+#[tokio::test]
+async fn one_recipient_cannot_hold_a_security_class() {
+    let (db, user) = fixture().await;
+    for _ in 0..50 {
+        enqueue(&db, user.id, Event::NewDevice).await;
+    }
+    let other = second_user(&db, "bystander").await;
+    let rows = enqueue(&db, other.id, Event::NewDevice).await;
+    let out = Recorder::default();
+    pass(&db, &config(true), &out).await.unwrap();
+    assert_eq!(status_of(&db, &rows).await, vec!["sent"]);
+    let flooder_sent = out
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(target, _)| !target.contains("bystander"))
+        .count();
+    assert!(
+        flooder_sent <= queue::PER_RECIPIENT as usize,
+        "{flooder_sent}"
+    );
+}
+
+/// V1: rows another member can cause (organization membership changes) do
+/// not delay the victim's own account warnings.
+#[tokio::test]
+async fn shared_resource_floods_do_not_delay_account_warnings() {
+    let (db, user) = fixture().await;
+    for _ in 0..100 {
+        enqueue(&db, user.id, Event::OrganizationAccessChanged).await;
+    }
+    let rows = enqueue(&db, user.id, Event::NewDevice).await;
+    pass(&db, &config(true), &Recorder::default())
+        .await
+        .unwrap();
+    assert_eq!(status_of(&db, &rows).await, vec!["sent", "sent"]);
+}
+
+/// The dispatcher keeps passing while passes settle rows instead of sleeping
+/// after each page; a row held by another worker does not keep it spinning.
+#[tokio::test]
+async fn draining_delivers_more_than_a_page_and_stops_on_held_rows() {
+    let (db, user) = fixture().await;
+    let mut rows = Vec::new();
+    for _ in 0..60 {
+        rows.extend(enqueue(&db, user.id, Event::Participating).await);
+    }
+    let held = rows.pop().unwrap();
+    let mut lease: notification_delivery::ActiveModel = held.clone().into();
+    lease.status = Set("inflight".into());
+    lease.lease_token = Set(Some("another-worker".into()));
+    lease.lease_until = Set(Some(chrono::Utc::now() + chrono::Duration::minutes(5)));
+    lease.update(&db).await.unwrap();
+
+    let settled = drain(&db, &config(true), &Recorder::default(), &|| false)
+        .await
+        .unwrap();
+    assert_eq!(settled, rows.len());
+    assert!(status_of(&db, &rows).await.iter().all(|s| s == "sent"));
+    assert_eq!(status_of(&db, &[held]).await, vec!["inflight"]);
+}
+
+fn thread_subject(repo_id: i64) -> super::super::thread::Subject {
+    super::super::thread::Subject {
+        kind: super::super::thread::SubjectKind::Issue,
+        id: 700,
+        number: 7,
+        repo_id,
+        title: "folded subject".into(),
+    }
+}
+
+async fn thread_repo(db: &DatabaseConnection, owner: &user::Model) -> i64 {
+    let now = chrono::Utc::now();
+    rg_db::ops::repo_ops::create(
+        db,
+        rg_db::entities::repository::ActiveModel {
+            owner_id: Set(owner.id),
+            name: Set("folds".into()),
+            is_private: Set(true),
+            default_branch: Set("main".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+    .id
+}
+
+async fn queued_thread_rows(db: &DatabaseConnection) -> Vec<notification_delivery::Model> {
+    notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::EventId.starts_with("thread:"))
+        .filter(notification_delivery::Column::Status.eq("queued"))
+        .all(db)
+        .await
+        .unwrap()
+}
+
+/// A fold supersedes the queued rows of earlier versions when it is
+/// enqueued: three events on one thread leave one version per channel.
+#[tokio::test]
+async fn folding_a_thread_cancels_its_queued_earlier_versions() {
+    use super::super::thread::{self, Reason, ThreadEvent};
+    let (db, user) = fixture().await;
+    let repo_id = thread_repo(&db, &user).await;
+    for action in ["first action", "second action", "third action"] {
+        thread::deliver(
+            &db,
+            &ThreadEvent::new(thread_subject(repo_id), None, action)
+                .to(user.id, Reason::Participating),
+        )
+        .await
+        .unwrap();
+    }
+    assert!(queued_thread_rows(&db).await.len() <= 2);
+    let superseded = notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::LastError.eq("thread_removed_or_superseded"))
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(superseded.len(), 4);
+    assert!(superseded
+        .iter()
+        .all(|row| row.metadata == "{}" && row.status == "cancelled"));
+}
+
+/// A version already held by a worker is not touched at enqueue; the
+/// dispatcher stops it as superseded once its lease runs out.
+#[tokio::test]
+async fn an_in_flight_version_is_left_to_the_dispatcher() {
+    use super::super::thread::{self, Reason, ThreadEvent};
+    let (db, user) = fixture().await;
+    let repo_id = thread_repo(&db, &user).await;
+    thread::deliver(
+        &db,
+        &ThreadEvent::new(thread_subject(repo_id), None, "first action")
+            .to(user.id, Reason::Participating),
+    )
+    .await
+    .unwrap();
+    let first = queued_thread_rows(&db).await;
+    for row in &first {
+        let mut held: notification_delivery::ActiveModel = row.clone().into();
+        held.status = Set("inflight".into());
+        held.lease_token = Set(Some("another-worker".into()));
+        held.lease_until = Set(Some(chrono::Utc::now() + chrono::Duration::minutes(5)));
+        held.update(&db).await.unwrap();
+    }
+    thread::deliver(
+        &db,
+        &ThreadEvent::new(thread_subject(repo_id), None, "second action")
+            .to(user.id, Reason::Participating),
+    )
+    .await
+    .unwrap();
+    assert!(status_of(&db, &first).await.iter().all(|s| s == "inflight"));
+
+    for row in &first {
+        let mut expired: notification_delivery::ActiveModel = row.clone().into();
+        expired.status = Set("inflight".into());
+        expired.lease_token = Set(Some("another-worker".into()));
+        expired.lease_until = Set(Some(chrono::Utc::now() - chrono::Duration::minutes(1)));
+        expired.update(&db).await.unwrap();
+    }
+    pass(&db, &config(true), &Recorder::default())
+        .await
+        .unwrap();
+    for row in &first {
+        let stopped = notification_delivery::Entity::find_by_id(row.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.status, "cancelled");
+        assert_eq!(
+            stopped.last_error.as_deref(),
+            Some("thread_removed_or_superseded")
+        );
+    }
+}
+
+/// Rendered into the warning's text, so the test finds it whatever the
+/// recipient's language (the fixture saves `ru`).
+const WARNING_MARKER: &str = "v3-warning-device";
+
+/// Records sends and, on the third one, enqueues a security event — a
+/// warning that arrives while a page of activity is being sent.
+struct EnqueueOnThird {
+    db: DatabaseConnection,
+    user_id: i64,
+    sent: Mutex<Vec<String>>,
+}
+impl Sender for EnqueueOnThird {
+    fn send<'a>(
+        &'a self,
+        _target: &'a Target,
+        message: &'a template::Message,
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<(), Failure>> + Send + 'a>> {
+        Box::pin(async move {
+            let count = {
+                let mut sent = self.sent.lock().unwrap();
+                sent.push(message.text.clone());
+                sent.len()
+            };
+            if count == 3 {
+                let mut event = queue::QueueEvent::security(self.user_id, Event::NewDevice, None);
+                event.metadata.device = Some(WARNING_MARKER.into());
+                queue::enqueue(&self.db, &event).await.unwrap();
+            }
+            Ok(())
+        })
+    }
+}
+
+/// V3: rows of a page go out one by one, so a warning arriving mid-page waits
+/// for at most one page of activity, not for a page sized for security.
+#[tokio::test]
+async fn a_warning_arriving_mid_page_waits_for_at_most_one_activity_page() {
+    let (db, user) = fixture().await;
+    for _ in 0..25 {
+        enqueue(&db, user.id, Event::Participating).await;
+    }
+    let out = EnqueueOnThird {
+        db: db.clone(),
+        user_id: user.id,
+        sent: Mutex::new(Vec::new()),
+    };
+    pass(&db, &config(true), &out).await.unwrap();
+    pass(&db, &config(true), &out).await.unwrap();
+    let sent = out.sent.lock().unwrap();
+    let first_warning = sent
+        .iter()
+        .position(|text| text.contains(WARNING_MARKER))
+        .expect("the warning was delivered by the second pass");
+    // The bound is the design's, written out: comparing with the constant
+    // would follow it if someone raised it back to a full page.
+    assert!(
+        first_warning <= 10,
+        "the warning waited behind {first_warning} activity sends"
+    );
+}
+
+/// L28: rows of an account whose retirement has begun are neither sent nor
+/// cancelled; an aborted retirement delivers them.
+#[tokio::test]
+async fn a_retiring_account_keeps_its_rows_and_an_abort_delivers_them() {
+    let (db, user) = fixture().await;
+    let rows = enqueue(&db, user.id, Event::NewDevice).await;
+    assert!(rg_db::ops::user_ops::begin_user_retirement(&db, user.id)
+        .await
+        .unwrap());
+    let out = Recorder::default();
+    assert_eq!(pass(&db, &config(true), &out).await.unwrap(), 0);
+    assert!(out.sent.lock().unwrap().is_empty());
+    assert_eq!(status_of(&db, &rows).await, vec!["queued", "queued"]);
+
+    rg_db::ops::user_ops::abort_user_retirement(&db, user.id)
+        .await
+        .unwrap();
+    pass(&db, &config(true), &out).await.unwrap();
+    assert_eq!(status_of(&db, &rows).await, vec!["sent", "sent"]);
+}
+
+/// A retirement that begins between claim and send hands the row back with
+/// the attempt the claim counted, so retirements started and aborted around a
+/// warning cannot spend its six attempts.
+#[tokio::test]
+async fn a_row_claimed_before_retirement_is_handed_back_with_its_attempt() {
+    let (db, user) = fixture().await;
+    let row = enqueue(&db, user.id, Event::NewDevice).await.remove(0);
+    let held = queue::claim(&db, row.id).await.unwrap().expect("claimed");
+    assert_eq!(held.attempts, row.attempts + 1);
+    assert!(rg_db::ops::user_ops::begin_user_retirement(&db, user.id)
+        .await
+        .unwrap());
+
+    let before = chrono::Utc::now();
+    assert!(settle(&db, held, &config(true), &Recorder::default())
+        .await
+        .unwrap());
+    let back = notification_delivery::Entity::find_by_id(row.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(back.status, "queued");
+    assert_eq!(back.attempts, row.attempts);
+    assert!(back.lease_token.is_none());
+    assert!(back.next_attempt_at >= before + chrono::Duration::seconds(55));
+    assert!(back.next_attempt_at <= chrono::Utc::now() + chrono::Duration::seconds(65));
+}
+
+/// The other branches stay terminal: no account, a bot, a deactivated account.
+#[tokio::test]
+async fn missing_bot_and_deactivated_accounts_are_cancelled() {
+    let (db, user) = fixture().await;
+    let out = Recorder::default();
+
+    let deactivated = enqueue(&db, user.id, Event::NewDevice).await;
+    let mut account: user::ActiveModel = user::Entity::find_by_id(user.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .into();
+    account.is_active = Set(false);
+    account.update(&db).await.unwrap();
+    pass(&db, &config(true), &out).await.unwrap();
+    assert_eq!(
+        status_of(&db, &deactivated).await,
+        vec!["cancelled", "cancelled"]
+    );
+
+    let owner = second_user(&db, "bot-owner").await;
+    let bot = second_user(&db, "a-bot").await;
+    let to_bot = enqueue(&db, bot.id, Event::NewDevice).await;
+    let mut as_bot: user::ActiveModel = bot.clone().into();
+    as_bot.bot_owner_id = Set(Some(owner.id));
+    as_bot.update(&db).await.unwrap();
+    pass(&db, &config(true), &out).await.unwrap();
+    assert_eq!(status_of(&db, &to_bot).await, vec!["cancelled"]);
+
+    // An account row gone between claim and send (a race with the final
+    // delete, whose cascade then removes the row): stop it, there is nobody to
+    // tell. The held copy points at an id no account has; the outcome is
+    // written to the real row through its lease.
+    let gone = second_user(&db, "gone").await;
+    let orphan = enqueue(&db, gone.id, Event::NewDevice).await;
+    let mut held = queue::claim(&db, orphan[0].id)
+        .await
+        .unwrap()
+        .expect("claimed");
+    held.user_id = i64::MAX;
+    assert!(settle(&db, held, &config(true), &out).await.unwrap());
+    let stopped = notification_delivery::Entity::find_by_id(orphan[0].id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.status, "cancelled");
+    assert_eq!(stopped.last_error.as_deref(), Some("account_unavailable"));
+    assert!(out.sent.lock().unwrap().is_empty());
+}
+
+/// A completed deletion removes the account's rows, warnings included.
+#[tokio::test]
+async fn a_completed_deletion_removes_the_rows_with_the_account() {
+    use sea_orm::ConnectionTrait;
+    let (db, _) = fixture().await;
+    let leaving = second_user(&db, "leaving").await;
+    let rows = enqueue(&db, leaving.id, Event::NewDevice).await;
+    db.execute_unprepared(&format!("DELETE FROM users WHERE id = {}", leaving.id))
+        .await
+        .unwrap();
+    assert!(notification_delivery::Entity::find_by_id(rows[0].id)
+        .one(&db)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+async fn kind_rows(
+    db: &DatabaseConnection,
+    user_id: i64,
+    key: &str,
+) -> Vec<notification_delivery::Model> {
+    notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::UserId.eq(user_id))
+        .filter(notification_delivery::Column::EventKey.eq(key))
+        .filter(notification_delivery::Column::Channel.eq("email"))
+        .all(db)
+        .await
+        .unwrap()
+}
+
+/// S10 bound, keep-oldest: the sixth warning of a kind to the same recipient
+/// and destination is recorded as coalesced; the five already waiting keep
+/// their payload.
+#[tokio::test]
+async fn a_full_kind_drops_the_new_row_and_keeps_the_waiting_ones() {
+    let (db, user) = fixture().await;
+    for _ in 0..6 {
+        enqueue(&db, user.id, Event::NewDevice).await;
+    }
+    let rows = kind_rows(&db, user.id, "new_device").await;
+    let queued: Vec<_> = rows.iter().filter(|r| r.status == "queued").collect();
+    let dropped: Vec<_> = rows
+        .iter()
+        .filter(|r| r.last_error.as_deref() == Some("coalesced"))
+        .collect();
+    assert_eq!(queued.len(), queue::QUEUED_PER_KIND as usize);
+    assert_eq!(dropped.len(), 1);
+    assert!(queued.iter().all(|r| r.metadata != "{}"));
+    assert_eq!(dropped[0].status, "cancelled");
+    assert_eq!(dropped[0].metadata, "{}");
+    assert!(dropped[0].id > queued.iter().map(|r| r.id).max().unwrap());
+}
+
+/// Somebody else's flood of a shared-resource event cannot push out the
+/// recipient's waiting warning of that kind.
+#[tokio::test]
+async fn a_flood_never_displaces_a_waiting_warning() {
+    let (db, user) = fixture().await;
+    let real = enqueue(&db, user.id, Event::OrganizationAccessChanged).await;
+    for _ in 0..20 {
+        enqueue(&db, user.id, Event::OrganizationAccessChanged).await;
+    }
+    let first = notification_delivery::Entity::find_by_id(
+        real.iter().find(|r| r.channel == "email").unwrap().id,
+    )
+    .one(&db)
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(first.status, "queued");
+    assert_eq!(
+        first.metadata,
+        real.iter().find(|r| r.channel == "email").unwrap().metadata
+    );
+    let queued = kind_rows(&db, user.id, "organization_access_changed")
+        .await
+        .into_iter()
+        .filter(|r| r.status == "queued")
+        .count();
+    assert_eq!(queued, queue::QUEUED_PER_KIND as usize);
+}
+
+/// Delivering one of the five frees a place; other kinds, channels and
+/// activity are not bounded by it.
+#[tokio::test]
+async fn the_bound_is_per_kind_and_frees_with_delivery() {
+    let (db, user) = fixture().await;
+    for _ in 0..5 {
+        enqueue(&db, user.id, Event::NewDevice).await;
+    }
+    let other_kind = enqueue(&db, user.id, Event::PasswordChanged).await;
+    assert!(status_of(&db, &other_kind)
+        .await
+        .iter()
+        .all(|s| s == "queued"));
+    let activity: Vec<_> = {
+        let mut rows = Vec::new();
+        for _ in 0..8 {
+            rows.extend(enqueue(&db, user.id, Event::Participating).await);
+        }
+        rows
+    };
+    assert!(status_of(&db, &activity)
+        .await
+        .iter()
+        .all(|s| s == "queued"));
+
+    let waiting = kind_rows(&db, user.id, "new_device").await;
+    deliver_one(&db, waiting[0].id, &config(true), &Recorder::default())
+        .await
+        .unwrap();
+    let next = enqueue(&db, user.id, Event::NewDevice).await;
+    let email = next.iter().find(|r| r.channel == "email").unwrap();
+    assert_eq!(
+        status_of(&db, std::slice::from_ref(email)).await,
+        vec!["queued"]
+    );
+}
+
+/// Changing the Telegram destination again and again cannot push out the
+/// warning owed to the first destination: each previous destination is its
+/// own kind.
+#[tokio::test]
+async fn repeated_destination_changes_keep_the_first_destinations_warning() {
+    let (db, user) = fixture().await;
+    let ctx = settings::SaveContext {
+        encryption_secret: KEY,
+        smtp_available: false,
+        metadata: Metadata::default(),
+    };
+    let generation = queue::profile(&db, user.id).await.unwrap().generation;
+    queue::confirm_telegram(&db, user.id, generation)
+        .await
+        .unwrap();
+    for chat in 1..=7 {
+        settings::save(
+            &db,
+            user.id,
+            &settings::Patch {
+                telegram: Some(settings::TelegramChange::Set {
+                    token: Some(TOKEN.into()),
+                    chat_id: -1_002_000 - chat,
+                    message_thread_id: None,
+                }),
+                ..Default::default()
+            },
+            &ctx,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let generation = queue::profile(&db, user.id).await.unwrap().generation;
+        queue::confirm_telegram(&db, user.id, generation)
+            .await
+            .unwrap();
+    }
+    let warnings: Vec<_> = notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::UserId.eq(user.id))
+        .filter(notification_delivery::Column::Channel.eq("telegram"))
+        .filter(notification_delivery::Column::PreviousDestinationEncrypted.is_not_null())
+        .all(&db)
+        .await
+        .unwrap();
+    assert!(warnings.len() >= 7, "{}", warnings.len());
+    assert!(warnings.iter().all(|r| r.status == "queued"));
+    let first = warnings.iter().min_by_key(|r| r.id).unwrap();
+    let opened = crate::auth::encryption::decrypt(
+        first.previous_destination_encrypted.as_deref().unwrap(),
+        &crate::auth::encryption::derive_key(KEY),
+    )
+    .unwrap();
+    assert!(opened.contains("-1001234"), "{opened}");
+}
+
+async fn queued_of(
+    db: &DatabaseConnection,
+    user_id: i64,
+    key: &str,
+) -> Vec<notification_delivery::Model> {
+    notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::UserId.eq(user_id))
+        .filter(notification_delivery::Column::EventKey.eq(key))
+        .filter(notification_delivery::Column::Status.eq("queued"))
+        .all(db)
+        .await
+        .unwrap()
+}
+
+/// Kinds are unbounded in number (each repository, each destination is one),
+/// so one event also has a per-recipient budget: past it a new row is
+/// coalesced whatever its kind, and the oldest rows keep their payload.
+#[tokio::test]
+async fn one_event_has_a_budget_across_its_kinds() {
+    let (db, user) = fixture().await;
+    let mut first = None;
+    for i in 0..60 {
+        let mut event = queue::QueueEvent::security(user.id, Event::RepositoryAccessChanged, None);
+        event.repo_id = Some(10_000 + i);
+        queue::enqueue(&db, &event).await.unwrap();
+        if first.is_none() {
+            first = Some(queue::event_rows(&db, user.id, &event.id).await.unwrap());
+        }
+    }
+    let queued = queued_of(&db, user.id, "repository_access_changed").await;
+    assert_eq!(queued.len(), queue::QUEUED_PER_EVENT as usize);
+    let coalesced = sea_orm::PaginatorTrait::count(
+        notification_delivery::Entity::find()
+            .filter(notification_delivery::Column::UserId.eq(user.id))
+            .filter(notification_delivery::Column::LastError.eq("coalesced")),
+        &db,
+    )
+    .await
+    .unwrap();
+    assert!(coalesced > 0);
+    for row in first.unwrap() {
+        let kept = notification_delivery::Entity::find_by_id(row.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.status, "queued");
+        assert_eq!(kept.metadata, row.metadata);
+    }
+
+    // A full budget of one event leaves another event untouched.
+    let other = enqueue(&db, user.id, Event::EmailChanged).await;
+    assert!(status_of(&db, &other).await.iter().all(|s| s == "queued"));
+}
+
+/// Changing the destination in a loop makes a new kind each time; the event
+/// budget still bounds the queue, and the warning owed to the first
+/// destination — the oldest — is kept.
+#[tokio::test]
+async fn a_settings_change_loop_is_bounded_and_keeps_the_first_warning() {
+    let (db, user) = fixture().await;
+    let ctx = settings::SaveContext {
+        encryption_secret: KEY,
+        smtp_available: false,
+        metadata: Metadata::default(),
+    };
+    let generation = queue::profile(&db, user.id).await.unwrap().generation;
+    queue::confirm_telegram(&db, user.id, generation)
+        .await
+        .unwrap();
+    for chat in 1..=60 {
+        settings::save(
+            &db,
+            user.id,
+            &settings::Patch {
+                telegram: Some(settings::TelegramChange::Set {
+                    token: Some(TOKEN.into()),
+                    chat_id: -1_003_000 - chat,
+                    message_thread_id: None,
+                }),
+                ..Default::default()
+            },
+            &ctx,
+            |_, _| Ok(()),
+        )
+        .await
+        .unwrap();
+        let generation = queue::profile(&db, user.id).await.unwrap().generation;
+        queue::confirm_telegram(&db, user.id, generation)
+            .await
+            .unwrap();
+    }
+    // Every change of destination is a new kind, so only the budget of prior
+    // warnings bounds them.
+    let queued_prior = queued_of(&db, user.id, "notification_settings_changed")
+        .await
+        .into_iter()
+        .filter(|r| r.previous_destination_encrypted.is_some())
+        .count();
+    assert_eq!(queued_prior, queue::QUEUED_PER_EVENT as usize);
+    let first = notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::UserId.eq(user.id))
+        .filter(notification_delivery::Column::Channel.eq("telegram"))
+        .filter(notification_delivery::Column::PreviousDestinationEncrypted.is_not_null())
+        .all(&db)
+        .await
+        .unwrap()
+        .into_iter()
+        .min_by_key(|r| r.id)
+        .expect("the warning to the first destination");
+    assert_eq!(first.status, "queued");
+    let opened = crate::auth::encryption::decrypt(
+        first.previous_destination_encrypted.as_deref().unwrap(),
+        &crate::auth::encryption::derive_key(KEY),
+    )
+    .unwrap();
+    assert!(opened.contains("-1001234"), "{opened}");
+}
+
+/// B-S10: ordinary settings-change rows filling their budget must not leave
+/// the warning to the previous destination without a place — the two do not
+/// share a budget.
+#[tokio::test]
+async fn ordinary_rows_cannot_take_the_budget_of_a_prior_destination_warning() {
+    let (db, user) = fixture().await;
+    let ctx = settings::SaveContext {
+        encryption_secret: KEY,
+        smtp_available: false,
+        metadata: Metadata::default(),
+    };
+    let generation = queue::profile(&db, user.id).await.unwrap().generation;
+    queue::confirm_telegram(&db, user.id, generation)
+        .await
+        .unwrap();
+    // Ordinary rows of one event and destination share a kind (5 at most);
+    // with the address changed each time they are 60 kinds, enough to fill the
+    // event budget.
+    let profile = queue::profile(&db, user.id).await.unwrap();
+    for i in 0..60 {
+        let event = queue::QueueEvent::security(user.id, Event::NotificationSettingsChanged, None);
+        let mut row = queue::row(&event, &user, &profile, "email").unwrap();
+        row.destination_hash = Set(format!("address-{i}"));
+        queue::insert(&db, row).await.unwrap();
+    }
+    let ordinary = queued_of(&db, user.id, "notification_settings_changed").await;
+    assert_eq!(ordinary.len(), queue::QUEUED_PER_EVENT as usize);
+
+    settings::save(
+        &db,
+        user.id,
+        &settings::Patch {
+            telegram: Some(settings::TelegramChange::Set {
+                token: Some(TOKEN.into()),
+                chat_id: -1_004_000,
+                message_thread_id: None,
+            }),
+            ..Default::default()
+        },
+        &ctx,
+        |_, _| Ok(()),
+    )
+    .await
+    .unwrap();
+    let warning = notification_delivery::Entity::find()
+        .filter(notification_delivery::Column::UserId.eq(user.id))
+        .filter(notification_delivery::Column::Channel.eq("telegram"))
+        .filter(notification_delivery::Column::PreviousDestinationEncrypted.is_not_null())
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("the warning to the previous Telegram destination");
+    assert_eq!(warning.status, "queued");
 }

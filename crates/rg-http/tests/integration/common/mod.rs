@@ -343,14 +343,15 @@ pub struct StateOverrides {
     /// Replaces the resolver that trusts no proxy. Only a server served with
     /// `into_make_service_with_connect_info` resolves an address at all.
     pub client_ip: Option<rg_http::client_ip::ClientIpResolver>,
-    /// Replaces this state's provenance signing identity.
+    /// Replaces this state's instance signing keys.
     ///
-    /// The default is derived from [`TEST_INSTANCE_KEY_SECRET`] rather than
-    /// loaded from the database, so a state can be built synchronously. A test
-    /// about the key's *lifetime* — that it survives a rotated `jwt_secret` —
-    /// must load it through `rg_core::auth::instance_key::load_or_adopt` and
-    /// inject it here, which is the production path.
-    pub instance_key: Option<Arc<rg_core::auth::instance_key::InstanceKey>>,
+    /// The default is a fixed ring derived from [`TEST_INSTANCE_KEY_SECRET`]
+    /// rather than loaded from the database, so a state can be built
+    /// synchronously. A test about the keys' *lifetime* — rotation, revocation,
+    /// a rotated `jwt_secret` — must establish them through
+    /// `rg_core::auth::instance_key::establish` and inject database-backed
+    /// `InstanceKeys` here, which is the production path.
+    pub instance_keys: Option<Arc<rg_core::auth::instance_key::InstanceKeys>>,
     /// `[server].external_url` for this state. The default leaves it unset,
     /// so client-facing URLs come from the request `Host`.
     pub external_url: Option<String>,
@@ -449,12 +450,14 @@ pub fn build_test_app_state_with(
         // whole defect. Any test that stores ciphertext must key it with
         // `TEST_ENCRYPTION_KEY`.
         encryption_key: Arc::new(TEST_ENCRYPTION_KEY.to_string()),
-        instance_key: overrides.instance_key.unwrap_or_else(|| {
-            Arc::new(
-                rg_core::auth::instance_key::InstanceKey::derived_from_secret(
-                    TEST_INSTANCE_KEY_SECRET,
+        instance_keys: overrides.instance_keys.unwrap_or_else(|| {
+            Arc::new(rg_core::auth::instance_key::InstanceKeys::fixed(
+                rg_core::auth::instance_key::KeyRing::single(
+                    rg_core::auth::instance_key::InstanceKey::derived_from_secret(
+                        TEST_INSTANCE_KEY_SECRET,
+                    ),
                 ),
-            )
+            ))
         }),
         external_webhook_secret: None,
         docker_enabled: false,
@@ -866,6 +869,38 @@ pub async fn register_full(base: &str, username: &str, email: &str) -> (String, 
         .await
         .unwrap();
     (token, body["id"].as_i64().unwrap())
+}
+
+/// One more open administrator, for a test that deactivates the account it
+/// registered first: that account is the instance's administrator, and the
+/// instance refuses to deactivate or demote its last one (card_e49592b4fd03).
+/// Written as plain rows — promoting through `update_by_id` would queue an
+/// authority notice the test never asked for.
+#[allow(dead_code)]
+pub async fn standby_administrator(db: &rg_db::DatabaseConnection) {
+    use rg_db::sea_orm::{ActiveModelTrait, Set};
+
+    let name = format!(
+        "standby{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let user = rg_db::ops::user_ops::create_user(
+        db,
+        &name,
+        &format!("{name}@example.invalid"),
+        "",
+        "Standby administrator",
+    )
+    .await
+    .expect("create a standby administrator");
+    rg_db::entities::user::ActiveModel {
+        id: Set(user.id),
+        is_admin: Set(true),
+        ..Default::default()
+    }
+    .update(db)
+    .await
+    .expect("make the standby account an administrator");
 }
 
 /// Create a repo and return its id.

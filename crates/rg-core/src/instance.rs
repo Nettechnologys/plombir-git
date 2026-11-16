@@ -3,7 +3,7 @@
 //! These describe one running instance, so they live in that instance's
 //! database and are cached by the process state that serves it.
 
-use sea_orm::DatabaseConnection;
+use sea_orm::{DatabaseConnection, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -147,30 +147,59 @@ impl InstanceSettingsCache {
     /// The cache is only advanced once the row is written: a failed write leaves
     /// both the database and the memo on the old value, and the caller learns the
     /// change did not take instead of watching it evaporate at the next restart.
+    ///
+    /// The row is read locked and written in one transaction, which also queues
+    /// the notice to every administrator when anything changed
+    /// (card_e49592b4fd03): maintenance mode blocks every user's writes and the
+    /// banner speaks to every user, so neither may move unannounced — not even
+    /// through an administrator's token. The notice names the change, never the
+    /// banner text: it leaves the instance by e-mail or Telegram, and the text is
+    /// whatever its author typed.
     pub async fn update(
         &self,
         db: &DatabaseConnection,
         f: impl FnOnce(&mut InstanceSettings),
-    ) -> Result<InstanceSettings, sea_orm::DbErr> {
+    ) -> anyhow::Result<SettingsChange> {
         let mut guard = self.cached.write().await;
-        let mut settings = rg_db::ops::instance_settings_ops::find(db)
+        rg_db::ops::instance_settings_ops::ensure_exists(db).await?;
+        let transaction = db.begin().await?;
+        let row = rg_db::ops::instance_settings_ops::find_for_update(&transaction)
             .await?
-            .map(InstanceSettings::from)
-            .unwrap_or_default();
+            .ok_or_else(|| anyhow::anyhow!("db: the instance settings row is missing"))?;
+        let previous = InstanceSettings::from(row.clone());
+        let mut current = previous.clone();
 
-        f(&mut settings);
+        f(&mut current);
 
-        rg_db::ops::instance_settings_ops::save(
-            db,
-            settings.maintenance_mode,
-            settings.banner_message.as_deref(),
-            &settings.banner_type,
+        rg_db::ops::instance_settings_ops::apply_settings(
+            &transaction,
+            row,
+            current.maintenance_mode,
+            current.banner_message.as_deref(),
+            &current.banner_type,
+            chrono::Utc::now(),
         )
         .await?;
+        if current != previous {
+            rg_db::ops::security_notification_ops::system_event(
+                &transaction,
+                "instance_settings_changed",
+                None,
+            )
+            .await?;
+        }
+        transaction.commit().await?;
 
-        *guard = Some((settings.clone(), Instant::now()));
-        Ok(settings)
+        *guard = Some((current.clone(), Instant::now()));
+        Ok(SettingsChange { previous, current })
     }
+}
+
+/// What a settings change found and what it left.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingsChange {
+    pub previous: InstanceSettings,
+    pub current: InstanceSettings,
 }
 
 /// card_90b36499e7bd: the settings memo used to be read from the database once
@@ -274,7 +303,8 @@ mod instance_settings_cache_tests {
         let after = instance_a
             .update(&db, |s| s.banner_message = Some("upgrading".to_string()))
             .await
-            .expect("write the settings row");
+            .expect("write the settings row")
+            .current;
 
         assert!(
             after.maintenance_mode,

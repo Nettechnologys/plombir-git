@@ -319,3 +319,76 @@ async fn admin_settings_non_admin_post() {
         .unwrap();
     assert_eq!(ok_resp.status(), 200);
 }
+
+/// card_e49592b4fd03: a settings change is journaled with what it was before
+/// and after, and every administrator is told — by the name of the change, never
+/// by the banner text, which leaves the instance by e-mail or Telegram. A PATCH
+/// that changes nothing journals and announces nothing.
+#[tokio::test]
+async fn a_settings_change_is_journaled_and_announced_without_its_banner() {
+    use rg_db::entities::{audit_log, notification_delivery};
+    use rg_db::sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let first = admin_token(&base, &db, "settings_journal_first").await;
+    let _second = admin_token(&base, &db, "settings_journal_second").await;
+    let db = &db;
+    let journal = move || async move {
+        audit_log::Entity::find()
+            .filter(audit_log::Column::Action.eq("admin.update_settings"))
+            .all(db)
+            .await
+            .unwrap()
+    };
+    let notices = move || async move {
+        notification_delivery::Entity::find()
+            .filter(notification_delivery::Column::EventKey.eq("admin_security_changed"))
+            .all(db)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.metadata.contains("instance_settings_changed"))
+            .collect::<Vec<_>>()
+    };
+    let banner = "Sign in again at settings-banner.example";
+    let change = serde_json::json!({
+        "maintenance_mode": true,
+        "banner_message": banner,
+        "banner_type": "warning",
+    });
+    let patch = || {
+        client
+            .patch(format!("{base}/api/v1/admin/settings"))
+            .bearer_auth(&first)
+            .json(&change)
+            .send()
+    };
+
+    assert_eq!(patch().await.unwrap().status(), 200);
+    let rows = journal().await;
+    assert_eq!(rows.len(), 1, "one change, one journal entry");
+    let details: serde_json::Value =
+        serde_json::from_str(rows[0].details.as_deref().unwrap()).unwrap();
+    assert_eq!(details["before"]["maintenance_mode"], false);
+    assert_eq!(details["after"]["maintenance_mode"], true);
+    assert_eq!(details["after"]["banner_message"], banner);
+    let announced = notices().await;
+    let recipients = announced
+        .iter()
+        .map(|row| row.user_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(recipients.len(), 2, "both administrators are told");
+    for row in &announced {
+        assert!(
+            !row.metadata.contains("settings-banner.example"),
+            "the banner text must not travel in the notice: {}",
+            row.metadata
+        );
+    }
+
+    // The same values again: nothing changed, nothing to record or announce.
+    assert_eq!(patch().await.unwrap().status(), 200);
+    assert_eq!(journal().await.len(), 1);
+    assert_eq!(notices().await.len(), announced.len());
+}

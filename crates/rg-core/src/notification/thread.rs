@@ -589,6 +589,21 @@ async fn deliver_page(
             })
         })
         .collect();
+    // A fold rewrote these notifications: the rows of their earlier versions
+    // still waiting in the outbox are superseded now, not when the dispatcher
+    // reaches them.
+    let current: Vec<_> = persisted
+        .values()
+        .map(|note| {
+            (
+                note.user_id,
+                note.id,
+                rg_db::ops::notification_delivery_ops::thread_event_id(note),
+            )
+        })
+        .collect();
+    rg_db::ops::notification_delivery_ops::cancel_superseded_thread_rows(&transaction, &current)
+        .await?;
     rg_db::ops::notification_delivery_ops::enqueue_many(&transaction, &queued).await?;
     transaction.commit().await?;
 

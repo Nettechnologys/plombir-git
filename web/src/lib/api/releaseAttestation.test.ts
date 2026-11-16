@@ -12,6 +12,7 @@ vi.mock('./_base.svelte', () => base);
 
 import ReleasesPage from '../../routes/[owner]/[repo]/releases/+page.svelte';
 import en from '../i18n/translations/en.json';
+import ru from '../i18n/translations/ru.json';
 import zhCN from '../i18n/translations/zh-CN.json';
 import { releases } from './releases';
 import { setTestPage } from '../test/app';
@@ -143,6 +144,24 @@ describe('release attestation production wiring', () => {
 		expect(rendered.container.textContent).not.toContain('Not signed');
 	});
 
+  // S11: a signature under a revoked key is refused by name — neither the
+  // tampering headline nor "could not be checked".
+	it('renders a signature under a revoked key as refused', async () => {
+		routeReleases.attestation.verify.mockResolvedValue({
+			status: 'revoked',
+			reason: 'attestation was signed by a revoked instance key (kid 0123456789abcdef)',
+			keyid: '0123456789abcdef',
+			key_status: 'revoked',
+		});
+		rendered = await renderComponent(ReleasesPage);
+		await click(button(rendered.container, 'Verify'));
+
+		expect(rendered.container.textContent).toContain('Signed by a revoked key');
+		expect(rendered.container.textContent).toContain('0123456789abcdef');
+		expect(rendered.container.textContent).not.toContain('Provenance could not be checked');
+		expect(rendered.container.textContent).not.toContain('Provenance check failed');
+	});
+
   // A third state, separate again: the check could not run. Folding an
   // unreachable blob store into "verify failed" accuses an asset of being
   // tampered with because of an infrastructure fault.
@@ -192,13 +211,15 @@ describe('release attestation production wiring', () => {
     'verified',
     'verify_failed',
     'undeterminable',
+    'revoked',
     'sign',
     'signing',
     'verify',
     'verifying',
     'error',
-  ])('has a real label in both catalogs: releases.attestation.%s', (key) => {
+  ])('has a real label in every catalog: releases.attestation.%s', (key) => {
     expect(en.releases.attestation).toHaveProperty(key);
+    expect(ru.releases.attestation).toHaveProperty(key);
     expect(zhCN.releases.attestation).toHaveProperty(key);
   });
 });

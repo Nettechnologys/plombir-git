@@ -45,9 +45,12 @@ With `attestation_enabled = true` under `[releases]`, anyone with write access
 can have a release asset signed: `POST …/releases/assets/{id}/attestation` produces an
 [in-toto Statement v1](https://github.com/in-toto/attestation) in a
 [DSSE](https://github.com/secure-systems-lab/dsse) envelope, canonicalised with
-RFC 8785 and signed with the instance's Ed25519 key. The public key is the one
-already published at `/api/v1/ci/oidc/jwks`, and `…/attestation/verify` checks
-an envelope on the server. The statement's `predicateType` is
+RFC 8785 and signed with the instance's active Ed25519 key. That key is the one
+published at `/api/v1/ci/oidc/jwks`, and `…/attestation/verify` checks an
+envelope on the server against every key the instance has recorded. After a
+key rotation the old key leaves the JWKS about 10 minutes later, so an older
+attestation is verified on the server, or re-signed for external
+verification. The statement's `predicateType` is
 `https://plombir.com/git/provenance/v1`. It names the format, not the signer:
 `predicate.builder.id` is the issuing instance's URL. Envelopes issued before
 the rename carry `https://forgekeep.dev/provenance/v1`, the same format under
