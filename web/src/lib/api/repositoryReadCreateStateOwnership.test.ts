@@ -75,31 +75,82 @@ afterEach(async () => {
 });
 
 describe('repository read and create state ownership', () => {
-	it('searches repository code from the button or Enter while retaining ordinary reference links', async () => {
+	it('searches repository code from Go to file while retaining ordinary reference links', async () => {
 		repos.tree.mockResolvedValue({ entries: [{ name: 'lib.rs', kind: 'blob' }] });
 		repos.branches.mockResolvedValue([{ name: 'main', is_default: true }]);
 		repos.log.mockResolvedValue({ commits: [] });
+		repos.files.mockResolvedValue({ paths: ['src/lib.rs'], complete: true });
 		setTestPage('/alice/demo?ref=main&path=src', { owner: 'alice', repo: 'demo' });
 		rendered = await renderComponent(RepositoryPage);
-		const query = element<HTMLInputElement>(rendered.container, '.repo-code-query');
+		const query = element<HTMLInputElement>(rendered.container, '.go-to-file-input');
+		query.focus();
+		query.dispatchEvent(new FocusEvent('focus'));
 		await input(query, '  needle & value  ');
-		const search = element<HTMLButtonElement>(rendered.container, '.code-search button');
-		expect(search.textContent?.trim()).toBe('Search');
-		expect(search.type).toBe('button');
-		await click(search);
-		const destination = `/search?q=${encodeURIComponent('needle & value repo:alice/demo')}&type=code`;
-		expect(navigation.goto).toHaveBeenLastCalledWith(destination);
-		query.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
 		await settle();
-		expect(navigation.goto).toHaveBeenCalledTimes(2);
+		expect(repos.files).toHaveBeenCalledWith('alice', 'demo', 'main');
+		// Nothing matches, so the only choice is to search the code for it.
+		const search = element(rendered.container, '.go-to-file-search');
+		expect(search.textContent).toContain('needle & value');
+		const destination = `/search?q=${encodeURIComponent('needle & value repo:alice/demo')}&type=code`;
+		search.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+		await settle();
 		expect(navigation.goto).toHaveBeenLastCalledWith(destination);
+
+		// A matching file comes first, and Enter opens it.
+		query.focus();
+		query.dispatchEvent(new FocusEvent('focus'));
+		await input(query, 'lib');
+		await settle();
+		query.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+		await settle();
+		expect(navigation.goto).toHaveBeenLastCalledWith('/alice/demo/blob/src/lib.rs?ref=main');
+
 		for (const destination of ['branches', 'tags', 'new']) {
-			const link = element<HTMLAnchorElement>(rendered.container, `.toolbar-actions a[href="/alice/demo/${destination}"]`);
+			const link = element<HTMLAnchorElement>(rendered.container, `.repo-toolbar a[href="/alice/demo/${destination}"]`);
 			expect(link.getAttribute('role')).not.toBe('tab');
 		}
 	});
 
-	it.each(['tree', 'commits'])('keeps branch navigation and keyboard menu behavior on the %s page', async page => {
+	it('opens the branch picker on its filter, narrows it, and keeps the path', async () => {
+		repos.tree.mockResolvedValue({ entries: [{ name: 'lib.rs', kind: 'blob' }] });
+		repos.branches.mockResolvedValue([{ name: 'main', is_default: true }, { name: 'feature/fix', is_default: false }]);
+		repos.tags.mockResolvedValue([{ name: 'v1.0' }]);
+		repos.log.mockResolvedValue({ commits: [] });
+		setTestPage('/alice/demo?ref=main&path=src%2Flib', { owner: 'alice', repo: 'demo' });
+		rendered = await renderComponent(RepositoryPage);
+		await settle();
+		const trigger = element<HTMLButtonElement>(rendered.container, '.branch-selector .dropdown-trigger');
+		// The viewport-aware menu needs a visible trigger; jsdom has no layout.
+		trigger.getBoundingClientRect = () => new DOMRect(20, 80, 100, 36);
+		trigger.focus();
+		trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+		await settle();
+		expect(trigger.getAttribute('aria-expanded')).toBe('true');
+		const filter = element<HTMLInputElement>(rendered.container, '.branch-selector .ref-filter');
+		expect(document.activeElement).toBe(filter);
+		expect(element(rendered.container, '.branch-selector .dropdown-item.active').textContent).toContain('main');
+		expect(rendered.container.querySelector('.branch-selector .ref-list')?.textContent).toContain('v1.0');
+		filter.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+		await settle();
+		expect(document.activeElement?.textContent).toContain('main');
+		document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+		await settle();
+		expect(document.activeElement).toBe(trigger);
+		expect(trigger.getAttribute('aria-expanded')).toBe('false');
+
+		trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+		await settle();
+		const reopened = element<HTMLInputElement>(rendered.container, '.branch-selector .ref-filter');
+		await input(reopened, 'fix');
+		const names = [...rendered.container.querySelectorAll('.branch-selector .ref-item-name')].map((node) => node.textContent);
+		expect(names).toEqual(['feature/fix']);
+		reopened.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+		await settle();
+		expect(navigation.goto.mock.calls.at(-1)?.[0]).toBe('/alice/demo?ref=feature%2Ffix&path=src%2Flib');
+		expect(trigger.getAttribute('aria-expanded')).toBe('false');
+	});
+
+	it.each(['commits'])('keeps branch navigation and keyboard menu behavior on the %s page', async page => {
 		repos.tree.mockResolvedValue({ entries: [{ name: 'lib.rs', kind: 'blob' }] });
 		repos.branches.mockResolvedValue([{ name: 'main', is_default: true }, { name: 'feature/fix', is_default: false }]);
 		repos.log.mockResolvedValue({ commits: [] });
@@ -151,7 +202,7 @@ describe('repository read and create state ownership', () => {
 		expect(submodule.textContent).toContain('vendor');
 		expect(submodule.textContent).toContain('Submodule');
 		expect(submodule.querySelector('a')).toBeNull();
-		const file = element(rendered.container, 'a.file-entry');
+		const file = element(rendered.container, '.file-entry a.entry-name');
 		expect(file.textContent).toContain('README.md');
 	});
 

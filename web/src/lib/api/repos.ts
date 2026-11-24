@@ -87,6 +87,14 @@ export interface RepositoryFork {
 
 export type RepoTreeEntryKind = 'tree' | 'blob' | 'commit';
 
+/** One commit as the history endpoints list it (`CommitEntry` in `repo_content.rs`). */
+export interface RepoCommitSummary {
+  sha: string;
+  message: string;
+  author: string;
+  date: string;
+}
+
 export interface RepoTreeEntry {
   name: string;
   kind: RepoTreeEntryKind;
@@ -220,6 +228,22 @@ export const repos = {
   tree: (owner: string, repo: string, ref?: string, path?: string) => {
     return request<{ entries: RepoTreeEntry[] }>(`${repoPath(owner, repo)}/tree${qs({ ref, path })}`);
   },
+  /** The commit that last changed each entry of a directory, by entry name. */
+  treeCommits: (owner: string, repo: string, ref?: string, path?: string) =>
+    request<{ entries: Record<string, RepoCommitSummary>; complete: boolean }>(
+      `${repoPath(owner, repo)}/tree/commits${qs({ ref, path })}`,
+    ),
+  /** Commits `ref` reaches; `complete: false` means at least `count`. */
+  commitCount: (owner: string, repo: string, ref?: string) =>
+    request<{ count: number; complete: boolean }>(`${repoPath(owner, repo)}/commit-count${qs({ ref })}`),
+  /** Bytes per language, largest first. */
+  languages: (owner: string, repo: string, ref?: string) =>
+    request<{ languages: { name: string; bytes: number }[]; complete: boolean }>(
+      `${repoPath(owner, repo)}/languages${qs({ ref })}`,
+    ),
+  /** Every file path of the tree, for "Go to file". */
+  files: (owner: string, repo: string, ref?: string) =>
+    request<{ paths: string[]; complete: boolean }>(`${repoPath(owner, repo)}/files${qs({ ref })}`),
   blob: (owner: string, repo: string, path: string, ref?: string) => {
     return request<BlobResponse>(`${repoPath(owner, repo)}/blob/${encodeRepoPath(path)}${qs({ ref })}`);
   },

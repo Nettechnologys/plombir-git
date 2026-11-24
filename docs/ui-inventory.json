@@ -3194,6 +3194,50 @@
     },
     {
       "method": "GET",
+      "url": "/api/v1/repos/{owner}/{name}/tree/commits",
+      "access": "RepoRead",
+      "handler": "api::repo_overview::tree_commits",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/repos/{owner}/{name}/commit-count",
+      "access": "RepoRead",
+      "handler": "api::repo_overview::commit_count",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/repos/{owner}/{name}/languages",
+      "access": "RepoRead",
+      "handler": "api::repo_overview::languages",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
+      "url": "/api/v1/repos/{owner}/{name}/files",
+      "access": "RepoRead",
+      "handler": "api::repo_overview::list_files",
+      "testedIn": [
+        "rust",
+        "web"
+      ],
+      "reachedFromUi": true
+    },
+    {
+      "method": "GET",
       "url": "/api/v1/repos/{owner}/{name}/blob/{*path}",
       "access": "RepoRead",
       "handler": "api::repo_content::get_blob",
@@ -5854,9 +5898,19 @@
       "admin": false,
       "controls": [
         {
+          "tag": "a",
+          "label": "",
+          "line": 351,
+          "via": null,
+          "href": "buildCommitHref(commit.sha)",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
           "tag": "button",
           "label": "i18n:repo.empty.copied",
-          "line": 308,
+          "line": 390,
           "via": null,
           "href": null,
           "handler": "copyUrl(httpCloneUrl)",
@@ -5866,7 +5920,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.empty.copied",
-          "line": 317,
+          "line": 399,
           "via": null,
           "href": null,
           "handler": "copyUrl(sshCloneUrl)",
@@ -5874,29 +5928,9 @@
           "unresolved": true
         },
         {
-          "tag": "button",
-          "label": "i18n:repo.browser.default_branch",
-          "line": 363,
-          "via": null,
-          "href": null,
-          "handler": "() => selectBranch(b.name, close)",
-          "calls": [],
-          "unresolved": true
-        },
-        {
-          "tag": "button",
-          "label": "i18n:common.search",
-          "line": 386,
-          "via": null,
-          "href": null,
-          "handler": "searchCode",
-          "calls": [],
-          "unresolved": true
-        },
-        {
           "tag": "a",
-          "label": "i18n:repo.branches.title",
-          "line": 389,
+          "label": ")}",
+          "line": 442,
           "via": null,
           "href": "`/${owner}/${repo}/branches`",
           "handler": null,
@@ -5905,8 +5939,8 @@
         },
         {
           "tag": "a",
-          "label": "i18n:repo.tags.title",
-          "line": 392,
+          "label": ")}",
+          "line": 445,
           "via": null,
           "href": "`/${owner}/${repo}/tags`",
           "handler": null,
@@ -5916,7 +5950,7 @@
         {
           "tag": "a",
           "label": "i18n:repo.new_file",
-          "line": 397,
+          "line": 451,
           "via": null,
           "href": "`/${owner}/${repo}/new`",
           "handler": null,
@@ -5926,7 +5960,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 409,
+          "line": 463,
           "via": null,
           "href": "buildTreeHref(ref, '')",
           "handler": null,
@@ -5936,7 +5970,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 415,
+          "line": 469,
           "via": null,
           "href": "buildTreeHref(ref, crumb.path)",
           "handler": null,
@@ -5945,8 +5979,38 @@
         },
         {
           "tag": "a",
+          "label": "",
+          "line": 480,
+          "via": null,
+          "href": "buildCommitHref(latestCommit.sha)",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "a",
+          "label": "",
+          "line": 482,
+          "via": null,
+          "href": "buildCommitHref(latestCommit.sha)",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "a",
+          "label": ")}",
+          "line": 484,
+          "via": null,
+          "href": "historyHref",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "a",
           "label": "..",
-          "line": 427,
+          "line": 498,
           "via": null,
           "href": "buildTreeHref(ref, parentPath(path))",
           "handler": null,
@@ -5956,7 +6020,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 434,
+          "line": 507,
           "via": null,
           "href": "buildTreeHref(ref, path ? `${path}/${entry.name}` : entry.name)",
           "handler": null,
@@ -5966,7 +6030,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 439,
+          "line": 513,
           "via": null,
           "href": "buildBlobHref(path ? path + '/' + entry.name : entry.name)",
           "handler": null,
@@ -5974,19 +6038,9 @@
           "unresolved": false
         },
         {
-          "tag": "a",
-          "label": "",
-          "line": 460,
-          "via": null,
-          "href": "buildCommitHref(commit.sha)",
-          "handler": null,
-          "calls": [],
-          "unresolved": false
-        },
-        {
           "tag": "button",
           "label": "i18n:common.retry",
-          "line": 476,
+          "line": 530,
           "via": null,
           "href": null,
           "handler": "() => loadReadme(owner, repo, queryRef, queryPath, entries)",
@@ -6021,6 +6075,26 @@
             }
           ],
           "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 548,
+          "via": null,
+          "href": null,
+          "handler": "() => (outlineOpen = !outlineOpen)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 562,
+          "via": null,
+          "href": null,
+          "handler": "() => showHeading(index)",
+          "calls": [],
+          "unresolved": true
         },
         {
           "tag": "a",
@@ -6245,13 +6319,73 @@
         },
         {
           "tag": "button",
-          "label": "",
-          "line": 150,
-          "via": "Dropdown",
+          "label": "i18n:repo.refs.default",
+          "line": 74,
+          "via": "RefPicker",
           "href": null,
-          "handler": "toggle",
+          "handler": "() => choose(name, close)",
           "calls": [],
           "unresolved": true
+        },
+        {
+          "tag": "button",
+          "label": "",
+          "line": 86,
+          "via": "RefPicker",
+          "href": null,
+          "handler": "() => choose(name, close)",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "a",
+          "label": "i18n:repo.refs.all_branches",
+          "line": 97,
+          "via": "RefPicker",
+          "href": "`/${owner}/${repo}/branches`",
+          "handler": "close",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "a",
+          "label": "i18n:repo.refs.all_tags",
+          "line": 98,
+          "via": "RefPicker",
+          "href": "`/${owner}/${repo}/tags`",
+          "handler": "close",
+          "calls": [],
+          "unresolved": true
+        },
+        {
+          "tag": "a",
+          "label": "⑂ )}",
+          "line": 81,
+          "via": "RepoAbout",
+          "href": "`/${owner}/${repo}/network`",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "a",
+          "label": "i18n:repo.about.releases",
+          "line": 88,
+          "via": "RepoAbout",
+          "href": "`/${owner}/${repo}/releases`",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "a",
+          "label": "🏷",
+          "line": 92,
+          "via": "RepoAbout",
+          "href": "`/${owner}/${repo}/releases?release=${latestRelease.id}`",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
         }
       ],
       "passive": [
@@ -6339,6 +6473,89 @@
           "browserScenarios": [
             "private-repository-page"
           ]
+        },
+        {
+          "symbol": "repos.tags",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/tags",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/tags",
+          "access": "RepoRead",
+          "handler": "api::repo_content::list_tags",
+          "matched": true,
+          "testedIn": [
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.treeCommits",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/tree/commits",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/tree/commits",
+          "access": "RepoRead",
+          "handler": "api::repo_overview::tree_commits",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.commitCount",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/commit-count",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/commit-count",
+          "access": "RepoRead",
+          "handler": "api::repo_overview::commit_count",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.files",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/files",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/files",
+          "access": "RepoRead",
+          "handler": "api::repo_overview::list_files",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "repos.languages",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/languages",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/languages",
+          "access": "RepoRead",
+          "handler": "api::repo_overview::languages",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
+        },
+        {
+          "symbol": "releases.list",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/releases",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/releases",
+          "access": "RepoRead",
+          "handler": "api::releases::list_releases",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
+          ]
         }
       ]
     },
@@ -6350,7 +6567,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 527,
+          "line": 529,
           "via": null,
           "href": "buildRepoHref(ref, '')",
           "handler": null,
@@ -6360,7 +6577,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 530,
+          "line": 532,
           "via": null,
           "href": "crumb.href",
           "handler": null,
@@ -6370,7 +6587,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.blob.hide_blame",
-          "line": 549,
+          "line": 557,
           "via": null,
           "href": null,
           "handler": "toggleBlame",
@@ -6394,7 +6611,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.blob.raw",
-          "line": 554,
+          "line": 562,
           "via": null,
           "href": null,
           "handler": "() => viewMode = viewMode === 'rendered' ? 'source' : 'rendered'",
@@ -6404,7 +6621,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.blob.copy_path",
-          "line": 562,
+          "line": 570,
           "via": null,
           "href": null,
           "handler": "copyPath",
@@ -6414,7 +6631,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.blob.copy_link",
-          "line": 565,
+          "line": 573,
           "via": null,
           "href": null,
           "handler": "copyLink",
@@ -6424,7 +6641,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.blob.download",
-          "line": 569,
+          "line": 577,
           "via": null,
           "href": null,
           "handler": "downloadFile",
@@ -6448,7 +6665,7 @@
         {
           "tag": "a",
           "label": "i18n:repo.edit_file",
-          "line": 575,
+          "line": 583,
           "via": null,
           "href": "buildEditHref()",
           "handler": null,
@@ -6458,7 +6675,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.blob.delete_file",
-          "line": 583,
+          "line": 591,
           "via": null,
           "href": null,
           "handler": "() => deleteOpen = !deleteOpen",
@@ -6468,7 +6685,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 623,
+          "line": 631,
           "via": null,
           "href": null,
           "handler": "() => deleteOpen = false",
@@ -6478,7 +6695,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.blob.deleting",
-          "line": 626,
+          "line": 634,
           "via": null,
           "href": null,
           "handler": "deleteFile",
@@ -6507,7 +6724,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.blob.download",
-          "line": 647,
+          "line": 655,
           "via": null,
           "href": null,
           "handler": "downloadFile",
@@ -6531,7 +6748,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 678,
+          "line": 686,
           "via": null,
           "href": "`/${owner}/${repo}/commits/${blameLines[index].commit}`",
           "handler": null,
@@ -6541,7 +6758,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 685,
+          "line": 693,
           "via": null,
           "href": "`#L${line.num}`",
           "handler": "(event) => clickLine(event, line.num)",
@@ -6799,6 +7016,20 @@
             "rust",
             "web",
             "smoke"
+          ]
+        },
+        {
+          "symbol": "repos.files",
+          "method": "GET",
+          "url": "/api/v1/repos/{owner}/{repo}/files",
+          "opaque": false,
+          "routeUrl": "/api/v1/repos/{owner}/{name}/files",
+          "access": "RepoRead",
+          "handler": "api::repo_overview::list_files",
+          "matched": true,
+          "testedIn": [
+            "rust",
+            "web"
           ]
         }
       ]
@@ -8080,7 +8311,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.browser.default_branch",
-          "line": 155,
+          "line": 168,
           "via": null,
           "href": null,
           "handler": "() => selectBranch(b.name, close)",
@@ -8090,10 +8321,10 @@
         {
           "tag": "button",
           "label": "i18n:common.retry",
-          "line": 171,
+          "line": 184,
           "via": null,
           "href": null,
-          "handler": "() => loadCommits(owner, repo, ref)",
+          "handler": "() => loadCommits(owner, repo, ref, path)",
           "calls": [
             {
               "symbol": "repos.log",
@@ -8115,7 +8346,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 192,
+          "line": 205,
           "via": null,
           "href": "`/${owner}/${repo}/commits/${commit.sha}`",
           "handler": null,
@@ -8125,7 +8356,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 210,
+          "line": 223,
           "via": null,
           "href": null,
           "handler": "loadMore",
@@ -8355,7 +8586,7 @@
         {
           "tag": "button",
           "label": "",
-          "line": 150,
+          "line": 153,
           "via": "Dropdown",
           "href": null,
           "handler": "toggle",
@@ -30095,7 +30326,7 @@
       "outsider"
     ],
     "scenarios": 52,
-    "inventoryEntries": 851,
+    "inventoryEntries": 858,
     "coveredEntries": 197,
     "coveredRoutes": 187,
     "maxUiRoutesWithoutFrontendTest": 22

@@ -297,7 +297,7 @@ describe.each(LEVELS)('viewer_permission %s', (level, writes) => {
 		expect(container.querySelector('a[href="/alice/demo/new"]') !== null).toBe(writes);
 		// card_61e77c8abec1: a directory is a link, so Enter, a middle click and
 		// the back button work.
-		expect(container.querySelector('a.entry[href="/alice/demo?path=src"]')).not.toBeNull();
+		expect(container.querySelector('.entry a.entry-name[href="/alice/demo?path=src"]')).not.toBeNull();
 		expect(container.querySelector('[role="button"].entry')).toBeNull();
 	});
 

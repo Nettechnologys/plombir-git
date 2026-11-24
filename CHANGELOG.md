@@ -6,6 +6,44 @@ This project records user-facing changes here. The format follows
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-11-24
+
+The repository home page now works the way GitHub's does. See the
+[v0.4.4 notes](docs/releases/v0.4.4.md); nothing changes on upgrade.
+
+### Added
+
+- Show the last commit of every file and directory in the listing, with its
+  message and age, and the newest commit with the commit count above the list.
+  Inside a directory the history link opens the history of that directory:
+  the commits page takes `?path=`.
+- Add an About column at the repository root: the description, stars, forks,
+  the latest release and a language bar.
+- Add "Go to file" on the repository and file pages: it finds a file by any
+  part of its path, `t` focuses it, and its last choice searches the code. It
+  replaces the separate code search box.
+- Let the branch picker filter by name and list tags as well as branches; the
+  toolbar counts both.
+- Add an outline of the README headings.
+- Add `GET /repos/{owner}/{name}/tree/commits`, `.../commit-count`,
+  `.../languages` and `.../files` for the above; see
+  [the API notes](docs/api.md#repository-overview-044).
+
+### Changed
+
+- List directories and submodules before files, each alphabetically without
+  regard to case, instead of in Git's byte order.
+- Draw the Code button with GitHub's `<>` icon and a single caret, and New file
+  as an ordinary button whose plus is visible in the light theme; drop the
+  repository name link at the right of the toolbar. Inside a directory every
+  step of the path is a link, also on the file page.
+- Draw folder, file and submodule icons in the theme colours.
+
+### Fixed
+
+- Keep rendered Markdown within its column: a wide image or table gave the
+  README a horizontal scrollbar, and the README was a scroll box of its own.
+
 ## [0.4.3] - 2026-11-15
 
 Read the [v0.4.3 upgrade notes](docs/releases/v0.4.3.md) before deploying: the

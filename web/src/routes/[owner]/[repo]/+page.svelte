@@ -3,19 +3,24 @@
   import { page } from '$app/stores';
   import { browser } from '$app/environment';
   import { goto } from '$app/navigation';
+  import { tick } from 'svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
-  import Dropdown from '$lib/components/Dropdown.svelte';
+  import GoToFile from '$lib/components/GoToFile.svelte';
+  import RefPicker from '$lib/components/RefPicker.svelte';
+  import RepoAbout from '$lib/components/RepoAbout.svelte';
   import { ApiError, buildHttpCloneUrl, buildSshCloneUrl } from '$lib/api/_base';
   import { repos, type RepoTreeEntry } from '$lib/api/client.svelte';
+  import type { RepoCommitSummary } from '$lib/api/repos';
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
-  import { createT, formatDate } from '$lib/i18n';
+  import { createT, formatDate, formatRelativeTime, pluralForm } from '$lib/i18n';
   import { canWriteRepo } from '$lib/repoPermission';
   import { renderMarkdown } from '$lib/utils/markdown';
   import { findReadme, readmeDirectories, type RepositoryLinkTargets } from '$lib/repoReadme';
   import { sortTreeEntries } from '$lib/repoTree';
 
   const t = createT();
-  const RECENT_COMMITS = 5;
+  // Only the newest commit is drawn, in the bar above the file list.
+  const LATEST_COMMIT = 1;
 
   let owner = $derived($page.params.owner!);
   let repo = $derived($page.params.repo!);
@@ -42,7 +47,12 @@
   );
   let readmeLoading = $state(false);
   let readmeError = $state('');
-  let codeQuery = $state('');
+  let tags = $state<{ name: string }[]>([]);
+  // The last commit of each listed entry and the commit count load after the
+  // listing and never hold it up; until they arrive the rows show no commit.
+  let entryCommits = $state<Record<string, RepoCommitSummary>>({});
+  let commitTotal = $state<{ count: number; complete: boolean } | null>(null);
+  const overviewRequests = new LatestRepositoryResourceRequestFence<string>();
   let loading = $state(true);
   let error = $state('');
   const dataRequests = new LatestRepositoryResourceRequestFence<string>();
@@ -106,11 +116,6 @@
     };
   }
 
-  function searchCode() {
-    const terms = [codeQuery.trim(), `repo:${owner}/${repo}`].filter(Boolean).join(' ');
-    goto(`/search?q=${encodeURIComponent(terms)}&type=code`);
-  }
-
   function repositoryViewIdentity(expectedRef: string, expectedPath: string): string {
     return `${expectedRef}\u0000${expectedPath}`;
   }
@@ -147,13 +152,17 @@
     readmeDirectory = '';
     readmeLoading = false;
     readmeError = '';
+    overviewRequests.begin(expectedOwner, expectedRepo, identity);
+    tags = [];
+    entryCommits = {};
+    commitTotal = null;
     try {
       const [treeData, branchData, logData, repoData] = await Promise.all([
         repos.tree(expectedOwner, expectedRepo, expectedRef || undefined, expectedPath || undefined),
         repos.branches(expectedOwner, expectedRepo),
-        // The page shows five commits; asking for the server's default 50
-        // walked and serialized ten times the history it renders.
-        repos.log(expectedOwner, expectedRepo, expectedRef || undefined, expectedPath || undefined, RECENT_COMMITS),
+        // The page shows one commit; asking for the server's default 50
+        // walked and serialized fifty times the history it renders.
+        repos.log(expectedOwner, expectedRepo, expectedRef || undefined, expectedPath || undefined, LATEST_COMMIT),
         repos.get(expectedOwner, expectedRepo),
       ]);
       if (!dataRequests.owns(claim, owner, repo, repositoryViewIdentity(queryRef, queryPath))) return;
@@ -161,13 +170,14 @@
       const nextEntries = treeData.entries || [];
       entries = sortTreeEntries(nextEntries);
       branches = branchData || [];
-      commits = (logData.commits || []).slice(0, RECENT_COMMITS);
+      commits = (logData.commits || []).slice(0, LATEST_COMMIT);
       repoInfo = repoData;
 
       // Load README when at root
       if (!expectedPath) {
         void loadReadme(expectedOwner, expectedRepo, expectedRef, expectedPath, nextEntries);
       }
+      if (nextEntries.length) void loadOverview(expectedOwner, expectedRepo, expectedRef, expectedPath);
     } catch (e: any) {
       if (dataRequests.owns(claim, owner, repo, repositoryViewIdentity(queryRef, queryPath))) {
         error = e.message;
@@ -177,6 +187,40 @@
         loading = false;
       }
     }
+  }
+
+  /**
+   * What the page draws around the listing: tags for the ref picker, the last
+   * commit of every entry, and at the root the commit count. Each part is
+   * best effort; a failure leaves that part out.
+   */
+  async function loadOverview(
+    expectedOwner: string,
+    expectedRepo: string,
+    expectedRef: string,
+    expectedPath: string,
+  ) {
+    const identity = repositoryViewIdentity(expectedRef, expectedPath);
+    const claim = overviewRequests.begin(expectedOwner, expectedRepo, identity);
+    const owns = () => overviewRequests.owns(claim, owner, repo, repositoryViewIdentity(queryRef, queryPath));
+    const ref = expectedRef || undefined;
+    // `Promise.resolve().then` turns a call that throws into a rejection, so
+    // one failing part can never take the page down with it.
+    const attempt = <T,>(read: () => Promise<T>, use: (value: T) => void) =>
+      Promise.resolve()
+        .then(read)
+        .then((value) => { if (owns()) use(value); })
+        .catch(() => {});
+    await Promise.all([
+      attempt(() => repos.tags(expectedOwner, expectedRepo), (list) => { tags = list ?? []; }),
+      attempt(
+        () => repos.treeCommits(expectedOwner, expectedRepo, ref, expectedPath || undefined),
+        (answer) => { entryCommits = answer?.entries ?? {}; },
+      ),
+      expectedPath
+        ? Promise.resolve()
+        : attempt(() => repos.commitCount(expectedOwner, expectedRepo, ref), (answer) => { if (answer) commitTotal = answer; }),
+    ]);
   }
 
   async function loadReadme(
@@ -247,6 +291,43 @@
     return parts.join('/');
   }
 
+  let latestCommit = $derived<RepoCommitSummary | null>(commits[0] ?? null);
+  /** The history of what is listed: the whole ref at the root, the directory inside it. */
+  let historyHref = $derived.by(() => {
+    const params = new URLSearchParams();
+    if (ref) params.set('ref', ref);
+    if (path) params.set('path', path);
+    const qs = params.toString();
+    return `/${owner}/${repo}/commits${qs ? `?${qs}` : ''}`;
+  });
+
+  // README outline: the headings of the rendered README, read from the page
+  // once it is drawn. Choosing one scrolls to it; the sanitizer gives
+  // headings no ids, so there is nothing to link to.
+  let readmeBody = $state<HTMLElement | null>(null);
+  let outlineOpen = $state(false);
+  let readmeOutline = $state<{ level: number; text: string }[]>([]);
+  $effect(() => {
+    void renderedReadme;
+    const body = readmeBody;
+    outlineOpen = false;
+    if (!body) {
+      readmeOutline = [];
+      return;
+    }
+    void tick().then(() => {
+      readmeOutline = Array.from(body.querySelectorAll('h1, h2, h3')).map((heading) => ({
+        level: Number(heading.tagName.slice(1)),
+        text: heading.textContent?.trim() ?? '',
+      }));
+    });
+  });
+
+  function showHeading(index: number) {
+    outlineOpen = false;
+    readmeBody?.querySelectorAll('h1, h2, h3')[index]?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
   /** The current directory as clickable steps, each leading to its own listing. */
   let pathCrumbs = $derived(
     path
@@ -254,16 +335,6 @@
       : [],
   );
 
-  function selectBranch(branchName: string, close: () => void) {
-    syncLocation(branchName, path);
-    close();
-  }
-
-  function formatFileSize(size: number) {
-    if (size < 1024) return size + t('repo.file_size.b');
-    if (size < 1024 * 1024) return (size / 1024).toFixed(1) + t('repo.file_size.kb');
-    return (size / (1024 * 1024)).toFixed(1) + t('repo.file_size.mb');
-  }
 </script>
 
 <svelte:head>
@@ -272,6 +343,17 @@
 
 {#snippet folderIcon()}
   <svg class="entry-icon folder" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M1.5 3.25c0-.69.56-1.25 1.25-1.25h3.1c.4 0 .77.19 1 .5l.9 1.25h5.5c.69 0 1.25.56 1.25 1.25v7.75c0 .69-.56 1.25-1.25 1.25H2.75c-.69 0-1.25-.56-1.25-1.25Z" /></svg>
+{/snippet}
+
+{#snippet entryCommit(name: string)}
+  {@const commit = entryCommits[name]}
+  {#if commit}
+    <a class="entry-commit" href={buildCommitHref(commit.sha)} title={commit.message}>{commit.message}</a>
+    <span class="entry-date" title={formatDate(commit.date)}>{formatRelativeTime(commit.date)}</span>
+  {:else}
+    <span class="entry-commit"></span>
+    <span class="entry-date"></span>
+  {/if}
 {/snippet}
 
 <div class="page-container">
@@ -351,177 +433,187 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
       </div>
     </div>
   {:else}
-    <!-- Branch selector + path breadcrumb -->
-    <div class="repo-toolbar">
-      <div class="branch-selector">
-        <Dropdown ariaLabel={t('repo.select_branch')} triggerClass="btn btn-outline" placement="left" fitViewport>
-          {#snippet trigger()}
-            <span aria-hidden="true">🌿</span><span class="branch-name" title={currentRefLabel}>{currentRefLabel}</span><span aria-hidden="true">▾</span>
-          {/snippet}
-          {#snippet menu(close)}
-            {#each branches as b}
-              <button
-                class="dropdown-item"
-                class:active={b.name === ref || (!ref && b.is_default)}
-                onclick={() => selectBranch(b.name, close)}
-                role="menuitem"
-              >
-                {b.name} {b.is_default ? t('repo.browser.default_branch') : ''}
-              </button>
-            {/each}
-          {/snippet}
-        </Dropdown>
-      </div>
-
-      <div class="toolbar-actions">
-        <div class="code-search">
-          <input
-            type="search"
-            class="repo-code-query"
-            bind:value={codeQuery}
-            onkeydown={(event) => { if (event.key === 'Enter') searchCode(); }}
-            placeholder={t('search.code_in_repo', 'Search code in this repository')}
-            aria-label={t('search.code_in_repo', 'Search code in this repository')}
-          />
-          <button type="button" class="btn btn-outline" onclick={searchCode}>{t('common.search')}</button>
+    <div class="repo-layout" class:with-about={!path}>
+      <div class="repo-main">
+        <div class="repo-toolbar">
+          <div class="branch-selector">
+            <RefPicker {owner} {repo} {branches} {tags} current={ref} label={currentRefLabel} onselect={(name) => syncLocation(name, path)} />
+          </div>
+          <a href={`/${owner}/${repo}/branches`} class="ref-count branches-link">
+            <strong>{branches.length}</strong> {pluralForm(branches.length, { one: t('repo.browser.branch_forms.one'), few: t('repo.browser.branch_forms.few'), many: t('repo.browser.branch_forms.many'), other: t('repo.browser.branch_forms.other') })}
+          </a>
+          <a href={`/${owner}/${repo}/tags`} class="ref-count tags-link">
+            <strong>{tags.length}</strong> {pluralForm(tags.length, { one: t('repo.browser.tag_forms.one'), few: t('repo.browser.tag_forms.few'), many: t('repo.browser.tag_forms.many'), other: t('repo.browser.tag_forms.other') })}
+          </a>
+          <div class="toolbar-actions">
+            <GoToFile {owner} {repo} {ref} />
+            {#if canWriteRepo(repoInfo?.viewer_permission)}
+              <a href={`/${owner}/${repo}/new`} class="btn btn-outline new-file-link">
+                <svg class="icon" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M8 2.5v11M2.5 8h11" /></svg>
+                {t('repo.new_file', 'New file')}
+              </a>
+            {/if}
+          </div>
         </div>
-        <div class="ref-links">
-          <a href={`/${owner}/${repo}/branches`} class="btn btn-outline branches-link">
-            {t('repo.branches.title')}
-          </a>
-          <a href={`/${owner}/${repo}/tags`} class="btn btn-outline tags-link">
-            {t('repo.tags.title')}
-          </a>
-        </div>
-        {#if canWriteRepo(repoInfo?.viewer_permission)}
-          <a href={`/${owner}/${repo}/new`} class="btn btn-outline new-file-link">
-            <svg class="icon" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M8 2.5v11M2.5 8h11" /></svg>
-            {t('repo.new_file', 'New file')}
-          </a>
-        {/if}
-      </div>
-    </div>
 
-    <!-- Inside a directory, the path is a breadcrumb whose every step is a
-         link, as on GitHub. At the root it would only repeat the header. -->
-    {#if pathCrumbs.length}
-      <nav class="breadcrumb" aria-label={t('repo.browser.path', 'Path')}>
-        <a href={buildTreeHref(ref, '')}>{repo}</a>
-        {#each pathCrumbs as crumb, index}
-          <span class="sep" aria-hidden="true">/</span>
-          {#if index === pathCrumbs.length - 1}
-            <span class="current" aria-current="page">{crumb.name}</span>
-          {:else}
-            <a href={buildTreeHref(ref, crumb.path)}>{crumb.name}</a>
-          {/if}
-        {/each}
-      </nav>
-    {/if}
-
-    <div class="content-grid">
-      <!-- File tree -->
-      <div class="gh-card tree-panel">
-        <!-- Directories are links (card_61e77c8abec1): Enter, a middle click and
-             the back button work, which a `div role="button"` gave none of. -->
-        {#if path}
-          <a href={buildTreeHref(ref, parentPath(path))} class="entry">
-            {@render folderIcon()}
-            <span class="entry-name up">..</span>
-          </a>
-        {/if}
-        {#each entries as entry}
-          {#if entry.kind === 'tree'}
-            <a href={buildTreeHref(ref, path ? `${path}/${entry.name}` : entry.name)} class="entry">
-              {@render folderIcon()}
-              <span class="entry-name dir">{entry.name}</span>
-            </a>
-          {:else if entry.kind === 'blob'}
-            <a href={buildBlobHref(path ? path + '/' + entry.name : entry.name)} class="entry file-entry">
-              <svg class="entry-icon file" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M4 1.75h5.25L12.5 5v8.75a.5.5 0 0 1-.5.5H4a.5.5 0 0 1-.5-.5V2.25a.5.5 0 0 1 .5-.5ZM9 1.75V5.5h3.5" /></svg>
-              <span class="entry-name">{entry.name}</span>
-              {#if entry.size}
-                <span class="entry-size">{formatFileSize(entry.size)}</span>
+        <!-- Inside a directory, the path is a breadcrumb whose every step is a
+             link, as on GitHub. At the root it would only repeat the header. -->
+        {#if pathCrumbs.length}
+          <nav class="breadcrumb" aria-label={t('repo.browser.path', 'Path')}>
+            <a href={buildTreeHref(ref, '')}>{repo}</a>
+            {#each pathCrumbs as crumb, index}
+              <span class="sep" aria-hidden="true">/</span>
+              {#if index === pathCrumbs.length - 1}
+                <span class="current" aria-current="page">{crumb.name}</span>
+              {:else}
+                <a href={buildTreeHref(ref, crumb.path)}>{crumb.name}</a>
               {/if}
+            {/each}
+          </nav>
+        {/if}
+
+        <div class="gh-card tree-panel">
+          <!-- The newest commit of what is listed, as GitHub heads the list. -->
+          {#if latestCommit}
+            <div class="latest-commit">
+              <span class="latest-author">{latestCommit.author}</span>
+              <a class="latest-message" href={buildCommitHref(latestCommit.sha)} title={latestCommit.message}>{latestCommit.message?.split('\n')[0]}</a>
+              <span class="latest-meta">
+                <a class="commit-sha" href={buildCommitHref(latestCommit.sha)}>{latestCommit.sha?.slice(0, 7)}</a>
+                <span title={formatDate(latestCommit.date)}>{formatRelativeTime(latestCommit.date)}</span>
+                <a class="history-link" href={historyHref}>
+                  <svg class="icon" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 8a6 6 0 1 0 1.76-4.24M2 2.5v3h3M8 4.5V8l2.5 1.5" /></svg>
+                  {#if commitTotal}
+                    <strong>{commitTotal.count}{commitTotal.complete ? '' : '+'}</strong> {pluralForm(commitTotal.count, { one: t('repo.browser.commit_forms.one'), few: t('repo.browser.commit_forms.few'), many: t('repo.browser.commit_forms.many'), other: t('repo.browser.commit_forms.other') })}
+                  {:else}
+                    {t('repo.browser.history', 'History')}
+                  {/if}
+                </a>
+              </span>
+            </div>
+          {/if}
+          <!-- Directories are links (card_61e77c8abec1): Enter, a middle click and
+               the back button work, which a `div role="button"` gave none of. -->
+          {#if path}
+            <a href={buildTreeHref(ref, parentPath(path))} class="entry">
+              {@render folderIcon()}
+              <span class="entry-name up">..</span>
             </a>
-          {:else}
-            <div class="entry submodule-entry">
-              <svg class="entry-icon submodule" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M1.5 3.25c0-.69.56-1.25 1.25-1.25h3.1c.4 0 .77.19 1 .5l.9 1.25h5.5c.69 0 1.25.56 1.25 1.25v7.75c0 .69-.56 1.25-1.25 1.25H2.75c-.69 0-1.25-.56-1.25-1.25ZM6 9.5h4M8.5 8l1.5 1.5L8.5 11" /></svg>
-              <span class="entry-name">{entry.name}</span>
-              <span class="entry-kind">{t('repo.browser.submodule')}</span>
-            </div>
           {/if}
-        {/each}
+          {#each entries as entry (entry.name)}
+            {#if entry.kind === 'tree'}
+              <div class="entry">
+                {@render folderIcon()}
+                <a href={buildTreeHref(ref, path ? `${path}/${entry.name}` : entry.name)} class="entry-name dir">{entry.name}</a>
+                {@render entryCommit(entry.name)}
+              </div>
+            {:else if entry.kind === 'blob'}
+              <div class="entry file-entry">
+                <svg class="entry-icon file" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M4 1.75h5.25L12.5 5v8.75a.5.5 0 0 1-.5.5H4a.5.5 0 0 1-.5-.5V2.25a.5.5 0 0 1 .5-.5ZM9 1.75V5.5h3.5" /></svg>
+                <a href={buildBlobHref(path ? path + '/' + entry.name : entry.name)} class="entry-name">{entry.name}</a>
+                {@render entryCommit(entry.name)}
+              </div>
+            {:else}
+              <div class="entry submodule-entry">
+                <svg class="entry-icon submodule" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M1.5 3.25c0-.69.56-1.25 1.25-1.25h3.1c.4 0 .77.19 1 .5l.9 1.25h5.5c.69 0 1.25.56 1.25 1.25v7.75c0 .69-.56 1.25-1.25 1.25H2.75c-.69 0-1.25-.56-1.25-1.25ZM6 9.5h4M8.5 8l1.5 1.5L8.5 11" /></svg>
+                <span class="entry-name">{entry.name} <span class="entry-kind">{t('repo.browser.submodule')}</span></span>
+                {@render entryCommit(entry.name)}
+              </div>
+            {/if}
+          {/each}
+        </div>
+
+        <!-- README rendering (at repo root) -->
+        {#if !path && readmeError}
+          <div class="gh-card readme-section readme-unavailable" role="alert">
+            <span>{t('repo.browser.readme_unavailable')}</span>
+            <button
+              type="button"
+              class="btn btn-outline btn-sm"
+              onclick={() => loadReadme(owner, repo, queryRef, queryPath, entries)}
+              disabled={readmeLoading}
+            >
+              {t('common.retry')}
+            </button>
+          </div>
+        {:else if !path && readmeContent}
+          <div class="gh-card readme-section">
+            <div class="readme-header">
+              <span class="readme-title">
+                <svg class="entry-icon file" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M4 1.75h5.25L12.5 5v8.75a.5.5 0 0 1-.5.5H4a.5.5 0 0 1-.5-.5V2.25a.5.5 0 0 1 .5-.5ZM9 1.75V5.5h3.5" /></svg>
+                {readmePath}
+              </span>
+              {#if readmeOutline.length > 1}
+                <div class="readme-outline">
+                  <button
+                    type="button"
+                    class="btn btn-outline btn-sm outline-toggle"
+                    aria-expanded={outlineOpen}
+                    aria-label={t('repo.browser.outline', 'Outline')}
+                    title={t('repo.browser.outline', 'Outline')}
+                    onclick={() => (outlineOpen = !outlineOpen)}
+                  >
+                    <svg class="icon" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4h12M5 8h9M5 12h9" /></svg>
+                  </button>
+                  {#if outlineOpen}
+                    <ul class="outline-list">
+                      {#each readmeOutline as heading, index}
+                        <li style:padding-left={`${(heading.level - 1) * 12 + 12}px`}>
+                          <button type="button" class="outline-item" onclick={() => showHeading(index)}>{heading.text}</button>
+                        </li>
+                      {/each}
+                    </ul>
+                  {/if}
+                </div>
+              {/if}
+            </div>
+            <div class="readme-body" bind:this={readmeBody}>
+              {#if readmeIsMarkdown}
+                <div class="markdown-body">{@html renderedReadme}</div>
+              {:else}
+                <pre class="readme-plain">{readmeContent}</pre>
+              {/if}
+            </div>
+          </div>
+        {:else if !path && readmeLoading}
+          <div class="gh-card readme-section">
+            <p class="text-secondary">{t('common.loading')}</p>
+          </div>
+        {/if}
       </div>
 
-      <!-- Recent commits -->
-      <div class="gh-card commits-panel">
-        <h3>{t('repo.browser.recent_commits')}</h3>
-        {#each commits as commit}
-          <a href={buildCommitHref(commit.sha)} class="commit-item">
-            <div class="commit-msg truncate">{commit.message?.split('\n')[0]}</div>
-            <div class="commit-meta">
-              <span class="commit-author">{commit.author}</span>
-              <span class="commit-date">{formatDate(commit.date)}</span>
-              <code class="commit-sha">{commit.sha?.slice(0, 7)}</code>
-            </div>
-          </a>
-        {/each}
-      </div>
+      {#if !path}
+        <RepoAbout {owner} {repo} {ref} info={repoInfo} />
+      {/if}
     </div>
-
-    <!-- README rendering (at repo root) -->
-    {#if !path && readmeError}
-      <div class="gh-card readme-section readme-unavailable" role="alert">
-        <span>{t('repo.browser.readme_unavailable')}</span>
-        <button
-          type="button"
-          class="btn btn-outline btn-sm"
-          onclick={() => loadReadme(owner, repo, queryRef, queryPath, entries)}
-          disabled={readmeLoading}
-        >
-          {t('common.retry')}
-        </button>
-      </div>
-    {:else if !path && readmeContent}
-      <div class="gh-card readme-section">
-        <div class="readme-header">
-          <span>📄 {readmePath}</span>
-        </div>
-        <div class="readme-body">
-          {#if readmeIsMarkdown}
-            <div class="markdown-body">{@html renderedReadme}</div>
-          {:else}
-            <pre class="readme-plain">{readmeContent}</pre>
-          {/if}
-        </div>
-      </div>
-    {:else if !path && readmeLoading}
-      <div class="gh-card readme-section">
-        <p class="text-secondary">{t('common.loading')}</p>
-      </div>
-    {/if}
   {/if}
 </div>
 
 <style>
+  /* GitHub's repository home: the file list and README in one column, the
+     About column beside them at the root. */
+  .repo-layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 24px; }
+  .repo-layout.with-about { grid-template-columns: minmax(0, 1fr) 296px; }
+  @media (max-width: 900px) {
+    .repo-layout.with-about { grid-template-columns: minmax(0, 1fr); }
+  }
+  .repo-main { min-width: 0; }
+
   .repo-toolbar {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    justify-content: space-between;
-    gap: 12px;
+    gap: 8px 16px;
     margin-bottom: 16px;
   }
 
   .branch-selector { min-width: 0; max-width: 100%; }
-  .branch-name { min-width: 0; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
-  .toolbar-actions { display: flex; flex: 1 1 480px; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
-  .code-search { display: flex; flex: 1 1 240px; align-items: center; gap: 8px; min-width: 0; }
-  .repo-code-query { flex: 1; min-width: 0; width: 100%; }
-  .code-search button { flex-shrink: 0; }
-  .ref-links { display: flex; flex-wrap: wrap; gap: 8px; }
-  .new-file-link { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
-  .icon { flex-shrink: 0; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; }
+  .ref-count { display: inline-flex; align-items: center; gap: 4px; color: var(--text-secondary); font-size: 14px; white-space: nowrap; }
+  .ref-count strong { color: var(--text-primary); }
+  .ref-count:hover, .ref-count:hover strong { color: var(--accent); }
+  .toolbar-actions { display: flex; flex: 1 1 320px; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; }
+  .new-file-link { display: inline-flex; align-items: center; gap: 6px; }
+  .icon { flex-shrink: 0; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 
   .breadcrumb {
     display: flex;
@@ -538,81 +630,64 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
   .breadcrumb .current { font-weight: 600; }
   .sep { color: var(--text-muted); }
 
-  .content-grid {
-    display: grid;
-    grid-template-columns: 1fr 320px;
-    gap: 16px;
-  }
-
-  @media (max-width: 900px) {
-    .content-grid { grid-template-columns: 1fr; }
-  }
-
   .tree-panel {
     overflow: hidden;
     padding: 0;
   }
 
-  .entry {
+  .latest-commit {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 8px;
+    gap: 4px 12px;
+    padding: 12px 16px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    font-size: 14px;
+  }
+  .latest-author { font-weight: 600; }
+  .latest-message { flex: 1 1 200px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); }
+  .latest-message:hover { color: var(--accent); }
+  .latest-meta { display: inline-flex; align-items: center; gap: 12px; margin-left: auto; color: var(--text-muted); font-size: 13px; white-space: nowrap; }
+  .history-link { display: inline-flex; align-items: center; gap: 4px; color: var(--text-secondary); }
+  .history-link strong { color: var(--text-primary); }
+  .history-link:hover, .history-link:hover strong { color: var(--accent); }
+
+  .entry {
+    display: grid;
+    grid-template-columns: 16px minmax(120px, 2fr) minmax(0, 3fr) auto;
+    align-items: center;
+    gap: 12px;
     padding: 8px 16px;
     border-bottom: 1px solid var(--border-light);
     font-size: 14px;
-    cursor: pointer;
-    text-decoration: none;
     color: var(--text-primary);
   }
+  .entry:last-child { border-bottom: none; }
   .entry:hover { background: var(--bg-hover); }
-  .file-entry { cursor: pointer; }
+  a.entry { text-decoration: none; }
+  @media (max-width: 600px) {
+    .entry { grid-template-columns: 16px minmax(0, 1fr) auto; }
+    .entry .entry-commit { display: none; }
+  }
 
   .entry-icon { flex-shrink: 0; }
   .entry-icon.folder { fill: var(--accent); }
   .entry-icon.file,
   .entry-icon.submodule { fill: none; stroke: var(--text-muted); stroke-width: 1.2; stroke-linejoin: round; }
-  .entry-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-  .entry-name.dir { color: var(--text-primary); font-weight: 500; }
+  .entry-name { min-width: 0; overflow-wrap: anywhere; color: var(--text-primary); }
+  a.entry-name:hover { color: var(--accent); text-decoration: underline; }
+  .entry-name.dir { font-weight: 500; }
   .entry-name.up { color: var(--text-muted); }
-  .entry-size { font-size: 12px; color: var(--text-muted); font-family: var(--font-mono); }
-  .submodule-entry { cursor: default; }
+  .entry-commit { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font-size: 13px; }
+  a.entry-commit:hover { color: var(--accent); text-decoration: underline; }
+  .entry-date { color: var(--text-muted); font-size: 13px; white-space: nowrap; text-align: right; }
   .entry-kind { font-size: 12px; color: var(--text-muted); }
 
-  .commits-panel {
-    padding: 16px;
-  }
-
-  h3 { font-size: 14px; margin-bottom: 12px; }
-
-  .commit-item {
-    display: block;
-    padding: 8px 0;
-    border-bottom: 1px solid var(--border-light);
-    color: inherit;
-    text-decoration: none;
-  }
-  .commit-item:last-child { border-bottom: none; }
-
-  .commit-msg {
-    font-size: 13px;
-    font-weight: 500;
-    margin-bottom: 4px;
-  }
-
-  .commit-meta {
-    display: flex;
-    gap: 8px;
-    font-size: 12px;
-    color: var(--text-muted);
-    align-items: center;
-  }
-
   .commit-sha {
-    font-size: 11px;
-    background: var(--bg-tertiary);
-    padding: 1px 6px;
-    border-radius: 4px;
-    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-secondary);
   }
 
   /* Empty repo setup guidance */
@@ -745,14 +820,48 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
   }
 
   .readme-header {
-    padding: 10px 16px;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 16px;
     background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-bottom: none;
-    border-radius: var(--radius) var(--radius) 0 0;
-    font-size: 13px;
+    border-bottom: 1px solid var(--border);
+    font-size: 14px;
     font-weight: 600;
   }
+  .readme-title { display: inline-flex; align-items: center; gap: 8px; min-width: 0; overflow-wrap: anywhere; }
+  .readme-outline { position: relative; }
+  .outline-toggle { display: inline-flex; align-items: center; padding: 4px 8px; }
+  .outline-list {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 4px);
+    z-index: 20;
+    width: min(320px, 80vw);
+    max-height: 60vh;
+    overflow-y: auto;
+    margin: 0;
+    padding: 4px 0;
+    list-style: none;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+    font-weight: 400;
+  }
+  .outline-item {
+    display: block;
+    width: 100%;
+    padding: 4px 12px 4px 0;
+    border: none;
+    background: none;
+    color: var(--text-primary);
+    font-size: 13px;
+    text-align: left;
+  }
+  .outline-item:hover { color: var(--accent); }
 
   .readme-body {
     background: var(--bg-secondary);

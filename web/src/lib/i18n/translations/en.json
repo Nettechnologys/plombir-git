@@ -709,7 +709,27 @@
       "no_diff": "No diff available.",
       "submodule": "Submodule",
       "readme_unavailable": "The README could not be loaded.",
-      "path": "Path"
+      "path": "Path",
+      "branch_forms": {
+        "one": "branch",
+        "few": "branches",
+        "many": "branches",
+        "other": "branches"
+      },
+      "tag_forms": {
+        "one": "tag",
+        "few": "tags",
+        "many": "tags",
+        "other": "tags"
+      },
+      "commit_forms": {
+        "one": "commit",
+        "few": "commits",
+        "many": "commits",
+        "other": "commits"
+      },
+      "history": "History",
+      "outline": "Outline"
     },
     "lines_count": "{count} lines",
     "file_size": {
@@ -734,6 +754,45 @@
       "admin": "You: admin",
       "write": "You: write",
       "read": "You: read"
+    },
+    "refs": {
+      "switch": "Switch branches/tags",
+      "find": "Find a branch or tag...",
+      "default": "default",
+      "nothing": "Nothing to show",
+      "all_branches": "View all branches",
+      "all_tags": "View all tags"
+    },
+    "go_to_file": {
+      "placeholder": "Go to file",
+      "failed": "The file list could not be loaded.",
+      "none": "No matching files",
+      "search_code": "Search code for “{query}”",
+      "partial": "Only the first {count} files are searched."
+    },
+    "about": {
+      "title": "About",
+      "no_description": "No description provided.",
+      "releases": "Releases",
+      "latest": "Latest",
+      "no_releases": "No releases published",
+      "languages": "Languages",
+      "other": "Other",
+      "star_forms": {
+        "one": "star",
+        "few": "stars",
+        "many": "stars",
+        "other": "stars"
+      },
+      "fork_forms": {
+        "one": "fork",
+        "few": "forks",
+        "many": "forks",
+        "other": "forks"
+      }
+    },
+    "commits": {
+      "history_for": "History for {path}"
     }
   },
   "issues": {
