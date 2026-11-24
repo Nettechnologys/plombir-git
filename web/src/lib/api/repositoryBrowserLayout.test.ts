@@ -3,7 +3,7 @@ import { afterEach, beforeEach, expect, it } from 'vitest';
 import RepositoryPage from '../../routes/[owner]/[repo]/+page.svelte';
 import { setTestPage } from '../test/app';
 import { releases, repos, resetTestClient } from '../test/client';
-import { click, element, renderComponent, settle, type RenderedComponent } from '../test/render';
+import { click, element, input, renderComponent, settle, type RenderedComponent } from '../test/render';
 import CommitsPage from '../../routes/[owner]/[repo]/commits/+page.svelte';
 
 let rendered: RenderedComponent | undefined;
@@ -206,4 +206,16 @@ it('narrows the commit history to the path in the URL', async () => {
 	await settle();
 	expect(repos.log).toHaveBeenCalledWith('alice', 'demo', 'dev', 'src/lib', 50);
 	expect(element(rendered.container, '.history-path').textContent).toBe('History for src/lib');
+});
+
+it('finds files when typing starts without a focus event', async () => {
+	// A page that gained the text some other way than a focus — autofill, a
+	// focus the browser did not report — still has to search the files.
+	repos.files.mockResolvedValue({ paths: ['README.md', 'src/lib/api/mod.rs'], complete: true });
+	setTestPage('/alice/demo', { owner: 'alice', repo: 'demo' });
+	rendered = await renderComponent(RepositoryPage);
+	await input(element<HTMLInputElement>(rendered.container, '.go-to-file-input'), 'mod');
+	await settle();
+	const items = [...rendered.container.querySelectorAll('.go-to-file-item:not(.go-to-file-search)')];
+	expect(items.map((item) => item.textContent)).toEqual(['src/lib/api/mod.rs']);
 });

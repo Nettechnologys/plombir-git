@@ -121,7 +121,7 @@
     aria-autocomplete="list"
     onfocus={() => { open = true; void load(); }}
     onblur={() => { open = false; }}
-    oninput={() => { open = true; }}
+    oninput={() => { open = true; void load(); }}
     {onkeydown}
   />
   <kbd class="go-to-file-key" aria-hidden="true">t</kbd>

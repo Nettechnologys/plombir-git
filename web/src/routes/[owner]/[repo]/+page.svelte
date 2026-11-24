@@ -655,7 +655,9 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
 
   .entry {
     display: grid;
-    grid-template-columns: 16px minmax(120px, 2fr) minmax(0, 3fr) auto;
+    /* Every row is its own grid, so the date column has a fixed width: an
+       `auto` one sized to each row's date shifted that row's message. */
+    grid-template-columns: 16px minmax(120px, 2fr) minmax(0, 3fr) minmax(max-content, 120px);
     align-items: center;
     gap: 12px;
     padding: 8px 16px;
@@ -667,7 +669,7 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
   .entry:hover { background: var(--bg-hover); }
   a.entry { text-decoration: none; }
   @media (max-width: 600px) {
-    .entry { grid-template-columns: 16px minmax(0, 1fr) auto; }
+    .entry { grid-template-columns: 16px minmax(0, 1fr) minmax(max-content, 120px); }
     .entry .entry-commit { display: none; }
   }
 
