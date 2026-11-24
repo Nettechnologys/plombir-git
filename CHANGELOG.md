@@ -44,6 +44,13 @@ The repository home page now works the way GitHub's does. See the
 - Keep rendered Markdown within its column: a wide image or table gave the
   README a horizontal scrollbar, and the README was a scroll box of its own.
 
+### Security
+
+- Update lettre to 0.11.24 for RUSTSEC-2026-0560 to RUSTSEC-2026-0565 (SMTP
+  command and STARTTLS reply injection, mail for a quoted local part sent to a
+  different address, unbounded reply buffering, two panics) and url to 2.5.9
+  for RUSTSEC-2026-0592 (stack overflow on nested `blob:` URLs).
+
 ## [0.4.3] - 2026-11-15
 
 Read the [v0.4.3 upgrade notes](docs/releases/v0.4.3.md) before deploying: the
