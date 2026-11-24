@@ -48,3 +48,84 @@ workspace's date-time type in ~350 files and SeaORM's default with-chrono entity
 timestamps, so there is no drop-in replacement. The exposure is unpatched bugs \
 found later, not a known flaw. Revisit when a chrono vulnerability is published \
 or the migration to time/jiff lands."""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0574"
+reason = """\
+heapless 0.8.0 unsound advisory, fixed only on the 0.9 line. heapless comes in \
+only through faster-hex 0.10 (gix-hash), which requires ^0.8 and uses it solely \
+without its alloc feature; our build enables alloc (via std), so no heapless \
+type is compiled into our code. Revisit when gix moves to a faster-hex on \
+heapless 0.9 or drops it."""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0575"
+reason = """\
+heapless 0.8.0 unsound advisory, fixed only on the 0.9 line. heapless comes in \
+only through faster-hex 0.10 (gix-hash), which requires ^0.8 and uses it solely \
+without its alloc feature; our build enables alloc (via std), so no heapless \
+type is compiled into our code. Revisit when gix moves to a faster-hex on \
+heapless 0.9 or drops it."""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0576"
+reason = """\
+heapless 0.8.0 unsound advisory, fixed only on the 0.9 line. heapless comes in \
+only through faster-hex 0.10 (gix-hash), which requires ^0.8 and uses it solely \
+without its alloc feature; our build enables alloc (via std), so no heapless \
+type is compiled into our code. Revisit when gix moves to a faster-hex on \
+heapless 0.9 or drops it."""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0577"
+reason = """\
+heapless 0.8.0 unsound advisory, fixed only on the 0.9 line. heapless comes in \
+only through faster-hex 0.10 (gix-hash), which requires ^0.8 and uses it solely \
+without its alloc feature; our build enables alloc (via std), so no heapless \
+type is compiled into our code. Revisit when gix moves to a faster-hex on \
+heapless 0.9 or drops it."""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0578"
+reason = """\
+heapless 0.8.0 unsound advisory, fixed only on the 0.9 line. heapless comes in \
+only through faster-hex 0.10 (gix-hash), which requires ^0.8 and uses it solely \
+without its alloc feature; our build enables alloc (via std), so no heapless \
+type is compiled into our code. Revisit when gix moves to a faster-hex on \
+heapless 0.9 or drops it."""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0579"
+reason = """\
+heapless 0.8.0 unsound advisory, fixed only on the 0.9 line. heapless comes in \
+only through faster-hex 0.10 (gix-hash), which requires ^0.8 and uses it solely \
+without its alloc feature; our build enables alloc (via std), so no heapless \
+type is compiled into our code. Revisit when gix moves to a faster-hex on \
+heapless 0.9 or drops it."""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0580"
+reason = """\
+heapless 0.8.0 unsound advisory, fixed only on the 0.9 line. heapless comes in \
+only through faster-hex 0.10 (gix-hash), which requires ^0.8 and uses it solely \
+without its alloc feature; our build enables alloc (via std), so no heapless \
+type is compiled into our code. Revisit when gix moves to a faster-hex on \
+heapless 0.9 or drops it."""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0581"
+reason = """\
+heapless 0.8.0 unsound advisory, fixed only on the 0.9 line. heapless comes in \
+only through faster-hex 0.10 (gix-hash), which requires ^0.8 and uses it solely \
+without its alloc feature; our build enables alloc (via std), so no heapless \
+type is compiled into our code. Revisit when gix moves to a faster-hex on \
+heapless 0.9 or drops it."""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0582"
+reason = """\
+heapless 0.8.0 unsound advisory, fixed only on the 0.9 line. heapless comes in \
+only through faster-hex 0.10 (gix-hash), which requires ^0.8 and uses it solely \
+without its alloc feature; our build enables alloc (via std), so no heapless \
+type is compiled into our code. Revisit when gix moves to a faster-hex on \
+heapless 0.9 or drops it."""

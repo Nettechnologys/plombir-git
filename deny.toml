@@ -19,6 +19,9 @@ version = 2
 # the crate comes back, its advisory is waived without anyone looking. Fail on
 # it instead, so the list only ever holds what the tree really carries.
 unused-ignored-advisory = "deny"
+# Unsound advisories count for every crate in the tree, not only our own, so
+# deny agrees with cargo audit and osv-scanner on what has to be accepted.
+unsound = "all"
 # Consciously accepted advisories without an available compatible dependency
 # update. Keep in sync with `.cargo/audit.toml` and `osv-scanner.toml`; each entry
 # documents the remaining exposure and when to revisit the acceptance.
@@ -56,6 +59,21 @@ ignore = [
     # chrono vulnerability is published or the migration to time/jiff lands.
     # Follow-up: card_79ecd679fc20.
     "RUSTSEC-2026-0543",
+    # heapless 0.8.0 unsound advisories (Treiber stack, Deque, IndexMap,
+    # Spsc, FindMutView, Drop). Fixed only on the 0.9 line, but heapless comes
+    # in only through faster-hex 0.10 (gix-hash), which requires ^0.8 and uses
+    # it solely without its `alloc` feature; our build enables `alloc` (via
+    # `std`), so no heapless type is compiled into our code. Revisit when gix
+    # moves to a faster-hex on heapless 0.9 or drops it.
+    "RUSTSEC-2026-0574",
+    "RUSTSEC-2026-0575",
+    "RUSTSEC-2026-0576",
+    "RUSTSEC-2026-0577",
+    "RUSTSEC-2026-0578",
+    "RUSTSEC-2026-0579",
+    "RUSTSEC-2026-0580",
+    "RUSTSEC-2026-0581",
+    "RUSTSEC-2026-0582",
 ]
 
 # ──────────────────────────────── Licenses ────────────────────────────────
