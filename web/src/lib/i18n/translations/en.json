@@ -708,7 +708,8 @@
       "recent_commits": "Recent commits",
       "no_diff": "No diff available.",
       "submodule": "Submodule",
-      "readme_unavailable": "The README could not be loaded."
+      "readme_unavailable": "The README could not be loaded.",
+      "path": "Path"
     },
     "lines_count": "{count} lines",
     "file_size": {

@@ -5856,7 +5856,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.empty.copied",
-          "line": 296,
+          "line": 308,
           "via": null,
           "href": null,
           "handler": "copyUrl(httpCloneUrl)",
@@ -5866,7 +5866,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.empty.copied",
-          "line": 305,
+          "line": 317,
           "via": null,
           "href": null,
           "handler": "copyUrl(sshCloneUrl)",
@@ -5876,7 +5876,7 @@
         {
           "tag": "button",
           "label": "i18n:repo.browser.default_branch",
-          "line": 351,
+          "line": 363,
           "via": null,
           "href": null,
           "handler": "() => selectBranch(b.name, close)",
@@ -5886,7 +5886,7 @@
         {
           "tag": "button",
           "label": "i18n:common.search",
-          "line": 374,
+          "line": 386,
           "via": null,
           "href": null,
           "handler": "searchCode",
@@ -5896,7 +5896,7 @@
         {
           "tag": "a",
           "label": "i18n:repo.branches.title",
-          "line": 377,
+          "line": 389,
           "via": null,
           "href": "`/${owner}/${repo}/branches`",
           "handler": null,
@@ -5906,7 +5906,7 @@
         {
           "tag": "a",
           "label": "i18n:repo.tags.title",
-          "line": 380,
+          "line": 392,
           "via": null,
           "href": "`/${owner}/${repo}/tags`",
           "handler": null,
@@ -5915,8 +5915,8 @@
         },
         {
           "tag": "a",
-          "label": "➕",
-          "line": 385,
+          "label": "i18n:repo.new_file",
+          "line": 397,
           "via": null,
           "href": "`/${owner}/${repo}/new`",
           "handler": null,
@@ -5926,7 +5926,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 392,
+          "line": 409,
           "via": null,
           "href": "buildTreeHref(ref, '')",
           "handler": null,
@@ -5935,8 +5935,18 @@
         },
         {
           "tag": "a",
-          "label": "📁 ..",
-          "line": 408,
+          "label": "",
+          "line": 415,
+          "via": null,
+          "href": "buildTreeHref(ref, crumb.path)",
+          "handler": null,
+          "calls": [],
+          "unresolved": false
+        },
+        {
+          "tag": "a",
+          "label": "..",
+          "line": 427,
           "via": null,
           "href": "buildTreeHref(ref, parentPath(path))",
           "handler": null,
@@ -5945,8 +5955,8 @@
         },
         {
           "tag": "a",
-          "label": "📁",
-          "line": 415,
+          "label": "",
+          "line": 434,
           "via": null,
           "href": "buildTreeHref(ref, path ? `${path}/${entry.name}` : entry.name)",
           "handler": null,
@@ -5955,8 +5965,8 @@
         },
         {
           "tag": "a",
-          "label": "📄",
-          "line": 420,
+          "label": "",
+          "line": 439,
           "via": null,
           "href": "buildBlobHref(path ? path + '/' + entry.name : entry.name)",
           "handler": null,
@@ -5966,7 +5976,7 @@
         {
           "tag": "a",
           "label": "",
-          "line": 441,
+          "line": 460,
           "via": null,
           "href": "buildCommitHref(commit.sha)",
           "handler": null,
@@ -5976,7 +5986,7 @@
         {
           "tag": "button",
           "label": "i18n:common.retry",
-          "line": 457,
+          "line": 476,
           "via": null,
           "href": null,
           "handler": "() => loadReadme(owner, repo, queryRef, queryPath, entries)",
@@ -6168,7 +6178,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -6678,7 +6688,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -7480,7 +7490,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -7968,7 +7978,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -8277,7 +8287,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -8798,7 +8808,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -9047,7 +9057,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -9681,7 +9691,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -10397,7 +10407,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -11176,7 +11186,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -11543,7 +11553,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -12193,7 +12203,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -12452,7 +12462,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -12839,7 +12849,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -13157,7 +13167,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -13804,7 +13814,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -14445,7 +14455,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -16872,7 +16882,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -17988,7 +17998,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -18302,7 +18312,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -18660,7 +18670,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -21808,7 +21818,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -22293,7 +22303,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -22635,7 +22645,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -23140,7 +23150,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,
@@ -23444,7 +23454,7 @@
         },
         {
           "tag": "button",
-          "label": "⌄ ▾",
+          "label": "▾",
           "line": 484,
           "via": "RepoHeader",
           "href": null,

@@ -12,6 +12,7 @@
   import { canWriteRepo } from '$lib/repoPermission';
   import { renderMarkdown } from '$lib/utils/markdown';
   import { findReadme, readmeDirectories, type RepositoryLinkTargets } from '$lib/repoReadme';
+  import { sortTreeEntries } from '$lib/repoTree';
 
   const t = createT();
   const RECENT_COMMITS = 5;
@@ -158,7 +159,7 @@
       if (!dataRequests.owns(claim, owner, repo, repositoryViewIdentity(queryRef, queryPath))) return;
 
       const nextEntries = treeData.entries || [];
-      entries = nextEntries;
+      entries = sortTreeEntries(nextEntries);
       branches = branchData || [];
       commits = (logData.commits || []).slice(0, RECENT_COMMITS);
       repoInfo = repoData;
@@ -246,6 +247,13 @@
     return parts.join('/');
   }
 
+  /** The current directory as clickable steps, each leading to its own listing. */
+  let pathCrumbs = $derived(
+    path
+      ? path.split('/').map((name, index, parts) => ({ name, path: parts.slice(0, index + 1).join('/') }))
+      : [],
+  );
+
   function selectBranch(branchName: string, close: () => void) {
     syncLocation(branchName, path);
     close();
@@ -261,6 +269,10 @@
 <svelte:head>
   <title>{owner}/{repo} · Plombir Git</title>
 </svelte:head>
+
+{#snippet folderIcon()}
+  <svg class="entry-icon folder" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M1.5 3.25c0-.69.56-1.25 1.25-1.25h3.1c.4 0 .77.19 1 .5l.9 1.25h5.5c.69 0 1.25.56 1.25 1.25v7.75c0 .69-.56 1.25-1.25 1.25H2.75c-.69 0-1.25-.56-1.25-1.25Z" /></svg>
+{/snippet}
 
 <div class="page-container">
   <RepoHeader {owner} {repo} activeTab="code" starsCount={repoInfo?.stars_count || 0} defaultBranch={repoInfo?.default_branch} />
@@ -382,22 +394,29 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
           </a>
         </div>
         {#if canWriteRepo(repoInfo?.viewer_permission)}
-          <a href={`/${owner}/${repo}/new`} class="btn btn-primary new-file-link">
-            ➕ {t('repo.new_file', 'New file')}
+          <a href={`/${owner}/${repo}/new`} class="btn btn-outline new-file-link">
+            <svg class="icon" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M8 2.5v11M2.5 8h11" /></svg>
+            {t('repo.new_file', 'New file')}
           </a>
         {/if}
       </div>
-
-      <div class="breadcrumb">
-        <a href={buildTreeHref(ref, '')}>{repo}</a>
-        {#if path}
-          {#each path.split('/') as part}
-            <span class="sep">/</span>
-            <span>{part}</span>
-          {/each}
-        {/if}
-      </div>
     </div>
+
+    <!-- Inside a directory, the path is a breadcrumb whose every step is a
+         link, as on GitHub. At the root it would only repeat the header. -->
+    {#if pathCrumbs.length}
+      <nav class="breadcrumb" aria-label={t('repo.browser.path', 'Path')}>
+        <a href={buildTreeHref(ref, '')}>{repo}</a>
+        {#each pathCrumbs as crumb, index}
+          <span class="sep" aria-hidden="true">/</span>
+          {#if index === pathCrumbs.length - 1}
+            <span class="current" aria-current="page">{crumb.name}</span>
+          {:else}
+            <a href={buildTreeHref(ref, crumb.path)}>{crumb.name}</a>
+          {/if}
+        {/each}
+      </nav>
+    {/if}
 
     <div class="content-grid">
       <!-- File tree -->
@@ -406,19 +425,19 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
              the back button work, which a `div role="button"` gave none of. -->
         {#if path}
           <a href={buildTreeHref(ref, parentPath(path))} class="entry">
-            <span class="entry-icon">📁</span>
+            {@render folderIcon()}
             <span class="entry-name up">..</span>
           </a>
         {/if}
         {#each entries as entry}
           {#if entry.kind === 'tree'}
             <a href={buildTreeHref(ref, path ? `${path}/${entry.name}` : entry.name)} class="entry">
-              <span class="entry-icon">📁</span>
+              {@render folderIcon()}
               <span class="entry-name dir">{entry.name}</span>
             </a>
           {:else if entry.kind === 'blob'}
             <a href={buildBlobHref(path ? path + '/' + entry.name : entry.name)} class="entry file-entry">
-              <span class="entry-icon">📄</span>
+              <svg class="entry-icon file" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M4 1.75h5.25L12.5 5v8.75a.5.5 0 0 1-.5.5H4a.5.5 0 0 1-.5-.5V2.25a.5.5 0 0 1 .5-.5ZM9 1.75V5.5h3.5" /></svg>
               <span class="entry-name">{entry.name}</span>
               {#if entry.size}
                 <span class="entry-size">{formatFileSize(entry.size)}</span>
@@ -426,7 +445,7 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
             </a>
           {:else}
             <div class="entry submodule-entry">
-              <span class="entry-icon">📦</span>
+              <svg class="entry-icon submodule" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M1.5 3.25c0-.69.56-1.25 1.25-1.25h3.1c.4 0 .77.19 1 .5l.9 1.25h5.5c.69 0 1.25.56 1.25 1.25v7.75c0 .69-.56 1.25-1.25 1.25H2.75c-.69 0-1.25-.56-1.25-1.25ZM6 9.5h4M8.5 8l1.5 1.5L8.5 11" /></svg>
               <span class="entry-name">{entry.name}</span>
               <span class="entry-kind">{t('repo.browser.submodule')}</span>
             </div>
@@ -501,7 +520,8 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
   .repo-code-query { flex: 1; min-width: 0; width: 100%; }
   .code-search button { flex-shrink: 0; }
   .ref-links { display: flex; flex-wrap: wrap; gap: 8px; }
-  .new-file-link { margin-left: auto; }
+  .new-file-link { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
+  .icon { flex-shrink: 0; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; }
 
   .breadcrumb {
     display: flex;
@@ -511,9 +531,11 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
     overflow-wrap: anywhere;
     align-items: center;
     gap: 4px;
-    font-size: 14px;
+    margin-bottom: 12px;
+    font-size: 16px;
   }
   .breadcrumb a { color: var(--accent); font-weight: 600; }
+  .breadcrumb .current { font-weight: 600; }
   .sep { color: var(--text-muted); }
 
   .content-grid {
@@ -545,8 +567,11 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
   .entry:hover { background: var(--bg-hover); }
   .file-entry { cursor: pointer; }
 
-  .entry-icon { font-size: 14px; }
-  .entry-name { flex: 1; }
+  .entry-icon { flex-shrink: 0; }
+  .entry-icon.folder { fill: var(--accent); }
+  .entry-icon.file,
+  .entry-icon.submodule { fill: none; stroke: var(--text-muted); stroke-width: 1.2; stroke-linejoin: round; }
+  .entry-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
   .entry-name.dir { color: var(--text-primary); font-weight: 500; }
   .entry-name.up { color: var(--text-muted); }
   .entry-size { font-size: 12px; color: var(--text-muted); font-family: var(--font-mono); }
@@ -734,8 +759,6 @@ git push -u origin {repoInfo?.default_branch || 'main'}</code></pre>
     border: none;
     border-radius: 0;
     padding: 32px;
-    max-height: 80vh;
-    overflow-y: auto;
   }
 
   .markdown-body {

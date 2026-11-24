@@ -708,7 +708,8 @@
       "recent_commits": "Последние коммиты",
       "no_diff": "Изменения недоступны.",
       "submodule": "Подмодуль",
-      "readme_unavailable": "Не удалось загрузить README."
+      "readme_unavailable": "Не удалось загрузить README.",
+      "path": "Путь"
     },
     "lines_count": "Строк: {count}",
     "file_size": {

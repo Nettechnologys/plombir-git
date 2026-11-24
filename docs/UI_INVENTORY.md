@@ -23,7 +23,7 @@
 | Reachable from the browser | 318 (69%) |
 | Layout modules | 3 |
 | Pages | 75 |
-| Interactive controls | 1068 |
+| Interactive controls | 1069 |
 | Controls calling an API | 383 |
 | Controls from shared components | 425 |
 | Browser sweep: scenarios / inventory entries / routes | 52 / 197 / 187 |
@@ -64,9 +64,9 @@
 | `/[owner]/[repo]/pulls` | 27 | 12 | 11 |
 | `/[owner]/[repo]/pipelines` | 26 | 13 | 13 |
 | `/[owner]/[repo]/releases` | 26 | 12 | 10 |
+| `/[owner]/[repo]` | 25 | 5 | 11 |
 | `/[owner]/[repo]/issues` | 25 | 9 | 11 |
 | `/admin/users` 🔒 | 25 | 8 | 4 |
-| `/[owner]/[repo]` | 24 | 5 | 11 |
 | `/[owner]/[repo]/blob/[...path]` | 24 | 8 | 10 |
 | `/settings/security` | 24 | 11 | 6 |
 | `/[owner]/[repo]/wiki/[title]` | 23 | 9 | 12 |
@@ -164,8 +164,8 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:common.retry | :457 | `GET /api/v1/repos/{owner}/{name}/tree` | `RepoRead` | rust+web |
-| i18n:common.retry | :457 | `GET /api/v1/repos/{owner}/{name}/blob/{*path}` | `RepoRead` | rust+web |
+| i18n:common.retry | :476 | `GET /api/v1/repos/{owner}/{name}/tree` | `RepoRead` | rust+web |
+| i18n:common.retry | :476 | `GET /api/v1/repos/{owner}/{name}/blob/{*path}` | `RepoRead` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke+browser |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web+browser |

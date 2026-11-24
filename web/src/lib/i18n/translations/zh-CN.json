@@ -637,7 +637,8 @@
       "recent_commits": "最近提交",
       "no_diff": "无差异可用。",
       "submodule": "子模块",
-      "readme_unavailable": "无法加载 README。"
+      "readme_unavailable": "无法加载 README。",
+      "path": "路径"
     },
     "packages": {
       "title": "包",
