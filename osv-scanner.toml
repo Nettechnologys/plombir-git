@@ -38,3 +38,13 @@ operator-controlled; the server does not accept untrusted SQLite uploads. \
 Keep the data directory and restore inputs trusted; restore-sidecar handling \
 remains a follow-up. This exception does not fix SQLite. Revisit when SQLx \
 admits patched libsqlite3-sys or the database/restore trust boundary changes."""
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+# Follow-up: card_79ecd679fc20.
+reason = """\
+chrono is unmaintained (all versions); no vulnerability is published. It is the \
+workspace's date-time type in ~350 files and SeaORM's default with-chrono entity \
+timestamps, so there is no drop-in replacement. The exposure is unpatched bugs \
+found later, not a known flaw. Revisit when a chrono vulnerability is published \
+or the migration to time/jiff lands."""
