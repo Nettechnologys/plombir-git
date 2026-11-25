@@ -1306,7 +1306,7 @@ pub(crate) async fn comment_moderator(
 )]
 pub async fn edit_comment(
     State(state): State<AppState>,
-    Path((_, _, comment_id)): Path<(String, String, i64)>,
+    Path((owner, name, comment_id)): Path<(String, String, i64)>,
     RepoAuthRead { repo, actor_id }: RepoAuthRead,
     Json(req): Json<EditCommentRequest>,
 ) -> impl IntoResponse {
@@ -1319,7 +1319,28 @@ pub async fn edit_comment(
     )
     .await
     {
-        Ok(comment) => (StatusCode::OK, Json(serde_json::json!(comment))).into_response(),
+        // The same shape `POST …/comments` and the comment list answer with —
+        // the row flattened, its author and its `html_url` — so a client that
+        // edits a comment can show the link it was just given on creation
+        // (card_fffb0abdbf40). The row is a superset of the old answer.
+        Ok(comment) => {
+            let issue_number =
+                match rg_db::ops::issue_ops::find_by_id(&state.db, comment.issue_id).await {
+                    Ok(issue) => issue.map(|issue| issue.number),
+                    Err(error) => return AppError::from(error).into_response(),
+                };
+            match comment_with_author(&state.db, comment).await {
+                Ok(comment) => {
+                    let comment = match issue_number {
+                        Some(number) => comment
+                            .linked(&crate::html_url::Links::new(&state, &owner, &name), number),
+                        None => comment,
+                    };
+                    (StatusCode::OK, Json(comment)).into_response()
+                }
+                Err(error) => error.into_response(),
+            }
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }

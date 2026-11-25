@@ -427,6 +427,37 @@ async fn a_tool_confined_token_works_only_through_mcp_and_only_for_its_tools() {
         .collect();
     names.sort_unstable();
     assert_eq!(names, vec!["create_issue", "get_issue"]);
+    // card_fffb0abdbf40: the annotations `docs/mcp.md` calls part of the
+    // contract reach a client of `POST /api/v1/mcp`, not only the stdio server.
+    let annotations = |name: &str| {
+        listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .map(|tool| tool["annotations"].clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        annotations("get_issue"),
+        serde_json::json!({
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false,
+        }),
+        "{listed}"
+    );
+    assert_eq!(
+        annotations("create_issue")["readOnlyHint"],
+        false,
+        "{listed}"
+    );
+    assert_eq!(
+        annotations("create_issue")["destructiveHint"],
+        false,
+        "{listed}"
+    );
 
     let (status, refused) = f
         .mcp(
