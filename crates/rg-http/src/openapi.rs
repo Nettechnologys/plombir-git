@@ -587,6 +587,10 @@ pub(crate) fn stamp_security(
         crate::api::collaborators::remove_collaborator,
         // Repository Content
         crate::api::repo_content::list_tree,
+        crate::api::repo_overview::tree_commits,
+        crate::api::repo_overview::commit_count,
+        crate::api::repo_overview::languages,
+        crate::api::repo_overview::list_files,
         crate::api::repo_content::get_blob,
         crate::api::repo_content::get_blame,
         crate::api::repo_content::get_raw,

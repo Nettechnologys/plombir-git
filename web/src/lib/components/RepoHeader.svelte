@@ -489,7 +489,7 @@
           aria-controls="clone-dropdown"
           aria-label={t('repo.clone_title')}
         >
-          <span class="code-icon" aria-hidden="true">⌄</span>
+          <svg class="code-icon" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M5.5 4 1.75 8l3.75 4M10.5 4l3.75 4-3.75 4" /></svg>
           <span class="label">{t('repo.code')}</span>
           <span class="caret" aria-hidden="true">▾</span>
         </button>
@@ -737,9 +737,14 @@
     background: #1a7f37;
   }
 
+  /* GitHub's `<>`: the only arrow on the button is the caret. */
   .code-icon {
-    font-size: 14px;
-    line-height: 1;
+    flex-shrink: 0;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
   }
 
   .caret {

@@ -144,12 +144,12 @@ describe('commit history ref and paging', () => {
 		expect(items[0].textContent).toContain('commit 900');
 	});
 
-	it('asks the repository home for the five commits it shows, not fifty', async () => {
+	it('asks the repository home for the one commit it shows, not fifty', async () => {
 		repos.tree.mockResolvedValue({ entries: [] });
-		repos.log.mockResolvedValue({ commits: history(1, 5) });
+		repos.log.mockResolvedValue({ commits: history(1, 1) });
 		setTestPage('/alice/demo', { owner: 'alice', repo: 'demo' });
 		rendered = await renderComponent(RepositoryPage);
 
-		expect(repos.log).toHaveBeenCalledWith('alice', 'demo', undefined, undefined, 5);
+		expect(repos.log).toHaveBeenCalledWith('alice', 'demo', undefined, undefined, 1);
 	});
 });

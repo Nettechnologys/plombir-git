@@ -19,6 +19,9 @@ version = 2
 # the crate comes back, its advisory is waived without anyone looking. Fail on
 # it instead, so the list only ever holds what the tree really carries.
 unused-ignored-advisory = "deny"
+# Unsound advisories count for every crate in the tree, not only our own, so
+# deny agrees with cargo audit and osv-scanner on what has to be accepted.
+unsound = "all"
 # Consciously accepted advisories without an available compatible dependency
 # update. Keep in sync with `.cargo/audit.toml` and `osv-scanner.toml`; each entry
 # documents the remaining exposure and when to revisit the acceptance.
@@ -49,6 +52,28 @@ ignore = [
     # libsqlite3-sys, or if the database/restore trust boundary changes.
     # Follow-ups: card_9883212e9192 (update), card_f8e122ff4fd8 (restore sidecars).
     "RUSTSEC-2026-0459",
+    # chrono is unmaintained (all versions; no vulnerability is published). It
+    # is the workspace's date-time type in ~350 files and SeaORM's default
+    # `with-chrono` entity timestamps, so there is no drop-in replacement. The
+    # exposure is unpatched bugs found later, not a known flaw. Revisit when a
+    # chrono vulnerability is published or the migration to time/jiff lands.
+    # Follow-up: card_79ecd679fc20.
+    "RUSTSEC-2026-0543",
+    # heapless 0.8.0 unsound advisories (Treiber stack, Deque, IndexMap,
+    # Spsc, FindMutView, Drop). Fixed only on the 0.9 line, but heapless comes
+    # in only through faster-hex 0.10 (gix-hash), which requires ^0.8 and uses
+    # it solely without its `alloc` feature; our build enables `alloc` (via
+    # `std`), so no heapless type is compiled into our code. Revisit when gix
+    # moves to a faster-hex on heapless 0.9 or drops it.
+    "RUSTSEC-2026-0574",
+    "RUSTSEC-2026-0575",
+    "RUSTSEC-2026-0576",
+    "RUSTSEC-2026-0577",
+    "RUSTSEC-2026-0578",
+    "RUSTSEC-2026-0579",
+    "RUSTSEC-2026-0580",
+    "RUSTSEC-2026-0581",
+    "RUSTSEC-2026-0582",
 ]
 
 # ──────────────────────────────── Licenses ────────────────────────────────

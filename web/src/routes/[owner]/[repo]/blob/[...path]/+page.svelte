@@ -4,6 +4,7 @@
   import { tick } from 'svelte';
   import { page } from '$app/stores';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
+  import GoToFile from '$lib/components/GoToFile.svelte';
   import { repos } from '$lib/api/client.svelte';
   import type { BlameLine } from '$lib/api/repos';
   import {
@@ -523,12 +524,19 @@
   {#if loading}
     <p class="text-secondary">{t('common.loading')}</p>
   {:else if blobData}
-    <div class="blob-breadcrumb">
-      <a href={buildRepoHref(ref, '')} class="crumb-link">{repo}</a>
-      {#each breadcrumbs as crumb}
-        <span class="crumb-sep">/</span>
-        <a href={crumb.href} class="crumb-link">{crumb.name}</a>
-      {/each}
+    <div class="blob-toolbar">
+      <nav class="blob-breadcrumb" aria-label={t('repo.browser.path', 'Path')}>
+        <a href={buildRepoHref(ref, '')} class="crumb-link">{repo}</a>
+        {#each breadcrumbs as crumb}
+          <span class="crumb-sep" aria-hidden="true">/</span>
+          <a href={crumb.href} class="crumb-link">{crumb.name}</a>
+        {/each}
+        <span class="crumb-sep" aria-hidden="true">/</span>
+        <span class="crumb-current" aria-current="page">{filePath.split('/').pop()}</span>
+      </nav>
+      <div class="blob-go-to-file">
+        <GoToFile {owner} {repo} {ref} />
+      </div>
     </div>
 
     <div class="file-header">
@@ -709,13 +717,25 @@
   }
 
   .blame-cell a { margin-left: 8px; }
-  .blob-breadcrumb {
+  .blob-toolbar {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 4px;
-    font-size: 14px;
+    justify-content: space-between;
+    gap: 8px 16px;
     margin-bottom: 12px;
   }
+  .blob-breadcrumb {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+    font-size: 16px;
+    overflow-wrap: anywhere;
+  }
+  .crumb-current { font-weight: 600; }
+  .blob-go-to-file { display: flex; flex: 0 1 320px; min-width: 200px; }
 
   .crumb-link {
     color: var(--accent);

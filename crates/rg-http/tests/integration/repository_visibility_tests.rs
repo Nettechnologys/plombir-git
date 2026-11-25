@@ -79,6 +79,10 @@ async fn hidden_and_absent_repository_rest_reads_are_identical_for_sessions_and_
         for suffix in [
             "",
             "/tree",
+            "/tree/commits",
+            "/commit-count",
+            "/languages",
+            "/files",
             "/branches",
             "/tags",
             "/log",

@@ -44,6 +44,7 @@ pub mod push_mirrors;
 pub mod releases;
 pub mod repo_access;
 pub mod repo_content;
+pub mod repo_overview;
 pub mod repos;
 pub mod reviews;
 pub mod runners;

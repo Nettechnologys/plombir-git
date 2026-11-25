@@ -708,7 +708,28 @@
       "recent_commits": "Последние коммиты",
       "no_diff": "Изменения недоступны.",
       "submodule": "Подмодуль",
-      "readme_unavailable": "Не удалось загрузить README."
+      "readme_unavailable": "Не удалось загрузить README.",
+      "path": "Путь",
+      "branch_forms": {
+        "one": "ветка",
+        "few": "ветки",
+        "many": "веток",
+        "other": "ветки"
+      },
+      "tag_forms": {
+        "one": "тег",
+        "few": "тега",
+        "many": "тегов",
+        "other": "тега"
+      },
+      "commit_forms": {
+        "one": "коммит",
+        "few": "коммита",
+        "many": "коммитов",
+        "other": "коммита"
+      },
+      "history": "История",
+      "outline": "Оглавление"
     },
     "lines_count": "Строк: {count}",
     "file_size": {
@@ -733,6 +754,45 @@
       "admin": "Ваш доступ: администрирование",
       "write": "Ваш доступ: запись",
       "read": "Ваш доступ: чтение"
+    },
+    "refs": {
+      "switch": "Ветки и теги",
+      "find": "Найти ветку или тег...",
+      "default": "по умолчанию",
+      "nothing": "Ничего не найдено",
+      "all_branches": "Все ветки",
+      "all_tags": "Все теги"
+    },
+    "go_to_file": {
+      "placeholder": "Перейти к файлу",
+      "failed": "Не удалось загрузить список файлов.",
+      "none": "Подходящих файлов нет",
+      "search_code": "Искать «{query}» в коде",
+      "partial": "Поиск идёт только по первым {count} файлам."
+    },
+    "about": {
+      "title": "О репозитории",
+      "no_description": "Описание не задано.",
+      "releases": "Релизы",
+      "latest": "Последний",
+      "no_releases": "Релизов пока нет",
+      "languages": "Языки",
+      "other": "Другие",
+      "star_forms": {
+        "one": "звезда",
+        "few": "звезды",
+        "many": "звёзд",
+        "other": "звезды"
+      },
+      "fork_forms": {
+        "one": "форк",
+        "few": "форка",
+        "many": "форков",
+        "other": "форка"
+      }
+    },
+    "commits": {
+      "history_for": "История {path}"
     }
   },
   "issues": {
