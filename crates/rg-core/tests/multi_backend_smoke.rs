@@ -7483,3 +7483,192 @@ async fn held_jobs_are_portable() {
         .await
         .unwrap());
 }
+
+/// Put `main` and `feature` into a bare repository at `repo_root/<owner>/<name>.git`
+/// through the git gateway, so a pull request has a head to resolve.
+fn bare_repository_with_a_feature_branch(repo_root: &std::path::Path, owner: &str, name: &str) {
+    let bare = repo_root.join(owner).join(format!("{name}.git"));
+    std::fs::create_dir_all(&bare).expect("create the repository directory");
+    let work = tempfile::tempdir().expect("work tree");
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway")
+            .run(args, Some(dir))
+            .expect("run git")
+            .ensure_success()
+            .unwrap_or_else(|error| panic!("git {args:?}: {error:#}"));
+    };
+    git(&bare, &["init", "--bare", "-q", "-b", "main"]);
+    git(work.path(), &["init", "-q", "-b", "main"]);
+    git(work.path(), &["config", "user.name", "Smoke"]);
+    git(
+        work.path(),
+        &["config", "user.email", "smoke@example.invalid"],
+    );
+    std::fs::write(work.path().join("README.md"), "smoke\n").unwrap();
+    git(work.path(), &["add", "README.md"]);
+    git(work.path(), &["commit", "-q", "-m", "main"]);
+    git(work.path(), &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(work.path().join("feature.txt"), "feature\n").unwrap();
+    git(work.path(), &["add", "feature.txt"]);
+    git(work.path(), &["commit", "-q", "-m", "feature"]);
+    let bare_text = bare.to_string_lossy().into_owned();
+    git(work.path(), &["push", "-q", &bare_text, "main", "feature"]);
+}
+
+/// card_105b91bd40c2: the fifth criterion of the local-numbers phase on the
+/// server databases. Two halves of the same promise, run against the backend
+/// the CI job points at:
+///
+/// - `db_retry` — eight issues and eight pull requests filed at once on one
+///   repository take eight distinct, consecutive numbers each, and every
+///   correct create succeeds; a lost `(repo_id, number)` race is re-read, not
+///   answered 5xx;
+/// - `repo_number_floors` — deleting the newest issue and the newest pull
+///   request leaves their numbers spent: the next filing gets the number after
+///   them, not theirs again.
+///
+/// The migration itself runs on this database by `rg_db::run_migrations` above
+/// every smoke test; this one is the runtime behaviour the table exists for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn local_numbers_are_unique_under_concurrency_and_never_reused_after_delete() {
+    const FILINGS: usize = 8;
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 8)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("numbers{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Numbers Smoke",
+    )
+    .await
+    .expect("create the owner");
+    let repo_name = format!("numbersrepo{suffix}");
+    let repository = rg_db::ops::repo_ops::create(&db, namespace_repo(owner.id, None, &repo_name))
+        .await
+        .expect("create the repository");
+    let repo_root = tempfile::tempdir().expect("repository root");
+    bare_repository_with_a_feature_branch(repo_root.path(), &username, &repo_name);
+
+    let (repo_id, owner_id) = (repository.id, owner.id);
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(FILINGS * 2));
+    let mut issues = Vec::new();
+    let mut pulls = Vec::new();
+    for index in 0..FILINGS {
+        let (db_issue, start_issue) = (db.clone(), start.clone());
+        issues.push(tokio::spawn(async move {
+            start_issue.wait().await;
+            rg_core::issue::service::create_issue(
+                &db_issue,
+                repo_id,
+                owner_id,
+                format!("concurrent issue {index}"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .map(|issue| issue.number)
+        }));
+        let (db_pull, start_pull) = (db.clone(), start.clone());
+        let root = repo_root.path().to_path_buf();
+        pulls.push(tokio::spawn(async move {
+            start_pull.wait().await;
+            rg_core::pull_request::service::create_pr(
+                &db_pull,
+                &root,
+                repo_id,
+                owner_id,
+                format!("concurrent pull request {index}"),
+                None,
+                "feature".to_string(),
+                "main".to_string(),
+                None,
+                false,
+                None,
+            )
+            .await
+            .map(|pr| pr.number)
+        }));
+    }
+    for (what, handles) in [("issue", issues), ("pull request", pulls)] {
+        let mut numbers = Vec::new();
+        for handle in handles {
+            let number = handle
+                .await
+                .expect("the filing task joins")
+                .unwrap_or_else(|error| panic!("a concurrent {what} filing failed: {error:#}"));
+            numbers.push(number);
+        }
+        numbers.sort_unstable();
+        assert_eq!(
+            numbers,
+            (1..=FILINGS as i64).collect::<Vec<_>>(),
+            "concurrent {what} filings must take distinct consecutive numbers"
+        );
+    }
+
+    let storage = rg_core::blob_storage::LocalBlobStorage::new(repo_root.path());
+    let newest = FILINGS as i64;
+    rg_core::issue::moderation::delete_issue(&db, &storage, repository.id, newest)
+        .await
+        .expect("delete the newest issue");
+    rg_core::issue::moderation::delete_pull_request(
+        &db,
+        &storage,
+        repo_root.path(),
+        &repository,
+        newest,
+        owner.id,
+    )
+    .await
+    .expect("delete the newest pull request");
+
+    let next_issue = rg_core::issue::service::create_issue(
+        &db,
+        repository.id,
+        owner.id,
+        "after the deletion".to_string(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("file an issue after the deletion");
+    assert_eq!(
+        next_issue.number,
+        newest + 1,
+        "the deleted issue's number must stay spent"
+    );
+    let next_pull = rg_core::pull_request::service::create_pr(
+        &db,
+        repo_root.path(),
+        repository.id,
+        owner.id,
+        "after the deletion".to_string(),
+        None,
+        "feature".to_string(),
+        "main".to_string(),
+        None,
+        false,
+        None,
+    )
+    .await
+    .expect("open a pull request after the deletion");
+    assert_eq!(
+        next_pull.number,
+        newest + 1,
+        "the deleted pull request's number must stay spent"
+    );
+}
