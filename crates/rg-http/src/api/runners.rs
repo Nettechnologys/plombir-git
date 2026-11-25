@@ -466,11 +466,9 @@ pub async fn deregister(
             Json(serde_json::json!({"status": "offline"})),
         )
             .into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "runner not found"})),
-        )
-            .into_response(),
+        // The API envelope, not a bare `{"error": "..."}`: that older shape
+        // carries no `error.code` to branch on (card_7fe0684198fc sweep).
+        Ok(false) => AppError::not_found("runner not found").into_response(),
         Err(e) => {
             tracing::error!(runner_id, error = %format!("{e:#}"), "Failed to take a stopping runner offline");
             AppError::from(e).into_response()
