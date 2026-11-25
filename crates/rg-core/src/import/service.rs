@@ -5632,7 +5632,15 @@ async fn import_gitlab_mr(
             None
         }),
         base_sha: Set(None),
-        head_repo_id: Set(mr.source_project_id),
+        // `head_repo_id` names a row of *this* instance's `repositories`. GitLab's
+        // `source_project_id` is a project id on the source instance, and
+        // writing it here made every imported merge request a fork pull
+        // request from whatever local repository happened to carry that
+        // primary key — its CI, head refresh and branch deletion then read
+        // somebody else's repository (card_2f18e715892e sweep). The head of an
+        // imported merge request is the target repository's branch, as the
+        // GitHub importer already records it.
+        head_repo_id: Set(None),
         ci_approved_sha: Set(None),
         ci_approved_by: Set(None),
         ci_approved_at: Set(None),
@@ -7326,6 +7334,40 @@ mod imported_issue_label_tests {
         let mut mutated = source.to_owned();
         mutated.replace_range(name_at..name_at + name.len(), &" ".repeat(name.len()));
         mutated
+    }
+
+    /// card_2f18e715892e: a merge request's `source_project_id` is GitLab's
+    /// project id, not a local repository's. Importing one must not turn it
+    /// into a fork pull request from the local repository that shares the
+    /// number.
+    #[tokio::test]
+    async fn a_gitlab_source_project_id_is_not_written_as_a_local_head_repository() {
+        let db = test_db().await;
+        let mut stats = ImportStats::default();
+        let mut mr = gitlab_mr();
+        mr.source_project_id = Some(4242);
+        import_gitlab_mr(
+            &db,
+            1,
+            &mr,
+            &[],
+            &[],
+            IMPORTER_ID,
+            &SourceOrigin::gitlab_com(),
+            &HashMap::new(),
+            &mut stats,
+        )
+        .await
+        .unwrap();
+        let prs = rg_db::entities::pull_request::Entity::find()
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(prs.len(), 1, "{stats:?}");
+        assert_eq!(
+            prs[0].head_repo_id, None,
+            "GitLab's project id landed in pull_requests.head_repo_id"
+        );
     }
 
     #[test]
