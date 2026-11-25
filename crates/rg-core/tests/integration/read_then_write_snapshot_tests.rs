@@ -277,3 +277,82 @@ async fn a_runner_registration_survives_a_writer_committing_mid_transaction() {
         .expect("the returned token is the committed one");
     assert_eq!(stored.id, runner.id);
 }
+
+/// card_8751c686a2da: `rg_db::contention::retry_transaction` itself, on a path
+/// that really reads before it writes. Moving an npm dist-tag first looks the
+/// target version up, then writes the tag, so on SQLite it is refused with 517
+/// for as long as the holder keeps the lock. Under the old budget of eight
+/// attempts that was spent in well under a second and the request answered
+/// 503; under the time budget it waits the holder out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_npm_dist_tag_move_survives_a_writer_committing_mid_transaction() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let db = fresh_db(directory.path()).await;
+    let owner = account(&db, "disttagholder").await;
+    let now = chrono::Utc::now();
+    let repo = rg_db::ops::repo_ops::create(
+        &db,
+        rg_db::entities::repository::ActiveModel {
+            owner_id: sea_orm::Set(owner),
+            name: sea_orm::Set("packages".to_string()),
+            is_private: sea_orm::Set(false),
+            default_branch: sea_orm::Set("main".to_string()),
+            created_at: sea_orm::Set(now),
+            updated_at: sea_orm::Set(now),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("create the repository");
+    let registry = rg_db::ops::package_registry_ops::create(&db, repo.id, "npm")
+        .await
+        .expect("create the npm registry");
+    let package =
+        rg_db::ops::package_ops::create(&db, registry.id, owner, "left-pad", None, None, None)
+            .await
+            .expect("create the package");
+    for version in ["1.0.0", "2.0.0"] {
+        rg_db::ops::package_version_ops::create(
+            &db,
+            package.id,
+            version,
+            None,
+            Some(version),
+            None,
+            1,
+            None,
+            Some(owner),
+        )
+        .await
+        .expect("create a version");
+    }
+
+    let holder = hold_the_write_lock(&db).await;
+    let started = std::time::Instant::now();
+    let moved = rg_core::package_registry::service::set_npm_dist_tag(
+        &db,
+        "disttagholder",
+        "packages",
+        "left-pad",
+        "stable",
+        "1.0.0",
+    )
+    .await;
+    holder.await.expect("the holding writer finished");
+
+    moved.unwrap_or_else(|error| panic!("an unrelated commit broke the dist-tag move: {error:#}"));
+    assert!(started.elapsed() >= HOLD, "nothing contended");
+    let tags = rg_core::package_registry::service::list_npm_dist_tags(
+        &db,
+        "disttagholder",
+        "packages",
+        "left-pad",
+    )
+    .await
+    .expect("read the tags back");
+    assert_eq!(
+        tags.get("stable").map(String::as_str),
+        Some("1.0.0"),
+        "{tags:?}"
+    );
+}

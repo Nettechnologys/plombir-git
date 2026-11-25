@@ -38,7 +38,7 @@ pub async fn register_runner(
     // long as the other writer holds the lock, so an attempt count would be
     // spent before a writer of any length let go. The token is drawn per
     // attempt, and only the committed one is returned.
-    crate::contention::retry_request_transaction("register a runner", || {
+    crate::contention::retry_transaction("register a runner", || {
         register_runner_once(db, repo_id, name, labels, version, os, arch)
     })
     .await

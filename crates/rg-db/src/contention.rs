@@ -42,13 +42,10 @@ use rand::Rng;
 /// Ceiling of the wait after the first refusal, doubling per attempt.
 const FIRST_BACKOFF: Duration = Duration::from_millis(1);
 
-/// Where the doubling stops. With the attempt budgets the loops carry, this
-/// bounds the total wait at well under a second — long enough to let a SQLite
-/// writer finish, short enough that a request never looks hung.
+/// Where the doubling stops. A loop under a [`ContentionBudget`] therefore
+/// re-asks at least every 25 ms — often enough to take its turn promptly once
+/// the writer ahead commits, rarely enough not to spin on the lock.
 const BACKOFF_CEILING: Duration = Duration::from_millis(25);
-
-/// Attempts [`retry_transaction`] makes in total, including the first.
-pub(crate) const MAX_ATTEMPTS: usize = 8;
 
 /// How long a *bulk* write keeps retrying before it reports contention as a
 /// failure.
@@ -207,7 +204,8 @@ pub fn contention_backoff(attempt: usize) -> Duration {
     Duration::from_micros(micros)
 }
 
-/// Run `operation`, re-running it while the backend refuses it for contention.
+/// Run `operation`, re-running it while the backend refuses it for contention,
+/// for up to [`REQUEST_WRITE_BUDGET`] of wall-clock time.
 ///
 /// For the self-contained transactions that have no caller-visible loop of
 /// their own to hang a retry on. A loop that must also treat a *lost race*
@@ -215,51 +213,21 @@ pub fn contention_backoff(attempt: usize) -> Duration {
 /// `rg_core::db_retry` instead: that distinction is the caller's, because only
 /// the caller knows whether re-reading changes what it writes.
 ///
-/// `what` names the operation in the log line a budget that runs out produces.
-/// Running out is a real failure and the caller still gets the error — the
-/// count is the only signal that the database was contended rather than broken.
-pub async fn retry_transaction<T, F, Fut>(what: &str, mut operation: F) -> Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T>>,
-{
-    for attempt in 1..=MAX_ATTEMPTS {
-        match operation().await {
-            Ok(value) => {
-                if attempt > 1 {
-                    tracing::debug!(
-                        operation = what,
-                        attempt,
-                        "the operation went through once the contending writer had committed"
-                    );
-                }
-                return Ok(value);
-            }
-            Err(error) if !crate::is_retryable_transaction_error_anyhow(&error) => {
-                return Err(error)
-            }
-            Err(error) if attempt == MAX_ATTEMPTS => {
-                return Err(error).context(format!(
-                    "db: {what} after {MAX_ATTEMPTS} concurrent conflicts"
-                ))
-            }
-            Err(_) => tokio::time::sleep(contention_backoff(attempt)).await,
-        }
-    }
-    unreachable!("the final attempt returns from inside the loop")
-}
-
-/// [`retry_transaction`] for a write with a request waiting on it: re-run
-/// while the backend refuses for contention, for up to
-/// [`REQUEST_WRITE_BUDGET`] rather than [`MAX_ATTEMPTS`] tries.
+/// The budget is time, not a number of tries. It used to be eight attempts,
+/// and that is the wrong budget whenever the writer ahead holds the lock for
+/// longer than a few milliseconds: on SQLite a read-then-write transaction is
+/// refused *instantly* while another writer holds the database, so eight
+/// attempts and their jittered waits were spent in well under a second however
+/// long the holder needed (card_d5612b049af6, card_adbe712869d6). Every caller
+/// of this helper is either a request write or a background transition whose
+/// competitor is a request write, so one deadline serves all of them; the
+/// count survived only as a second, faster way to fail (card_8751c686a2da).
 ///
-/// The attempt count is the wrong budget whenever the writer ahead holds the
-/// lock for longer than a few milliseconds: on SQLite a read-then-write
-/// transaction is refused *instantly* while another writer holds the database,
-/// so eight attempts and their jittered waits are spent in well under a second
-/// however long the holder needs (card_d5612b049af6). Measured against a
-/// holder of 750 ms, a runner registration lost every time (card_adbe712869d6).
-pub(crate) async fn retry_request_transaction<T, F, Fut>(what: &str, mut operation: F) -> Result<T>
+/// `what` names the operation in the context line a spent budget produces.
+/// Running out is a real failure and the caller still gets the error — the
+/// time and attempt count in that line are the only signal that the database
+/// was contended rather than broken.
+pub async fn retry_transaction<T, F, Fut>(what: &str, mut operation: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
@@ -281,7 +249,9 @@ where
             Err(error) if !crate::is_retryable_transaction_error_anyhow(&error) => {
                 return Err(error)
             }
-            Err(error) if !budget.may_retry() => return Err(error).context(budget.exhausted(what)),
+            Err(error) if !budget.may_retry() => {
+                return Err(error).context(format!("db: {}", budget.exhausted(what)))
+            }
             Err(_) => tokio::time::sleep(contention_backoff(attempt)).await,
         }
     }
