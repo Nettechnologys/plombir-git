@@ -164,10 +164,16 @@ impl Field {
                 (start, if step.is_some() { self.max } else { start })
             };
             let step = step.unwrap_or(1);
-            let mut value = start;
-            while value <= end {
-                mask |= 1 << value;
-                value += step;
+            // card_a6cb498b142d: the step is any positive `u32` a workflow
+            // author wrote, and `value += step` overflowed on a huge one —
+            // a panic in a debug build, and in release a wrap back below
+            // `end` that walked every value of the field, so `59/4294967295`
+            // ran each minute instead of at :59. A step that leaves the field
+            // simply ends the walk, as it does in every cron.
+            let mut value = Some(start);
+            while let Some(current) = value.filter(|value| *value <= end) {
+                mask |= 1 << current;
+                value = current.checked_add(step);
             }
         }
         Ok(mask)
@@ -411,6 +417,35 @@ mod tests {
                 "`{expression}`: the refusal must say why ({named}), got: {error}"
             );
         }
+    }
+
+    /// card_a6cb498b142d: a step past the field's width selects only the
+    /// start. `u32::MAX` used to overflow `value += step` — a panic here, and
+    /// in release a wrap that selected every minute of the hour.
+    #[test]
+    fn a_step_wider_than_the_field_selects_only_its_start() {
+        for expression in [
+            "59/4294967295 * * * *",
+            "59/60 * * * *",
+            "*/4294967295 * * * *",
+        ] {
+            let schedule = CronSchedule::parse(expression)
+                .unwrap_or_else(|error| panic!("`{expression}` must parse: {error}"));
+            let start = if expression.starts_with('*') { 0 } else { 59 };
+            assert_eq!(
+                schedule.minutes,
+                1u64 << start,
+                "`{expression}` must select minute {start} alone"
+            );
+        }
+        assert_eq!(
+            latest("59/4294967295 * * * *", "2026-11-25T12:30:00Z"),
+            "2026-11-25T11:59:00+00:00"
+        );
+        assert_eq!(
+            latest("0 23/4294967295 * * *", "2026-11-25T12:30:00Z"),
+            "2026-11-24T23:00:00+00:00"
+        );
     }
 
     #[test]

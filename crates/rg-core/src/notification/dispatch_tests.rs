@@ -150,6 +150,80 @@ async fn smtp_disabled_does_not_prevent_telegram_and_latest_saved_language_wins(
     );
 }
 
+/// card_455022e839cc: the enqueue bound counts rows per destination, and
+/// every Telegram row used to carry the account's e-mail as its destination.
+/// A new chat then inherited the old chat's queue: five `NewDevice` warnings
+/// waiting for the old chat turned the first one for the new chat into
+/// `coalesced`, and the five were cancelled as `destination_changed` — neither
+/// chat was warned.
+#[tokio::test]
+async fn a_new_telegram_chat_has_a_budget_of_its_own() {
+    let (db, user) = fixture().await;
+    let mut old_chat = Vec::new();
+    for _ in 0..queue::QUEUED_PER_KIND {
+        let rows = enqueue(&db, user.id, Event::NewDevice).await;
+        old_chat.extend(rows.into_iter().filter(|row| row.channel == "telegram"));
+    }
+    assert_eq!(old_chat.len() as u64, queue::QUEUED_PER_KIND);
+    assert!(old_chat.iter().all(|row| row.status == "queued"));
+
+    settings::save(
+        &db,
+        user.id,
+        &settings::Patch {
+            telegram: Some(settings::TelegramChange::Set {
+                token: None,
+                chat_id: -1009999,
+                message_thread_id: None,
+            }),
+            ..Default::default()
+        },
+        &settings::SaveContext {
+            encryption_secret: KEY,
+            smtp_available: false,
+            metadata: Metadata::default(),
+        },
+        |_, _| Ok(()),
+    )
+    .await
+    .unwrap();
+    let latest = enqueue(&db, user.id, Event::NewDevice).await;
+    let latest = latest
+        .iter()
+        .find(|row| row.channel == "telegram")
+        .expect("the new chat is queued a warning");
+    assert_eq!(
+        (latest.status.as_str(), latest.last_error.as_deref()),
+        ("queued", None),
+        "the old chat's queue must not count against the new chat"
+    );
+
+    let out = Recorder::default();
+    drain(&db, &config(true), &out, &|| false).await.unwrap();
+    let delivered = notification_delivery::Entity::find_by_id(latest.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        delivered.status, "sent",
+        "the new chat received no warning: {:?}",
+        delivered.last_error
+    );
+    for row in old_chat {
+        let row = notification_delivery::Entity::find_by_id(row.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (row.status.as_str(), row.last_error.as_deref()),
+            ("cancelled", Some("destination_changed")),
+            "a warning queued for the old chat must not follow the account to the new one"
+        );
+    }
+}
+
 #[tokio::test]
 async fn ordinary_jobs_are_cancelled_for_changed_recipient_or_preference() {
     let (db, user) = fixture().await;

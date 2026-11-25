@@ -162,6 +162,54 @@ describe('release attestation production wiring', () => {
 		expect(rendered.container.textContent).not.toContain('Provenance check failed');
 	});
 
+  // card_f85987dd660e: after a key is revoked the asset still reads as
+  // "signed", and that branch used to draw only Verify — a check that can
+  // never pass again — while the API replaces the envelope. A writer must be
+  // able to sign the asset over under the active key from here.
+	it('lets a writer sign over an attestation refused for a revoked key', async () => {
+		routeReleases.attestation.verify.mockResolvedValue({
+			status: 'revoked',
+			reason: 'attestation was signed by a revoked instance key',
+			key_status: 'revoked',
+		});
+		rendered = await renderComponent(ReleasesPage);
+		await click(button(rendered.container, 'Verify'));
+		expect(rendered.container.textContent).toContain('Signed by a revoked key');
+
+		await click(button(rendered.container, 'Sign again'));
+		expect(routeReleases.attestation.sign).toHaveBeenCalledWith('alice', 'demo', 11);
+		// The refusal described the envelope that was just replaced.
+		expect(rendered.container.textContent).not.toContain('Signed by a revoked key');
+		expect(rendered.container.textContent).toContain('Signed');
+	});
+
+	// The re-sign stays off where it would be wrong or not allowed: a digest
+	// mismatch is the tampering alarm, and signing over it would bless the
+	// asset it accuses; a reader cannot sign at all.
+	it('offers no re-sign on a mismatch or to a reader', async () => {
+		const resign = () =>
+			Array.from(rendered!.container.querySelectorAll('button')).some(
+				(control) => control.textContent?.trim() === 'Sign again',
+			);
+		rendered = await renderComponent(ReleasesPage);
+		await click(button(rendered.container, 'Verify'));
+		expect(rendered.container.textContent).toContain('Provenance check failed');
+		expect(resign()).toBe(false);
+		await rendered.destroy();
+
+		viewerRepos.get.mockResolvedValue({ viewer_permission: 'read' });
+		routeReleases.attestation.verify.mockResolvedValue({
+			status: 'revoked',
+			reason: 'attestation was signed by a revoked instance key',
+			key_status: 'revoked',
+		});
+		rendered = await renderComponent(ReleasesPage);
+		await click(button(rendered.container, 'Verify'));
+		expect(rendered.container.textContent).toContain('Signed by a revoked key');
+		expect(resign()).toBe(false);
+		expect(routeReleases.attestation.sign).not.toHaveBeenCalled();
+	});
+
   // A third state, separate again: the check could not run. Folding an
   // unreachable blob store into "verify failed" accuses an asset of being
   // tampered with because of an infrastructure fault.
@@ -213,6 +261,7 @@ describe('release attestation production wiring', () => {
     'undeterminable',
     'revoked',
     'sign',
+    'resign',
     'signing',
     'verify',
     'verifying',

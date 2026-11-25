@@ -669,13 +669,20 @@ pub(crate) fn failure(entry: &PointerInHistory, reason: String) -> LfsFetchFailu
 
 /// Send what `build` makes, again after a pause when the answer is one a
 /// later try may not repeat.
+///
+/// A transport error comes back without its URL. Every caller logs it with
+/// `{error:#}`, and the URLs sent here are a source's download `href`s and the
+/// address a release asset redirects to — routinely pre-signed object-store
+/// URLs whose signature is in the query (`X-Amz-Signature=…`), a bearer
+/// credential for as long as it is valid. The callers already name the host
+/// they were talking to (card_0c749c62f7ab, sideways from webhook delivery).
 pub(crate) async fn send_with_retry(
     build: impl Fn() -> reqwest::RequestBuilder,
 ) -> reqwest::Result<reqwest::Response> {
     let mut backoff = RETRY_BACKOFF;
     let mut attempt = 1;
     loop {
-        let result = build().send().await;
+        let result = build().send().await.map_err(reqwest::Error::without_url);
         let transient = match &result {
             Ok(response) => {
                 let status = response.status();
@@ -885,6 +892,22 @@ mod tests {
     const OWNER: &str = "importer";
     const REPO: &str = "assets";
     const TOKEN: &str = "private-import-token";
+
+    /// card_0c749c62f7ab (sideways): a pre-signed download URL carries its
+    /// signature in the query, and every caller of `send_with_retry` logs the
+    /// error it returns with `{error:#}`.
+    #[tokio::test]
+    async fn a_failed_send_does_not_carry_the_signed_url() {
+        let client = reqwest::Client::new();
+        let error = send_with_retry(|| {
+            client.get("ftp://objects.example.com/blob?X-Amz-Signature=SIGNED_SECRET")
+        })
+        .await
+        .expect_err("reqwest refuses an ftp URL");
+        let shown = format!("{error:#}");
+        assert!(!shown.contains("SIGNED_SECRET"), "{shown}");
+        assert!(error.url().is_none(), "{shown}");
+    }
 
     type Handler = Arc<dyn Fn(&Request) -> Vec<u8> + Send + Sync>;
 

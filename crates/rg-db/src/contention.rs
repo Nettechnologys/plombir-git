@@ -249,6 +249,44 @@ where
     unreachable!("the final attempt returns from inside the loop")
 }
 
+/// [`retry_transaction`] for a write with a request waiting on it: re-run
+/// while the backend refuses for contention, for up to
+/// [`REQUEST_WRITE_BUDGET`] rather than [`MAX_ATTEMPTS`] tries.
+///
+/// The attempt count is the wrong budget whenever the writer ahead holds the
+/// lock for longer than a few milliseconds: on SQLite a read-then-write
+/// transaction is refused *instantly* while another writer holds the database,
+/// so eight attempts and their jittered waits are spent in well under a second
+/// however long the holder needs (card_d5612b049af6). Measured against a
+/// holder of 750 ms, a runner registration lost every time (card_adbe712869d6).
+pub(crate) async fn retry_request_transaction<T, F, Fut>(what: &str, mut operation: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut budget = ContentionBudget::for_request_write();
+    loop {
+        let attempt = budget.begin_attempt();
+        match operation().await {
+            Ok(value) => {
+                if attempt > 1 {
+                    tracing::debug!(
+                        operation = what,
+                        attempt,
+                        "the operation went through once the contending writer had committed"
+                    );
+                }
+                return Ok(value);
+            }
+            Err(error) if !crate::is_retryable_transaction_error_anyhow(&error) => {
+                return Err(error)
+            }
+            Err(error) if !budget.may_retry() => return Err(error).context(budget.exhausted(what)),
+            Err(_) => tokio::time::sleep(contention_backoff(attempt)).await,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
