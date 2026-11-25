@@ -626,6 +626,25 @@
                               ? t('releases.attestation.verifying')
                               : t('releases.attestation.verify')}
                           </button>
+                          {#if canWrite && attestationReports[asset.id]?.status === 'revoked'}
+                            <!-- A signature under a revoked key is refused, and the
+                                 asset stays "signed" — so without this the page offered
+                                 only a check that can never pass again, while the API
+                                 replaces the envelope with one under the active key
+                                 (card_f85987dd660e). Only for `revoked`: a `mismatch`
+                                 is an asset whose bytes moved, and signing over that
+                                 would bless what the alarm is about. -->
+                            <button
+                              type="button"
+                              class="attestation-sign"
+                              onclick={() => handleSignAsset(asset)}
+                              disabled={busyAssetIds.has(asset.id) || busyReleaseIds.has(release.id)}
+                            >
+                              {signingAssetId === asset.id
+                                ? t('releases.attestation.signing')
+                                : t('releases.attestation.resign')}
+                            </button>
+                          {/if}
                         {:else if attestationPresence[asset.id] !== 'unavailable' && canWrite}
                           <button
                             type="button"

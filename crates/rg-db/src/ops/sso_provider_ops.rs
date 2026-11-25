@@ -229,6 +229,22 @@ pub async fn update_settings(
     let now = chrono::Utc::now();
     let txn = db.begin().await?;
 
+    // card_adbe712869d6 (sideways): SQLite has no `FOR UPDATE`, and a deferred
+    // transaction that reads first is refused with `SQLITE_BUSY_SNAPSHOT` the
+    // moment any other connection commits before its first write — a provider
+    // PATCH answering 500 for something unrelated. Writing the row first takes
+    // the writer lock under `busy_timeout`, so the read below cannot be
+    // overtaken. The self-assignment changes nothing, and fires no trigger.
+    if txn.get_database_backend() == DatabaseBackend::Sqlite {
+        Entity::update_many()
+            .col_expr(
+                sso_provider::Column::UpdatedAt,
+                Expr::col(sso_provider::Column::UpdatedAt).into(),
+            )
+            .filter(sso_provider::Column::Id.eq(id))
+            .exec(&txn)
+            .await?;
+    }
     let Some(current) = Entity::find_by_id(id).lock_exclusive().one(&txn).await? else {
         txn.rollback().await?;
         return Ok(SsoProviderUpdate::Gone);
