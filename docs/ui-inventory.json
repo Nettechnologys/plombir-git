@@ -1799,6 +1799,7 @@
       "access": "RepoWrite",
       "handler": "api::pulls::approve_pr_ci",
       "testedIn": [
+        "rust",
         "web"
       ],
       "reachedFromUi": true
@@ -15057,6 +15058,7 @@
               "handler": "api::pulls::approve_pr_ci",
               "matched": true,
               "testedIn": [
+                "rust",
                 "web"
               ]
             },
@@ -15179,6 +15181,7 @@
               "handler": "api::pulls::approve_pr_ci",
               "matched": true,
               "testedIn": [
+                "rust",
                 "web"
               ]
             },
