@@ -180,6 +180,8 @@ pub mod m20261105_000001_notification_channels;
 pub mod m20261113_000001_instance_signing_keys;
 pub mod m20261113_000002_notification_delivery_priority;
 pub mod m20261127_000001_agent_runs;
+pub mod m20261127_000002_gitlab_merge_requests_head_in_target;
+pub mod m20261127_000003_reviews_reference_their_pull_request;
 
 use sea_orm_migration::prelude::*;
 
@@ -450,6 +452,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261113_000001_instance_signing_keys::Migration),
             Box::new(m20261113_000002_notification_delivery_priority::Migration),
             Box::new(m20261127_000001_agent_runs::Migration),
+            Box::new(m20261127_000002_gitlab_merge_requests_head_in_target::Migration),
+            Box::new(m20261127_000003_reviews_reference_their_pull_request::Migration),
         ]
     }
 }

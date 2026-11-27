@@ -558,6 +558,17 @@ jobs:
           PLOMBIR_GIT_TEST_EXCLUSIVE_DATABASE_URL: postgres://plombir_git:plombir_git@127.0.0.1:5432/plombir_git_exclusive
         run: cargo test -p rg-db-migration -j 6 --lib the_schema_arrives_over_live_tokens_and_profiles_on_a_server_database -- --ignored --nocapture
 
+      # The next two carry the same exclusive database on, in migration order.
+      - name: Prove imported GitLab merge requests lose their foreign head on PostgreSQL
+        env:
+          PLOMBIR_GIT_TEST_EXCLUSIVE_DATABASE_URL: postgres://plombir_git:plombir_git@127.0.0.1:5432/plombir_git_exclusive
+        run: cargo test -p rg-db-migration -j 6 --lib only_imported_merge_requests_lose_their_head_repository_on_a_server_database -- --ignored --nocapture
+
+      - name: Prove reviews reference their pull request on PostgreSQL
+        env:
+          PLOMBIR_GIT_TEST_EXCLUSIVE_DATABASE_URL: postgres://plombir_git:plombir_git@127.0.0.1:5432/plombir_git_exclusive
+        run: cargo test -p rg-db-migration -j 6 --lib the_references_install_over_orphans_on_a_server_database -- --ignored --nocapture
+
       - name: Run PostgreSQL runtime smoke
         run: cargo test -p rg-core --test multi_backend_smoke -j 6 -- --ignored --nocapture
 
@@ -711,6 +722,17 @@ jobs:
         env:
           PLOMBIR_GIT_TEST_EXCLUSIVE_DATABASE_URL: mysql://plombir_git:plombir_git@127.0.0.1:3306/plombir_git_exclusive
         run: cargo test -p rg-db-migration -j 6 --lib the_schema_arrives_over_live_tokens_and_profiles_on_a_server_database -- --ignored --nocapture
+
+      # The next two carry the same exclusive database on, in migration order.
+      - name: Prove imported GitLab merge requests lose their foreign head on MySQL
+        env:
+          PLOMBIR_GIT_TEST_EXCLUSIVE_DATABASE_URL: mysql://plombir_git:plombir_git@127.0.0.1:3306/plombir_git_exclusive
+        run: cargo test -p rg-db-migration -j 6 --lib only_imported_merge_requests_lose_their_head_repository_on_a_server_database -- --ignored --nocapture
+
+      - name: Prove reviews reference their pull request on MySQL
+        env:
+          PLOMBIR_GIT_TEST_EXCLUSIVE_DATABASE_URL: mysql://plombir_git:plombir_git@127.0.0.1:3306/plombir_git_exclusive
+        run: cargo test -p rg-db-migration -j 6 --lib the_references_install_over_orphans_on_a_server_database -- --ignored --nocapture
 
       - name: Run MySQL runtime smoke
         run: cargo test -p rg-core --test multi_backend_smoke -j 6 -- --ignored --nocapture
