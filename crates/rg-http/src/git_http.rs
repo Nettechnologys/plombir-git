@@ -2351,7 +2351,9 @@ mod tests {
                 "spawn_post_push_hooks",
                 "self.delivery_tracker.spawn",
             )?;
-            let run = one_call(app_source, "spawn_post_push_hooks", "run")?;
+            // `run_with_origin`: the hand-off carries whether an agent run made
+            // the moves (ADR-0001 D4).
+            let run = one_call(app_source, "spawn_post_push_hooks", "run_with_origin")?;
             if !rust_source::call_site_contains(app_source, spawn, run) {
                 return Err(format!(
                     "post-push run at lib.rs:{} is outside the tracked spawn at lib.rs:{}",
@@ -2431,7 +2433,7 @@ mod tests {
 
         for (function, name) in [
             ("spawn_post_push_hooks", "self.delivery_tracker.spawn"),
-            ("spawn_post_push_hooks", "run"),
+            ("spawn_post_push_hooks", "run_with_origin"),
         ] {
             let mutated = without_call(app_source, function, name);
             assert!(
