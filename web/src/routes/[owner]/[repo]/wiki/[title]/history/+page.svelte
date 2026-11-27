@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { wiki } from '$lib/api/client.svelte';
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
@@ -7,9 +7,9 @@
 
   const t = createT();
 
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
-  let title = $derived($page.params.title!);
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
+  let title = $derived(page.params.title!);
   let revisions = $state<any[]>([]);
   let currentRev = $state<any>(null);
   let loading = $state(true);

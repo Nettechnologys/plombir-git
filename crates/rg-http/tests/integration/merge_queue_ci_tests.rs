@@ -1527,6 +1527,9 @@ mod fork_approval_at_enqueue_tests {
                         repository_ids: Some(vec![f.repo_id, fork.repo.id]),
                         mcp_tools: None,
                         deny_protected_merge: false,
+                        write_ref_prefix: None,
+                        allow_git: false,
+                        agent_run_attempt_id: None,
                     },
                 )
                 .await

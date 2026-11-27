@@ -111,6 +111,22 @@ async fn every_listed_resource_names_its_page() {
         f.get(&format!("/issues/{number}/comments")).await[0]["html_url"],
         comment_page
     );
+    // The edit answers with the same link (card_fffb0abdbf40): it used to
+    // return the bare row, and a client that edited a comment lost its page.
+    let edited = f
+        .send(
+            f.http
+                .patch(f.url(&format!(
+                    "/issues/comments/{}",
+                    comment["id"].as_i64().unwrap()
+                )))
+                .json(&json!({ "body": "Seen it twice" })),
+            200,
+        )
+        .await;
+    assert_eq!(edited["html_url"], comment_page, "{edited}");
+    assert_eq!(edited["body"], "Seen it twice", "{edited}");
+    assert_eq!(edited["author"], OWNER, "{edited}");
 
     // Pull request: create, read, list.
     let written = f

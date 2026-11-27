@@ -96,8 +96,17 @@ async fn backfill_audit(db: &DatabaseConnection, org_id: i64) -> Vec<serde_json:
         .collect()
 }
 
-/// The text a timestamp is stored as, with its digits blanked: two writers
-/// agree on the format exactly when these match.
+/// The text a timestamp is stored as, with its digits blanked and its
+/// fractional seconds dropped: two writers agree on the format exactly when
+/// these match.
+///
+/// The fraction has to go. A `DateTime<Utc>` is stored on SQLite as RFC 3339
+/// with `SecondsFormat::AutoSi` (sqlx-sqlite), which writes 3, 6 or 9 digits —
+/// as many as the value needs. A clock reading whose nanoseconds end in `000`
+/// is six digits, so two rows written the same way could compare unequal —
+/// rarely, and only in a run whose clock happened to land there
+/// (card_e0c54bc9e84a). What the comparison is for — the
+/// `T`, the offset, a `CURRENT_TIMESTAMP` text instead of either — survives.
 async fn created_at_shape(db: &DatabaseConnection, member_id: i64) -> String {
     let row = db
         .query_one(Statement::from_sql_and_values(
@@ -109,9 +118,62 @@ async fn created_at_shape(db: &DatabaseConnection, member_id: i64) -> String {
         .unwrap()
         .expect("membership row");
     let text: String = row.try_get("", "created_at").unwrap();
-    text.chars()
-        .map(|c| if c.is_ascii_digit() { '0' } else { c })
-        .collect()
+    timestamp_shape(&text)
+}
+
+fn timestamp_shape(text: &str) -> String {
+    let mut shape = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '.' && chars.peek().is_some_and(char::is_ascii_digit) {
+            while chars.next_if(char::is_ascii_digit).is_some() {}
+            continue;
+        }
+        shape.push(if c.is_ascii_digit() { '0' } else { c });
+    }
+    shape
+}
+
+/// The comparison above holds for any two clock readings, not only for the
+/// ones a run happens to take: a reading whose nanoseconds end in zeros is
+/// stored with fewer fraction digits.
+#[tokio::test]
+async fn a_timestamp_shape_does_not_depend_on_the_clock_reading() {
+    use chrono::TimeZone;
+    use sea_orm::{ActiveModelTrait, Set};
+
+    let temp = TempDb::new();
+    let db = rg_db::connect_with_pool(&temp.url(), rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 1)
+        .await
+        .expect("connect to throwaway SQLite database");
+    crate::run_migrations(&db).await.expect("run migrations");
+    let alice = user(&db, "alice").await;
+    let bob = user(&db, "bob").await;
+    let org_id = org(&db, "shapes", alice, None).await;
+    let second = chrono::Utc.with_ymd_and_hms(2026, 11, 27, 4, 5, 6).unwrap();
+    let mut ids = Vec::new();
+    for (user_id, nanos) in [(alice, 123_456_789), (bob, 120_000_000)] {
+        let member = organization_member::ActiveModel {
+            org_id: Set(org_id),
+            user_id: Set(user_id),
+            role: Set("member".to_string()),
+            created_at: Set(second + chrono::Duration::nanoseconds(nanos)),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert a membership");
+        ids.push(member.id);
+    }
+    assert_eq!(
+        created_at_shape(&db, ids[0]).await,
+        created_at_shape(&db, ids[1]).await
+    );
+    assert_ne!(
+        timestamp_shape("2026-11-27 04:05:06"),
+        timestamp_shape("2026-11-27T04:05:06.123+00:00"),
+        "a CURRENT_TIMESTAMP text still differs from what the entities write"
+    );
 }
 
 /// The acceptance of card_03d784041747, through the migrator on the schema

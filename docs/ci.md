@@ -154,6 +154,35 @@ exit code of the *last* command it ran, and a job would go green on a failed
 test whenever a later line succeeded. If you write `set -e` yourself as the
 first line it is not added twice.
 
+### What the job sees
+
+The workspace and the environment differ by where the job runs, and a script
+that reads its history or its locale has to know which one it got.
+
+| | Embedded runner, on the host | Embedded runner, in a container | External runner (`forgekeep-runner`) |
+|---|---|---|---|
+| Workspace | `git worktree add --detach` of the repository at the pipeline's commit, with the full history | The same worktree, mounted at `/workspace` | A **snapshot** of the commit's tree (`git archive`): the files only, **no `.git`** |
+| `git rev-parse HEAD`, `git log`, `git ls-files` | Work | Fail: the worktree's `.git` is a link to the server's repository on the host, which is not mounted into the container | Fail with "not a git repository" |
+
+Wherever `git` cannot see the workspace, `CI_COMMIT_SHA` is the commit and the
+one place the job learns it. A step that needs the history has to fetch it
+itself.
+
+The environment the script starts from:
+
+| | On the host (no `image`) | In a container (`image`) |
+|---|---|---|
+| Shell | `sh -c` | `sh -c` inside the image |
+| `HOME` | The job's workspace | `/tmp` — a directory every uid can write; the workspace is not mounted under it |
+| `PATH` | The runner's own `PATH` | The image's `PATH` |
+| `LANG`, `LC_*` | The runner's own `LANG` | The image's, which for most images is **unset**: the script runs in the C locale, so `grep`, `sort` and `tr` treat a multi-byte character as several bytes |
+
+`HOME`, `PATH`, `LANG` and `LC_*` set under [`variables`](#variables) do not
+reach a container, for the reason given there. A job that needs UTF-8 exports
+the locale on the first line of its script (`export LC_ALL=C.UTF-8`); a check
+that asserts something about `HOME` — "the temporary directory is not inside
+the home directory" — sees `/tmp` as both in a container.
+
 ### `image`
 
 The image the job runs in. Two instance-level settings decide whether a job is

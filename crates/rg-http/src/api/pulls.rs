@@ -734,6 +734,17 @@ pub async fn merge_pr(
     // that check also runs for merges the server performs on other people's
     // behalf — an auto-merge an approval completes, a queue pass — and a
     // narrowing meant for this caller must not fail those.
+    // A token confined to some refs (one issued for an agent run) merges
+    // nothing, into any branch (ADR-0001 D3).
+    if let Err(e) = rg_core::auth::credential_context::refuse_write_scoped_merge(
+        &state.db,
+        repo_model.id,
+        "merge_pr",
+    )
+    .await
+    {
+        return AppError::from(e).into_response();
+    }
     if let Err(e) = rg_core::auth::credential_context::refuse_protected_write(
         &state.db,
         repo_model.id,
@@ -806,6 +817,7 @@ pub async fn merge_pr(
                             head_owner,
                             head_repo,
                             Some(actor_id),
+                            rg_core::push_hooks::PushOrigin::of_current_credential(),
                             vec![update],
                         );
                         Ok(())
@@ -890,6 +902,15 @@ pub async fn enable_auto_merge(
     .await
     {
         return error.into_response();
+    }
+    if let Err(error) = rg_core::auth::credential_context::refuse_write_scoped_merge(
+        &state.db,
+        repo_model.id,
+        "enable_auto_merge",
+    )
+    .await
+    {
+        return AppError::from(error).into_response();
     }
     if let Err(error) = rg_core::auth::credential_context::refuse_protected_write(
         &state.db,
@@ -1150,6 +1171,15 @@ pub async fn enqueue_merge_queue(
     // The queue merges this entry on a later pass as readily as on this one, so
     // a token kept off protected branches is refused at the door
     // (card_60a80311d512).
+    if let Err(error) = rg_core::auth::credential_context::refuse_write_scoped_merge(
+        &state.db,
+        repository.id,
+        "enqueue_merge_queue",
+    )
+    .await
+    {
+        return AppError::from(error).into_response();
+    }
     if let Err(error) = rg_core::auth::credential_context::refuse_protected_write(
         &state.db,
         repository.id,

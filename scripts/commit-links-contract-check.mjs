@@ -12,7 +12,7 @@ const commitDetailPage = productionTsSource(readFileSync(commitDetailPagePath, '
 
 const failures = [];
 
-if (!existsSync(commitDetailPagePath) || !commitDetailPage.includes('$page.params')) {
+if (!existsSync(commitDetailPagePath) || !commitDetailPage.includes('page.params')) {
   failures.push('Commit detail page must exist at /:owner/:repo/commits/:sha');
 }
 
@@ -28,11 +28,11 @@ if (!hasCommitDetailLink) {
   failures.push('Commits list must link each commit to /:owner/:repo/commits/:sha');
 }
 
-if (!commitsPage.includes('let owner = $derived($page.params.owner!)')) {
+if (!commitsPage.includes('let owner = $derived(page.params.owner!)')) {
   failures.push('Commits page must treat owner route param as required before calling repos.log');
 }
 
-if (!commitsPage.includes('let repo = $derived($page.params.repo!)')) {
+if (!commitsPage.includes('let repo = $derived(page.params.repo!)')) {
   failures.push('Commits page must treat repo route param as required before calling repos.log');
 }
 

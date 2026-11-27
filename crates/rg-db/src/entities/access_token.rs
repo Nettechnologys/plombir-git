@@ -29,6 +29,17 @@ pub struct Model {
     /// Whether the token is refused every write that lands on a protected
     /// branch: a merge into one, a push to one, a server-side commit on one.
     pub deny_protected_merge: bool,
+    /// Every ref this token may write, when it is confined (ADR-0001 D3). A
+    /// value ending in `/` admits the refs under it, any other value exactly
+    /// that one ref. `None` is an ordinary token.
+    pub write_ref_prefix: Option<String>,
+    /// Whether a token confined to MCP tools may use the git transport too.
+    /// REST outside the MCP endpoint stays closed to it either way.
+    pub allow_git: bool,
+    /// The agent run attempt the token was issued for. Deleting the run
+    /// deletes the token.
+    #[sea_orm(unique)]
+    pub agent_run_attempt_id: Option<i64>,
 }
 
 impl Model {
@@ -45,7 +56,10 @@ impl Model {
 
     /// Whether anything narrows this token beyond its scopes.
     pub fn is_restricted(&self) -> bool {
-        self.repo_restricted || self.mcp_tools.is_some() || self.deny_protected_merge
+        self.repo_restricted
+            || self.mcp_tools.is_some()
+            || self.deny_protected_merge
+            || self.write_ref_prefix.is_some()
     }
 }
 

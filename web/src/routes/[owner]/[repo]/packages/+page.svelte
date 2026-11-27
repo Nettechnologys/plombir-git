@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import Modal from '$lib/components/Modal.svelte';
   import { packages } from '$lib/api/client.svelte';
@@ -17,8 +17,8 @@
 
   const t = createT();
 
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
   // Publishing is `RepoWrite` (card_270a0a77fd79).
   const permission = viewerPermission(() => owner, () => repo);
   let formatFilter = $state<string>('');
@@ -193,7 +193,7 @@
   }
 
   function pullCommand(image: OciImageSummary): string {
-    return `docker pull ${$page.url.host}/${image.namespace}:${image.tag}`;
+    return `docker pull ${page.url.host}/${image.namespace}:${image.tag}`;
   }
 </script>
 

@@ -298,6 +298,20 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
          on `users` (and on `organizations`) in the same statement as its holder",
     ),
     (
+        "agent_runs",
+        "bot_id",
+        "NO FOREIGN KEY",
+        "card_621be18a01e5: the run is the durable record that a pull request was written by an \
+         agent, and the CI gate asks it for the bot's pull requests after the bot is gone; a \
+         cascade would erase that answer, so a missing bot reads as a ghost",
+    ),
+    (
+        "agent_runs",
+        "triggered_by",
+        "NO FOREIGN KEY",
+        "card_621be18a01e5: who asked for the run, kept as a ghost snapshot beside the run",
+    ),
+    (
         "audit_log",
         "user_id",
         "NO FOREIGN KEY",
@@ -438,6 +452,7 @@ const USER_REFERENCE_COLUMN_NAMES: &[&str] = &[
     "assignee_id",
     "author_id",
     "auto_merge_enabled_by_id",
+    "bot_id",
     "created_by",
     "created_by_id",
     "creator_id",

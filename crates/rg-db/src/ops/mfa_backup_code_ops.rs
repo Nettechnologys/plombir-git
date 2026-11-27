@@ -199,15 +199,15 @@ pub async fn verify_and_consume(
     code: &str,
 ) -> Result<bool, DbErr> {
     let hash = hash_code(code);
-    let mut attempt = 1;
+    // The same time budget `retry_transaction` carries, not a count of tries:
+    // a count is spent in a fraction of a second whatever the writer ahead
+    // needs (card_8751c686a2da).
+    let mut budget = crate::contention::ContentionBudget::for_request_write();
     loop {
+        let attempt = budget.begin_attempt();
         match consume_once(db, user_id, &hash).await {
-            Err(error)
-                if attempt < crate::contention::MAX_ATTEMPTS
-                    && crate::is_retryable_transaction_error(&error) =>
-            {
+            Err(error) if budget.may_retry() && crate::is_retryable_transaction_error(&error) => {
                 tokio::time::sleep(crate::contention::contention_backoff(attempt)).await;
-                attempt += 1;
             }
             outcome => return outcome,
         }

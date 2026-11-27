@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { goto } from '$app/navigation';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { releases, buildReleaseUpdatePayload, type RepoPermission } from '$lib/api/client.svelte';
@@ -12,9 +12,9 @@
 
   const t = createT();
 
-  const owner = $derived($page.params.owner!);
-  const repo = $derived($page.params.repo!);
-  const releaseId = $derived(parseInt($page.params.id!, 10));
+  const owner = $derived(page.params.owner!);
+  const repo = $derived(page.params.repo!);
+  const releaseId = $derived(parseInt(page.params.id!, 10));
 
   let loading = $state(true);
   let submitting = $state(false);

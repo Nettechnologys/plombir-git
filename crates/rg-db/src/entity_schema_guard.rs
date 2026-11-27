@@ -70,6 +70,8 @@ probed_entities!(
     access_token_repository,
     agent_profile,
     agent_profile_repository,
+    agent_run,
+    agent_run_attempt,
     artifact,
     attachment,
     audit_log,

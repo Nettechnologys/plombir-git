@@ -175,7 +175,7 @@ describe('RepoHeader on a renamed repository', () => {
 		await renderHeader();
 		await vi.waitFor(() => expect(navigation.goto).toHaveBeenCalled());
 		expect(navigation.goto).toHaveBeenCalledWith('/acme/renamed/issues/4?tab=files#c2', {
-			replaceState: true,
+			replace: true,
 		});
 		window.history.replaceState({}, '', '/');
 	});

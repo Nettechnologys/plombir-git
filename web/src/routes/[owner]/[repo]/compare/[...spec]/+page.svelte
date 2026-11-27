@@ -4,7 +4,7 @@
   // is a branch of this repository or `{fork owner}:{branch}` of one of its
   // forks; a spec with no `...` names only the head and compares it against the
   // default branch.
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import DiffFileList from '$lib/components/DiffFileList.svelte';
   import { pulls, repos } from '$lib/api/client.svelte';
@@ -15,9 +15,9 @@
 
   const t = createT();
 
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
-  let rawSpec = $derived($page.params.spec ?? '');
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
+  let rawSpec = $derived(page.params.spec ?? '');
   let spec = $derived(parseCompareSpec(rawSpec));
 
   let base = $state('');

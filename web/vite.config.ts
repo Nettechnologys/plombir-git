@@ -1,4 +1,5 @@
 import { sveltekit } from '@sveltejs/kit/vite';
+import kitConfig from './kit.config.js';
 import { defineConfig, type ProxyOptions } from 'vite';
 
 // The app calls its backend on the origin it was loaded from: `_base.svelte.ts`
@@ -73,7 +74,7 @@ const proxy: Record<string, ProxyOptions> = {
 };
 
 export default defineConfig({
-	plugins: [sveltekit()],
+	plugins: [sveltekit(kitConfig)],
 	server: { proxy },
 	preview: { proxy }
 });

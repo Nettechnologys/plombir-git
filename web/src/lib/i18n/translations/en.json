@@ -1266,6 +1266,7 @@
       "undeterminable": "Provenance could not be checked",
       "revoked": "Signed by a revoked key",
       "sign": "Sign",
+      "resign": "Sign again",
       "signing": "Signing…",
       "verify": "Verify",
       "verifying": "Verifying…",

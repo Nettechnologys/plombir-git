@@ -6,7 +6,7 @@ implements a **subset** of it. This page is that subset's boundary.
 
 Reaching for GitHub's own documentation instead will mislead you, which is why
 this page exists rather than a link. There is no Actions runtime here: a job is
-a list of steps the runner executes in a worktree of your repository, so the
+a list of steps the runner executes in a checkout of your repository, so the
 parts of Actions that are *the runtime* — JavaScript and Docker actions — have
 nothing to map onto and are refused. Composite actions are written into the job
 as steps when the workflow is read; see [Actions](#actions). Steps, their
@@ -882,7 +882,7 @@ implements itself.
 
 | `uses:` | What happens |
 |---------|--------------|
-| `actions/checkout@…` | Nothing — the workspace already **is** a `git worktree` of the repository at the pipeline's commit, so the step is skipped. |
+| `actions/checkout@…` | Nothing — the workspace already holds the pipeline's commit, so the step is skipped. Only a host job on the embedded runner can run `git` against it; in a container, and on an external runner, the workspace is files without a usable `.git` (see [What the job sees](ci.md#what-the-job-sees)). |
 | `actions/cache@…` | Translated into the native [cache](ci.md#cache). |
 | `actions/upload-artifact@…` | Translated into the native [artifacts](ci.md#artifacts) block. |
 
@@ -1115,8 +1115,11 @@ An input the three built-in actions do not implement fails the workflow.
 fetch-depth
 ```
 
-Accepted at any value, including `0`: the worktree always carries the
-repository's full history, so "at least this much history" is always met.
+Accepted at any value, including `0`. A host job on the embedded runner
+works in a worktree that carries the repository's full history, so "at least
+this much history" is met. In a container, and on an external runner, `git`
+cannot read the workspace's history at all — the value is still accepted, and a
+step that runs `git` there fails; see [What the job sees](ci.md#what-the-job-sees).
 Everything else the real action takes — `ref`, `repository`, `path`,
 `submodules`, `lfs`, `sparse-checkout`, `clean`, `persist-credentials` —
 changes what ends up in the workspace, and the workspace answers to none of

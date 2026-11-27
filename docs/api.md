@@ -36,6 +36,25 @@ receive the same non-zero failure and `repository not found` message for a
 hidden or missing target. These rules conceal existence through response
 status/body; they do not promise indistinguishable network timing.
 
+### Links to the web app (`html_url`)
+
+Repositories, issues, issue comments, pull requests, review comments, pipelines
+and releases carry `html_url`: the page a person opens to see that resource.
+It is part of the contract — build links from it, not from the web app's
+routes, which may change. The answers that create, read and list these
+resources carry it, and so do the edits of issues and of both kinds of
+comment.
+
+- The base is `[server].external_url`, and nothing else. Without it the field
+  is **absent** — never a relative path, and never a guess from the request's
+  `Host`.
+- A comment's link is its issue or pull request page with a fragment:
+  `…/issues/7#comment-42`, `…/pulls/3#review-comment-9`.
+- A pipeline and a release have no page of their own; the link is their list
+  with a query parameter: `…/pipelines?pipeline=12`, `…/releases?release=5`.
+- The owner and repository are spelled as the request named them,
+  percent-encoded.
+
 ```bash
 # Login → returns a JWT
 TOKEN="$(curl -fsS -X POST "$BASE_URL/api/v1/users/login" \

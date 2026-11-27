@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { onDestroy } from 'svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import PipelineBadge from '$lib/components/PipelineBadge.svelte';
@@ -23,8 +23,8 @@
   const t = createT();
   const confirmer = createConfirmer();
 
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
   // Running, retrying, cancelling, playing a manual job and deleting an
   // artifact are `RepoWrite`; approving an environment is `RepoAuthRead` and
   // the server checks the reviewer list itself (card_270a0a77fd79).
@@ -213,7 +213,7 @@
 
   /** The pipeline `?pipeline=<id>` names, when it names a valid id. */
   function linkedPipelineId(): number | null {
-    return linkedId($page.url.searchParams.get('pipeline'));
+    return linkedId(page.url.searchParams.get('pipeline'));
   }
 
   async function loadPipelines(expectedOwner: string, expectedRepo: string) {

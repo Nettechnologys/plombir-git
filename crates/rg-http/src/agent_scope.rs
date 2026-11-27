@@ -182,6 +182,22 @@ impl TokenGrant {
         self.0.token.mcp_tools.is_some()
     }
 
+    /// Whether a token confined to MCP tools may use the git transport as
+    /// well (ADR-0001 D3). REST outside the MCP endpoint stays closed to it.
+    pub fn allows_git(&self) -> bool {
+        self.0.token.allow_git
+    }
+
+    /// The refs the token may write at all, when it is confined to some.
+    pub fn write_ref_prefix(&self) -> Option<&str> {
+        self.0.token.write_ref_prefix.as_deref()
+    }
+
+    /// The attempt of an agent run the token was issued for, when it was.
+    pub fn agent_run_attempt_id(&self) -> Option<i64> {
+        self.0.token.agent_run_attempt_id
+    }
+
     /// The narrowing published to `rg-core` for the duration of the request.
     pub(crate) fn credential_context(
         &self,
@@ -192,6 +208,8 @@ impl TokenGrant {
             token_id: Some(self.0.token.id),
             mcp_tool,
             deny_protected_writes: self.denies_protected_writes(),
+            write_ref_prefix: self.write_ref_prefix().map(str::to_owned),
+            agent_run_attempt_id: self.agent_run_attempt_id(),
         }
     }
 
