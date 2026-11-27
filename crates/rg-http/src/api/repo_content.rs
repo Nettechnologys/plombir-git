@@ -138,7 +138,7 @@ pub enum TreeEntryKind {
 }
 
 impl TreeEntryKind {
-    fn from_mode(mode: gix::object::tree::EntryMode) -> Self {
+    pub(super) fn from_mode(mode: gix::object::tree::EntryMode) -> Self {
         use gix::object::tree::EntryKind;
 
         match mode.kind() {
@@ -151,11 +151,11 @@ impl TreeEntryKind {
         }
     }
 
-    fn is_tree(self) -> bool {
+    pub(super) fn is_tree(self) -> bool {
         self == Self::Tree
     }
 
-    fn is_blob(self) -> bool {
+    pub(super) fn is_blob(self) -> bool {
         self == Self::Blob
     }
 }
@@ -218,7 +218,7 @@ pub const MAX_BLOB_API_BYTES: u64 = rg_core::repo::service::MAX_BLOB_API_BYTES;
 /// of those fields unbounded.
 pub(crate) const CONTENT_EDIT_JSON_MAX_BYTES: usize = MAX_BLOB_API_BYTES as usize * 6 + 64 * 1024;
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct CommitEntry {
     pub sha: String,
     #[serde(rename = "author")]
@@ -260,7 +260,7 @@ pub enum SignatureVerdict {
 }
 
 /// GPG signature information for a commit.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct GpgSignature {
     /// The verdict itself. Deliberately not a `verified: bool`: a consumer
     /// reading a boolean has to fold "could not check" into one of the two
@@ -1520,9 +1520,9 @@ fn get_blob_size(repo: &gix::Repository, oid: gix::ObjectId) -> anyhow::Result<i
 /// A tree entry located by [`lookup_tree_path`]. Only the two facts both
 /// content endpoints need travel out of the walk, so no tree buffer has to stay
 /// borrowed while the caller decides what the entry means.
-struct TreePathEntry {
-    id: gix::ObjectId,
-    kind: TreeEntryKind,
+pub(super) struct TreePathEntry {
+    pub(super) id: gix::ObjectId,
+    pub(super) kind: TreeEntryKind,
 }
 
 /// Walk `path` inside `tree`, keeping "this path is not in that tree" apart
@@ -1535,7 +1535,7 @@ struct TreePathEntry {
 /// because it drops undecodable entries (`filter_map(Result::ok)`) and so
 /// reports a corrupt tree as a missing path, which is exactly the collapse this
 /// walk exists to avoid.
-fn lookup_tree_path(
+pub(super) fn lookup_tree_path(
     repo: &gix::Repository,
     tree: gix::Tree<'_>,
     path: &str,
@@ -1590,7 +1590,7 @@ fn lookup_tree_path(
 /// Resolve the documented ref forms of the content endpoints — branch, tag,
 /// commit SHA, `HEAD` — without asking `rev_parse_single` to encode both
 /// absence and a broken ref/object store in its one error value.
-fn resolve_content_ref<'repo>(
+pub(super) fn resolve_content_ref<'repo>(
     repo: &'repo gix::Repository,
     git_ref: &str,
     repo_path: &std::path::Path,
@@ -1792,68 +1792,78 @@ fn get_commit_log(
             continue;
         }
 
-        let message = commit
-            .message_raw()
-            .with_context(|| {
-                format!(
-                    "decoding message for commit '{}' while walking ref '{}' in {}",
-                    commit_id,
-                    git_ref,
-                    repo_path.display()
-                )
-            })?
-            .to_string();
-        let first_line = message.lines().next().unwrap_or("").to_string();
+        entries.push(commit_entry(&commit, git_ref, repo_path)?);
+    }
 
-        let author = commit.author().with_context(|| {
+    Ok(entries)
+}
+
+/// One commit as the history endpoints list it: first line of the message,
+/// author and author date. `git_ref` and `repo_path` only label errors.
+pub(super) fn commit_entry(
+    commit: &gix::Commit<'_>,
+    git_ref: &str,
+    repo_path: &std::path::Path,
+) -> anyhow::Result<CommitEntry> {
+    let message = commit
+        .message_raw()
+        .with_context(|| {
             format!(
-                "decoding author for commit '{}' while walking ref '{}' in {}",
-                commit_id,
+                "decoding message for commit '{}' while walking ref '{}' in {}",
+                commit.id,
+                git_ref,
+                repo_path.display()
+            )
+        })?
+        .to_string();
+    let first_line = message.lines().next().unwrap_or("").to_string();
+
+    let author = commit.author().with_context(|| {
+        format!(
+            "decoding author for commit '{}' while walking ref '{}' in {}",
+            commit.id,
+            git_ref,
+            repo_path.display()
+        )
+    })?;
+    let author_name = String::from_utf8_lossy(author.name).to_string();
+    let author_email = String::from_utf8_lossy(author.email).to_string();
+    // Parse author time from the signature string (format: "timestamp offset")
+    // e.g., "1700000000 +0000"
+    let timestamp = author
+        .time
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .parse::<i64>()
+        .with_context(|| {
+            format!(
+                "parsing author timestamp for commit '{}' while walking ref '{}' in {}",
+                commit.id,
                 git_ref,
                 repo_path.display()
             )
         })?;
-        let author_name = String::from_utf8_lossy(author.name).to_string();
-        let author_email = String::from_utf8_lossy(author.email).to_string();
-        // Parse author time from the signature string (format: "timestamp offset")
-        // e.g., "1700000000 +0000"
-        let timestamp = author
-            .time
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .parse::<i64>()
-            .with_context(|| {
-                format!(
-                    "parsing author timestamp for commit '{}' while walking ref '{}' in {}",
-                    commit_id,
-                    git_ref,
-                    repo_path.display()
-                )
-            })?;
-        let author_date = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "author timestamp {} is out of range for commit '{}' while walking ref '{}' in {}",
-                    timestamp,
-                    commit_id,
-                    git_ref,
-                    repo_path.display()
-                )
-            })?
-            .to_rfc3339();
+    let author_date = chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "author timestamp {} is out of range for commit '{}' while walking ref '{}' in {}",
+                timestamp,
+                commit.id,
+                git_ref,
+                repo_path.display()
+            )
+        })?
+        .to_rfc3339();
 
-        entries.push(CommitEntry {
-            sha: commit_id.to_string(),
-            author_name,
-            author_email,
-            author_date,
-            message: first_line,
-            gpg_signature: None,
-        });
-    }
-
-    Ok(entries)
+    Ok(CommitEntry {
+        sha: commit.id.to_string(),
+        author_name,
+        author_email,
+        author_date,
+        message: first_line,
+        gpg_signature: None,
+    })
 }
 
 /// Whether `commit` changes `path` — see [`get_commit_log`]: not TREESAME to

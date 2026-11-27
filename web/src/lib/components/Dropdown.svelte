@@ -20,8 +20,11 @@
   let position = $state<{ left: number; top: number; maxHeight: number; maxWidth: number } | null>(null);
   let focusLast = false;
 
+  // In document order: the arrow keys walk the menu as it reads. jsdom answers
+  // a selector list group by group, so the order is not left to it.
   function items() {
-    return Array.from(menuEl?.querySelectorAll<HTMLElement>('a[href], button:not(:disabled), [tabindex]:not([tabindex="-1"])') ?? []);
+    return Array.from(menuEl?.querySelectorAll<HTMLElement>('a[href], button:not(:disabled), [tabindex]:not([tabindex="-1"])') ?? [])
+      .sort((a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1));
   }
 
   function placeMenu() {

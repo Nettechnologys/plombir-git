@@ -2196,6 +2196,26 @@ pub(crate) fn build_all_routes(
         )
         .get(
             RepoRead,
+            "/repos/{owner}/{name}/tree/commits",
+            api::repo_overview::tree_commits,
+        )
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/commit-count",
+            api::repo_overview::commit_count,
+        )
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/languages",
+            api::repo_overview::languages,
+        )
+        .get(
+            RepoRead,
+            "/repos/{owner}/{name}/files",
+            api::repo_overview::list_files,
+        )
+        .get(
+            RepoRead,
             "/repos/{owner}/{name}/blob/{*path}",
             api::repo_content::get_blob,
         )

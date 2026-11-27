@@ -19,13 +19,13 @@
 
 | | |
 |---|---|
-| Router routes (with declared `Access`) | 458 |
-| Reachable from the browser | 318 (69%) |
+| Router routes (with declared `Access`) | 462 |
+| Reachable from the browser | 322 (70%) |
 | Layout modules | 3 |
 | Pages | 75 |
-| Interactive controls | 1069 |
+| Interactive controls | 1079 |
 | Controls calling an API | 384 |
-| Controls from shared components | 425 |
+| Controls from shared components | 431 |
 | Browser sweep: scenarios / inventory entries / routes | 52 / 197 / 187 |
 | **UI routes without a web/smoke/browser test** | **22** |
 | UI routes without corpus or browser coverage | 0 |
@@ -34,7 +34,7 @@
 
 | `Access` | routes | reachable from UI | no frontend test | no corpus/browser coverage |
 |---|---:|---:|---:|---:|
-| `RepoRead` | 111 | 72 | 4 | 0 |
+| `RepoRead` | 115 | 76 | 4 | 0 |
 | `RepoWrite` | 81 | 62 | 12 | 2 |
 | `User` | 63 | 52 | 3 | 0 |
 | `RepoAdmin` | 54 | 49 | 0 | 4 |
@@ -60,13 +60,13 @@
 | `/[owner]/[repo]/pulls/[number]` | 73 | 37 | 26 |
 | `/[owner]/[repo]/boards` | 41 | 14 | 14 |
 | `/[owner]/[repo]/issues/[number]` | 39 | 17 | 22 |
+| `/[owner]/[repo]` | 34 | 5 | 17 |
 | `/orgs/[name]` | 28 | 10 | 2 |
 | `/[owner]/[repo]/pulls` | 27 | 12 | 11 |
 | `/[owner]/[repo]/releases` | 27 | 13 | 10 |
 | `/[owner]/[repo]/pipelines` | 26 | 13 | 13 |
 | `/[owner]/[repo]/issues` | 25 | 9 | 11 |
 | `/admin/users` 🔒 | 25 | 8 | 4 |
-| `/[owner]/[repo]` | 24 | 5 | 11 |
 | `/[owner]/[repo]/blob/[...path]` | 24 | 8 | 10 |
 | `/settings/security` | 24 | 11 | 6 |
 | `/[owner]/[repo]/wiki/[title]` | 23 | 9 | 12 |
@@ -164,8 +164,8 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:common.retry | :457 | `GET /api/v1/repos/{owner}/{name}/tree` | `RepoRead` | rust+web |
-| i18n:common.retry | :457 | `GET /api/v1/repos/{owner}/{name}/blob/{*path}` | `RepoRead` | rust+web |
+| i18n:common.retry | :530 | `GET /api/v1/repos/{owner}/{name}/tree` | `RepoRead` | rust+web |
+| i18n:common.retry | :530 | `GET /api/v1/repos/{owner}/{name}/blob/{*path}` | `RepoRead` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke+browser |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web+browser |
@@ -178,15 +178,21 @@ succeed and which must be denied.
 | _(page load)_ | — | `GET /api/v1/repos/{owner}/{name}/branches` | `RepoRead` | web+browser |
 | _(page load)_ | — | `GET /api/v1/repos/{owner}/{name}/log` | `RepoRead` | rust+web+browser |
 | _(page load)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web+smoke+browser |
+| _(page load)_ | — | `GET /api/v1/repos/{owner}/{name}/tags` | `RepoRead` | web |
+| _(page load)_ | — | `GET /api/v1/repos/{owner}/{name}/tree/commits` | `RepoRead` | rust+web |
+| _(page load)_ | — | `GET /api/v1/repos/{owner}/{name}/commit-count` | `RepoRead` | rust+web |
+| _(page load)_ | — | `GET /api/v1/repos/{owner}/{name}/files` | `RepoRead` | rust+web |
+| _(page load)_ | — | `GET /api/v1/repos/{owner}/{name}/languages` | `RepoRead` | rust+web |
+| _(page load)_ | — | `GET /api/v1/repos/{owner}/{name}/releases` | `RepoRead` | rust+web |
 
 ### `/[owner]/[repo]/blob/[...path]`
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:repo.blob.hide_blame | :549 | `GET /api/v1/repos/{owner}/{name}/blame/{*path}` | `RepoRead` | web |
-| i18n:repo.blob.download | :569 | `GET /api/v1/repos/{owner}/{name}/raw/{*path}` | `RepoRead` | web |
-| i18n:repo.blob.deleting | :626 | `DELETE /api/v1/repos/{owner}/{name}/contents/{*path}` | `RepoWrite` | rust+web+browser |
-| i18n:repo.blob.download | :647 | `GET /api/v1/repos/{owner}/{name}/raw/{*path}` | `RepoRead` | web |
+| i18n:repo.blob.hide_blame | :557 | `GET /api/v1/repos/{owner}/{name}/blame/{*path}` | `RepoRead` | web |
+| i18n:repo.blob.download | :577 | `GET /api/v1/repos/{owner}/{name}/raw/{*path}` | `RepoRead` | web |
+| i18n:repo.blob.deleting | :634 | `DELETE /api/v1/repos/{owner}/{name}/contents/{*path}` | `RepoWrite` | rust+web+browser |
+| i18n:repo.blob.download | :655 | `GET /api/v1/repos/{owner}/{name}/raw/{*path}` | `RepoRead` | web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
@@ -197,6 +203,7 @@ succeed and which must be denied.
 | _(page load)_ | — | `GET /api/v1/repos/{owner}/{name}/raw/{*path}` | `RepoRead` | web |
 | _(page load)_ | — | `GET /api/v1/repos/{owner}/{name}/blob/{*path}` | `RepoRead` | rust+web+browser |
 | _(page load)_ | — | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web+smoke |
+| _(page load)_ | — | `GET /api/v1/repos/{owner}/{name}/files` | `RepoRead` | rust+web |
 
 ### `/[owner]/[repo]/boards`
 
@@ -252,8 +259,8 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:common.retry | :171 | `GET /api/v1/repos/{owner}/{name}/log` | `RepoRead` | rust+web |
-| i18n:common.loading | :210 | `GET /api/v1/repos/{owner}/{name}/log` | `RepoRead` | rust+web |
+| i18n:common.retry | :184 | `GET /api/v1/repos/{owner}/{name}/log` | `RepoRead` | rust+web |
+| i18n:common.loading | :223 | `GET /api/v1/repos/{owner}/{name}/log` | `RepoRead` | rust+web |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |

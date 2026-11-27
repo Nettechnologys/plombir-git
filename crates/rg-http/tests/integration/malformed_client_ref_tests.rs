@@ -76,6 +76,10 @@ async fn malformed_content_refs_are_client_errors_on_every_read_endpoint() {
         "/api/v1/repos/contentref-owner/contentref-repo/tree",
         "/api/v1/repos/contentref-owner/contentref-repo/blob/README.md",
         "/api/v1/repos/contentref-owner/contentref-repo/log",
+        "/api/v1/repos/contentref-owner/contentref-repo/tree/commits",
+        "/api/v1/repos/contentref-owner/contentref-repo/commit-count",
+        "/api/v1/repos/contentref-owner/contentref-repo/languages",
+        "/api/v1/repos/contentref-owner/contentref-repo/files",
     ];
 
     for endpoint in endpoints {

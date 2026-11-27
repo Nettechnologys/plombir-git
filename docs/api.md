@@ -110,6 +110,30 @@ PATs are rejected on these writes regardless of scope; clients must not retry wi
 PAT or treat the refusal as success. Ordinary operations, CI variables and emergency
 credential revocation retain their existing role/scope contract.
 
+### Repository overview (0.4.4)
+
+Four read endpoints serve the repository home page. Each takes `?ref=` (a
+branch, tag or commit; `HEAD` by default), needs read access to the
+repository like `GET .../tree`, answers `400` for a malformed ref and `404` for
+an unknown one, and is bounded: when it stops at its limit it says
+`"complete": false` instead of reading the whole history or tree.
+
+- `GET /repos/{owner}/{name}/tree/commits?path=` — the commit that last gave
+  each entry of a directory its current content, as
+  `{"entries": {"<name>": {sha, author, date, message}}, "complete": bool}`.
+  The walk reads at most 10 000 commits, newest first; an entry it did not
+  reach is absent. `400` when `path` is a file, `404` when it is missing.
+- `GET /repos/{owner}/{name}/commit-count` — `{"count", "complete"}`; counting
+  stops at 100 000, and `complete: false` then means "at least".
+- `GET /repos/{owner}/{name}/languages` —
+  `{"languages": [{"name", "bytes"}], "complete"}`, largest first. Languages are
+  told by file name and extension; data and prose (JSON, YAML, Markdown) are
+  not counted, nor are vendored, generated and documentation paths
+  (`node_modules/`, `vendor/`, `third_party/`, `dist/`, `docs/`, `*.min.js`,
+  `*.d.ts`). At most 200 000 tree entries are visited.
+- `GET /repos/{owner}/{name}/files` — `{"paths": [...], "complete"}`, every file
+  path of the tree, at most 50 000; the list behind "Go to file".
+
 ### Instance administration (0.4.3)
 
 `PATCH /admin/settings` keeps its contract: an instance administrator, an

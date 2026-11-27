@@ -21,6 +21,11 @@
   // default is `master` answered "ref not found" and a new empty repository
   // an error instead of "No commits yet" (card_2e320f5287d7).
   let ref = $derived($page.url.searchParams.get('ref') || '');
+  // `?path=` narrows the history to one file or directory, as the history
+  // link of a directory listing asks for.
+  let path = $derived($page.url.searchParams.get('path') || '');
+  /** One history is one ref and one path. */
+  let view = $derived(`${ref}\u0000${path}`);
 
   let commits = $state<Commit[]>([]);
   let branches = $state<Branch[]>([]);
@@ -38,8 +43,9 @@
     const expectedOwner = owner;
     const expectedRepo = repo;
     const expectedRef = ref;
+    const expectedPath = path;
     if (!expectedOwner || !expectedRepo) return;
-    void loadCommits(expectedOwner, expectedRepo, expectedRef);
+    void loadCommits(expectedOwner, expectedRepo, expectedRef, expectedPath);
   });
 
   $effect(() => {
@@ -61,8 +67,8 @@
     }
   }
 
-  async function loadCommits(expectedOwner: string, expectedRepo: string, expectedRef: string) {
-    const claim = logRequests.begin(expectedOwner, expectedRepo, expectedRef);
+  async function loadCommits(expectedOwner: string, expectedRepo: string, expectedRef: string, expectedPath: string) {
+    const claim = logRequests.begin(expectedOwner, expectedRepo, `${expectedRef}\u0000${expectedPath}`);
     loading = true;
     loadingMore = false;
     hasMore = false;
@@ -70,8 +76,8 @@
     loadMoreError = '';
     commits = [];
     try {
-      const result = await repos.log(expectedOwner, expectedRepo, expectedRef || undefined, undefined, PAGE_SIZE);
-      if (!logRequests.owns(claim, owner, repo, ref)) return;
+      const result = await repos.log(expectedOwner, expectedRepo, expectedRef || undefined, expectedPath || undefined, PAGE_SIZE);
+      if (!logRequests.owns(claim, owner, repo, view)) return;
       if (result?.commits && Array.isArray(result.commits)) {
         commits = result.commits;
         hasMore = result.commits.length === PAGE_SIZE;
@@ -79,11 +85,11 @@
         error = 'Invalid response format from server';
       }
     } catch (e: any) {
-      if (logRequests.owns(claim, owner, repo, ref)) {
+      if (logRequests.owns(claim, owner, repo, view)) {
         error = e.message || 'Failed to load commits';
       }
     } finally {
-      if (logRequests.owns(claim, owner, repo, ref)) loading = false;
+      if (logRequests.owns(claim, owner, repo, view)) loading = false;
     }
   }
 
@@ -96,7 +102,8 @@
     const expectedOwner = owner;
     const expectedRepo = repo;
     const expectedRef = ref;
-    const claim = logRequests.begin(expectedOwner, expectedRepo, expectedRef);
+    const expectedPath = path;
+    const claim = logRequests.begin(expectedOwner, expectedRepo, `${expectedRef}\u0000${expectedPath}`);
     loadingMore = true;
     loadMoreError = '';
     try {
@@ -104,11 +111,11 @@
         expectedOwner,
         expectedRepo,
         expectedRef || undefined,
-        undefined,
+        expectedPath || undefined,
         PAGE_SIZE,
         commits.length
       );
-      if (!logRequests.owns(claim, owner, repo, ref)) return;
+      if (!logRequests.owns(claim, owner, repo, view)) return;
       const nextPage = Array.isArray(result?.commits) ? result.commits : [];
       // A history that moved between the two pages can repeat a commit at
       // the seam; the list stays a list of distinct commits.
@@ -117,16 +124,19 @@
       commits = [...commits, ...fresh];
       hasMore = nextPage.length === PAGE_SIZE;
     } catch (e: any) {
-      if (logRequests.owns(claim, owner, repo, ref)) {
+      if (logRequests.owns(claim, owner, repo, view)) {
         loadMoreError = e.message || 'Failed to load commits';
       }
     } finally {
-      if (logRequests.owns(claim, owner, repo, ref)) loadingMore = false;
+      if (logRequests.owns(claim, owner, repo, view)) loadingMore = false;
     }
   }
 
   function commitsHref(nextRef: string): string {
-    const query = nextRef ? `?${new URLSearchParams({ ref: nextRef }).toString()}` : '';
+    const params = new URLSearchParams();
+    if (nextRef) params.set('ref', nextRef);
+    if (path) params.set('path', path);
+    const query = params.size ? `?${params.toString()}` : '';
     return `/${owner}/${repo}/commits${query}`;
   }
 
@@ -146,6 +156,9 @@
 
   <div class="commits-header">
     <h1>{t('repo.tabs.commits')}</h1>
+    {#if path}
+      <span class="history-path">{t('repo.commits.history_for', { path }, 'History for {path}')}</span>
+    {/if}
     <Dropdown ariaLabel={t('repo.select_branch')} triggerClass="btn btn-outline" placement="right" fitViewport>
       {#snippet trigger()}
         <span aria-hidden="true">🌿</span><span class="branch-name" title={currentRefLabel}>{currentRefLabel}</span><span aria-hidden="true">▾</span>
@@ -168,7 +181,7 @@
   {#if error}
     <div class="error-banner">
       <p>{error}</p>
-      <button onclick={() => loadCommits(owner, repo, ref)}>{t('common.retry')}</button>
+      <button onclick={() => loadCommits(owner, repo, ref, path)}>{t('common.retry')}</button>
     </div>
   {/if}
 
@@ -216,6 +229,7 @@
 </div>
 
 <style>
+  .history-path { flex: 1; min-width: 0; color: var(--text-secondary); font-family: var(--font-mono); font-size: 13px; overflow-wrap: anywhere; }
   .commits-header {
     display: flex;
     flex-wrap: wrap;

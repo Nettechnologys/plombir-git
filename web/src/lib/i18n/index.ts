@@ -165,6 +165,43 @@ export function formatDate(dateStr: string, options?: Intl.DateTimeFormatOptions
   return date.toLocaleDateString(dateLocales[$locale], options ?? defaultOptions);
 }
 
+/**
+ * The form of a counted noun the active locale uses for `count`: "1 branch",
+ * "2 branches"; "1 ветка", "3 ветки", "5 веток". The forms are passed in, each
+ * from its own literal key, so the catalog check still sees every key.
+ */
+export function pluralForm(
+  count: number,
+  forms: { one: string; few: string; many: string; other: string },
+): string {
+  const category = new Intl.PluralRules(dateLocales[activeLocale()]).select(count);
+  return category === 'one' || category === 'few' || category === 'many' ? forms[category] : forms.other;
+}
+
+/**
+ * How long ago `dateStr` was, in the active locale ("3 days ago", "3 дня
+ * назад"), the way GitHub labels commits. Past a year it is the date itself.
+ */
+export function formatRelativeTime(dateStr: string, now: number = Date.now()): string {
+  const $locale = activeLocale();
+  const seconds = Math.round((parseServerTime(dateStr).getTime() - now) / 1000);
+  const steps: [Intl.RelativeTimeFormatUnit, number][] = [
+    ['second', 60],
+    ['minute', 60],
+    ['hour', 24],
+    ['day', 30],
+    ['month', 12],
+  ];
+  let value = seconds;
+  for (const [unit, size] of steps) {
+    if (Math.abs(value) < size) {
+      return new Intl.RelativeTimeFormat(dateLocales[$locale], { numeric: 'auto' }).format(value, unit);
+    }
+    value = Math.round(value / size);
+  }
+  return formatDate(dateStr);
+}
+
 export function formatDateTime(dateStr: string): string {
   const $locale = activeLocale();
   const date = parseServerTime(dateStr);
