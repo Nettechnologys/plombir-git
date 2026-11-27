@@ -193,6 +193,11 @@ impl TokenGrant {
         self.0.token.write_ref_prefix.as_deref()
     }
 
+    /// The attempt of an agent run the token was issued for, when it was.
+    pub fn agent_run_attempt_id(&self) -> Option<i64> {
+        self.0.token.agent_run_attempt_id
+    }
+
     /// The narrowing published to `rg-core` for the duration of the request.
     pub(crate) fn credential_context(
         &self,
@@ -204,6 +209,7 @@ impl TokenGrant {
             mcp_tool,
             deny_protected_writes: self.denies_protected_writes(),
             write_ref_prefix: self.write_ref_prefix().map(str::to_owned),
+            agent_run_attempt_id: self.agent_run_attempt_id(),
         }
     }
 

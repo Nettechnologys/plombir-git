@@ -358,6 +358,7 @@ mod tests {
             mcp_tool: Some("create_pr".to_string()),
             deny_protected_writes: false,
             write_ref_prefix: None,
+            agent_run_attempt_id: None,
         };
 
         let stamped = with_credential(

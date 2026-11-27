@@ -2697,6 +2697,9 @@ fn spawn_post_push_hooks_for_edit(
         owner.to_string(),
         repo.to_string(),
         Some(pusher_id),
+        // Inside the request that made the commit: an agent run's editor commit
+        // starts no pipeline by itself (ADR-0001 D4).
+        rg_core::push_hooks::PushOrigin::of_current_credential(),
         vec![rg_git::protocol::receive_pack::RefUpdate {
             old_sha: old_sha.to_string(),
             new_sha: new_sha.to_string(),

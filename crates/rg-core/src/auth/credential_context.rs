@@ -58,6 +58,11 @@ pub struct CredentialContext {
     /// (a token issued for an agent run, ADR-0001 D3) — matched by
     /// [`rg_git::protocol::receive_pack::ref_write_admitted`].
     pub write_ref_prefix: Option<String>,
+    /// The attempt of an agent run the token was issued for (ADR-0001 D3).
+    /// A write made through it is the agent's, and CI does not run on what an
+    /// agent wrote until a person approves it (ADR-0001 D4,
+    /// [`crate::push_hooks::PushOrigin`]).
+    pub agent_run_attempt_id: Option<i64>,
 }
 
 /// Run `future` with `context` published as the current request's credential.
@@ -235,6 +240,7 @@ mod tests {
             mcp_tool: Some("create_issue".to_string()),
             deny_protected_writes: true,
             write_ref_prefix: Some("refs/heads/agent/bot/".to_string()),
+            agent_run_attempt_id: Some(5),
         };
         scope(context.clone(), async {
             assert_eq!(current(), Some(context.clone()));

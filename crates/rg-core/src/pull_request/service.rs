@@ -74,6 +74,29 @@ pub async fn create_pr(
             .map_err(|_| crate::error::invalid_request(format!("invalid {label} branch name")))?;
     }
 
+    // A pull request an agent run opens is that run's for good (ADR-0001 D4):
+    // the CI gate holds every head of it for a person. One run opens one pull
+    // request — a second would carry the same agent's code past the gate the
+    // first one is held by.
+    let agent_run = match crate::auth::credential_context::current()
+        .and_then(|credential| credential.agent_run_attempt_id)
+    {
+        Some(attempt_id) => {
+            let run = rg_db::ops::agent_run_ops::run_of_attempt(db, attempt_id)
+                .await?
+                .ok_or_else(|| {
+                    crate::error::forbidden("the agent run this token was issued for is gone")
+                })?;
+            if let Some(opened) = run.result_pull_request_id {
+                return Err(crate::error::conflict(format!(
+                    "this agent run already has its pull request (id {opened})"
+                )));
+            }
+            Some(run.id)
+        }
+        None => None,
+    };
+
     let target_repo = repo_entity::Entity::find_by_id(repo_id)
         .one(db)
         .await?
@@ -152,6 +175,9 @@ pub async fn create_pr(
     };
 
     let pr = insert_with_repo_number(db, repo_id, model).await?;
+    if let Some(run_id) = agent_run {
+        link_to_agent_run(db, run_id, &pr).await?;
+    }
     if let Err(error) = rg_db::ops::pr_event_ops::record(
         db,
         pr.repo_id,
@@ -393,6 +419,32 @@ where
             }
         }
     }
+}
+
+/// Record that agent run `run_id` opened `pr`, or take `pr` back.
+///
+/// Fail-closed: a pull request of an agent that the run does not name would
+/// pass the CI gate as anyone's. If the link cannot be written — another pull
+/// request of the same run won the race, or the write failed — the pull request
+/// is deleted again before anything (its `pull_request` pipeline, its
+/// webhook) has seen it, and the caller gets the error.
+async fn link_to_agent_run(db: &DatabaseConnection, run_id: i64, pr: &PullRequest) -> Result<()> {
+    let refusal =
+        match rg_db::ops::agent_run_ops::record_opened_pull_request(db, run_id, pr.id).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => crate::error::conflict("this agent run already has its pull request"),
+            Err(error) => error.context("record the pull request an agent run opened"),
+        };
+    if let Err(error) = rg_db::ops::pull_request_ops::delete_with_dependents(db, pr.id).await {
+        tracing::error!(
+            pr_id = pr.id,
+            run_id,
+            error = %format!("{error:#}"),
+            "an agent run's pull request could not be linked to its run nor deleted; \
+             its CI is not held for a person — delete it"
+        );
+    }
+    Err(refusal)
 }
 
 /// Resolve a head reference in `owner:branch` format to (head_branch, head_repo_id).

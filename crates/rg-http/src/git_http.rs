@@ -1741,6 +1741,15 @@ pub(crate) async fn handle_git_receive_pack(
         Err(response) => return response,
     };
     let actor_id = credential.as_ref().map(|credential| credential.user_id);
+    // Whether an agent run's token is pushing (ADR-0001 D4): its push starts
+    // no pipeline of its own. Read off the credential this request resolved,
+    // not the task-local context, which the post-push task does not see.
+    let push_origin = rg_core::push_hooks::PushOrigin {
+        agent_run_attempt_id: credential
+            .as_ref()
+            .and_then(|credential| credential.grant.as_ref())
+            .and_then(|grant| grant.agent_run_attempt_id()),
+    };
     let push_policy =
         match current_git_push_policy(&state, repo_model.id, credential.as_ref()).await {
             Ok(policy) => policy,
@@ -1819,6 +1828,7 @@ pub(crate) async fn handle_git_receive_pack(
                 owner.clone(),
                 repo.clone(),
                 actor_id,
+                push_origin,
                 ref_updates,
             );
 
@@ -1857,6 +1867,7 @@ pub(crate) async fn handle_git_receive_pack(
                     owner.clone(),
                     repo.clone(),
                     actor_id,
+                    push_origin,
                     ref_updates,
                 );
             }

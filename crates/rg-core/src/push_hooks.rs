@@ -35,6 +35,47 @@ pub trait PushNotifier: Send + Sync {
     fn notify(&self, user_id: i64, event_type: &str, data: serde_json::Value);
 }
 
+/// Where a ref move came from beyond the account that made it (ADR-0001 D4).
+///
+/// An agent run's token writes as its bot, so `pusher_id` alone cannot tell
+/// the bot's ordinary automation from a run whose instructions may have been
+/// written by whoever filed the issue. A run never sees the repository's CI
+/// secrets, but a pipeline started by its push would — and the workflow files
+/// on the agent's branch are the agent's to write. So a move an agent made
+/// starts no pipeline by itself: no `push` pipeline, no `pull_request`
+/// pipeline for the pull requests it synchronised. Everything else a push owes
+/// still happens — head SHAs, webhooks, the watch fan-out, merge evaluation —
+/// and a person releases CI for the agent's pull request by approving its head
+/// (`pull_request::ci::fork_head_ci_is_approved`).
+///
+/// It has to be decided where the write is made, while the request that made
+/// it is still current: the hooks run on a detached task, which sees no
+/// credential at all. Every HTTP path that moves a ref therefore hands one to
+/// `AppState::spawn_post_push_hooks` explicitly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PushOrigin {
+    /// The attempt of an agent run whose token made the write, when one did.
+    pub agent_run_attempt_id: Option<i64>,
+}
+
+impl PushOrigin {
+    /// The origin the current request's credential gives the writes it makes.
+    ///
+    /// Read it inside the request: a detached task reads no credential and
+    /// would call an agent's write a person's.
+    pub fn of_current_credential() -> Self {
+        Self {
+            agent_run_attempt_id: crate::auth::credential_context::current()
+                .and_then(|credential| credential.agent_run_attempt_id),
+        }
+    }
+
+    /// Whether an agent run made this write, so CI waits for a person.
+    pub fn is_agent_run(self) -> bool {
+        self.agent_run_attempt_id.is_some()
+    }
+}
+
 /// Borrowed parameters for one post-push hook run.
 pub struct PostPushParams<'a> {
     pub db: &'a DatabaseConnection,
@@ -51,6 +92,10 @@ pub struct PostPushParams<'a> {
     /// `triggered_by`. `None` (an unauthenticated push on an open-access server)
     /// means nobody is excluded and the pipeline has no attributed actor.
     pub pusher_id: Option<i64>,
+    /// Whether an agent run made the moves this run was handed — see
+    /// [`PushOrigin`]. It describes those moves only: a merge the hooks
+    /// perform in their wake is the server's.
+    pub origin: PushOrigin,
     pub docker_enabled: bool,
     pub external_runners: bool,
     pub allow_host_runner: bool,
@@ -165,6 +210,34 @@ impl PostPushContext {
         pusher_id: Option<i64>,
         ref_updates: &[RefUpdate],
     ) {
+        self.run_with_origin(
+            db,
+            repo_path,
+            owner,
+            repo_name,
+            pusher_id,
+            PushOrigin::default(),
+            ref_updates,
+        )
+        .await;
+    }
+
+    /// [`Self::run`] for moves whose [`PushOrigin`] the caller knows — every
+    /// path a token can write through.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the per-push arguments of `run` plus the origin of the moves"
+    )]
+    pub async fn run_with_origin(
+        &self,
+        db: &DatabaseConnection,
+        repo_path: &Path,
+        owner: &str,
+        repo_name: &str,
+        pusher_id: Option<i64>,
+        origin: PushOrigin,
+        ref_updates: &[RefUpdate],
+    ) {
         post_push_hooks(
             &PostPushParams {
                 db,
@@ -173,6 +246,7 @@ impl PostPushContext {
                 owner,
                 repo_name,
                 pusher_id,
+                origin,
                 docker_enabled: self.docker_enabled,
                 external_runners: self.external_runners,
                 allow_host_runner: self.allow_host_runner,
@@ -216,6 +290,7 @@ impl PostPushContext {
                     owner: &owner,
                     repo_name: &repo_name,
                     pusher_id: None,
+                    origin: PushOrigin::default(),
                     docker_enabled: context.docker_enabled,
                     external_runners: context.external_runners,
                     allow_host_runner: context.allow_host_runner,
@@ -701,12 +776,20 @@ async fn run_ref_move_hooks(
         // The moves the mirror pass itself made; everything the cascade adds
         // below is a merge of this server's.
         let announced = !(origin == RefMoveOrigin::MirrorPass && depth == 0);
+        // The moves an agent run made itself; a merge the cascade adds below is
+        // this server's, released by whoever enabled it.
+        let agent_move = depth == 0 && params.origin.is_agent_run();
 
         // 0. PR head-SHA refresh + auto-merge/merge-queue + protected-branch audit
         if let Some(branch_name) = update.refname.strip_prefix("refs/heads/") {
-            let merged =
-                post_push_branch_maintenance(params, &target, branch_name, &update, announced)
-                    .await;
+            let merged = post_push_branch_maintenance(
+                params,
+                &target,
+                branch_name,
+                &update,
+                announced && !agent_move,
+            )
+            .await;
             // A merge the maintenance above performed advanced *another* branch,
             // and that move owes these same hooks. Back into the work list it
             // goes rather than into a recursive call (card_87c4912c51ed) — under
@@ -736,8 +819,18 @@ async fn run_ref_move_hooks(
             continue;
         }
 
-        // 1. Trigger CI pipeline if .plombir-git-ci.yml exists
-        trigger_ci_for_push(params, &target, &update).await;
+        // 1. Trigger CI pipeline if .plombir-git-ci.yml exists — unless an
+        // agent run wrote it (ADR-0001 D4): its workflow files are the agent's.
+        if agent_move {
+            tracing::info!(
+                repo_id = target.repo_id,
+                refname = %update.refname,
+                agent_run_attempt_id = params.origin.agent_run_attempt_id,
+                "Post-push: no push pipeline for a move an agent run made; CI waits for a person"
+            );
+        } else {
+            trigger_ci_for_push(params, &target, &update).await;
+        }
 
         // 2-3. Push + branch/tag webhooks and the real-time notification
         trigger_push_webhooks(params, &target, &update).await;
@@ -1849,6 +1942,7 @@ mod tests {
             owner: &target.owner,
             repo_name: &target.name,
             pusher_id: None,
+            origin: PushOrigin::default(),
             docker_enabled: false,
             external_runners: false,
             allow_host_runner: false,
@@ -1960,6 +2054,7 @@ mod tests {
                 owner: &target.owner,
                 repo_name: &target.name,
                 pusher_id: None,
+                origin: PushOrigin::default(),
                 docker_enabled: false,
                 external_runners: false,
                 allow_host_runner: false,
@@ -2007,6 +2102,7 @@ mod tests {
             owner: &target.owner,
             repo_name: &target.name,
             pusher_id: target.personal_owner_id,
+            origin: PushOrigin::default(),
             docker_enabled: false,
             external_runners: false,
             allow_host_runner: false,
@@ -2434,6 +2530,7 @@ mod tests {
             owner: "headsync",
             repo_name: "head-sync",
             pusher_id: Some(owner.id),
+            origin: PushOrigin::default(),
             docker_enabled: false,
             external_runners: false,
             allow_host_runner: false,
@@ -2723,6 +2820,7 @@ mod seed_lookup_tests {
                 owner: "owner",
                 repo_name: "repo",
                 pusher_id: None,
+                origin: PushOrigin::default(),
                 docker_enabled: false,
                 external_runners: false,
                 allow_host_runner: false,

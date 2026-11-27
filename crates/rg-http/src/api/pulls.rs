@@ -817,6 +817,7 @@ pub async fn merge_pr(
                             head_owner,
                             head_repo,
                             Some(actor_id),
+                            rg_core::push_hooks::PushOrigin::of_current_credential(),
                             vec![update],
                         );
                         Ok(())
