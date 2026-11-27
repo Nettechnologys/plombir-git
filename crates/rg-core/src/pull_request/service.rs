@@ -87,10 +87,10 @@ pub async fn create_pr(
                 .ok_or_else(|| {
                     crate::error::forbidden("the agent run this token was issued for is gone")
                 })?;
-            if let Some(opened) = run.result_pull_request_id {
-                return Err(crate::error::conflict(format!(
-                    "this agent run already has its pull request (id {opened})"
-                )));
+            if run.result_pull_request_id.is_some() {
+                return Err(crate::error::conflict(
+                    "this agent run already has its pull request",
+                ));
             }
             Some(run.id)
         }
