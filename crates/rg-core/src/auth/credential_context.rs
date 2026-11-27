@@ -23,6 +23,12 @@
 //! scope and sees no narrowing at all, which is why the routes that *schedule*
 //! a later merge refuse a narrowed token up front.
 //!
+//! A token issued for an agent run carries one more narrowing of the same
+//! kind: the refs it may write at all (ADR-0001 D3). [`refuse_ref_outside_write_scope`]
+//! asks it where the server moves a ref or makes a commit for the caller, and
+//! [`refuse_write_scoped_merge`] refuses such a token every merge; receive-pack
+//! holds a push to the same rule.
+//!
 //! The same context is what [`crate::audit::record`] stamps on every audit row
 //! written during the request, so a mutation an agent made says which token —
 //! and which MCP tool — it came through.
@@ -48,6 +54,10 @@ pub struct CredentialContext {
     pub mcp_tool: Option<String>,
     /// Whether every write landing on a protected branch is refused.
     pub deny_protected_writes: bool,
+    /// The refs the credential may write at all, when it is confined to some
+    /// (a token issued for an agent run, ADR-0001 D3) — matched by
+    /// [`rg_git::protocol::receive_pack::ref_write_admitted`].
+    pub write_ref_prefix: Option<String>,
 }
 
 /// Run `future` with `context` published as the current request's credential.
@@ -108,6 +118,103 @@ pub async fn refuse_protected_write(
     ))
 }
 
+/// Refuse a write of `refname` in `repo_id` when the current credential is
+/// confined to some refs and this is not one of them.
+///
+/// Asked where the server moves a ref on the caller's behalf: every ref change
+/// of [`crate::repo::refs`] (branch and tag creation and deletion) and every
+/// server-side commit ([`crate::branch_protection::server_side::
+/// ServerSideCommitPolicy::load`]). A push meets the same rule inside
+/// receive-pack. The refusal is a typed `Forbidden` (403), journalled as
+/// `agent.scope_denied` with the reason `write_ref_prefix`.
+pub async fn refuse_ref_outside_write_scope(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    refname: &str,
+    deletes: bool,
+) -> Result<()> {
+    let Some(context) = current() else {
+        return Ok(());
+    };
+    let Some(scope) = context.write_ref_prefix.as_deref() else {
+        return Ok(());
+    };
+    if rg_git::protocol::receive_pack::ref_write_admitted(scope, refname, deletes) {
+        return Ok(());
+    }
+    record_write_scope_denial(
+        db,
+        &context,
+        repo_id,
+        serde_json::json!({
+            "reason": "write_ref_prefix",
+            "ref": refname,
+            "deletes": deletes,
+            "write_ref_prefix": scope,
+        }),
+    )
+    .await;
+    Err(crate::error::forbidden(
+        rg_git::protocol::receive_pack::write_scope_refusal(refname),
+    ))
+}
+
+/// Refuse a merge — now, later, or by the queue — when the current credential
+/// is confined to some refs.
+///
+/// A merge writes the base branch, which a token issued for an agent run must
+/// never reach, whatever its name: not even a base under the token's own
+/// prefix, because a merge is the person's decision (ADR-0001 D3). Refused at
+/// the routes that merge or schedule a merge, for the same reason
+/// [`refuse_protected_write`] is.
+pub async fn refuse_write_scoped_merge(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    action: &str,
+) -> Result<()> {
+    let Some(context) = current() else {
+        return Ok(());
+    };
+    let Some(scope) = context.write_ref_prefix.as_deref() else {
+        return Ok(());
+    };
+    record_write_scope_denial(
+        db,
+        &context,
+        repo_id,
+        serde_json::json!({
+            "reason": "write_ref_prefix",
+            "action": action,
+            "write_ref_prefix": scope,
+        }),
+    )
+    .await;
+    Err(crate::error::forbidden(WRITE_SCOPED_MERGE_REFUSAL))
+}
+
+/// What a token confined to some refs reads when it asks for a merge.
+pub const WRITE_SCOPED_MERGE_REFUSAL: &str = "this token may not merge pull requests";
+
+async fn record_write_scope_denial(
+    db: &DatabaseConnection,
+    context: &CredentialContext,
+    repo_id: i64,
+    details: serde_json::Value,
+) {
+    let actor = crate::audit::AuditActor::resolve_after_the_fact(db, context.user_id).await;
+    crate::audit::record(
+        db,
+        &actor,
+        SCOPE_DENIED_ACTION,
+        Some("repo"),
+        Some(repo_id),
+        None,
+        None,
+        Some(details),
+    )
+    .await;
+}
+
 /// The audit action of every refusal a token's narrowing produces.
 pub const SCOPE_DENIED_ACTION: &str = "agent.scope_denied";
 
@@ -127,6 +234,7 @@ mod tests {
             token_id: Some(3),
             mcp_tool: Some("create_issue".to_string()),
             deny_protected_writes: true,
+            write_ref_prefix: Some("refs/heads/agent/bot/".to_string()),
         };
         scope(context.clone(), async {
             assert_eq!(current(), Some(context.clone()));

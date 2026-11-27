@@ -3320,6 +3320,7 @@
       "access": "RepoWrite",
       "handler": "api::repo_content::create_branch",
       "testedIn": [
+        "rust",
         "web"
       ],
       "reachedFromUi": true
@@ -7924,6 +7925,7 @@
               "handler": "api::repo_content::create_branch",
               "matched": true,
               "testedIn": [
+                "rust",
                 "web"
               ]
             },

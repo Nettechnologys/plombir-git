@@ -46,6 +46,15 @@ impl ServerSideCommitPolicy {
         // kept off protected branches is refused here, ahead of the rules that
         // would otherwise admit the account (card_60a80311d512).
         crate::auth::credential_context::refuse_protected_write(db, repo_id, branch).await?;
+        // And one confined to some refs (a token issued for an agent run) is
+        // refused every branch outside them (ADR-0001 D3).
+        crate::auth::credential_context::refuse_ref_outside_write_scope(
+            db,
+            repo_id,
+            &format!("refs/heads/{branch}"),
+            false,
+        )
+        .await?;
         let protections = rg_db::ops::protected_branch_ops::list_rules_by_repo(db, repo_id).await?;
         let signed_commit_required_refs = signed_commit_required_refs(&protections);
         let signing_keys = if signed_commit_required_refs.is_empty() {

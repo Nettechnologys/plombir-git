@@ -551,6 +551,13 @@ jobs:
           PLOMBIR_GIT_TEST_EXCLUSIVE_DATABASE_URL: postgres://plombir_git:plombir_git@127.0.0.1:5432/plombir_git_exclusive
         run: cargo test -p rg-db-migration -j 6 --lib the_reference_installs_over_orphans_on_a_server_database -- --ignored --nocapture
 
+      # After the step above, on the same database: it carries the exclusive
+      # database on from where that one left it to just before its own migration.
+      - name: Prove the agent-run schema arrives over live tokens on PostgreSQL
+        env:
+          PLOMBIR_GIT_TEST_EXCLUSIVE_DATABASE_URL: postgres://plombir_git:plombir_git@127.0.0.1:5432/plombir_git_exclusive
+        run: cargo test -p rg-db-migration -j 6 --lib the_schema_arrives_over_live_tokens_and_profiles_on_a_server_database -- --ignored --nocapture
+
       - name: Run PostgreSQL runtime smoke
         run: cargo test -p rg-core --test multi_backend_smoke -j 6 -- --ignored --nocapture
 
@@ -697,6 +704,13 @@ jobs:
         env:
           PLOMBIR_GIT_TEST_EXCLUSIVE_DATABASE_URL: mysql://plombir_git:plombir_git@127.0.0.1:3306/plombir_git_exclusive
         run: cargo test -p rg-db-migration -j 6 --lib the_reference_installs_over_orphans_on_a_server_database -- --ignored --nocapture
+
+      # After the step above, on the same database: it carries the exclusive
+      # database on from where that one left it to just before its own migration.
+      - name: Prove the agent-run schema arrives over live tokens on MySQL
+        env:
+          PLOMBIR_GIT_TEST_EXCLUSIVE_DATABASE_URL: mysql://plombir_git:plombir_git@127.0.0.1:3306/plombir_git_exclusive
+        run: cargo test -p rg-db-migration -j 6 --lib the_schema_arrives_over_live_tokens_and_profiles_on_a_server_database -- --ignored --nocapture
 
       - name: Run MySQL runtime smoke
         run: cargo test -p rg-core --test multi_backend_smoke -j 6 -- --ignored --nocapture
