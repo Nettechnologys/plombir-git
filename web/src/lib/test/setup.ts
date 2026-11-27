@@ -1,10 +1,5 @@
 import { beforeEach, vi } from 'vitest';
 
-vi.mock('$app/stores', async () => {
-	const { pageStore } = await import('$lib/test/app');
-	return { page: pageStore };
-});
-
 vi.mock('$app/state', async () => {
 	const { pageState } = await import('$lib/test/app');
 	return {
@@ -19,7 +14,7 @@ vi.mock('$app/navigation', async () => {
 	return navigation;
 });
 
-vi.mock('$app/environment', () => ({
+vi.mock('$app/env', () => ({
 	browser: true,
 	building: false,
 	dev: false,

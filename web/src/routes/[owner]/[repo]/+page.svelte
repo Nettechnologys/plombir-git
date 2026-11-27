@@ -1,7 +1,7 @@
 <script lang="ts">
   import { copyToClipboard } from '$lib/clipboard';
-  import { page } from '$app/stores';
-  import { browser } from '$app/environment';
+  import { page } from '$app/state';
+  import { browser } from '$app/env';
   import { goto } from '$app/navigation';
   import { tick } from 'svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
@@ -22,12 +22,12 @@
   // Only the newest commit is drawn, in the bar above the file list.
   const LATEST_COMMIT = 1;
 
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
   let ref = $state('');
   let path = $state('');
-  let queryRef = $derived($page.url.searchParams.get('ref') || '');
-  let queryPath = $derived($page.url.searchParams.get('path') || '');
+  let queryRef = $derived(page.url.searchParams.get('ref') || '');
+  let queryPath = $derived(page.url.searchParams.get('path') || '');
   let entries = $state<RepoTreeEntry[]>([]);
   let branches = $state<any[]>([]);
   let commits = $state<any[]>([]);
@@ -89,7 +89,7 @@
     const normalizedPath = nextPath ? nextPath.replace(/\/+/g, '/') : '';
     ref = nextRef;
     path = normalizedPath;
-    goto(`/${owner}/${repo}${buildRepoQuery(nextRef, normalizedPath)}`, { replaceState: true });
+    goto(`/${owner}/${repo}${buildRepoQuery(nextRef, normalizedPath)}`, { replace: true });
   }
 
   function buildTreeHref(nextRef: string, nextPath: string) {

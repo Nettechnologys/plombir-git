@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { allowedUserLabel, ciEnvironments, parseStringList, type CiEnvironment } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
@@ -9,7 +9,7 @@
   const t = createT();
   const confirmer = createConfirmer();
 
-  const owner = $derived($page.params.owner!); const repo = $derived($page.params.repo!);
+  const owner = $derived(page.params.owner!); const repo = $derived(page.params.repo!);
   let items = $state<CiEnvironment[]>([]); let name = $state('production'); let isProtected = $state(true);
   let required = $state(1); let approvers = $state(''); let error = $state(''); let editingId = $state<number | null>(null); let saving = $state(false);
   let busyRows = $state<Set<string>>(new Set());

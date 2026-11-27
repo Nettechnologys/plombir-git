@@ -1,4 +1,5 @@
 import { sveltekit } from '@sveltejs/kit/vite';
+import kitConfig from './kit.config.js';
 import { defineConfig } from 'vitest/config';
 
 // `environment: 'jsdom'` is the point of this file. `src/lib/utils/markdown.ts`
@@ -10,7 +11,7 @@ import { defineConfig } from 'vitest/config';
 // development proxy while still compiling `.svelte` files and resolving Kit's
 // virtual `$app/*` modules.
 export default defineConfig({
-	plugins: [sveltekit()],
+	plugins: [sveltekit(kitConfig)],
 	resolve: {
 		conditions: ['browser'],
 	},

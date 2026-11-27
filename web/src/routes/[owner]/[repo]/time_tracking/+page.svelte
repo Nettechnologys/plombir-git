@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { issues, timeTracking } from '$lib/api/client.svelte';
   import {
@@ -14,8 +14,8 @@
   const t = createT();
   const confirmer = createConfirmer();
 
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
   // Logging and deleting time are `RepoWrite` (card_270a0a77fd79).
   const permission = viewerPermission(() => owner, () => repo);
   const canWrite = $derived(permission.canWrite);

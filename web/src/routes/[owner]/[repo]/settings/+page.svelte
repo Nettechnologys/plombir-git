@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { goto } from '$app/navigation';
   import Modal from '$lib/components/Modal.svelte';
   import {
@@ -18,8 +18,8 @@
 
   let { data } = $props();
 
-  const owner = $derived($page.params.owner!);
-  const repo = $derived($page.params.repo!);
+  const owner = $derived(page.params.owner!);
+  const repo = $derived(page.params.repo!);
   
   let repository = $state<RepositoryDetail | null>(null);
   let loading = $state(true);

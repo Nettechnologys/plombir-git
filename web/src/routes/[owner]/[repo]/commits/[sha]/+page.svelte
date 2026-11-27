@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { repos, type CommitDiff, type CommitSignature } from '$lib/api/client.svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import DiffFileList from '$lib/components/DiffFileList.svelte';
@@ -12,9 +12,9 @@
   const t = createT();
 
   // Svelte 5 runes
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
-  let sha = $derived(($page.params as any).sha as string);
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
+  let sha = $derived((page.params as any).sha as string);
 
   let loading = $state(true);
   let error = $state<string | null>(null);

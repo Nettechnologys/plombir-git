@@ -1,6 +1,6 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import {
     buildOrganizationUpdatePayload,
@@ -24,7 +24,7 @@
 
   const t = createT();
   const confirmer = createConfirmer();
-  let name = $derived($page.params.name!);
+  let name = $derived(page.params.name!);
 
   let org = $state<Organization | null>(null);
   let teams = $state<OrganizationTeam[]>([]);

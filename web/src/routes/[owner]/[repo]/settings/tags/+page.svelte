@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { allowedUserLabel, tagProtections, buildTagProtectionPayload, type TagProtection, type TagProtectionPayload } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT } from '$lib/i18n';
@@ -21,7 +21,7 @@
       });
   }
 
-  const owner = $derived($page.params.owner!); const repo = $derived($page.params.repo!);
+  const owner = $derived(page.params.owner!); const repo = $derived(page.params.repo!);
   let items = $state<TagProtection[]>([]); let error = $state(''); let editingId = $state<number | null>(null);
   let form = $state({ pattern: '', allowed_users: '' });
   let saving = $state(false); let busyRows = $state<Set<string>>(new Set());

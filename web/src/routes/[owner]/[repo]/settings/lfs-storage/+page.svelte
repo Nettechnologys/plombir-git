@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import {
     lfsStorage,
     type LfsObject,
@@ -13,8 +13,8 @@
 
   const t = createT();
   const confirmer = createConfirmer();
-  const owner = $derived($page.params.owner!);
-  const repo = $derived($page.params.repo!);
+  const owner = $derived(page.params.owner!);
+  const repo = $derived(page.params.repo!);
 
   let usage = $state<LfsUsage | null>(null);
   let objects = $state<LfsObject[]>([]);

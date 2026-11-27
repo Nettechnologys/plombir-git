@@ -79,7 +79,7 @@ for (const [label, source] of [
   ['wiki page route', wikiPage],
   ['wiki history route', wikiHistory],
 ]) {
-  if (/decodeURIComponent\(\$page\.params\.title!\)/.test(source)) {
+  if (/decodeURIComponent\(\$?page\.params\.title!\)/.test(source)) {
     failures.push(`${label} must not decode SvelteKit title params a second time`);
   }
 }

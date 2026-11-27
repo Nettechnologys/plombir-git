@@ -6,7 +6,7 @@
   import { buildHttpCloneUrl, buildSshCloneUrl, downloadApiFile } from '$lib/api/_base';
   import { isUnavailable, optionalSection } from '$lib/optionalSection';
   import { goto } from '$app/navigation';
-  import { browser } from '$app/environment';
+  import { browser } from '$app/env';
   import { canWriteRepo } from '$lib/repoPermission';
   import type { RepoPermission } from '$lib/api/client.svelte';
   import OverflowTabs from './OverflowTabs.svelte';
@@ -169,7 +169,7 @@
           (repoInfo.owner_name !== expectedOwner || repoInfo.name !== expectedRepo)
         ) {
           void goto(movedPath(expectedOwner, expectedRepo, repoInfo.owner_name, repoInfo.name), {
-            replaceState: true,
+            replace: true,
           });
           return;
         }

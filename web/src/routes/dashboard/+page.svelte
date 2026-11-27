@@ -2,7 +2,7 @@
   import { isLoggedIn, getUser } from '$lib/stores/auth.svelte';
   import { orgs, repos, type Collaboration, type Organization } from '$lib/api/client.svelte';
   import { goto } from '$app/navigation';
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { LatestRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDate } from '$lib/i18n';
   import { isUnavailable, optionalSection } from '$lib/optionalSection';
@@ -97,7 +97,7 @@
   // worst case is a stale link creating one repository in the wrong place
   // rather than a dead end.
   $effect(() => {
-    const requested = $page.url.searchParams.get('owner');
+    const requested = page.url.searchParams.get('owner');
     if (!requested) return;
     showCreate = true;
     createOwner = requested === owner ? '' : requested;

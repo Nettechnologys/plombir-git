@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { untrack } from 'svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import BotBadge from '$lib/components/BotBadge.svelte';
@@ -16,8 +16,8 @@
 
   const t = createT();
 
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
   let prList = $state<any[]>([]);
   let loading = $state(true);
   let error = $state('');
@@ -117,7 +117,7 @@
   });
 
   function applyCreatePrefill(expectedOwner: string, expectedRepo: string, expectedRoute: number) {
-    const query = $page.url.searchParams;
+    const query = page.url.searchParams;
     if (query.get('new') !== '1') return;
     const base = query.get('base');
     const head = parseHeadRef(query.get('head') ?? '');

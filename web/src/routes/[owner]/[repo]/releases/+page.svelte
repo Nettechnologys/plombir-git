@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import {
     ApiError,
@@ -19,12 +19,12 @@
 
   const t = createT();
 
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
   // A link names one release — the API's `html_url` is `…/releases?release=<id>`,
   // and that release may be older than the first page — so the page shows it
   // alone.
-  let linkedReleaseId = $derived(linkedId($page.url.searchParams.get('release')));
+  let linkedReleaseId = $derived(linkedId(page.url.searchParams.get('release')));
 
   let releaseList = $state<any[]>([]);
   let latestPublishedId = $derived(releaseList.find((release) => !release.is_draft && !release.is_prerelease)?.id);

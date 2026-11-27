@@ -2,7 +2,7 @@
   // Tags of a repository, with delete (card_2060696224ff). Same rules as the
   // branches page: write controls for a `write`/`admin` viewer, the server's refusal
   // shown inline, and a tag a protection pattern covers disabled up front.
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import Modal from '$lib/components/Modal.svelte';
   import { repos, tagProtections } from '$lib/api/client.svelte';
@@ -13,8 +13,8 @@
 
   const t = createT();
 
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
   let tags = $state<Array<{ name: string }>>([]);
   let protections = $state<string[]>([]);
   let loading = $state(true);

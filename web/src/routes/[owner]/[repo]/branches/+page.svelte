@@ -6,7 +6,7 @@
   // in — and the server's answer (403/409 with its message) is shown inline.
   // The default branch and branches a protection rule covers are refused by the
   // server for every caller, so their Delete is disabled up front.
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import Modal from '$lib/components/Modal.svelte';
   import { branchProtections, repos } from '$lib/api/client.svelte';
@@ -18,8 +18,8 @@
 
   const t = createT();
 
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
   let branches = $state<Array<{ name: string; is_default: boolean }>>([]);
   let protections = $state<string[]>([]);
   let loading = $state(true);
