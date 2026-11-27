@@ -82,7 +82,7 @@ Paths below are relative to `crates/` unless stated otherwise.
 | MCP stdio and HTTP tools | ✅ 🔒 | `rg-mcp/`, `rg-http/src/api/mcp.rs`; REST authorization applies |
 | Repository read and write tools | ✅ 🔒 | `rg-mcp/src/tools/mod.rs`; writes use REST authorization |
 | CI tools and search | ✅ | `rg-mcp/src/tools/mod.rs`; code search needs an index |
-| AI tree endpoint | 🟡 | MCP wrapper exists; HTTP `repo_tree` currently returns 501 |
+| AI tree endpoint | ✅ 🔒 | `rg-http/src/api/ai.rs` `ai_repo_tree`, same listing as `GET /repos/{owner}/{name}/tree`; MCP `ai_repo_tree` calls it |
 | Bot accounts and scoped tokens | ✅ 🔒 | `rg-core/src/user/bots.rs`, `rg-http/src/agent_scope.rs` |
 | Agent activity audit | ✅ 🔒 | `rg-core/src/audit/audit.rs` |
 | Human approval for bot-authored PRs | ✅ 🔒 | `rg-core/src/branch_protection/service.rs` |

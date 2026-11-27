@@ -159,7 +159,7 @@ pub fn row(
         repo_id: Set(event.repo_id),
         admin_only: Set(event.admin_only),
         generation: Set(profile.generation),
-        destination_hash: Set(crate::token_digest(&user.email)),
+        destination_hash: Set(destination_hash(user, profile, channel)),
         previous_destination_encrypted: Set(None),
         previous_token_encrypted: Set(None),
         prior_locale: Set(None),
@@ -175,6 +175,29 @@ pub fn row(
         expires_at: Set(now + chrono::Duration::hours(24)),
         completed_at: Set(None),
     })
+}
+
+/// Which destination a row is bound for, as the enqueue bound and the
+/// dispatcher compare it.
+///
+/// card_455022e839cc: this used to be the account's e-mail for every channel.
+/// The bound counts rows per destination ([`Kind`]), so for Telegram a new
+/// chat inherited the old chat's queue: five `NewDevice` warnings waiting for
+/// the old chat made the first warning for the new one `coalesced`, and the
+/// five were then cancelled as `destination_changed` — neither chat heard
+/// anything.
+///
+/// A Telegram destination is named by the profile's `generation`, which moves
+/// exactly when the destination does and is what the dispatcher already
+/// cancels a Telegram row on. Not the chat id: changing chat A → B → A would
+/// otherwise hand the new A the budget of A's old rows, which are cancelled
+/// all the same because their generation is stale. Channels with no
+/// destination of their own (`none`) are overwritten by their caller.
+fn destination_hash(user: &user::Model, profile: &profile::Model, channel: &str) -> String {
+    match channel {
+        "telegram" => crate::token_digest(&format!("telegram generation {}", profile.generation)),
+        _ => crate::token_digest(&user.email),
+    }
 }
 
 /// Queued or in-flight security rows of one kind one recipient may hold.

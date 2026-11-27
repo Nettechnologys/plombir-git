@@ -2043,6 +2043,25 @@ mod tests {
 
     const GREET: &str = "name: Greet\ninputs:\n  who:\n    required: true\n  greeting:\n    default: Hello\noutputs:\n  said:\n    value: ${{ steps.say.outputs.text }}\nruns:\n  using: composite\n  steps:\n    - id: say\n      shell: sh\n      run: echo \"text=${{ inputs.greeting }} ${{ inputs.who }}\" >> \"$GITHUB_OUTPUT\"\n    - shell: sh\n      if: inputs.greeting == 'Hello'\n      run: echo polite\n";
 
+    /// `docs/why.md` lists these Gitea spellings as refused, not as resolved
+    /// some other way: a URL owner, `self:` and `builtin:` must each fail the
+    /// workflow rather than be read as an `owner/repo` on the upstream forge.
+    #[test]
+    fn gitea_only_uses_spellings_are_refused() {
+        for uses in [
+            "https://gitea.com/actions/checkout@v4",
+            "self:owner/repo@v1",
+            "self:owner/repo/.gitea/workflows/build.yml@v1",
+            "builtin:checkout",
+        ] {
+            assert!(
+                ActionReference::parse(uses).is_err(),
+                "{uses} must be refused, got {:?}",
+                ActionReference::parse(uses)
+            );
+        }
+    }
+
     #[test]
     fn references_parse_the_way_workflows_spell_them() {
         assert_eq!(ActionReference::parse("actions/checkout@v4").unwrap(), None);

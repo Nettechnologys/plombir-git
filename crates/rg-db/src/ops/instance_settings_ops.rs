@@ -42,11 +42,34 @@ pub async fn ensure_exists(db: &DatabaseConnection) -> Result<(), DbErr> {
     }
 }
 
-/// The singleton row, locked until `transaction` ends (`FOR UPDATE` on
-/// PostgreSQL and MySQL; SQLite serializes the writers instead).
+/// The singleton row, locked until `transaction` ends: `FOR UPDATE` on
+/// PostgreSQL and MySQL, the database's writer lock on SQLite.
+///
+/// card_adbe712869d6: SQLite has no row lock, and the comment here used to
+/// say it "serializes the writers instead". It does not for a transaction that
+/// reads first. SeaORM's `BEGIN` is `BEGIN DEFERRED`, so the `SELECT` below took
+/// a read snapshot and the later `UPDATE` asked to upgrade it; any commit on
+/// another connection in between — to any table — made that snapshot stale,
+/// and SQLite refused the upgrade at once with `SQLITE_BUSY_SNAPSHOT` (517),
+/// which `busy_timeout` does not cover. A settings PATCH answered 500.
+///
+/// So on SQLite the first statement is a write to the row itself: it takes
+/// the writer lock (waiting for it under `busy_timeout`, like any writer), and
+/// the read after it can no longer be overtaken. A missing row makes the write
+/// a no-op that still holds the lock. See `rg_db::contention` for the class.
 pub async fn find_for_update(
     transaction: &DatabaseTransaction,
 ) -> Result<Option<instance_settings::Model>, DbErr> {
+    if transaction.get_database_backend() == DatabaseBackend::Sqlite {
+        Entity::update_many()
+            .col_expr(
+                instance_settings::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::col(instance_settings::Column::UpdatedAt).into(),
+            )
+            .filter(instance_settings::Column::Id.eq(SINGLETON_ID))
+            .exec(transaction)
+            .await?;
+    }
     Entity::find_by_id(SINGLETON_ID)
         .lock_exclusive()
         .one(transaction)
