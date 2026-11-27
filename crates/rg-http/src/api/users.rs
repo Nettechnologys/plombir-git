@@ -989,6 +989,9 @@ pub async fn create_token(
             repository_ids: narrowing.repository_ids,
             mcp_tools: narrowing.mcp_tools,
             deny_protected_merge: narrowing.deny_protected_merge,
+            write_ref_prefix: None,
+            allow_git: false,
+            agent_run_attempt_id: None,
         },
     )
     .await

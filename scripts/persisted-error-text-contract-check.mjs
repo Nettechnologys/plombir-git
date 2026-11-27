@@ -65,6 +65,11 @@ const DECISIONS = new Set(['fixed_text', 'client_facing_message', 'owner_detail'
 
 const PERSISTED_TEXT = [
   {
+    column: 'agent_runs.failure_reason',
+    decision: 'client_facing_message',
+    why: 'why an agent run failed, shown in the issue timeline and on the bot owner\'s run page; the run lifecycle (card_231f9eb28ee3) writes client_facing_message or a fixed outcome code (`timeout`, `cancelled`, `runner_lost`), never the job log or a git chain (card_621be18a01e5)',
+  },
+  {
     column: 'import_tasks.error',
     decision: 'client_facing_message',
     why: 'import::service::failure_reason writes client_facing_message (source credentials masked) or a fixed "the import failed" line; the chain is logged with the task id (ee9360a)',

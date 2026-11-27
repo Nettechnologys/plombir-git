@@ -52,6 +52,8 @@ pub fn token_narrowing_refusal(update: &RefUpdate) -> Option<&str> {
 /// `token_kept_off_protected` is the credential's own narrowing — a personal
 /// access token kept off protected branches is refused every one of them
 /// first, whatever the rules would let its account do (card_60a80311d512).
+/// `write_ref_prefix` is the other one a token can carry: the refs it may
+/// write at all (ADR-0001 D3), enforced by receive-pack over the whole push.
 ///
 /// In order, first match wins:
 /// 1. an enabled pull mirror refuses every ref (card_97a2c0209056);
@@ -66,6 +68,7 @@ pub async fn load_receive_pack_policy(
     repo_id: i64,
     actor_id: Option<i64>,
     token_kept_off_protected: bool,
+    write_ref_prefix: Option<&str>,
 ) -> Result<PushPolicy> {
     let mut rejected_refs = Vec::new();
     if let Some(reason) = crate::mirror::write_guard::read_only_reason(db, repo_id).await? {
@@ -112,6 +115,7 @@ pub async fn load_receive_pack_policy(
         fast_forward_only_refs,
         foreign_locks,
         undeletable_refs,
+        write_ref_scope: write_ref_prefix.map(str::to_owned),
     })
 }
 

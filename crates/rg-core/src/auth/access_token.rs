@@ -34,6 +34,15 @@ pub struct NewAccessToken {
     /// Comma-separated MCP tools the token is confined to, if any.
     pub mcp_tools: Option<String>,
     pub deny_protected_merge: bool,
+    /// The refs the token may write, when it is confined to some: a value
+    /// ending in `/` admits the refs under it, any other one exactly that ref
+    /// (ADR-0001 D3). Only a token issued for an agent run carries one.
+    pub write_ref_prefix: Option<String>,
+    /// Whether a token confined to MCP tools may also use the git transport.
+    pub allow_git: bool,
+    /// The agent run attempt the token is issued for; deleting the run
+    /// deletes the token.
+    pub agent_run_attempt_id: Option<i64>,
 }
 
 /// A freshly issued token: the raw credential, shown to its owner once and
@@ -75,6 +84,9 @@ pub async fn issue(db: &DatabaseConnection, new: NewAccessToken) -> Result<Issue
         repo_restricted: Set(new.repository_ids.is_some()),
         mcp_tools: Set(new.mcp_tools),
         deny_protected_merge: Set(new.deny_protected_merge),
+        write_ref_prefix: Set(new.write_ref_prefix),
+        allow_git: Set(new.allow_git),
+        agent_run_attempt_id: Set(new.agent_run_attempt_id),
     };
     let token =
         rg_db::ops::token_ops::create(db, model, new.repository_ids.as_deref().unwrap_or_default())

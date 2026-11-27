@@ -274,6 +274,7 @@ mod tracked_ref_operation_tests {
             token_id: Some(11),
             mcp_tool: Some("create_branch".into()),
             deny_protected_writes: true,
+            write_ref_prefix: Some("refs/heads/agent/bot/".into()),
         };
         let observed = rg_core::auth::credential_context::scope(context.clone(), async {
             super::run_tracked_ref_operation(&tracker, async {

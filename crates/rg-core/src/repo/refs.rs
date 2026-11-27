@@ -88,6 +88,17 @@ pub async fn change_ref(
     old_sha: &str,
     new_sha: &str,
 ) -> Result<RefUpdate> {
+    // A token confined to some refs is refused any other here, as a 403 the
+    // audit log records — every ref this module moves passes through this
+    // function. It is the server's own door, so the scope is checked by the
+    // door rather than handed to the policy below as a push's would be.
+    crate::auth::credential_context::refuse_ref_outside_write_scope(
+        db,
+        repo_id,
+        refname,
+        new_sha == NULL_SHA,
+    )
+    .await?;
     let token_kept_off_protected = crate::auth::credential_context::current()
         .is_some_and(|context| context.deny_protected_writes);
     let policy = crate::branch_protection::push_rules::load_receive_pack_policy(
@@ -95,6 +106,7 @@ pub async fn change_ref(
         repo_id,
         actor_id,
         token_kept_off_protected,
+        None,
     )
     .await
     .context("load push policy")?;
