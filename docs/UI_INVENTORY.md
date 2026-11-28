@@ -346,24 +346,24 @@ succeed and which must be denied.
 
 | Control | Source | Call | `Access` | test |
 |---|---|---|---|---|
-| i18n:common.loading | :422 | `PATCH /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoWrite` | rust+web |
-| i18n:common.saving | :465 | `PATCH /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}` | `RepoAdmin` | web+browser |
-| i18n:issues.comment_placeholder | :482 | `POST /api/v1/repos/{owner}/{name}/issues/{number}/comments` | `RepoAuthRead` | rust+browser |
-| i18n:issues.comment_placeholder | :482 | `GET /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoRead` | rust+web+browser |
-| i18n:issues.comment_placeholder | :482 | `GET /api/v1/repos/{owner}/{name}/issues/{number}/comments` | `RepoRead` | rust+web+browser |
-| i18n:issues.comment_placeholder | :482 | `GET /api/v1/repos/{owner}/{name}/milestones` | `RepoRead` | rust+web+browser |
-| i18n:issues.comment_placeholder | :482 | `GET /api/v1/repos/{owner}/{name}/collaborators` | `RepoRead` | rust+web+browser |
-| i18n:issues.comment_placeholder | :482 | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web+smoke |
-| i18n:issues.comment_placeholder | :482 | `GET /api/v1/repos/{owner}/{name}/labels` | `RepoRead` | rust+web |
-| i18n:issues.close_issue | :487 | `PATCH /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoWrite` | rust+web+browser |
-| i18n:issues.close_issue | :487 | `GET /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoRead` | rust+web |
-| i18n:issues.close_issue | :487 | `GET /api/v1/repos/{owner}/{name}/issues/{number}/comments` | `RepoRead` | rust+web |
-| i18n:issues.close_issue | :487 | `GET /api/v1/repos/{owner}/{name}/milestones` | `RepoRead` | rust+web |
-| i18n:issues.close_issue | :487 | `GET /api/v1/repos/{owner}/{name}/collaborators` | `RepoRead` | rust+web |
-| i18n:issues.close_issue | :487 | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web+smoke |
-| i18n:issues.close_issue | :487 | `GET /api/v1/repos/{owner}/{name}/labels` | `RepoRead` | rust+web |
-| i18n:common.deleting | :516 | `DELETE /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}` | `RepoAdmin` | rust+web+browser |
-| i18n:common.deleting | :532 | `DELETE /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoAdmin` | web+browser |
+| i18n:common.loading | :436 | `PATCH /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoWrite` | rust+web |
+| i18n:common.saving | :479 | `PATCH /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}` | `RepoAdmin` | web+browser |
+| i18n:issues.comment_placeholder | :496 | `POST /api/v1/repos/{owner}/{name}/issues/{number}/comments` | `RepoAuthRead` | rust+browser |
+| i18n:issues.comment_placeholder | :496 | `GET /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoRead` | rust+web+browser |
+| i18n:issues.comment_placeholder | :496 | `GET /api/v1/repos/{owner}/{name}/issues/{number}/comments` | `RepoRead` | rust+web+browser |
+| i18n:issues.comment_placeholder | :496 | `GET /api/v1/repos/{owner}/{name}/milestones` | `RepoRead` | rust+web+browser |
+| i18n:issues.comment_placeholder | :496 | `GET /api/v1/repos/{owner}/{name}/collaborators` | `RepoRead` | rust+web+browser |
+| i18n:issues.comment_placeholder | :496 | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web+smoke |
+| i18n:issues.comment_placeholder | :496 | `GET /api/v1/repos/{owner}/{name}/labels` | `RepoRead` | rust+web |
+| i18n:issues.close_issue | :501 | `PATCH /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoWrite` | rust+web+browser |
+| i18n:issues.close_issue | :501 | `GET /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoRead` | rust+web |
+| i18n:issues.close_issue | :501 | `GET /api/v1/repos/{owner}/{name}/issues/{number}/comments` | `RepoRead` | rust+web |
+| i18n:issues.close_issue | :501 | `GET /api/v1/repos/{owner}/{name}/milestones` | `RepoRead` | rust+web |
+| i18n:issues.close_issue | :501 | `GET /api/v1/repos/{owner}/{name}/collaborators` | `RepoRead` | rust+web |
+| i18n:issues.close_issue | :501 | `GET /api/v1/repos/{owner}/{name}` | `RepoRead` | rust+web+smoke |
+| i18n:issues.close_issue | :501 | `GET /api/v1/repos/{owner}/{name}/labels` | `RepoRead` | rust+web |
+| i18n:common.deleting | :530 | `DELETE /api/v1/repos/{owner}/{name}/issues/comments/{comment_id}` | `RepoAdmin` | rust+web+browser |
+| i18n:common.deleting | :546 | `DELETE /api/v1/repos/{owner}/{name}/issues/{number}` | `RepoAdmin` | web+browser |
 | toggleStar | `RepoHeader` | `PUT /api/v1/repos/{owner}/{name}/star` | `RepoAuthRead` | rust+web+smoke |
 | toggleStar | `RepoHeader` | `GET /api/v1/repos/{owner}/{name}/starred` | `RepoAuthRead` | rust+web |
 | 👁 | `RepoHeader` | `DELETE /api/v1/repos/{owner}/{name}/watch` | `RepoAuthRead` | rust+web |
@@ -1254,7 +1254,7 @@ succeed and which must be denied.
 | i18n:agents.token_name | :318 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
 | i18n:agents.revoking | :374 | `DELETE /api/v1/users/bots/{bot}/tokens/{id}` | `User` | web |
 | i18n:agents.revoking | :374 | `GET /api/v1/users/bots/{bot}/tokens` | `User` | rust+web |
-| i18n:agents.profile.enabled | `AgentProfilePanel` | `PUT /api/v1/users/bots/{bot}/agent` | `User` | web |
+| i18n:agents.profile.enabled | `AgentProfilePanel` | `PUT /api/v1/users/bots/{bot}/agent` | `User` | rust+web |
 | i18n:agents.deleting | `AgentProfilePanel` | `DELETE /api/v1/users/bots/{bot}/agent` | `User` | web |
 | _(page load)_ | — | `GET /api/v1/users/bots/{bot}/agent` | `User` | rust+web |
 | _(page load)_ | — | `GET /api/v1/instance` | `Public` | rust+web+smoke |

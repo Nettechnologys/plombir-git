@@ -1361,7 +1361,7 @@ async fn claim_dispatched_job(
 ) -> Result<bool, Response> {
     // An agent run's token is written by the claim that wins, in its own
     // transaction: a poller that lost never wrote one (card_47195d097b79).
-    let hand_out = run_token.cloned().map(rg_core::agent::job::hand_out);
+    let hand_out = run_token.map(|token| rg_core::agent::job::hand_out(token.clone()));
     match rg_db::ops::pipeline_ops::assign_job_with_mask_snapshot(
         &state.db,
         job_id,

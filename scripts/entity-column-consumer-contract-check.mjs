@@ -186,23 +186,11 @@ const ALLOWED_WITHOUT_CONSUMER = new Map([
       'variants of one version from colliding; no Rust has to read it back for that to work',
   ],
   [
-    'agent_run.trigger_key',
-    'the database reads it. It carries the UNIQUE index of `m20261127_000001_agent_runs`, which is ' +
-      'how a second delivery of one assignment or mention inserts no second run (ADR-0001 D12); ' +
-      'the event that asks for a run names it, and nothing has to read it back for that to hold',
-  ],
-  [
     'agent_run.iteration',
     'written as 1 by the first run of an issue (`rg_core::agent::run`). Its reader is the iteration ' +
       'limit of ADR-0001 D9 and the review-driven iterations of D11 (card_b391e92474a0, ' +
       'card_5123a85574c3), which count runs on one pull request by it; until they land nothing ' +
       'starts a second iteration to count',
-  ],
-  [
-    'agent_run_attempt.attempt',
-    'the database reads it. `(run_id, attempt)` is UNIQUE in `m20261127_000001_agent_runs`, so a ' +
-      'lost runner is a new numbered row and never an overwrite. The first code reader is the ' +
-      'next attempt after a lost runner (card_4e61d764c20c), which numbers itself from it',
   ],
 ]);
 

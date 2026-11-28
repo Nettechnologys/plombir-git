@@ -691,6 +691,7 @@
       "access": "User",
       "handler": "api::agent_profiles::put_agent_profile",
       "testedIn": [
+        "rust",
         "web"
       ],
       "reachedFromUi": true
@@ -10043,7 +10044,7 @@
         {
           "tag": "select",
           "label": "i18n:issues.unassigned",
-          "line": 405,
+          "line": 416,
           "via": null,
           "href": null,
           "handler": null,
@@ -10053,7 +10054,7 @@
         {
           "tag": "select",
           "label": "· `, undefined, formatTranslationFallback(milestone.state))}",
-          "line": 414,
+          "line": 425,
           "via": null,
           "href": null,
           "handler": null,
@@ -10063,7 +10064,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 422,
+          "line": 436,
           "via": null,
           "href": null,
           "handler": "saveLinks",
@@ -10088,7 +10089,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 453,
+          "line": 467,
           "via": null,
           "href": null,
           "handler": "() => startEdit(comment)",
@@ -10098,7 +10099,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 454,
+          "line": 468,
           "via": null,
           "href": null,
           "handler": "() => askDeleteComment(comment)",
@@ -10108,7 +10109,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 460,
+          "line": 474,
           "via": null,
           "href": null,
           "handler": null,
@@ -10118,7 +10119,7 @@
         {
           "tag": "button",
           "label": "i18n:common.saving",
-          "line": 465,
+          "line": 479,
           "via": null,
           "href": null,
           "handler": "() => saveEdit(comment)",
@@ -10146,7 +10147,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 468,
+          "line": 482,
           "via": null,
           "href": null,
           "handler": "cancelEdit",
@@ -10156,7 +10157,7 @@
         {
           "tag": "form",
           "label": "i18n:issues.comment_placeholder",
-          "line": 482,
+          "line": 496,
           "via": null,
           "href": null,
           "handler": "handleComment",
@@ -10285,7 +10286,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 483,
+          "line": 497,
           "via": null,
           "href": null,
           "handler": null,
@@ -10295,7 +10296,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.comment",
-          "line": 485,
+          "line": 499,
           "via": null,
           "href": null,
           "handler": null,
@@ -10305,7 +10306,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.close_issue",
-          "line": 487,
+          "line": 501,
           "via": null,
           "href": null,
           "handler": "toggleState",
@@ -10419,7 +10420,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.delete.button",
-          "line": 499,
+          "line": 513,
           "via": null,
           "href": null,
           "handler": "() => { issueDeleteOpen = true; issueDeleteError = ''; }",
@@ -10429,7 +10430,7 @@
         {
           "tag": "button",
           "label": "i18n:common.deleting",
-          "line": 516,
+          "line": 530,
           "via": null,
           "href": null,
           "handler": "confirmDeleteComment",
@@ -10458,7 +10459,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 519,
+          "line": 533,
           "via": null,
           "href": null,
           "handler": "closeDeleteComment",
@@ -10468,7 +10469,7 @@
         {
           "tag": "button",
           "label": "i18n:common.deleting",
-          "line": 532,
+          "line": 546,
           "via": null,
           "href": null,
           "handler": "confirmDeleteIssue",
@@ -10496,7 +10497,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 535,
+          "line": 549,
           "via": null,
           "href": null,
           "handler": "closeDeleteIssue",
@@ -28649,6 +28650,7 @@
               "handler": "api::agent_profiles::put_agent_profile",
               "matched": true,
               "testedIn": [
+                "rust",
                 "web"
               ]
             }

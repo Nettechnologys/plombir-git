@@ -42,15 +42,15 @@
   let assigneeOptions = $state<Array<{ id: number; label: string }>>([]);
   /** The collaborators that are bots, which may be agents (ADR-0001 D7). */
   let botIds = $state<Set<number>>(new Set());
-  let warnUntrustedAuthor = $derived(
-    issue !== null &&
-      agentReadsUntrustedAuthor(linkForm, issue.assignee_id, botIds, issue.author_can_write),
-  );
   let loading = $state(true);
   let mutationBusy = $state(false);
   let error = $state('');
   let newComment = $state('');
   let linkForm = $state<IssueLinksFormState>({ assigneeId: '', milestoneId: '' });
+  let warnUntrustedAuthor = $derived(
+    issue !== null &&
+      agentReadsUntrustedAuthor(linkForm, issue.assignee_id, botIds, issue.author_can_write),
+  );
   const issueRequests = new LatestRepositoryResourceRequestFence<number>();
   let routeGeneration = 0;
 
