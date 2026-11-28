@@ -1,32 +1,8 @@
 import { vi } from 'vitest';
 
-type TestPage = {
-	data: Record<string, unknown>;
-	params: Record<string, string>;
-	route: { id: string | null };
-	state: Record<string, unknown>;
-	status: number;
-	url: URL;
-};
+import { pageState } from './page-state.svelte';
 
-const subscribers = new Set<(page: TestPage) => void>();
-
-export const pageState: TestPage = {
-	data: {},
-	params: {},
-	route: { id: null },
-	state: {},
-	status: 200,
-	url: new URL('https://plombir-git.test/'),
-};
-
-export const pageStore = {
-	subscribe(run: (page: TestPage) => void): () => void {
-		subscribers.add(run);
-		run(pageState);
-		return () => subscribers.delete(run);
-	},
-};
+export { pageState };
 
 export function setTestPage(
 	path: string,
@@ -41,7 +17,6 @@ export function setTestPage(
 		status: 200,
 		url: new URL(path, 'https://plombir-git.test'),
 	});
-	for (const run of subscribers) run(pageState);
 }
 
 export const navigation = {

@@ -274,6 +274,8 @@ mod tracked_ref_operation_tests {
             token_id: Some(11),
             mcp_tool: Some("create_branch".into()),
             deny_protected_writes: true,
+            write_ref_prefix: Some("refs/heads/agent/bot/".into()),
+            agent_run_attempt_id: Some(13),
         };
         let observed = rg_core::auth::credential_context::scope(context.clone(), async {
             super::run_tracked_ref_operation(&tracker, async {
@@ -362,12 +364,24 @@ impl AppState {
     /// `delivery_tracker()` is what the shutdown drain in [`run`] awaits, so a
     /// SIGTERM in the next few seconds cannot sever the work silently
     /// (card_8d4148774f32).
+    ///
+    /// `origin` says whether an agent run made the moves (ADR-0001 D4), and
+    /// it is a parameter rather than something this helper reads because the
+    /// hooks run detached: decide it where the write was made — from the
+    /// credential that made it, or [`rg_core::push_hooks::PushOrigin::of_current_credential`]
+    /// inside the request — and an agent's write never becomes a person's on
+    /// the way here.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the push itself, who made it and on whose behalf"
+    )]
     pub fn spawn_post_push_hooks(
         &self,
         repo_path: PathBuf,
         owner: String,
         repo_name: String,
         pusher_id: Option<i64>,
+        origin: rg_core::push_hooks::PushOrigin,
         ref_updates: Vec<rg_git::protocol::receive_pack::RefUpdate>,
     ) {
         if ref_updates.is_empty() {
@@ -379,7 +393,15 @@ impl AppState {
 
         self.delivery_tracker.spawn(async move {
             context
-                .run(&db, &repo_path, &owner, &repo_name, pusher_id, &ref_updates)
+                .run_with_origin(
+                    &db,
+                    &repo_path,
+                    &owner,
+                    &repo_name,
+                    pusher_id,
+                    origin,
+                    &ref_updates,
+                )
                 .await;
         });
     }
@@ -409,6 +431,8 @@ impl AppState {
             + 'static,
     {
         let state = self.clone();
+        // Decided here, in the request, before the operation is detached.
+        let origin = rg_core::push_hooks::PushOrigin::of_current_credential();
         self.tracked_ref_operation(async move {
             let update = operation.await?;
             state.spawn_post_push_hooks(
@@ -416,6 +440,7 @@ impl AppState {
                 owner,
                 repo_name,
                 Some(pusher_id),
+                origin,
                 vec![update.clone()],
             );
             Ok(update)
@@ -496,6 +521,16 @@ impl AppState {
 
     /// This process's CI wiring, in the borrowed form a pipeline-triggering
     /// path takes (the merge queue, the pull-request trigger).
+    /// What an assignment to a bot needs to start an agent run
+    /// (`rg_core::agent::run`).
+    pub fn agent_run_launcher(&self) -> rg_core::agent::run::AgentRunLauncher<'_> {
+        rg_core::agent::run::AgentRunLauncher {
+            enabled: self.agents_enabled,
+            repo_root: &self.repo_root,
+            ci: self.pipeline_ci(),
+        }
+    }
+
     pub fn pipeline_ci(&self) -> rg_core::pull_request::ci::PipelineCi<'_> {
         rg_core::pull_request::ci::PipelineCi {
             trigger: &*self.ci_engine,

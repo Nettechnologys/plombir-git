@@ -301,23 +301,44 @@ pub async fn list_tree(
     Path((owner, repo)): Path<(String, String)>,
     Query(params): Query<TreeQuery>,
 ) -> impl IntoResponse {
-    // H-02: Validate owner/repo before constructing repository path
-    if let Err(e) = rg_core::platform::validate_repo_path(&owner) {
-        return AppError::bad_request(e.to_string()).into_response();
-    }
-    if let Err(e) = rg_core::platform::validate_repo_path(&repo) {
-        return AppError::bad_request(e.to_string()).into_response();
-    }
+    tree_listing_response(&state, &owner, &repo, params.r#ref, params.path).await
+}
 
-    // H-01: Auth check for private repos
+/// The directory listing both tree doors answer with: the REST
+/// `GET /repos/{owner}/{name}/tree` and the agent-facing
+/// `GET /ai/repos/{owner}/{name}/tree`.
+///
+/// One body for both, because the agent door used to be a mounted `501`
+/// stub (card_7fe0684198fc): the route, the OpenAPI entry and the MCP tool
+/// all promised a tree, and every call answered "not yet implemented" in a
+/// `{"error": "..."}` shape no client could branch on. Sharing the reader
+/// also shares its typed outcomes — empty repository, HEAD without a branch,
+/// malformed ref — so the two doors cannot drift apart again.
+///
+/// The caller has already passed its own access gate; this does no
+/// authorization of its own.
+pub(crate) async fn tree_listing_response(
+    state: &AppState,
+    owner: &str,
+    repo: &str,
+    git_ref: Option<String>,
+    sub_path: Option<String>,
+) -> axum::response::Response {
+    // H-02: Validate owner/repo before constructing repository path
+    if let Err(e) = rg_core::platform::validate_repo_path(owner) {
+        return AppError::bad_request(e.to_string()).into_response();
+    }
+    if let Err(e) = rg_core::platform::validate_repo_path(repo) {
+        return AppError::bad_request(e.to_string()).into_response();
+    }
 
     let repo_path = state.repo_root.join(format!("{}/{}.git", owner, repo));
     if let Err(e) = crate::error::ensure_repository_storage(&repo_path) {
         return AppError::from(e).into_response();
     }
 
-    let git_ref = params.r#ref.unwrap_or_else(|| "HEAD".to_string());
-    let sub_path = params.path.unwrap_or_default();
+    let git_ref = git_ref.unwrap_or_else(|| "HEAD".to_string());
+    let sub_path = sub_path.unwrap_or_default();
 
     let result = rg_core::blocking::run_blocking_git("list repository tree", {
         let repo_path = repo_path.clone();
@@ -2676,6 +2697,9 @@ fn spawn_post_push_hooks_for_edit(
         owner.to_string(),
         repo.to_string(),
         Some(pusher_id),
+        // Inside the request that made the commit: an agent run's editor commit
+        // starts no pipeline by itself (ADR-0001 D4).
+        rg_core::push_hooks::PushOrigin::of_current_credential(),
         vec![rg_git::protocol::receive_pack::RefUpdate {
             old_sha: old_sha.to_string(),
             new_sha: new_sha.to_string(),

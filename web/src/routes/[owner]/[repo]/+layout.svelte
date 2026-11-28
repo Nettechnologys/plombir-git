@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { untrack, type Snippet } from 'svelte';
   import { repos, ApiError } from '$lib/api/client.svelte';
   import { getUser, isAuthReady } from '$lib/stores/auth.svelte';
@@ -8,10 +8,10 @@
 
   let { children }: { children: Snippet } = $props();
   const t = createT();
-  const owner = $derived($page.params.owner!);
-  const repo = $derived($page.params.repo!);
+  const owner = $derived(page.params.owner!);
+  const repo = $derived(page.params.repo!);
   const identity = $derived(JSON.stringify([
-    owner, repo, $page.url.pathname, $page.url.search, getUser()?.id ?? null, isAuthReady(),
+    owner, repo, page.url.pathname, page.url.search, getUser()?.id ?? null, isAuthReady(),
   ]));
   let result = $state<{ identity: string; status: number } | null>(null);
   let attempt = $state(0);

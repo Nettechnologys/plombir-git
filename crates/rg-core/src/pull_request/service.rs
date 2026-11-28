@@ -74,6 +74,29 @@ pub async fn create_pr(
             .map_err(|_| crate::error::invalid_request(format!("invalid {label} branch name")))?;
     }
 
+    // A pull request an agent run opens is that run's for good (ADR-0001 D4):
+    // the CI gate holds every head of it for a person. One run opens one pull
+    // request — a second would carry the same agent's code past the gate the
+    // first one is held by.
+    let agent_run = match crate::auth::credential_context::current()
+        .and_then(|credential| credential.agent_run_attempt_id)
+    {
+        Some(attempt_id) => {
+            let run = rg_db::ops::agent_run_ops::run_of_attempt(db, attempt_id)
+                .await?
+                .ok_or_else(|| {
+                    crate::error::forbidden("the agent run this token was issued for is gone")
+                })?;
+            if run.result_pull_request_id.is_some() {
+                return Err(crate::error::conflict(
+                    "this agent run already has its pull request",
+                ));
+            }
+            Some(run.id)
+        }
+        None => None,
+    };
+
     let target_repo = repo_entity::Entity::find_by_id(repo_id)
         .one(db)
         .await?
@@ -152,6 +175,9 @@ pub async fn create_pr(
     };
 
     let pr = insert_with_repo_number(db, repo_id, model).await?;
+    if let Some(run_id) = agent_run {
+        link_to_agent_run(db, run_id, &pr).await?;
+    }
     if let Err(error) = rg_db::ops::pr_event_ops::record(
         db,
         pr.repo_id,
@@ -393,6 +419,32 @@ where
             }
         }
     }
+}
+
+/// Record that agent run `run_id` opened `pr`, or take `pr` back.
+///
+/// Fail-closed: a pull request of an agent that the run does not name would
+/// pass the CI gate as anyone's. If the link cannot be written — another pull
+/// request of the same run won the race, or the write failed — the pull request
+/// is deleted again before anything (its `pull_request` pipeline, its
+/// webhook) has seen it, and the caller gets the error.
+async fn link_to_agent_run(db: &DatabaseConnection, run_id: i64, pr: &PullRequest) -> Result<()> {
+    let refusal =
+        match rg_db::ops::agent_run_ops::record_opened_pull_request(db, run_id, pr.id).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => crate::error::conflict("this agent run already has its pull request"),
+            Err(error) => error.context("record the pull request an agent run opened"),
+        };
+    if let Err(error) = rg_db::ops::pull_request_ops::delete_with_dependents(db, pr.id).await {
+        tracing::error!(
+            pr_id = pr.id,
+            run_id,
+            error = %format!("{error:#}"),
+            "an agent run's pull request could not be linked to its run nor deleted; \
+             its CI is not held for a person — delete it"
+        );
+    }
+    Err(refusal)
 }
 
 /// Resolve a head reference in `owner:branch` format to (head_branch, head_repo_id).
@@ -4423,6 +4475,89 @@ pub async fn disable_auto_merge(
         }
     }
     Ok(updated)
+}
+
+/// Withdraw the merge consent a person gave `pr` once an agent run has moved
+/// its head (ADR-0001 D4, card_07ec0cf0c06a): auto-merge goes off and a queued
+/// entry is cancelled, each with its timeline event.
+///
+/// The consent was for the head the person saw. The CI gate already refuses an
+/// agent's new head until a person approves it — but approving a head's CI is
+/// not approving its merge, and without this the old auto-merge would merge
+/// the new head the moment its CI is released. GitHub does the same for a push
+/// by someone without write access; a run's bot has write access, so the rule
+/// is keyed on the run instead.
+///
+/// Best-effort per half: the push is already accepted, and a half that could
+/// not be written is logged rather than stopping the other.
+pub async fn disarm_merges_after_agent_move(
+    db: &DatabaseConnection,
+    repo_root: &std::path::Path,
+    pr: &PullRequest,
+    agent_run_attempt_id: i64,
+) {
+    match pull_request_ops::disarm_auto_merge(db, pr.id).await {
+        Ok(true) => {
+            if let Err(error) = rg_db::ops::pr_event_ops::record(
+                db,
+                pr.repo_id,
+                pr.id,
+                None,
+                "auto_merge_disabled",
+                None,
+                serde_json::json!({
+                    "reason": "agent_push",
+                    "agent_run_attempt_id": agent_run_attempt_id,
+                }),
+            )
+            .await
+            {
+                tracing::error!(
+                    pr_id = pr.id,
+                    error = %format!("{error:#}"),
+                    "auto-merge was disarmed after an agent's push, but its timeline event could not be recorded"
+                );
+            }
+            tracing::info!(
+                pr_id = pr.id,
+                agent_run_attempt_id,
+                "auto-merge disarmed: an agent run moved the head it was enabled for"
+            );
+        }
+        Ok(false) => {}
+        Err(error) => tracing::error!(
+            pr_id = pr.id,
+            error = %format!("{error:#}"),
+            "auto-merge could not be disarmed after an agent's push"
+        ),
+    }
+    let repository = match rg_db::ops::repo_ops::find_by_id(db, pr.repo_id).await {
+        Ok(Some(repository)) => repository,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::error!(
+                pr_id = pr.id,
+                error = %format!("{error:#}"),
+                "the merge queue entry of a pull request an agent moved could not be checked"
+            );
+            return;
+        }
+    };
+    if let Err(error) = super::merge_queue::cancel_after_agent_move(
+        db,
+        repo_root,
+        &repository,
+        pr,
+        agent_run_attempt_id,
+    )
+    .await
+    {
+        tracing::error!(
+            pr_id = pr.id,
+            error = %format!("{error:#}"),
+            "the merge queue entry of a pull request an agent moved could not be cancelled"
+        );
+    }
 }
 
 /// Attempt an enabled auto-merge. A protection rule that refused is returned as

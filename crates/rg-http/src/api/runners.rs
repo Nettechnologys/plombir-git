@@ -466,11 +466,9 @@ pub async fn deregister(
             Json(serde_json::json!({"status": "offline"})),
         )
             .into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "runner not found"})),
-        )
-            .into_response(),
+        // The API envelope, not a bare `{"error": "..."}`: that older shape
+        // carries no `error.code` to branch on (card_7fe0684198fc sweep).
+        Ok(false) => AppError::not_found("runner not found").into_response(),
         Err(e) => {
             tracing::error!(runner_id, error = %format!("{e:#}"), "Failed to take a stopping runner offline");
             AppError::from(e).into_response()
@@ -1053,7 +1051,13 @@ async fn add_server_variables(
         variables.remove(reserved);
     }
     let mut mask_secrets = Vec::new();
-    match decrypted_repo_secrets(state, pipeline.repo_id, job.environment_id).await {
+    // An agent run's job is handed none of them (ADR-0001 D5).
+    let secrets = if rg_core::ci::receives_ci_secrets(&pipeline.trigger_type) {
+        decrypted_repo_secrets(state, pipeline.repo_id, job.environment_id).await
+    } else {
+        Ok(Vec::new())
+    };
+    match secrets {
         Ok(secrets) => {
             for (name, value) in secrets {
                 mask_secrets.push(value.clone());

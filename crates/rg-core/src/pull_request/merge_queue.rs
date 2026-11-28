@@ -247,6 +247,55 @@ pub async fn cancel(
     pr: &pull_request::Model,
     actor_id: i64,
 ) -> Result<CancelOutcome> {
+    cancel_as(
+        db,
+        repo_root,
+        repository,
+        pr,
+        Some(actor_id),
+        serde_json::json!({}),
+    )
+    .await
+}
+
+/// Take `pr` out of the queue because an agent run moved its head (ADR-0001
+/// D4, card_07ec0cf0c06a).
+///
+/// Enqueuing was a person's consent to merge the head they saw; the agent's
+/// next push is a version nobody consented to. The CI gate already holds that
+/// head until a person approves it, but approving its CI is not approving its
+/// merge, so the entry goes and the person enqueues again if they mean it. An
+/// entry a worker has already claimed merges the group it built from the
+/// earlier head and is left alone.
+pub async fn cancel_after_agent_move(
+    db: &DatabaseConnection,
+    repo_root: &Path,
+    repository: &repository::Model,
+    pr: &pull_request::Model,
+    agent_run_attempt_id: i64,
+) -> Result<CancelOutcome> {
+    cancel_as(
+        db,
+        repo_root,
+        repository,
+        pr,
+        None,
+        serde_json::json!({
+            "reason": "agent_push",
+            "agent_run_attempt_id": agent_run_attempt_id,
+        }),
+    )
+    .await
+}
+
+async fn cancel_as(
+    db: &DatabaseConnection,
+    repo_root: &Path,
+    repository: &repository::Model,
+    pr: &pull_request::Model,
+    actor_id: Option<i64>,
+    details: serde_json::Value,
+) -> Result<CancelOutcome> {
     if let Some(canceled_entry) = merge_queue_ops::cancel(db, pr.id).await? {
         // The conditional write above has committed: this entry is `canceled`
         // and no retry can reach it again — a second `DELETE` reads the row as
@@ -261,10 +310,10 @@ pub async fn cancel(
             db,
             pr.repo_id,
             pr.id,
-            Some(actor_id),
+            actor_id,
             "merge_queue_canceled",
             None,
-            serde_json::json!({}),
+            details,
         )
         .await
         {
@@ -272,7 +321,7 @@ pub async fn cancel(
                 entry_id = canceled_entry.id,
                 pr_id = pr.id,
                 repo_id = pr.repo_id,
-                actor_id,
+                actor_id = ?actor_id,
                 error = %format!("{error:#}"),
                 "the queue entry was canceled, but its merge_queue_canceled timeline event could not be recorded"
             );

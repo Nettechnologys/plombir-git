@@ -1,0 +1,970 @@
+//! Starting an agent run from an assignment, and the token one attempt of it
+//! gets (ADR-0001 D1, D3, D6; card_b6a1860baf04, card_4d614c4480e9,
+//! card_0316854ae5c3).
+//!
+//! The checks of D6 are driven through the core, past the HTTP route: the
+//! route already refuses an assigner without write access, and a test that
+//! went through it would pass for a core that checked nothing. One test per
+//! check, each against an otherwise launchable setup, so a refusal can only
+//! come from the check it names.
+
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+
+use crate::common::{
+    build_test_app_state_with, register_full, register_user, setup_test_db, wait_for_listener,
+    StateOverrides,
+};
+
+const BOT: &str = "alice-agent";
+const PREFIX: &str = "refs/heads/agent/alice-agent/";
+const IMAGE: &str = "ghcr.io/acme/agent:1";
+const COMMAND: &str = "run-agent --task \"$PLOMBIR_TASK_FILE\"";
+
+/// What `enqueue_agent_run` was asked for.
+#[derive(Clone, Debug)]
+struct Enqueued {
+    repo_id: i64,
+    commit_sha: String,
+    ref_name: String,
+    image: String,
+    command: String,
+    timeout_secs: i64,
+    triggered_by: Option<i64>,
+}
+
+#[derive(Default)]
+struct RecordingCiEngine {
+    enqueued: Mutex<Vec<Enqueued>>,
+}
+
+impl RecordingCiEngine {
+    fn take(&self) -> Vec<Enqueued> {
+        std::mem::take(&mut *self.enqueued.lock().unwrap())
+    }
+}
+
+impl rg_core::ci::CiTrigger for RecordingCiEngine {
+    fn has_ci_config(&self, _repo_path: &Path, _commit_sha: &str) -> bool {
+        false
+    }
+
+    fn has_workflow_for_event(&self, _query: rg_core::ci::WorkflowEventQuery<'_>) -> bool {
+        false
+    }
+
+    fn trigger_pipeline<'a>(
+        &'a self,
+        _params: rg_core::ci::TriggerPipelineParams<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<i64>> + Send + 'a>> {
+        Box::pin(async { anyhow::bail!("no workflow pipeline belongs in these tests") })
+    }
+
+    fn resume_pipeline<'a>(
+        &'a self,
+        _params: rg_core::ci::ResumePipelineParams<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn enqueue_agent_run<'a>(
+        &'a self,
+        params: rg_core::ci::AgentRunPipelineParams<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<i64>> + Send + 'a>> {
+        let entry = Enqueued {
+            repo_id: params.repo_id,
+            commit_sha: params.commit_sha.to_string(),
+            ref_name: params.ref_name.to_string(),
+            image: params.image.to_string(),
+            command: params.command.to_string(),
+            timeout_secs: params.timeout_secs,
+            triggered_by: params.triggered_by,
+        };
+        let db = params.db.clone();
+        Box::pin(async move {
+            // A real row: the attempt points at its pipeline by foreign key.
+            let pipeline = rg_db::entities::pipeline::ActiveModel {
+                repo_id: Set(entry.repo_id),
+                commit_sha: Set(entry.commit_sha.clone()),
+                ref_name: Set(entry.ref_name.clone()),
+                status: Set("pending".to_string()),
+                trigger_type: Set(rg_core::ci::AGENT_RUN_EVENT.to_string()),
+                triggered_by: Set(entry.triggered_by),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await?;
+            self.enqueued.lock().unwrap().push(entry);
+            Ok(pipeline.id)
+        })
+    }
+}
+
+fn git(args: &[&str], cwd: Option<&Path>) -> String {
+    let gateway = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+    let output = gateway.run(args, cwd).unwrap();
+    assert!(output.success(), "git {args:?}: {}", output.stderr_str());
+    output.stdout_str().trim().to_string()
+}
+
+fn git_outcome(args: &[&str], cwd: Option<&Path>) -> (bool, String) {
+    let gateway = rg_git::cli_gateway::global_gateway().as_ref().unwrap();
+    let output = gateway.run(args, cwd).unwrap();
+    (output.success(), output.stderr_str().to_string())
+}
+
+struct Fixture {
+    base: String,
+    db: rg_db::DatabaseConnection,
+    state: rg_http::AppState,
+    ci: Arc<RecordingCiEngine>,
+    alice: String,
+    alice_id: i64,
+    /// A collaborator with read access only.
+    bob_id: i64,
+    bot: rg_db::entities::user::Model,
+    repo_id: i64,
+    other_repo_id: i64,
+    main_sha: String,
+    http: reqwest::Client,
+    _dir: tempfile::TempDir,
+}
+
+/// `alice/app` with one commit on `main` and issue #1, `alice/other` beside it;
+/// Alice's bot is a writer on `app` and has an enabled custom profile listing
+/// it; agents are on and CI runs in Docker. Every launch check passes.
+async fn fixture() -> Fixture {
+    let (db, dir) = setup_test_db().await;
+    let repo_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    let ci = Arc::new(RecordingCiEngine::default());
+    let mut state = build_test_app_state_with(
+        db.clone(),
+        repo_root.clone(),
+        StateOverrides {
+            ci_engine: Some(ci.clone()),
+            ..StateOverrides::default()
+        },
+    );
+    state.agents_enabled = true;
+    state.docker_enabled = true;
+    let app = rg_http::create_router_for_test(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    wait_for_listener(&addr).await;
+    let base = format!("http://{addr}");
+
+    register_user(&base, "root", "root@example.test", "Qz7$wRtm").await;
+    let (alice, alice_id) = register_full(&base, "alice", "alice@example.test").await;
+    let (_, bob_id) = register_full(&base, "bob", "bob@example.test").await;
+    let http = reqwest::Client::new();
+
+    let repo =
+        rg_core::repo::service::create_repo(&db, alice_id, "app", None, true, &repo_root, None)
+            .await
+            .unwrap();
+    let other =
+        rg_core::repo::service::create_repo(&db, alice_id, "other", None, true, &repo_root, None)
+            .await
+            .unwrap();
+    let worktree = tempfile::tempdir().unwrap();
+    let seed = |args: &[&str]| git(args, Some(worktree.path()));
+    seed(&["init", "--initial-branch=main"]);
+    seed(&["config", "user.name", "Seed"]);
+    seed(&["config", "user.email", "seed@example.test"]);
+    std::fs::write(worktree.path().join("README.md"), "seed\n").unwrap();
+    seed(&["add", "."]);
+    seed(&["commit", "-m", "seed"]);
+    let main_sha = seed(&["rev-parse", "HEAD"]);
+    for name in ["app", "other"] {
+        let bare = repo_root.join(format!("alice/{name}.git"));
+        let bare = bare.to_string_lossy().to_string();
+        seed(&["push", &bare, "main"]);
+        seed(&["push", &bare, "main:agent/alice-agent/1-fix"]);
+    }
+    for id in [repo.id, other.id] {
+        rg_db::ops::repo_ops::set_default_branch(&db, id, "main")
+            .await
+            .unwrap();
+    }
+
+    let response = http
+        .post(format!("{base}/api/v1/users/bots"))
+        .bearer_auth(&alice)
+        .json(&serde_json::json!({ "username": BOT, "display_name": "Alice's agent" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+    for (username, permission) in [(BOT, "write"), ("bob", "read")] {
+        let response = http
+            .post(format!("{base}/api/v1/repos/alice/app/collaborators"))
+            .bearer_auth(&alice)
+            .json(&serde_json::json!({ "username": username, "permission": permission }))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "add {username}");
+    }
+    let bot = rg_db::ops::user_ops::find_by_username(&db, BOT)
+        .await
+        .unwrap()
+        .expect("the bot exists");
+
+    let response = http
+        .post(format!("{base}/api/v1/repos/alice/app/issues"))
+        .bearer_auth(&alice)
+        .json(&serde_json::json!({ "title": "Fix the thing", "body": "It is broken." }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+
+    let f = Fixture {
+        base,
+        db,
+        state,
+        ci,
+        alice,
+        alice_id,
+        bob_id,
+        bot,
+        repo_id: repo.id,
+        other_repo_id: other.id,
+        main_sha,
+        http,
+        _dir: dir,
+    };
+    f.save_profile(|_| {}).await;
+    f
+}
+
+impl Fixture {
+    /// Store the bot's profile: enabled, custom, listing `alice/app`, then
+    /// whatever `change` makes of it.
+    async fn save_profile(&self, change: impl FnOnce(&mut rg_core::agent::profile::ProfileUpdate)) {
+        let mut update = rg_core::agent::profile::ProfileUpdate {
+            enabled: true,
+            preset: "custom".to_string(),
+            image: Some(IMAGE.to_string()),
+            command: Some(COMMAND.to_string()),
+            runner_tags: None,
+            model_key: rg_core::agent::profile::ModelKey::Keep,
+            timeout_secs: Some(1200),
+            max_runs_per_day: None,
+            max_iterations: None,
+            repository_ids: vec![self.repo_id],
+        };
+        change(&mut update);
+        let key = rg_core::auth::encryption::derive_key(&self.state.encryption_key);
+        rg_core::agent::profile::save(&self.db, &key, &self.bot, update)
+            .await
+            .expect("save the bot's profile");
+    }
+
+    /// Assign issue #1 to the bot as `actor`, through the core — no HTTP
+    /// route in front of it.
+    async fn assign_in_core(&self, actor: i64) {
+        self.assign_in_core_with(actor, &self.state.agent_run_launcher())
+            .await;
+    }
+
+    async fn assign_in_core_with(
+        &self,
+        actor: i64,
+        launcher: &rg_core::agent::run::AgentRunLauncher<'_>,
+    ) {
+        rg_core::issue::service::update_issue(
+            &self.state.db_pools(),
+            "alice",
+            "app",
+            1,
+            None,
+            None,
+            None,
+            None,
+            Some(Some(self.bot.id)),
+            None,
+            Some(&self.state.delivery_tracker),
+            Some(actor),
+            Some(launcher),
+        )
+        .await
+        .expect("the assignment itself succeeds");
+    }
+
+    async fn runs(&self) -> Vec<rg_db::entities::agent_run::Model> {
+        rg_db::entities::agent_run::Entity::find()
+            .all(&self.db)
+            .await
+            .unwrap()
+    }
+
+    async fn bot_comments(&self) -> Vec<String> {
+        rg_db::entities::issue_comment::Entity::find()
+            .filter(rg_db::entities::issue_comment::Column::AuthorId.eq(self.bot.id))
+            .all(&self.db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|comment| comment.body)
+            .collect()
+    }
+
+    /// The `details` of every audit row named `action`.
+    async fn audited(&self, action: &str) -> Vec<serde_json::Value> {
+        rg_db::entities::audit_log::Entity::find()
+            .filter(rg_db::entities::audit_log::Column::Action.eq(action))
+            .all(&self.db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| serde_json::from_str(row.details.as_deref().unwrap_or("null")).unwrap())
+            .collect()
+    }
+
+    /// Assigning as `actor` starts nothing, and the bot says why: `reason` in
+    /// the audit log, `phrase` in its comment.
+    async fn assert_refused(&self, actor: i64, reason: &str, phrase: &str) {
+        self.assign_in_core(actor).await;
+        let enqueued = self.ci.take();
+        assert!(
+            enqueued.is_empty(),
+            "a refused assignment ({reason}) queued a run: {enqueued:?}"
+        );
+        assert!(
+            self.runs().await.is_empty(),
+            "a refused assignment ({reason}) recorded a run"
+        );
+        let refused = self.audited("agent.run_refused").await;
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["reason"], reason, "{refused:?}");
+        assert_eq!(refused[0]["bot"], BOT);
+        let comments = self.bot_comments().await;
+        assert_eq!(comments.len(), 1, "{comments:?}");
+        assert!(
+            comments[0].contains(phrase),
+            "the bot's comment does not say why ({reason}): {}",
+            comments[0]
+        );
+    }
+
+    /// An agent run of the bot in `repo_id` with one attempt; the attempt.
+    async fn run_attempt(&self, repo_id: i64, bot_id: i64) -> i64 {
+        let now = chrono::Utc::now();
+        let run = rg_db::entities::agent_run::ActiveModel {
+            bot_id: Set(bot_id),
+            repository_id: Set(repo_id),
+            issue_id: Set(None),
+            pull_request_id: Set(None),
+            iteration: Set(1),
+            triggered_by: Set(self.alice_id),
+            trigger_key: Set(format!(
+                "test:{repo_id}:{bot_id}:{}",
+                now.timestamp_micros()
+            )),
+            status: Set("running".to_string()),
+            active: Set(Some(true)),
+            result_pull_request_id: Set(None),
+            failure_reason: Set(None),
+            write_ref_prefix: Set(Some(PREFIX.to_string())),
+            created_at: Set(now),
+            finished_at: Set(None),
+            ..Default::default()
+        }
+        .insert(&self.db)
+        .await
+        .expect("record the run");
+        rg_db::entities::agent_run_attempt::ActiveModel {
+            run_id: Set(run.id),
+            attempt: Set(1),
+            pipeline_id: Set(None),
+            created_at: Set(now),
+            finished_at: Set(None),
+            ..Default::default()
+        }
+        .insert(&self.db)
+        .await
+        .expect("record the attempt")
+        .id
+    }
+
+    async fn issue_run_token(
+        &self,
+        attempt_id: i64,
+        prefix: &str,
+    ) -> anyhow::Result<rg_core::auth::access_token::IssuedAccessToken> {
+        rg_core::auth::access_token::issue_for_agent_run(
+            &self.db,
+            rg_core::auth::access_token::AgentRunGrant {
+                bot: &self.bot,
+                repository_id: self.repo_id,
+                attempt_id,
+                write_ref_prefix: prefix,
+                timeout_secs: 1200,
+            },
+        )
+        .await
+    }
+
+    fn remote(&self, token: &str, repo: &str) -> String {
+        let host = self.base.trim_start_matches("http://");
+        format!("http://{BOT}:{token}@{host}/alice/{repo}.git")
+    }
+
+    async fn lfs_batch(
+        &self,
+        token: &str,
+        repo: &str,
+        operation: &str,
+        payload: &[u8],
+    ) -> reqwest::Response {
+        self.http
+            .post(format!(
+                "{}/api/v1/repos/alice/{repo}/lfs/objects/batch",
+                self.base
+            ))
+            .basic_auth(BOT, Some(token))
+            .header("Content-Type", "application/vnd.git-lfs+json")
+            .header("Accept", "application/vnd.git-lfs+json")
+            .json(&serde_json::json!({
+                "operation": operation,
+                "objects": [{ "oid": oid_of(payload), "size": payload.len() }],
+                "transfers": ["basic"],
+            }))
+            .send()
+            .await
+            .unwrap()
+    }
+}
+
+fn oid_of(payload: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(payload))
+}
+
+// ── Launch: the positive case and every check of D6 ────────────────────────
+
+/// A person with write access assigns the issue to a bot whose profile allows
+/// this repository: one run, one attempt, one `agent_run` pipeline built from
+/// the profile, at the default branch's head.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn assigning_an_issue_to_an_agent_queues_its_run() {
+    let f = fixture().await;
+    let response = f
+        .http
+        .patch(format!("{}/api/v1/repos/alice/app/issues/1", f.base))
+        .bearer_auth(&f.alice)
+        .json(&serde_json::json!({ "assignee": BOT }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+
+    let enqueued = f.ci.take();
+    assert_eq!(enqueued.len(), 1, "{enqueued:?}");
+    let job = &enqueued[0];
+    assert_eq!(job.repo_id, f.repo_id);
+    assert_eq!(job.commit_sha, f.main_sha);
+    assert_eq!(job.ref_name, "refs/heads/main");
+    assert_eq!((job.image.as_str(), job.command.as_str()), (IMAGE, COMMAND));
+    assert_eq!(job.timeout_secs, 1200);
+    assert_eq!(job.triggered_by, Some(f.alice_id));
+
+    let runs = f.runs().await;
+    assert_eq!(runs.len(), 1);
+    let run = &runs[0];
+    assert_eq!(run.bot_id, f.bot.id);
+    assert_eq!(run.triggered_by, f.alice_id);
+    assert_eq!(run.status, "queued");
+    assert_eq!(run.active, Some(true));
+    assert_eq!(run.write_ref_prefix.as_deref(), Some(PREFIX));
+    let attempts = rg_db::entities::agent_run_attempt::Entity::find()
+        .filter(rg_db::entities::agent_run_attempt::Column::RunId.eq(run.id))
+        .all(&f.db)
+        .await
+        .unwrap();
+    assert_eq!(attempts.len(), 1);
+    let pipeline_id = attempts[0]
+        .pipeline_id
+        .expect("the attempt names its pipeline");
+    let pipeline = rg_db::entities::pipeline::Entity::find_by_id(pipeline_id)
+        .one(&f.db)
+        .await
+        .unwrap()
+        .expect("the pipeline exists");
+    assert_eq!(pipeline.trigger_type, rg_core::ci::AGENT_RUN_EVENT);
+
+    let started = f.audited("agent.run_started").await;
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(started[0]["run_id"], run.id);
+    assert!(
+        f.bot_comments().await.is_empty(),
+        "a started run is no refusal"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agents_turned_off_on_the_instance_start_nothing() {
+    let f = fixture().await;
+    let mut launcher = f.state.agent_run_launcher();
+    launcher.enabled = false;
+    f.assign_in_core_with(f.alice_id, &launcher).await;
+    assert!(f.ci.take().is_empty());
+    assert!(f.runs().await.is_empty());
+    assert_eq!(
+        f.audited("agent.run_refused").await[0]["reason"],
+        "agents_disabled"
+    );
+    assert!(f.bot_comments().await[0].contains("turned off on this instance"));
+}
+
+/// Off, and the bot has no profile: an assignment is what it was before
+/// agents existed — no comment on every issue a bot is handed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agents_turned_off_leave_a_bot_without_a_profile_alone() {
+    let f = fixture().await;
+    rg_core::agent::profile::delete(&f.db, &f.bot)
+        .await
+        .unwrap();
+    let mut launcher = f.state.agent_run_launcher();
+    launcher.enabled = false;
+    f.assign_in_core_with(f.alice_id, &launcher).await;
+    assert!(f.ci.take().is_empty());
+    assert!(f.audited("agent.run_refused").await.is_empty());
+    assert!(f.bot_comments().await.is_empty());
+}
+
+/// Bots do not start runs, whoever owns them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bot_assigning_starts_nothing() {
+    let f = fixture().await;
+    f.assert_refused(f.bot.id, "not_a_person", "only when a person assigns me")
+        .await;
+}
+
+/// The token of an agent run is not a person either, even when its account
+/// is one: the credential is what is asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_assignment_made_with_an_agent_run_token_starts_nothing() {
+    let f = fixture().await;
+    let context = rg_core::auth::credential_context::CredentialContext {
+        user_id: f.alice_id,
+        deny_protected_writes: true,
+        write_ref_prefix: Some(PREFIX.to_string()),
+        agent_run_attempt_id: Some(1),
+        ..Default::default()
+    };
+    rg_core::auth::credential_context::scope(context, f.assign_in_core(f.alice_id)).await;
+    assert!(f.ci.take().is_empty());
+    assert_eq!(
+        f.audited("agent.run_refused").await[0]["reason"],
+        "not_a_person"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_assigner_without_write_access_starts_nothing() {
+    let f = fixture().await;
+    f.assert_refused(f.bob_id, "assigner_cannot_write", "@bob has none")
+        .await;
+}
+
+/// The phase's own words: a bot with no profile starts nothing and says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bot_without_a_profile_says_it_has_none() {
+    let f = fixture().await;
+    rg_core::agent::profile::delete(&f.db, &f.bot)
+        .await
+        .unwrap();
+    f.assert_refused(f.alice_id, "no_profile", "I have no agent profile")
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_switched_off_profile_starts_nothing() {
+    let f = fixture().await;
+    f.save_profile(|update| update.enabled = false).await;
+    f.assert_refused(f.alice_id, "profile_disabled", "switched off")
+        .await;
+}
+
+/// The owner's consent: a repository admin adding the bot is not enough.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repository_the_profile_does_not_list_starts_nothing() {
+    let f = fixture().await;
+    f.save_profile(|update| update.repository_ids = vec![f.other_repo_id])
+        .await;
+    f.assert_refused(f.alice_id, "repository_not_allowed", "not allowed me")
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bot_without_write_access_starts_nothing() {
+    let f = fixture().await;
+    let response = f
+        .http
+        .delete(format!(
+            "{}/api/v1/repos/alice/app/collaborators/{}",
+            f.base, f.bot.id
+        ))
+        .bearer_auth(&f.alice)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "remove the bot: {}",
+        response.text().await.unwrap()
+    );
+    let response = f
+        .http
+        .post(format!("{}/api/v1/repos/alice/app/collaborators", f.base))
+        .bearer_auth(&f.alice)
+        .json(&serde_json::json!({ "username": BOT, "permission": "read" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success(), "re-add the bot as a reader");
+    f.assert_refused(f.alice_id, "bot_cannot_write", "write access")
+        .await;
+}
+
+/// Only Docker (D2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_instance_without_docker_or_runners_starts_nothing() {
+    let f = fixture().await;
+    let mut launcher = f.state.agent_run_launcher();
+    launcher.ci.docker_enabled = false;
+    launcher.ci.external_runners = false;
+    f.assign_in_core_with(f.alice_id, &launcher).await;
+    assert!(f.ci.take().is_empty());
+    assert!(f.runs().await.is_empty());
+    assert_eq!(
+        f.audited("agent.run_refused").await[0]["reason"],
+        "no_docker"
+    );
+}
+
+/// One active run per bot in a repository (D9).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_assignment_while_a_run_is_live_starts_nothing() {
+    let f = fixture().await;
+    f.run_attempt(f.repo_id, f.bot.id).await;
+    f.assign_in_core(f.alice_id).await;
+    assert!(f.ci.take().is_empty());
+    assert_eq!(f.runs().await.len(), 1, "a second run was recorded");
+    assert_eq!(
+        f.audited("agent.run_refused").await[0]["reason"],
+        "run_in_progress"
+    );
+}
+
+/// A pipeline the server built itself is never rebuilt by a retry: that would
+/// skip every check above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_run_pipeline_is_not_retried() {
+    let f = fixture().await;
+    let pipeline = rg_db::entities::pipeline::ActiveModel {
+        repo_id: Set(f.repo_id),
+        commit_sha: Set(f.main_sha.clone()),
+        ref_name: Set("refs/heads/main".to_string()),
+        status: Set("failed".to_string()),
+        trigger_type: Set(rg_core::ci::AGENT_RUN_EVENT.to_string()),
+        triggered_by: Set(Some(f.alice_id)),
+        ..Default::default()
+    }
+    .insert(&f.db)
+    .await
+    .expect("record an agent run pipeline");
+    let response = f
+        .http
+        .post(format!(
+            "{}/api/v1/repos/alice/app/pipelines/{}/retry",
+            f.base, pipeline.id
+        ))
+        .bearer_auth(&f.alice)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409, "{}", response.text().await.unwrap());
+}
+
+// ── The token of one attempt ───────────────────────────────────────────────
+
+/// Every tool a run's token is confined to is one the MCP server has.
+#[test]
+fn every_run_tool_is_a_tool_the_mcp_server_implements() {
+    let known: Vec<&str> = rg_mcp::tools::tool_names().collect();
+    for tool in rg_core::agent::run::RUN_MCP_TOOLS {
+        assert!(known.contains(tool), "{tool} is no MCP tool");
+    }
+}
+
+/// What `issue_for_agent_run` mints: the attempt's, confined to one
+/// repository, the run tools and the git transport, writing only under the
+/// prefix — and gone with the attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_attempt_token_writes_under_its_prefix_only_and_goes_with_the_attempt() {
+    let f = fixture().await;
+    let attempt = f.run_attempt(f.repo_id, f.bot.id).await;
+    let issued = f.issue_run_token(attempt, PREFIX).await.unwrap();
+    let token = &issued.token;
+    assert_eq!(token.user_id, f.bot.id);
+    assert_eq!(token.agent_run_attempt_id, Some(attempt));
+    assert_eq!(token.write_ref_prefix.as_deref(), Some(PREFIX));
+    assert!(token.allow_git && token.deny_protected_merge && token.repo_restricted);
+    assert_eq!(
+        token.mcp_tools.as_deref(),
+        Some(rg_core::agent::run::RUN_MCP_TOOLS.join(",").as_str())
+    );
+    let expires = token.expires_at.expect("a run token expires");
+    let ceiling = chrono::Utc::now()
+        + chrono::Duration::seconds(1200 + rg_core::auth::access_token::AGENT_RUN_TOKEN_GRACE_SECS);
+    assert!(expires <= ceiling && expires > chrono::Utc::now() + chrono::Duration::seconds(1200));
+
+    // Clone, then push under the prefix and outside it.
+    let dir = tempfile::tempdir().unwrap();
+    let checkout = dir.path().join("app");
+    let remote = f.remote(&issued.raw, "app");
+    git(&["clone", &remote, checkout.to_str().unwrap()], None);
+    git(&["config", "user.name", "Agent"], Some(&checkout));
+    git(
+        &["config", "user.email", "agent@example.test"],
+        Some(&checkout),
+    );
+    std::fs::write(checkout.join("fix.txt"), "fix\n").unwrap();
+    git(&["add", "."], Some(&checkout));
+    git(&["commit", "-m", "fix"], Some(&checkout));
+    git(
+        &["push", &remote, "HEAD:refs/heads/agent/alice-agent/1-fix"],
+        Some(&checkout),
+    );
+    let (pushed, stderr) = git_outcome(&["push", &remote, "HEAD:refs/heads/main"], Some(&checkout));
+    assert!(!pushed, "the run token pushed to main");
+    assert!(stderr.contains("refs/heads/main"), "{stderr}");
+
+    // REST outside MCP stays closed to it.
+    let rest = f
+        .http
+        .get(format!("{}/api/v1/repos/alice/app", f.base))
+        .bearer_auth(&issued.raw)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rest.status(), 403);
+
+    // Revoking finds it; deleting the attempt finds nothing left. A second
+    // token, deleted with its attempt by the foreign key.
+    assert!(
+        rg_core::auth::access_token::revoke_for_agent_run_attempt(&f.db, attempt)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !rg_core::auth::access_token::revoke_for_agent_run_attempt(&f.db, attempt)
+            .await
+            .unwrap()
+    );
+    let reissued = f.issue_run_token(attempt, PREFIX).await.unwrap();
+    rg_db::entities::agent_run_attempt::Entity::delete_by_id(attempt)
+        .exec(&f.db)
+        .await
+        .unwrap();
+    assert!(
+        rg_db::entities::access_token::Entity::find_by_id(reissued.token.id)
+            .one(&f.db)
+            .await
+            .unwrap()
+            .is_none(),
+        "the token outlived its attempt"
+    );
+}
+
+/// The token knows its attempt, so what it writes is an agent's to the CI
+/// gate: opening a pull request links it to the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_attempt_token_is_known_for_an_agent_run_by_the_gate() {
+    let f = fixture().await;
+    let attempt = f.run_attempt(f.repo_id, f.bot.id).await;
+    let issued = f.issue_run_token(attempt, PREFIX).await.unwrap();
+    // The token is confined to MCP tools, so the pull request is opened the
+    // way an agent opens it: through the MCP endpoint's `create_pr`.
+    let response = f
+        .http
+        .post(format!("{}/api/v1/mcp", f.base))
+        .bearer_auth(&issued.raw)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "create_pr", "arguments": {
+                "owner": "alice", "repo": "app", "title": "agent work",
+                "head": "agent/alice-agent/1-fix", "base": "main",
+            }},
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["result"]["isError"], false, "{body}");
+    let run = rg_db::ops::agent_run_ops::run_of_attempt(&f.db, attempt)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        run.result_pull_request_id.is_some(),
+        "the pull request was not linked to the run"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_attempt_token_is_refused_for_anything_but_the_bots_own_run_and_branches() {
+    let f = fixture().await;
+    let attempt = f.run_attempt(f.repo_id, f.bot.id).await;
+    for prefix in ["refs/heads/main", "refs/heads/", "refs/heads/agent/bob/"] {
+        assert!(
+            f.issue_run_token(attempt, prefix).await.is_err(),
+            "a run token was issued for {prefix}"
+        );
+    }
+    // A person is no bot.
+    let alice = rg_db::ops::user_ops::find_by_id(&f.db, f.alice_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(rg_core::auth::access_token::issue_for_agent_run(
+        &f.db,
+        rg_core::auth::access_token::AgentRunGrant {
+            bot: &alice,
+            repository_id: f.repo_id,
+            attempt_id: attempt,
+            write_ref_prefix: "refs/heads/agent/alice/",
+            timeout_secs: 60,
+        },
+    )
+    .await
+    .is_err());
+    // Another repository's attempt is not this one's.
+    let elsewhere = f.run_attempt(f.other_repo_id, f.bot.id).await;
+    assert!(f.issue_run_token(elsewhere, PREFIX).await.is_err());
+    // The iteration form: exactly one branch under the prefix.
+    assert!(f
+        .issue_run_token(attempt, "refs/heads/agent/alice-agent/1-fix")
+        .await
+        .is_ok());
+}
+
+// ── Git LFS with the attempt token (card_0316854ae5c3) ─────────────────────
+
+/// `git lfs push` before receive-pack: the batch request, the upload, the
+/// download and the lock check go through; its other repository, and the rest
+/// of REST, stay closed. A token confined to MCP tools without the git
+/// transport is refused LFS as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_attempt_token_moves_lfs_objects_of_its_repository_only() {
+    let f = fixture().await;
+    let attempt = f.run_attempt(f.repo_id, f.bot.id).await;
+    let token = f.issue_run_token(attempt, PREFIX).await.unwrap().raw;
+    let payload = b"an object the agent's commit tracks in LFS";
+
+    let batch = f.lfs_batch(&token, "app", "upload", payload).await;
+    assert_eq!(batch.status(), 200, "{}", batch.text().await.unwrap());
+    let batch: serde_json::Value = batch.json().await.unwrap();
+    let upload = &batch["objects"][0]["actions"]["upload"];
+    let href = upload["href"].as_str().expect("upload href");
+    // `git lfs` sends the remote's credentials along with the object.
+    let stored = f
+        .http
+        .put(href)
+        .basic_auth(BOT, Some(&token))
+        .body(payload.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stored.status(), 200, "{}", stored.text().await.unwrap());
+
+    let batch = f.lfs_batch(&token, "app", "download", payload).await;
+    assert_eq!(batch.status(), 200);
+    let batch: serde_json::Value = batch.json().await.unwrap();
+    let href = batch["objects"][0]["actions"]["download"]["href"]
+        .as_str()
+        .expect("download href")
+        .to_string();
+    let fetched = f
+        .http
+        .get(&href)
+        .basic_auth(BOT, Some(&token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(fetched.status(), 200);
+    assert_eq!(fetched.bytes().await.unwrap().as_ref(), payload);
+
+    let verify = f
+        .http
+        .post(format!(
+            "{}/api/v1/repos/alice/app/lfs/locks/verify",
+            f.base
+        ))
+        .basic_auth(BOT, Some(&token))
+        .header("Content-Type", "application/vnd.git-lfs+json")
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(verify.status(), 200, "{}", verify.text().await.unwrap());
+
+    // Not a transfer: a lock is a person's claim on a file.
+    let lock = f
+        .http
+        .post(format!("{}/api/v1/repos/alice/app/lfs/locks", f.base))
+        .basic_auth(BOT, Some(&token))
+        .header("Content-Type", "application/vnd.git-lfs+json")
+        .json(&serde_json::json!({ "path": "big.bin" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(lock.status(), 403, "{}", lock.text().await.unwrap());
+    // Another repository: the confinement answers, as for git.
+    let elsewhere = f.lfs_batch(&token, "other", "upload", payload).await;
+    assert_eq!(
+        elsewhere.status(),
+        404,
+        "{}",
+        elsewhere.text().await.unwrap()
+    );
+    let rest = f
+        .http
+        .get(format!("{}/api/v1/repos/alice/app/issues", f.base))
+        .basic_auth(BOT, Some(&token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rest.status(), 403);
+
+    // The same narrowing without the git transport.
+    let mcp_only = rg_core::auth::access_token::issue(
+        &f.db,
+        rg_core::auth::access_token::NewAccessToken {
+            user_id: f.bot.id,
+            name: "mcp only".to_string(),
+            scopes: "repo".to_string(),
+            expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            repository_ids: Some(vec![f.repo_id]),
+            mcp_tools: Some("read_file".to_string()),
+            deny_protected_merge: true,
+            write_ref_prefix: None,
+            allow_git: false,
+            agent_run_attempt_id: None,
+        },
+    )
+    .await
+    .unwrap()
+    .raw;
+    let refused = f.lfs_batch(&mcp_only, "app", "download", payload).await;
+    assert_eq!(refused.status(), 403, "{}", refused.text().await.unwrap());
+}

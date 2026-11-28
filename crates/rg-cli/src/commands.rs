@@ -1026,6 +1026,44 @@ fn require_confidential_package_server(
     }
 }
 
+/// The upload URL `package publish` sends the file to.
+///
+/// Every value here comes from the command line, and none of them is a safe
+/// URL component as typed: an owner `a/b` adds a path segment, a repository
+/// `x?y` ends the path early, and a package name `n&version=9` rewrote the
+/// version the server saw (card_e22ad980605f). Each path value is encoded into
+/// exactly one segment — and an empty, `.` or `..` value is refused, because
+/// a client normalising the path would resolve it to a different resource —
+/// while name and version travel as properly encoded query pairs.
+fn package_publish_url(
+    server_url: &str,
+    owner: &str,
+    repo: &str,
+    pkg_type: &str,
+    name: &str,
+    version: &str,
+) -> anyhow::Result<reqwest::Url> {
+    fn segment(label: &str, value: &str) -> anyhow::Result<String> {
+        if value.is_empty() || value == "." || value == ".." {
+            anyhow::bail!("{label} must not be empty, `.` or `..` (got `{value}`)");
+        }
+        Ok(rg_core::package_registry::encode_path_segment(value))
+    }
+    let raw = format!(
+        "{}/api/v1/repos/{}/{}/packages/{}/publish",
+        server_url.trim_end_matches('/'),
+        segment("--owner", owner)?,
+        segment("--repo", repo)?,
+        segment("package type", pkg_type)?,
+    );
+    let mut url = reqwest::Url::parse(&raw)
+        .with_context(|| format!("--server-url does not form a valid upload URL: {raw}"))?;
+    url.query_pairs_mut()
+        .append_pair("name", name)
+        .append_pair("version", version);
+    Ok(url)
+}
+
 /// `plombir-git package` — package registry management (publish / list).
 pub(crate) async fn cmd_package(
     cmd: PackageCmd,
@@ -1071,17 +1109,10 @@ pub(crate) async fn cmd_package(
                 // still stops a dead/hung `--server-url` from hanging the CLI on
                 // connect forever.
                 let client = build_package_publish_client()?;
-                let url = format!(
-                    "{}/api/v1/repos/{}/{}/packages/{}/publish?name={}&version={}",
-                    server_url.trim_end_matches('/'),
-                    owner,
-                    repo,
-                    pkg_type,
-                    name,
-                    version
-                );
+                let url =
+                    package_publish_url(&server_url, &owner, &repo, &pkg_type, &name, &version)?;
                 let resp = client
-                    .post(&url)
+                    .post(url)
                     .header("Authorization", format!("Bearer {}", bearer))
                     .header(
                         "Content-Disposition",
@@ -1094,7 +1125,7 @@ pub(crate) async fn cmd_package(
                 let status = resp.status();
                 let body = resp.text().await?;
                 if status.is_success() {
-                    println!("✅ Package published: {}/{}@{}", name, name, version);
+                    println!("✅ Package published to {owner}/{repo}: {name}@{version}");
                     println!("   {}", body);
                 } else {
                     anyhow::bail!("Publish failed ({}): {}", status, body);
@@ -1408,7 +1439,7 @@ fn human_bytes(bytes: u64) -> String {
 mod tests {
     use super::{
         build_package_publish_client, cmd_list_tombstones, cmd_migrate, cmd_package,
-        cmd_revoke_instance_key, cmd_rotate_instance_key, human_bytes,
+        cmd_revoke_instance_key, cmd_rotate_instance_key, human_bytes, package_publish_url,
         require_confidential_package_server,
     };
     use crate::cli::PackageCmd;
@@ -1911,6 +1942,51 @@ mod tests {
         .unwrap();
         let request = sink.await.unwrap().to_ascii_lowercase();
         assert!(request.contains("authorization: bearer package-token"));
+        assert!(
+            request.starts_with(
+                "post /api/v1/repos/alice/project/packages/generic/publish?name=artifact&version=1.0.0 "
+            ),
+            "the upload must reach the route the arguments name: {request}"
+        );
+    }
+
+    /// card_e22ad980605f: a value the caller typed stays in its own segment.
+    /// Without the encoding `a/b` became two path segments, `x?y` cut the path
+    /// short, and `n&version=9` overrode the version the server saw.
+    #[test]
+    fn package_publish_keeps_every_caller_value_in_its_own_segment() {
+        let url = package_publish_url(
+            "https://forge.example/prefix/",
+            "own/er",
+            "re?po#x",
+            "generic",
+            "n&version=9",
+            "1.0.0",
+        )
+        .unwrap();
+        assert_eq!(
+            url.path(),
+            "/prefix/api/v1/repos/own%2Fer/re%3Fpo%23x/packages/generic/publish"
+        );
+        assert_eq!(url.fragment(), None);
+        let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("name".to_string(), "n&version=9".to_string()),
+                ("version".to_string(), "1.0.0".to_string()),
+            ]
+        );
+
+        for (owner, repo) in [("", "r"), (".", "r"), ("o", ".."), ("o", "")] {
+            let error =
+                package_publish_url("https://forge.example", owner, repo, "generic", "n", "1")
+                    .expect_err("an empty or dot segment must be refused");
+            assert!(
+                format!("{error:#}").contains("must not be empty"),
+                "{error:#}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { copyToClipboard } from '$lib/clipboard';
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { packages } from '$lib/api/client.svelte';
   import { nextYankState } from '$lib/api/packageYank';
@@ -12,12 +12,12 @@
 
   const t = createT();
 
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
   // Yanking and deleting a version are `RepoWrite` (card_270a0a77fd79).
   const permission = viewerPermission(() => owner, () => repo);
-  let format = $derived($page.params.format!);
-  let name = $derived($page.params.name!);
+  let format = $derived(page.params.format!);
+  let name = $derived(page.params.name!);
 
   type PackageFile = {
     filename: string;
@@ -186,7 +186,7 @@
       repo: repo!,
       name: name!,
       version: ver,
-      origin: $page.url.origin,
+      origin: page.url.origin,
     });
   }
 

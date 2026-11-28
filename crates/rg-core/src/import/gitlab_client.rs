@@ -539,21 +539,66 @@ impl GitLabClient {
                 return Err(super::source_api_refusal("GitLab", status, &body));
             }
 
-            // Extract pagination header BEFORE consuming resp
-            let total_pages = total_pages_from(resp.headers(), &url)?;
+            // Extract pagination headers BEFORE consuming resp
+            let next = next_page_from(resp.headers(), page, &url)?;
 
             let page_data: Vec<T> = resp.json().await?;
-            let is_last = page >= total_pages || page_data.is_empty();
+            let is_empty = page_data.is_empty();
             results.extend(page_data);
 
-            if is_last {
-                break;
+            match next {
+                Some(next) if !is_empty => page = next,
+                _ => break,
             }
-            page += 1;
         }
 
         Ok(results)
     }
+}
+
+/// Which page to ask for after `page`, or `None` when GitLab says `page` was
+/// the last one.
+///
+/// card_b898b7746070: `x-next-page` is what decides. GitLab drops `x-total`
+/// and `x-total-pages` on large collections (offset pagination past 10 000
+/// rows) but keeps sending `x-next-page`, and reading the missing count as
+/// "one page" cut every large import off after its first page while the job
+/// reported success. A present-but-empty `x-next-page` is GitLab's own "this
+/// was the last page".
+///
+/// Only a response with no `x-next-page` at all falls back to the count, so a
+/// server (or a proxy) that sends just `x-total-pages` is still walked to the
+/// end, and one that sends neither is a single page.
+///
+/// A next page that does not move forward is refused rather than followed: a
+/// source repeating `x-next-page: 1` would otherwise keep the import asking
+/// for the same page forever.
+fn next_page_from(
+    headers: &reqwest::header::HeaderMap,
+    page: i64,
+    url: &str,
+) -> Result<Option<i64>> {
+    let Some(value) = headers.get("x-next-page") else {
+        let total_pages = total_pages_from(headers, url)?;
+        return Ok((page < total_pages).then_some(page + 1));
+    };
+    let value = value.to_str().map_err(|_| {
+        anyhow::anyhow!("GitLab sent an `x-next-page` header that is not valid text for {url}")
+    })?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let next: i64 = value.parse().map_err(|_| {
+        anyhow::anyhow!("GitLab sent an unreadable `x-next-page` header for {url}: {value:?}")
+    })?;
+    if next <= page {
+        anyhow::bail!(
+            "GitLab sent `x-next-page: {next}` on page {page} of {url}; \
+             the next page must come after the current one"
+        );
+    }
+    Ok(Some(next))
 }
 
 /// How many pages GitLab says the collection has, or an error if it said
@@ -561,8 +606,9 @@ impl GitLabClient {
 ///
 /// card_47f5114a92bc: absent and unreadable are different answers and only one
 /// of them means "one page". GitLab legitimately omits `x-total-pages` — it
-/// stops counting past the offset-pagination limit — so an absent header has to
-/// go on meaning a single page. A header that is *present* and cannot be
+/// stops counting past the offset-pagination limit — and this count is only
+/// consulted when `x-next-page` is missing too (see [`next_page_from`]), so an
+/// absent header there means a single page. A header that is *present* and cannot be
 /// decoded or parsed is the source or a proxy in between failing its own
 /// protocol, and reading it as `1` used to end the import there: every later
 /// page silently missing from a job that reported success, which is exactly the
@@ -696,6 +742,87 @@ mod pagination_tests {
             requests[0].contains("page=1") && requests[1].contains("page=2"),
             "each page must be asked for once: {requests:?}"
         );
+    }
+
+    /// card_b898b7746070: past the offset-pagination limit GitLab stops sending
+    /// `x-total-pages` but keeps `x-next-page`. Reading the missing count as
+    /// "one page" dropped everything after page one; the next-page header is
+    /// what has to decide, and its empty value is the end.
+    #[tokio::test]
+    async fn a_next_page_header_is_followed_without_a_total_count() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let second_member = MEMBER_PAGE
+            .replace("\"id\":1", "\"id\":2")
+            .replace("ada", "grace");
+        let server = tokio::spawn(serve(
+            listener,
+            vec![
+                respond(b"x-next-page: 2\r\nx-page: 1\r\n", MEMBER_PAGE),
+                respond(b"x-next-page: \r\nx-page: 2\r\n", &second_member),
+            ],
+        ));
+
+        let client =
+            GitLabClient::new_for_trusted_test("token".to_owned(), format!("http://{addr}"))
+                .expect("build client");
+        let members = client
+            .list_members("group/widgets")
+            .await
+            .expect("an uncounted two-page collection imports whole");
+
+        let ids: Vec<i64> = members.iter().map(|m| m.id).collect();
+        assert_eq!(ids, [1, 2], "x-next-page promised a second page");
+        let requests = server.await.expect("server");
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].contains("page=1") && requests[1].contains("page=2"),
+            "each page must be asked for once: {requests:?}"
+        );
+    }
+
+    /// An empty `x-next-page` ends the walk even where a stale count promises
+    /// more, and a next page that does not move forward fails the import
+    /// instead of asking for the same page forever.
+    #[tokio::test]
+    async fn the_next_page_header_wins_over_the_count_and_must_advance() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let server = tokio::spawn(serve(
+            listener,
+            vec![respond(
+                b"x-next-page: \r\nx-total-pages: 3\r\n",
+                MEMBER_PAGE,
+            )],
+        ));
+        let client =
+            GitLabClient::new_for_trusted_test("token".to_owned(), format!("http://{addr}"))
+                .expect("build client");
+        let members = client
+            .list_members("group/widgets")
+            .await
+            .expect("last page");
+        assert_eq!(members.len(), 1);
+        assert_eq!(server.await.expect("server").len(), 1);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let server = tokio::spawn(serve(
+            listener,
+            vec![respond(b"x-next-page: 1\r\n", MEMBER_PAGE)],
+        ));
+        let client =
+            GitLabClient::new_for_trusted_test("token".to_owned(), format!("http://{addr}"))
+                .expect("build client");
+        let error = client
+            .list_members("group/widgets")
+            .await
+            .expect_err("a next page that repeats the current one must not be followed");
+        assert!(
+            format!("{error:#}").contains("x-next-page"),
+            "the failure must name the header: {error:#}"
+        );
+        assert_eq!(server.await.expect("server").len(), 1);
     }
 
     /// card_ba4dab292b1c: GitLab lists notes newest first unless told

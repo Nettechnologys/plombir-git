@@ -6,6 +6,39 @@ This project records user-facing changes here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- With `[agents] enabled = true`, assigning an issue to a bot whose agent
+  profile lists the repository queues an `agent_run` pipeline built from the
+  profile. Only a person with write access starts one, the bot must be a
+  writer and the instance must run CI in Docker or on external runners; any
+  refusal is a comment from the bot and an `agent.run_refused` audit row. The
+  run's job is handed none of the repository's CI secrets, and its pipeline
+  cannot be retried.
+
+### Fixed
+
+- Saving a bot's agent profile no longer fails with a server error when
+  another write lands at the same moment on SQLite.
+
+- Stop showing merge requests imported from GitLab before 0.4.4 as fork pull
+  requests from an unrelated or missing repository: a migration clears the
+  GitLab project id the importer stored as their head repository. A fork pull
+  request whose fork was deleted keeps its head; rows the migration cannot
+  attribute are counted in the server log and left alone.
+- Make the database refuse a review or a review comment on a pull request
+  that does not exist, and delete them with their pull request. The migration
+  removes the ones already pointing at nothing, says how many in the server
+  log, and detaches attachments uploaded into them instead of deleting them.
+
+### Security
+
+- Move the web UI to SvelteKit 3.4.1 and adapter-static 4.0.1 for
+  GHSA-pfhg-q3qv-9q6r, GHSA-27mw-82g8-phjj, GHSA-mw6w-2fmv-pvw3,
+  GHSA-3r8g-jcqq-3p5j, GHSA-6cf5-gc4q-fm3x, GHSA-rqp5-r3wg-vg35 and
+  GHSA-jf9x-2fg2-hx4w, and cookie 2.0.2 for GHSA-pxg6-pf52-xh8x. The first two
+  are fixed only in SvelteKit 3.
+
 ## [0.4.4] - 2026-11-24
 
 The repository home page now works the way GitHub's does. See the

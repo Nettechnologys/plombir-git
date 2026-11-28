@@ -363,9 +363,9 @@ impl From<anyhow::Error> for AppError {
         //
         // The contention half matters most here rather than on the raw `DbErr`
         // path: `rg_db::contention::retry_transaction` is what a contended
-        // write meets first, and what it hands back once its attempts are spent
-        // is precisely this shape — the backend's refusal under a
-        // `db: <what> after N concurrent conflicts` context. A 500 there tells
+        // write meets first, and what it hands back once its time budget is
+        // spent is precisely this shape — the backend's refusal under a
+        // `db: <what>: the database stayed contended …` context. A 500 there tells
         // the client not to repeat a request that would succeed the moment the
         // writer ahead of it commits.
         if let Some(db_err) = e.downcast_ref::<sea_orm::DbErr>() {

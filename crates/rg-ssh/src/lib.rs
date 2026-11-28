@@ -2535,9 +2535,10 @@ async fn load_receive_pack_context(
     // A rule whose stored allow-list does not decode refuses the exec as a
     // server failure: rejecting the ref instead would blame the pusher for a
     // broken row, and would be flatly wrong for a pusher who is on that list.
-    // No SSH credential carries a token's narrowing, hence `false`.
+    // No SSH credential carries a token's narrowing, hence `false` and no
+    // write scope.
     let policy = rg_core::branch_protection::push_rules::load_receive_pack_policy(
-        db, repo.id, actor_id, false,
+        db, repo.id, actor_id, false, None,
     )
     .await
     .map_err(GitServiceError::ServerUnavailable)?;

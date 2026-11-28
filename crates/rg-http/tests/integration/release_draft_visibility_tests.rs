@@ -22,6 +22,9 @@ async fn scoped_pat(
             repository_ids: Some(repositories),
             mcp_tools: None,
             deny_protected_merge: false,
+            write_ref_prefix: None,
+            allow_git: false,
+            agent_run_attempt_id: None,
         },
     )
     .await

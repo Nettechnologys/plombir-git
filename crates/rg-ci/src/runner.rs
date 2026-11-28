@@ -1772,7 +1772,7 @@ impl PipelineRunner {
                 }
             }
         }
-        if self.repo_id > 0 {
+        if self.repo_id > 0 && rg_core::ci::receives_ci_secrets(&pipeline.trigger_type) {
             if let Some(encryption_key) = &self.encryption_key {
                 let key = rg_core::auth::encryption::derive_key(encryption_key);
                 // The repository-wide scope, plus this job's environment's
@@ -2990,6 +2990,72 @@ mod tests {
         .await
         .unwrap();
         cache_runner_on(db, root, repository.id, "refs/heads/main").await
+    }
+
+    /// ADR-0001 D5: a job of an agent run's pipeline is handed none of the
+    /// repository's secrets — not even masked into its log list, since it
+    /// never reads them. The same job under `push` gets them, so the empty
+    /// answer is the event's doing.
+    #[tokio::test]
+    async fn an_agent_run_job_is_handed_no_repository_secret() {
+        use sea_orm::{ActiveModelTrait as _, EntityTrait as _};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut runner = cache_runner(temp.path()).await;
+        let encryption_key = "runner-at-rest-encryption-key";
+        runner.set_encryption_key(encryption_key.into());
+        let key = rg_core::auth::encryption::derive_key(encryption_key);
+        let owner = rg_db::ops::repo_ops::find_by_id(&runner.db, runner.repo_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_id;
+        let encrypted = rg_core::auth::encryption::encrypt("repo-value", &key).unwrap();
+        rg_db::ops::ci_secret_ops::upsert(
+            &runner.db,
+            runner.repo_id,
+            None,
+            "REPO_KEY",
+            &encrypted,
+            owner,
+        )
+        .await
+        .unwrap();
+
+        let read = || async {
+            let (variables, masked, _) = runner
+                .job_environment(None, None, None, None, DEFAULT_CI_TOKEN_SCOPES)
+                .await
+                .unwrap();
+            let secret = variables
+                .into_iter()
+                .find(|(name, _)| name == "REPO_KEY")
+                .map(|(_, value)| value);
+            (secret, masked)
+        };
+        let (secret, masked) = read().await;
+        assert_eq!(
+            secret.as_deref(),
+            Some("repo-value"),
+            "the control job got no secret"
+        );
+        assert!(masked.contains(&"repo-value".to_string()));
+
+        let pipeline = rg_db::entities::pipeline::Entity::find_by_id(runner.pipeline_id)
+            .one(&runner.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut agent_run: rg_db::entities::pipeline::ActiveModel = pipeline.into();
+        agent_run.trigger_type = Set(rg_core::ci::AGENT_RUN_EVENT.to_string());
+        agent_run.update(&runner.db).await.unwrap();
+
+        let (secret, masked) = read().await;
+        assert_eq!(secret, None, "an agent run's job was handed a CI secret");
+        assert!(
+            !masked.contains(&"repo-value".to_string()),
+            "an agent run's job read the secret to mask it"
+        );
     }
 
     /// PR #16: the embedded runner hands a job the repository-wide secrets,

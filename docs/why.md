@@ -76,11 +76,12 @@ ecosystem; Plombir Git's promise is narrower and stricter.
 
 ## Actions compatibility
 
-Compared with **Gitea 28.0.0** and **Gitea Runner 2.0.0**, as of 2026-10-03.
+Compared with **Gitea 28.4.0** and **Gitea Runner 6.0.1**, as of 2026-11-25.
 Gitea documents its Actions as GitHub-compatible except for the differences on
 [its comparison page](https://docs.gitea.com/usage/actions/comparison/); a ✅ in
 the Gitea column means the key is not listed there, or that the release notes
-cited in the row added it. Plombir Git's side is specified in full in
+cited in the row added it. The 28.1–28.4 releases changed no workflow syntax
+this table covers — their Actions entries are fixes. Plombir Git's side is specified in full in
 [docs/gitea-actions.md](gitea-actions.md).
 
 | Workflow syntax | Plombir Git | Gitea 28 |
@@ -110,6 +111,7 @@ cited in the row added it. Plombir Git's side is specified in full in
 | `container.options` | ❌ refused — it could undo the job sandbox | ✅ |
 | `services:` | ✅ Docker mode; a network per job, health-checked before the first step, `ports:` on loopback only; `volumes` and non-health `options` refused | ✅ |
 | `uses:` actions | ⚠️ composite and JavaScript (`node12`–`node24`) actions from `./path`, this instance or an upstream the operator allows (`[ci] actions_sources`), plus the built-in `actions/checkout`, `actions/cache`, `actions/upload-artifact`; Docker actions refused by name; GitHub's artifact, cache and OIDC services not emulated | ✅ any action |
+| `uses:` with an absolute URL (`https://host/owner/repo@v1`), `self:` or `builtin:` prefix | ❌ refused when the workflow is read; `owner/repo@ref` resolves through `[ci] actions_sources` instead | ✅ ([comparison page](https://docs.gitea.com/usage/actions/comparison/)) |
 | Step `id` | ✅ | ✅ |
 | Step outputs, `jobs.<id>.outputs`, `needs.<id>.outputs` | ✅ `$GITHUB_OUTPUT`, 1 MiB per job, masked; `::set-output` refused; a job's `if:` reads them, and a job that needs a skipped one is skipped | ✅ |
 | Composite actions | ✅ `inputs`, `outputs`, nested up to 10 deep; the resolved commit is in the job log; `github.action_path` / `$GITHUB_ACTION_PATH` — the action's files reach the runner (runner protocol 6) | ✅ |

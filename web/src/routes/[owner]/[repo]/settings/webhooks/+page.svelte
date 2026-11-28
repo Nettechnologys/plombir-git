@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDateTime } from '$lib/i18n';
   import { webhooks, type RepositoryWebhook, type WebhookDelivery } from '$lib/api/client.svelte';
@@ -12,8 +12,8 @@
 
   const t = createT();
   const confirmer = createConfirmer();
-  const owner = $derived($page.params.owner!);
-  const repo = $derived($page.params.repo!);
+  const owner = $derived(page.params.owner!);
+  const repo = $derived(page.params.repo!);
 
   const eventOptions = [
     'push',

@@ -2,7 +2,9 @@
 //!
 //! A bot account becomes an agent through its [`profile`]: what it runs, on
 //! which runner labels, with whose model key, in which repositories and under
-//! which limits. Starting a run from an assignment, the per-run token and the
-//! runner side come in later cards of `phase_948358cdfcf6`.
+//! which limits. An assignment to it starts a [`run`]: the checks of D6, the
+//! run's record and its synthetic pipeline. The runner side comes in later
+//! cards of `phase_948358cdfcf6`.
 
 pub mod profile;
+pub mod run;

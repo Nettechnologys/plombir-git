@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { goto } from '$app/navigation';
   import { createT, formatTranslationFallback } from '$lib/i18n';
   import { search, type SearchResult } from '$lib/api/client.svelte';
@@ -46,7 +46,7 @@
   // button — and did so on exactly the empty-search screen every visitor sees
   // first. The URL is the only thing this effect should react to.
   $effect(() => {
-    const url = $page.url;
+    const url = page.url;
     const q = url.searchParams.get('q') || '';
     const type = normalizeSearchType(url.searchParams.get('type'));
     const pg = parseInt(url.searchParams.get('page') || '1', 10);
