@@ -64,6 +64,51 @@ impl Preset {
         }
     }
 
+    /// The image a preset runs in when the profile names none: Node, for
+    /// the CLI's npm package, with git. The command installs the CLI when the
+    /// image does not carry it.
+    pub fn default_image(self) -> Option<&'static str> {
+        match self {
+            Preset::ClaudeCode | Preset::Codex => Some("node:22-bookworm"),
+            Preset::Custom => None,
+        }
+    }
+
+    /// What a preset runs, after the prologue has cloned the repository and
+    /// written the task (`super::job::job_script`). Checked against the live
+    /// CLIs on 2026-11-28:
+    ///
+    /// - **Claude Code 2.1.332**: `claude -p --bare` reads no hooks, plugins
+    ///   or `CLAUDE.md` of the repository and authenticates strictly with
+    ///   `ANTHROPIC_API_KEY`; `--mcp-config` with `--strict-mcp-config` loads
+    ///   only the server's MCP endpoint, not a `.mcp.json` from the
+    ///   repository; `--dangerously-skip-permissions` because the container
+    ///   is the sandbox. Its `--help` lists no `--max-turns`; the run's
+    ///   timeout is the limit.
+    /// - **codex-cli 0.172.0**: `codex exec
+    ///   --dangerously-bypass-approvals-and-sandbox`, the mode meant for an
+    ///   externally sandboxed environment, in the clone (`-C`), with the MCP
+    ///   endpoint as a streamable HTTP server reading the token from
+    ///   `PLOMBIR_AGENT_TOKEN`. Hooks of the repository stay untrusted:
+    ///   `--dangerously-bypass-hook-trust` is not passed.
+    pub fn command(self) -> Option<&'static str> {
+        match self {
+            Preset::ClaudeCode => Some(
+                "command -v claude >/dev/null 2>&1 || npm install --global --silent --no-fund --no-audit @anthropic-ai/claude-code\n\
+                 claude -p \"$(cat \"$PLOMBIR_TASK_FILE\")\" --bare --dangerously-skip-permissions \\\n  \
+                 --mcp-config \"$PLOMBIR_MCP_CONFIG\" --strict-mcp-config",
+            ),
+            Preset::Codex => Some(
+                "command -v codex >/dev/null 2>&1 || npm install --global --silent --no-fund --no-audit @openai/codex\n\
+                 codex exec --dangerously-bypass-approvals-and-sandbox -C \"$PLOMBIR_WORKDIR\" \\\n  \
+                 -c \"mcp_servers.plombir.url=\\\"$PLOMBIR_MCP_URL\\\"\" \\\n  \
+                 -c 'mcp_servers.plombir.bearer_token_env_var=\"PLOMBIR_AGENT_TOKEN\"' \\\n  \
+                 \"$(cat \"$PLOMBIR_TASK_FILE\")\"",
+            ),
+            Preset::Custom => None,
+        }
+    }
+
     pub fn parse(value: &str) -> Result<Self> {
         Preset::ALL
             .into_iter()

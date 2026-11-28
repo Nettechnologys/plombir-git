@@ -262,6 +262,11 @@ pub fn notify_review_requested(
 }
 
 /// List all reviews for a PR.
+///
+/// An agent run reading with its token sees only the reviews of people with
+/// write access, and none imported from another platform
+/// ([`crate::agent::trust::visible_to_run`]); every other reader sees all of
+/// them.
 pub async fn list_reviews(
     db: &DatabaseConnection,
     owner: &str,
@@ -273,7 +278,11 @@ pub async fn list_reviews(
         .await?
         .ok_or_else(|| crate::error::not_found("pull request"))?;
 
-    pr_review_ops::list_by_pr(db, pr.id).await
+    let reviews = pr_review_ops::list_by_pr(db, pr.id).await?;
+    crate::agent::trust::visible_to_run(db, &repo, reviews, |review| {
+        (review.reviewer_id, review.original_author.is_some())
+    })
+    .await
 }
 
 /// Get a single review by ID.
@@ -516,6 +525,76 @@ pub struct AppliedSuggestions {
     pub commit_sha: String,
 }
 
+/// One line of a suggestion's target file: its text and the terminator it
+/// ended with — `"\r\n"`, `"\n"`, or `""` for a last line that has none.
+///
+/// card_98cad1f4246c: the file used to go through `str::lines()` and come back
+/// through `join("\n")`. `lines()` eats `\r\n` as readily as `\n`, so applying
+/// a one-line suggestion to a CRLF file rewrote *every* line of it to LF — a
+/// commit that touched the whole file — and the file's trailing newline was
+/// put back even where the suggestion had deleted everything before it. Lines
+/// outside a suggestion's range now keep the bytes they had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceLine<'a> {
+    text: &'a str,
+    ending: &'a str,
+}
+
+impl<'a> SourceLine<'a> {
+    fn split(content: &'a str) -> Vec<Self> {
+        content
+            .split_inclusive('\n')
+            .map(|raw| {
+                let ending = if raw.ends_with("\r\n") {
+                    2
+                } else {
+                    usize::from(raw.ends_with('\n'))
+                };
+                let (text, ending) = raw.split_at(raw.len() - ending);
+                SourceLine { text, ending }
+            })
+            .collect()
+    }
+
+    /// Put `replacement` where `range` was, in the line endings the replaced
+    /// lines used: the first replaced line's terminator between the new
+    /// lines, and the last one's after them — so a range that ended the file
+    /// without a newline still does.
+    fn replace(lines: &mut Vec<Self>, range: std::ops::Range<usize>, replacement: &[&'a str]) {
+        let last_ending = lines[range.end - 1].ending;
+        let between = match lines[range.start].ending {
+            "" => range
+                .start
+                .checked_sub(1)
+                .map_or("\n", |previous| lines[previous].ending),
+            ending => ending,
+        };
+        let ends_file = range.end == lines.len();
+        let count = replacement.len();
+        lines.splice(
+            range,
+            replacement
+                .iter()
+                .enumerate()
+                .map(|(index, text)| SourceLine {
+                    text,
+                    ending: if index + 1 == count {
+                        last_ending
+                    } else {
+                        between
+                    },
+                }),
+        );
+        // Deleting the unterminated last line leaves the line before it last;
+        // it takes over "no newline at end of file" rather than gaining one.
+        if count == 0 && ends_file && last_ending.is_empty() {
+            if let Some(last) = lines.last_mut() {
+                last.ending = "";
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_suggestion(
     db: &DatabaseConnection,
@@ -712,8 +791,8 @@ pub async fn apply_suggestions(
                 let object = format!("{head_sha_for_git}:{path}");
                 // Charge the ceiling against the size in the tree BEFORE the read.
                 // `git show` has no cap of its own, neither does the gateway that
-                // collects its output, and the `Vec<String>` split below allocates a
-                // 24-byte header per line on top of the content bytes. A file measured
+                // collects its output, and the line split below allocates a
+                // 32-byte entry per line on top of the content bytes. A file measured
                 // only once it is decoded costs exactly the memory the ceiling was
                 // declared to save; the size is chosen by whoever can push to the head
                 // branch, and this endpoint is reachable by the PR author over their
@@ -738,8 +817,7 @@ pub async fn apply_suggestions(
                 let sha_output = git.run(&["rev-parse", &object], Some(&repo_path))?;
                 sha_output.ensure_success()?;
                 let blob_sha = sha_output.stdout_str().trim().to_string();
-                let had_trailing_newline = content.ends_with('\n');
-                let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+                let mut lines = SourceLine::split(&content);
 
                 for suggestion in suggestions.iter().rev() {
                     let start_index = (suggestion.start_line - 1) as usize;
@@ -750,23 +828,23 @@ pub async fn apply_suggestions(
                             suggestion.start_line, suggestion.end_line, path
                         )));
                     }
-                    let replacement = suggestion
-                        .replacement
-                        .lines()
-                        .map(str::to_string)
-                        .collect::<Vec<_>>();
-                    if lines[start_index..end_index] == replacement {
+                    let replacement = suggestion.replacement.lines().collect::<Vec<_>>();
+                    if lines[start_index..end_index]
+                        .iter()
+                        .map(|line| line.text)
+                        .eq(replacement.iter().copied())
+                    {
                         return Err(crate::error::conflict(format!(
                             "suggestion #{} does not change {path}",
                             suggestion.comment.id
                         )));
                     }
-                    lines.splice(start_index..end_index, replacement);
+                    SourceLine::replace(&mut lines, start_index..end_index, &replacement);
                 }
-                let mut updated_content = lines.join("\n");
-                if had_trailing_newline {
-                    updated_content.push('\n');
-                }
+                let updated_content = lines
+                    .iter()
+                    .flat_map(|line| [line.text, line.ending])
+                    .collect::<String>();
                 file_updates.push(crate::repo::service::FileUpdate {
                     path: path.clone(),
                     content: updated_content,
@@ -1008,6 +1086,10 @@ pub async fn get_thread_root(
 }
 
 /// List all review comments for a PR.
+///
+/// The same rule as [`list_reviews`]: an agent run sees only comments by
+/// people with write access, and none under a review imported from another
+/// platform.
 pub async fn list_review_comments(
     db: &DatabaseConnection,
     owner: &str,
@@ -1019,7 +1101,20 @@ pub async fn list_review_comments(
         .await?
         .ok_or_else(|| crate::error::not_found("pull request"))?;
 
-    review_comment_ops::list_by_pr(db, pr.id).await
+    let comments = review_comment_ops::list_by_pr(db, pr.id).await?;
+    if !crate::agent::trust::reading_for_a_run() {
+        return Ok(comments);
+    }
+    let imported: HashSet<i64> = pr_review_ops::list_by_pr(db, pr.id)
+        .await?
+        .into_iter()
+        .filter(|review| review.original_author.is_some())
+        .map(|review| review.id)
+        .collect();
+    crate::agent::trust::visible_to_run(db, &repo, comments, |comment| {
+        (comment.author_id, imported.contains(&comment.review_id))
+    })
+    .await
 }
 
 // `check_approval_status` used to live here: "does this PR have enough
@@ -1112,5 +1207,68 @@ mod suggestion_target_size_guard {
              `git.run(&[\"show\", …])` has collected the blob: a 5 GiB file committed at the \
              suggestion's path is then materialised in full and refused afterwards"
         );
+    }
+}
+
+#[cfg(test)]
+mod suggestion_line_endings {
+    //! card_98cad1f4246c: the splice keeps the bytes of every line it does not
+    //! replace, and gives the lines it inserts the endings of the lines they
+    //! replace. The end-to-end path through a real repository is covered in
+    //! `tests/integration/suggestion_line_endings_tests.rs`.
+    use super::SourceLine;
+
+    fn apply(content: &str, range: std::ops::Range<usize>, replacement: &str) -> String {
+        let mut lines = SourceLine::split(content);
+        let replacement = replacement.lines().collect::<Vec<_>>();
+        SourceLine::replace(&mut lines, range, &replacement);
+        lines
+            .iter()
+            .flat_map(|line| [line.text, line.ending])
+            .collect()
+    }
+
+    #[test]
+    fn untouched_crlf_lines_keep_their_endings() {
+        assert_eq!(
+            apply("old\r\nuntouched\r\n", 0..1, "new"),
+            "new\r\nuntouched\r\n"
+        );
+        assert_eq!(
+            apply("keep\r\nold\r\nkeep\r\n", 1..2, "a\nb"),
+            "keep\r\na\r\nb\r\nkeep\r\n",
+            "inserted lines take the replaced line's CRLF, not the suggestion's LF"
+        );
+        assert_eq!(
+            apply("lf\nold\r\nlf\n", 1..2, "new"),
+            "lf\nnew\r\nlf\n",
+            "a mixed file keeps each untouched line exactly as it was"
+        );
+    }
+
+    #[test]
+    fn deleting_everything_leaves_an_empty_file() {
+        assert_eq!(apply("old\n", 0..1, ""), "");
+        assert_eq!(apply("old\r\n", 0..1, ""), "");
+        assert_eq!(apply("a\nb\n", 0..2, ""), "");
+    }
+
+    #[test]
+    fn a_missing_final_newline_stays_missing() {
+        assert_eq!(apply("a\nold", 1..2, "new"), "a\nnew");
+        assert_eq!(apply("old", 0..1, "x\ny"), "x\ny");
+        assert_eq!(apply("a\r\nold", 1..2, "x\ny"), "a\r\nx\r\ny");
+        assert_eq!(
+            apply("a\nold", 1..2, ""),
+            "a",
+            "deleting the unterminated last line must not add a newline to the one before it"
+        );
+        assert_eq!(apply("old\nlast", 0..1, ""), "last");
+    }
+
+    #[test]
+    fn an_ordinary_lf_file_is_unchanged_outside_the_range() {
+        assert_eq!(apply("old\nuntouched\n", 0..1, "new"), "new\nuntouched\n");
+        assert_eq!(apply("a\nold\nc\n", 1..2, "\n"), "a\n\nc\n");
     }
 }

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import {
     repos,
@@ -11,8 +11,8 @@
   const t = createT();
   const PER_PAGE = 20;
 
-  const owner = $derived($page.params.owner!);
-  const repo = $derived($page.params.repo!);
+  const owner = $derived(page.params.owner!);
+  const repo = $derived(page.params.repo!);
 
   let stargazers = $state<Stargazer[]>([]);
   let stargazersPage = $state(1);

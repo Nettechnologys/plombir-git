@@ -153,6 +153,37 @@ pub async fn update_in_transaction(
         .context("db: update PR in ownership handoff")
 }
 
+/// Switch auto-merge off for `pr_id` when it is on; `true` when this call did.
+///
+/// Conditional on the flag, so two writers that both decide to disarm the same
+/// pull request record one `auto_merge_disabled` between them.
+pub async fn disarm_auto_merge(db: &DatabaseConnection, pr_id: i64) -> Result<bool> {
+    let result = PrEntity::update_many()
+        .col_expr(pull_request::Column::AutoMergeEnabled, Expr::value(false))
+        .col_expr(
+            pull_request::Column::AutoMergeStrategy,
+            Expr::value(Option::<String>::None),
+        )
+        .col_expr(
+            pull_request::Column::AutoMergeEnabledById,
+            Expr::value(Option::<i64>::None),
+        )
+        .col_expr(
+            pull_request::Column::AutoMergeEnabledAt,
+            Expr::value(Option::<chrono::DateTime<chrono::Utc>>::None),
+        )
+        .col_expr(
+            pull_request::Column::UpdatedAt,
+            Expr::value(chrono::Utc::now()),
+        )
+        .filter(pull_request::Column::Id.eq(pr_id))
+        .filter(pull_request::Column::AutoMergeEnabled.eq(true))
+        .exec(db)
+        .await
+        .context("db: disarm auto-merge")?;
+    Ok(result.rows_affected > 0)
+}
+
 /// Relinquish auto-merge ownership inside a merge-queue handoff.
 ///
 /// The caller locks and validates the current row before this write. On SQLite

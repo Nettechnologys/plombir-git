@@ -211,6 +211,12 @@ attestation_enabled = false
 # its container. Profiles can be edited either way; this decides whether they
 # ever run.
 enabled = false
+# Ceilings over every bot's profile: a profile may ask for less, never more.
+# Runs one bot may start in a UTC day (a profile allows 20 by default).
+max_runs_per_day = 500
+# The longest one run may take, in seconds (a profile allows 30 minutes by
+# default).
+max_timeout_secs = 14400
 
 [rate_limit]
 max = 0          # 0 = disabled (global per-IP limit for every request)

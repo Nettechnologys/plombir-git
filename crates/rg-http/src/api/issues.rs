@@ -138,6 +138,13 @@ pub struct IssueResponse {
     /// The issue's page in the web app, when `external_url` is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub html_url: Option<String>,
+    /// Whether the author is a person who can write to the repository — the
+    /// people whose text an agent run trusts (ADR-0001 D7). `false` for an
+    /// issue imported from another platform, whose real author is no local
+    /// account. Answered on the issue itself, left out of listings: the page
+    /// warns before an assignment hands a stranger's text to an agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_can_write: Option<bool>,
 }
 
 /// A person an imported issue or pull request named on its source: a login on
@@ -452,11 +459,25 @@ pub async fn list_issues(
 pub async fn get_issue(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    RepoRead { .. }: RepoRead,
+    RepoRead { repo: repository }: RepoRead,
 ) -> impl IntoResponse {
     match rg_core::issue::get_issue(&state.db, &owner, &repo, number).await {
         Ok(issue) => {
             let issue_id = issue.id;
+            let author_can_write = if issue.original_author.is_some() {
+                false
+            } else {
+                match rg_core::agent::trust::trusted_authors(
+                    &state.db,
+                    &repository,
+                    [issue.author_id],
+                )
+                .await
+                {
+                    Ok(trusted) => trusted.contains(&issue.author_id),
+                    Err(error) => return AppError::from(error).into_response(),
+                }
+            };
             let mut issue = match issue_with_author(&state.db, issue).await {
                 Ok(issue) => issue.linked(&crate::html_url::Links::new(&state, &owner, &repo)),
                 Err(error) => return error.into_response(),
@@ -470,6 +491,7 @@ pub async fn get_issue(
                 Ok((assignees, _)) => issue.original_assignees = assignees,
                 Err(error) => return error.into_response(),
             }
+            issue.author_can_write = Some(author_can_write);
             (StatusCode::OK, Json(issue)).into_response()
         }
         Err(e) => AppError::from(e).into_response(),
@@ -723,6 +745,7 @@ pub async fn update_issue(
         req.milestone_id,
         Some(&state.delivery_tracker),
         Some(user_id),
+        Some(&state.agent_run_launcher()),
     )
     .await
     {
@@ -853,6 +876,7 @@ async fn issue_with_author(
         assignee,
         original_assignees: Vec::new(),
         html_url: None,
+        author_can_write: None,
     })
 }
 
@@ -883,6 +907,7 @@ async fn issues_with_authors(
             assignee,
             original_assignees: Vec::new(),
             html_url: None,
+            author_can_write: None,
         });
     }
     Ok(responses)
@@ -1306,7 +1331,7 @@ pub(crate) async fn comment_moderator(
 )]
 pub async fn edit_comment(
     State(state): State<AppState>,
-    Path((_, _, comment_id)): Path<(String, String, i64)>,
+    Path((owner, name, comment_id)): Path<(String, String, i64)>,
     RepoAuthRead { repo, actor_id }: RepoAuthRead,
     Json(req): Json<EditCommentRequest>,
 ) -> impl IntoResponse {
@@ -1319,7 +1344,28 @@ pub async fn edit_comment(
     )
     .await
     {
-        Ok(comment) => (StatusCode::OK, Json(serde_json::json!(comment))).into_response(),
+        // The same shape `POST …/comments` and the comment list answer with —
+        // the row flattened, its author and its `html_url` — so a client that
+        // edits a comment can show the link it was just given on creation
+        // (card_fffb0abdbf40). The row is a superset of the old answer.
+        Ok(comment) => {
+            let issue_number =
+                match rg_db::ops::issue_ops::find_by_id(&state.db, comment.issue_id).await {
+                    Ok(issue) => issue.map(|issue| issue.number),
+                    Err(error) => return AppError::from(error).into_response(),
+                };
+            match comment_with_author(&state.db, comment).await {
+                Ok(comment) => {
+                    let comment = match issue_number {
+                        Some(number) => comment
+                            .linked(&crate::html_url::Links::new(&state, &owner, &name), number),
+                        None => comment,
+                    };
+                    (StatusCode::OK, Json(comment)).into_response()
+                }
+                Err(error) => error.into_response(),
+            }
+        }
         Err(e) => AppError::from(e).into_response(),
     }
 }

@@ -275,34 +275,43 @@ pub async fn ai_list_prs(
     Ok((StatusCode::OK, Json(summaries)))
 }
 
-// ── Stub handlers (NOT IMPLEMENTED) ─────────────────
-
 /// GET /api/v1/ai/repos/{owner}/{name}/tree
+///
+/// The same listing the REST tree door answers with — see
+/// [`crate::api::repo_content::tree_listing_response`]. This was a mounted
+/// `501` stub until card_7fe0684198fc; the MCP `ai_repo_tree` tool called it
+/// and got "not yet implemented" on every call.
 #[utoipa::path(
     get,
     path = "/ai/repos/{owner}/{name}/tree",
     params(
         ("owner" = String, Path, description = "Repository owner"),
         ("name" = String, Path, description = "Repository name"),
-        ("ref" = Option<String>, Query, description = "Branch/tag/SHA (default: default branch)"),
+        ("ref" = Option<String>, Query, description = "Branch/tag/SHA (default: HEAD, the default branch)"),
         ("path" = Option<String>, Query, description = "Subdirectory path (default: root)"),
     ),
     responses(
-        (status = 200, description = "Repository file tree"),
-        (status = 404, description = "Repository not found"),
-        (status = 501, description = "Not yet implemented"),
+        (status = 200, description = "Directory entries as `{\"entries\": [...]}`; an empty repository answers an empty list", body = serde_json::Value),
+        (status = 400, description = "Malformed ref or path"),
+        (status = 404, description = "Repository, ref or path not found"),
+        (status = 409, description = "HEAD points at a branch that does not exist while other branches do"),
     ),
     tag = "ai",
 )]
 pub async fn ai_repo_tree(
+    State(state): State<AppState>,
     RepoRead { .. }: RepoRead,
-    Path((_, _)): Path<(String, String)>,
-    Query(_params): Query<TreeQuery>,
-) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
-    Ok((
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({"error": "repo_tree not yet implemented"})),
-    ))
+    Path((owner, name)): Path<(String, String)>,
+    Query(params): Query<TreeQuery>,
+) -> axum::response::Response {
+    crate::api::repo_content::tree_listing_response(
+        &state,
+        &owner,
+        &name,
+        params.r#ref,
+        params.path,
+    )
+    .await
 }
 
 /// Code search result for AI API

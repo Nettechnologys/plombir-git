@@ -51,8 +51,24 @@ pub async fn create(
         .begin()
         .await
         .context("db: begin restricted access token create")?;
+    let token = create_in(&transaction, model, repository_ids).await?;
+    transaction
+        .commit()
+        .await
+        .context("db: commit restricted access token create")?;
+    Ok(token)
+}
+
+/// [`create`] inside a transaction the caller owns: the token, its
+/// repository confinement and its account event, committed with whatever else
+/// the caller writes (an agent run job's claim).
+pub async fn create_in(
+    transaction: &impl ConnectionTrait,
+    model: ActiveModel,
+    repository_ids: &[i64],
+) -> Result<AccessToken> {
     let token = model
-        .insert(&transaction)
+        .insert(transaction)
         .await
         .context("db: create access token")?;
     if token.repo_restricted && !repository_ids.is_empty() {
@@ -65,12 +81,12 @@ pub async fn create(
                 repository_id: Set(repository_id),
             }
         }))
-        .exec(&transaction)
+        .exec(transaction)
         .await
         .context("db: record access token repositories")?;
     }
     super::notification_delivery_ops::account_event(
-        &transaction,
+        transaction,
         token.user_id,
         crate::notification::Event::TokenCreated,
         Some(crate::notification::Event::AgentTokenCreated),
@@ -78,10 +94,6 @@ pub async fn create(
         None,
     )
     .await?;
-    transaction
-        .commit()
-        .await
-        .context("db: commit restricted access token create")?;
     Ok(token)
 }
 

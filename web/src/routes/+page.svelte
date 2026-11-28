@@ -19,7 +19,7 @@
   // repository" button that only navigated to `/dashboard` (card_c30077df5603).
   $effect(() => {
     if (isLoggedIn()) {
-      void goto('/dashboard', { replaceState: true });
+      void goto('/dashboard', { replace: true });
       return;
     }
     loadRepos();

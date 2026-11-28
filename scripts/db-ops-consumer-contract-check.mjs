@@ -159,6 +159,20 @@ if (declarations.length === 0) {
 // failure — the allowlist is a ratchet, not a parking lot.
 const ALLOWED_WITHOUT_CONSUMER = new Map([
   [
+    'crates/rg-core/src/auth/access_token.rs::issue_for_agent_run',
+    'the one place an agent run attempt token is minted (ADR-0001 D3, card_4d614c4480e9). Its ' +
+      'caller is the hand-off of the run\'s job to a runner, which delivers the raw token into the ' +
+      'job (card_47195d097b79); minting one at enqueue time, with nowhere to deliver it, would only ' +
+      'leave a live credential behind. Delete this entry when that caller lands',
+  ],
+  [
+    'crates/rg-core/src/auth/access_token.rs::revoke_for_agent_run_attempt',
+    'the revocation of an attempt token, for the single point where a run ends however it ends ' +
+      '(card_231f9eb28ee3). No token is minted in production until card_47195d097b79, so there is ' +
+      'nothing to revoke yet; deleting the attempt already takes the token by foreign key. Delete ' +
+      'this entry when that caller lands',
+  ],
+  [
     'crates/rg-db/src/ops/user_ops.rs::enable_mfa_with_backup_codes',
     'legacy fixture seam for atomicity/contention tests and direct MFA fixture setup. ' +
       'Production HTTP enrolment uses complete_mfa_enrolment with the exact verified ' +

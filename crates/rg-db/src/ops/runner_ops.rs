@@ -27,6 +27,32 @@ pub async fn register_runner(
     os: Option<&str>,
     arch: Option<&str>,
 ) -> Result<(Runner, String)> {
+    // card_adbe712869d6 (sideways): the repository read below comes before the
+    // first write, and on SQLite (no `FOR UPDATE`) a deferred transaction
+    // shaped like that is refused with `SQLITE_BUSY_SNAPSHOT` as soon as any
+    // other connection commits in between — `busy_timeout` does not apply, and
+    // a registration answered 500. The write-first remedy is not available
+    // here: every `UPDATE` of `repositories` fires its search-index triggers.
+    // So the whole transaction is re-run from a fresh snapshot instead, on the
+    // request-write time budget: SQLite refuses the upgrade at once for as
+    // long as the other writer holds the lock, so an attempt count would be
+    // spent before a writer of any length let go. The token is drawn per
+    // attempt, and only the committed one is returned.
+    crate::contention::retry_transaction("register a runner", || {
+        register_runner_once(db, repo_id, name, labels, version, os, arch)
+    })
+    .await
+}
+
+async fn register_runner_once(
+    db: &DatabaseConnection,
+    repo_id: i64,
+    name: &str,
+    labels: &str,
+    version: Option<&str>,
+    os: Option<&str>,
+    arch: Option<&str>,
+) -> Result<(Runner, String)> {
     let now = Utc::now();
     let token = generate_token();
 

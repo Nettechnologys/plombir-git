@@ -1,7 +1,7 @@
 <script lang="ts">
   import { repos } from '$lib/api/client.svelte';
   import { createT, formatDate } from '$lib/i18n';
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { goto } from '$app/navigation';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import Dropdown from '$lib/components/Dropdown.svelte';
@@ -13,17 +13,17 @@
   const t = createT();
   const PAGE_SIZE = 50;
 
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
   // The URL is the only source of the ref. Without `?ref=` the request names
   // no ref at all and the server walks HEAD — the repository's own default
   // branch. This page used to send a hard-coded `main`, so a repository whose
   // default is `master` answered "ref not found" and a new empty repository
   // an error instead of "No commits yet" (card_2e320f5287d7).
-  let ref = $derived($page.url.searchParams.get('ref') || '');
+  let ref = $derived(page.url.searchParams.get('ref') || '');
   // `?path=` narrows the history to one file or directory, as the history
   // link of a directory listing asks for.
-  let path = $derived($page.url.searchParams.get('path') || '');
+  let path = $derived(page.url.searchParams.get('path') || '');
   /** One history is one ref and one path. */
   let view = $derived(`${ref}\u0000${path}`);
 
@@ -143,7 +143,7 @@
   function selectBranch(name: string, close: () => void) {
     close();
     if (name === ref) return;
-    void goto(commitsHref(name), { replaceState: true, keepFocus: true, noScroll: true });
+    void goto(commitsHref(name), { replace: true, reset: false });
   }
 </script>
 

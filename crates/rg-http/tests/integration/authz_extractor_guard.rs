@@ -403,6 +403,21 @@ const WORKSPACE_FUNCTION_SIGNED_OFF: &[(&str, &str, &str)] = &[
          receives base-repository CI secrets; detached producers have no request extractor",
     ),
     (
+        "rg-core/src/agent/run.rs",
+        "check_launch",
+        "ADR-0001 D6: an assignment starts an agent run only if the assigner may write and the \
+         bot may write too; the subjects are the assigner and the bot, not the request's caller \
+         alone, and the core asks for every door into `update_issue` — the HTTP route's own write \
+         gate cannot stand in for the bot's",
+    ),
+    (
+        "rg-core/src/agent/trust.rs",
+        "trusted_authors",
+        "ADR-0001 D7: whose text an agent run may read is decided by each author's write access, \
+         not the caller's — the subjects are the commenters, and the task file is written while \
+         the assignment is planned, with no request for an extractor to gate",
+    ),
+    (
         "rg-core/src/pull_request/fork_source.rs",
         "may_publish",
         "checks the PR author's current authority to publish a private fork; \

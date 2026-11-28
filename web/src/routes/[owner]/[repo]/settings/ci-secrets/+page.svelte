@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { ciEnvironments, ciSecrets, type CiEnvironment, type CiSecret } from '$lib/api/client.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
   import { createT, formatDateTime } from '$lib/i18n';
@@ -9,7 +9,7 @@
   const t = createT();
   const confirmer = createConfirmer();
 
-  const owner = $derived($page.params.owner!); const repo = $derived($page.params.repo!);
+  const owner = $derived(page.params.owner!); const repo = $derived(page.params.repo!);
   let items = $state<CiSecret[]>([]); let environments = $state<CiEnvironment[]>([]); let environment = $state(''); let name = $state(''); let value = $state(''); let error = $state(''); let saving = $state(false);
   const hasShortLine = $derived(value.split(/\r?\n/).some((line) => line.length > 0 && new TextEncoder().encode(line).length < 4));
   let busyRows = $state<Set<string>>(new Set());

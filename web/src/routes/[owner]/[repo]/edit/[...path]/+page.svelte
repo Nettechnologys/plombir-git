@@ -1,6 +1,6 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import FileEditor from '$lib/components/FileEditor.svelte';
   import { repos } from '$lib/api/client.svelte';
   import {
@@ -21,10 +21,10 @@
     is_binary?: boolean;
   };
 
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
-  let path = $derived($page.params.path!);
-  let branch = $derived($page.url.searchParams.get('ref') || '');
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
+  let path = $derived(page.params.path!);
+  let branch = $derived(page.url.searchParams.get('ref') || '');
   // Without `?ref=` the file is read at the server's HEAD and committed to
   // the repository's own default branch. Both pages used to fall back to a
   // literal `main`: on a repository whose default is `master` the edit page

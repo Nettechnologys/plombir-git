@@ -2060,14 +2060,33 @@ pub async fn assign_job(db: &DatabaseConnection, job_id: i64, runner_id: i64) ->
 /// Claim a job and persist its sealed log mask in the same conditional write.
 /// The runner must never receive secret values without the matching durable
 /// snapshot; a refused claim stores neither ownership nor the snapshot.
+///
+/// `hand_out` is what an agent run's job writes when it is handed out — its
+/// token ([`assign_agent_job`]); `None` for every other job.
 pub async fn assign_job_with_mask_snapshot(
     db: &DatabaseConnection,
     job_id: i64,
     runner_id: i64,
     encrypted_snapshot: &str,
+    hand_out: Option<HandOut<'_>>,
 ) -> Result<bool> {
-    assign_job_with_snapshot(db, job_id, runner_id, Some(encrypted_snapshot)).await
+    match hand_out {
+        Some(hand_out) => {
+            assign_agent_job(db, job_id, runner_id, encrypted_snapshot, hand_out).await
+        }
+        None => assign_job_with_snapshot(db, job_id, runner_id, Some(encrypted_snapshot)).await,
+    }
 }
+
+/// What a job writes in the transaction of the claim that hands it out.
+pub type HandOutFn = dyn for<'t> Fn(
+        &'t sea_orm::DatabaseTransaction,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 't>>
+    + Send
+    + Sync;
+
+/// A borrowed [`HandOutFn`].
+pub type HandOut<'a> = &'a HandOutFn;
 
 async fn assign_job_with_snapshot(
     db: &DatabaseConnection,
@@ -2113,6 +2132,44 @@ async fn assign_job_with_snapshot(
         .await;
     }
     claim_pending_job(db, job_id, runner_id, encrypted_snapshot).await
+}
+
+/// Claim agent run job `job_id` for `runner_id`, as
+/// [`assign_job_with_mask_snapshot`] does, and — only when this claim is the
+/// one that wins — run `hand_out` in the same transaction: the run's token is
+/// written there, so a poller that lost the claim never wrote one, and the
+/// winner's is never replaced by a loser's (card_47195d097b79).
+async fn assign_agent_job(
+    db: &DatabaseConnection,
+    job_id: i64,
+    runner_id: i64,
+    encrypted_snapshot: &str,
+    hand_out: HandOut<'_>,
+) -> Result<bool> {
+    crate::contention::retry_transaction("claim an agent run job", || async {
+        let tx = db.begin().await.context("db: begin agent run job claim")?;
+        let claimed = async {
+            if !claim_pending_job(&tx, job_id, runner_id, Some(encrypted_snapshot)).await? {
+                return Ok(false);
+            }
+            hand_out(&tx).await?;
+            Ok(true)
+        }
+        .await;
+        match claimed {
+            Ok(claimed) => {
+                tx.commit().await.context("db: commit agent run job claim")?;
+                Ok(claimed)
+            }
+            Err(error) => {
+                if let Err(rollback) = tx.rollback().await {
+                    tracing::error!(error = %format!("{rollback:#}"), "an agent run job claim could not be rolled back");
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
 }
 
 async fn claim_pending_job(

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import {
     buildMilestoneCreatePayload,
@@ -20,8 +20,8 @@
 
   const t = createT();
   const confirmer = createConfirmer();
-  const owner = $derived($page.params.owner!);
-  const repo = $derived($page.params.repo!);
+  const owner = $derived(page.params.owner!);
+  const repo = $derived(page.params.repo!);
 
   let milestoneList = $state<Milestone[]>([]);
   let loading = $state(true);

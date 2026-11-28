@@ -51,6 +51,22 @@ An agent that reads the usual `mcpServers` block:
 Logs go to stderr so the stdio channel stays clean; `RUST_LOG` selects what is
 logged.
 
+### Tool annotations
+
+Every tool in `tools/list` carries MCP `annotations`, and they are part of the
+contract: a client can decide from them which calls to confirm with a person.
+Without them the specification tells a client to treat every tool as
+destructive.
+
+| Hint | `true` means |
+|------|--------------|
+| `readOnlyHint` | The tool only reads; calling it changes nothing. |
+| `destructiveHint` | The change cannot be put back through this API — a merge, a commit pushed onto a branch, an overwritten issue body, a cancelled job. A write with `false` adds something that can be removed again (a comment, a label set). Meaningful only when `readOnlyHint` is `false`. |
+| `idempotentHint` | Calling it again with the same arguments leaves the forge as the first call did. |
+| `openWorldHint` | Always `false`: every tool talks to this forge's own API and nothing beyond it. |
+
+The same hints are returned by the stdio server and by `POST /api/v1/mcp`.
+
 ### MCP over HTTP and agent accounts
 
 The server answers MCP itself at `POST /api/v1/mcp` — one JSON-RPC message per

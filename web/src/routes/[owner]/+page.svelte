@@ -1,12 +1,12 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { orgs, repos, type Organization } from '$lib/api/client.svelte';
   import { getUser, isLoggedIn } from '$lib/stores/auth.svelte';
   import { createT, formatDate } from '$lib/i18n';
 
   const t = createT();
 
-  let owner = $derived($page.params.owner!);
+  let owner = $derived(page.params.owner!);
   let repoList = $state<any[]>([]);
   // Set once the owner turns out to be an organization rather than an account.
   let org = $state<Organization | null>(null);

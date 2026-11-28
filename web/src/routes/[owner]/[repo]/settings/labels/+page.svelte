@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { labels, buildLabelPayload } from '$lib/api/client.svelte';
   import { viewerPermission } from '$lib/viewerPermission.svelte';
   import { LatestRepositoryRequestFence } from '$lib/asyncStateOwnership';
@@ -17,8 +17,8 @@
   let { data } = $props();
   const t = createT();
   
-  const owner = $derived($page.params.owner!);
-  const repo = $derived($page.params.repo!);
+  const owner = $derived(page.params.owner!);
+  const repo = $derived(page.params.repo!);
   
   let labelList = $state<Label[]>([]);
   let loading = $state(true);

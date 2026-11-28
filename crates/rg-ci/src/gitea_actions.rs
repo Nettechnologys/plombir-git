@@ -8843,6 +8843,40 @@ mod tail_tests {
         assert_pipeline_events_are_canonical(&produced);
     }
 
+    /// The one pipeline event that is deliberately outside the canon above:
+    /// an agent run's (ADR-0001 D1). It is created by
+    /// `CiTrigger::enqueue_agent_run` from the bot's profile and never asks a
+    /// workflow anything, so it has no business in `PIPELINE_EVENTS` — and it
+    /// must stay out, because a workflow that could declare `on: agent_run`
+    /// would run the repository's own jobs, with its secrets, beside an
+    /// agent's run. Its producer lives in `rg-ci`, which the census above does
+    /// not read, so the exclusion is stated here rather than left to that.
+    #[test]
+    fn an_agent_run_is_an_event_no_workflow_can_declare() {
+        assert!(
+            !rg_core::ci::PIPELINE_EVENTS.contains(&rg_core::ci::AGENT_RUN_EVENT),
+            "`agent_run` is in the canon a workflow may declare"
+        );
+        let yaml = format!(
+            "name: W\non:\n  {}:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ok\n",
+            rg_core::ci::AGENT_RUN_EVENT
+        );
+        let workflow: GiteaWorkflow = rg_core::yaml::from_str(&yaml).unwrap();
+        let refusal = workflow
+            .validate_supported_triggers()
+            .expect_err("`on: agent_run` must be refused as a trigger nothing can raise");
+        assert!(
+            format!("{refusal:#}").contains(rg_core::ci::AGENT_RUN_EVENT),
+            "the refusal does not name the trigger: {refusal:#}"
+        );
+        assert!(!workflow.matches_event(
+            rg_core::ci::AGENT_RUN_EVENT,
+            "refs/heads/main",
+            "main",
+            &ChangedPaths::unknown()
+        ));
+    }
+
     /// …and the matcher answers every one of them, each under **its own name**.
     /// A name in the canon that the matcher does not handle is the same dead end
     /// from the other side, and it does not stop being one because some *other*

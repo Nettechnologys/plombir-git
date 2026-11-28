@@ -325,6 +325,44 @@ pub(crate) struct AgentsConfig {
     /// (default false). Runs have open network access in this version.
     #[serde(default)]
     pub(crate) enabled: Option<bool>,
+    /// The most runs one bot may start in a UTC day, over every profile's own
+    /// limit (ADR-0001 D9). Default [`DEFAULT_AGENTS_MAX_RUNS_PER_DAY`].
+    #[serde(default)]
+    pub(crate) max_runs_per_day: Option<i64>,
+    /// The longest an agent run may take, in seconds, over every profile's own
+    /// timeout. Default [`DEFAULT_AGENTS_MAX_TIMEOUT_SECS`].
+    #[serde(default)]
+    pub(crate) max_timeout_secs: Option<i64>,
+}
+
+/// `[agents]` ceilings, each checked against the range a profile itself may
+/// ask for: a ceiling above it would cap nothing, and zero would refuse every
+/// run while looking like a setting.
+pub(crate) fn resolve_agent_limits(
+    cfg: Option<&ConfigFile>,
+) -> anyhow::Result<rg_core::agent::run::AgentLimits> {
+    let agents = cfg.map(|config| &config.agents);
+    let ceiling = |key: &str, value: Option<i64>, default: i64, max: i64| match value {
+        None => Ok(default),
+        Some(value) if (1..=max).contains(&value) => Ok(value),
+        Some(value) => Err(anyhow::anyhow!(
+            "[agents].{key} = {value} is out of range; it must be between 1 and {max}"
+        )),
+    };
+    Ok(rg_core::agent::run::AgentLimits {
+        max_runs_per_day: ceiling(
+            "max_runs_per_day",
+            agents.and_then(|agents| agents.max_runs_per_day),
+            DEFAULT_AGENTS_MAX_RUNS_PER_DAY,
+            rg_core::agent::profile::MAX_RUNS_PER_DAY,
+        )?,
+        max_timeout_secs: ceiling(
+            "max_timeout_secs",
+            agents.and_then(|agents| agents.max_timeout_secs),
+            DEFAULT_AGENTS_MAX_TIMEOUT_SECS,
+            rg_core::agent::profile::MAX_TIMEOUT_SECS,
+        )?,
+    })
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -814,6 +852,11 @@ pub(crate) const DEFAULT_ATTESTATION_ENABLED: bool = false;
 /// wrote, with open network access (ADR-0001 D8), so an upgrade never turns it
 /// on.
 pub(crate) const DEFAULT_AGENTS_ENABLED: bool = false;
+/// `[agents].max_runs_per_day`: no ceiling below what a profile may ask for,
+/// so a profile's own limit (20 by default) is the one that holds.
+pub(crate) const DEFAULT_AGENTS_MAX_RUNS_PER_DAY: i64 = rg_core::agent::profile::MAX_RUNS_PER_DAY;
+/// `[agents].max_timeout_secs`: likewise, the profile maximum of 4 hours.
+pub(crate) const DEFAULT_AGENTS_MAX_TIMEOUT_SECS: i64 = rg_core::agent::profile::MAX_TIMEOUT_SECS;
 /// `[server].hsts_preload`: a promise about every subdomain is never made by
 /// default.
 pub(crate) const DEFAULT_HSTS_PRELOAD: bool = false;
@@ -2240,6 +2283,18 @@ mod tests {
                 "enabled",
                 "DEFAULT_AGENTS_ENABLED",
                 super::DEFAULT_AGENTS_ENABLED.to_string(),
+            ),
+            row(
+                "agents",
+                "max_runs_per_day",
+                "DEFAULT_AGENTS_MAX_RUNS_PER_DAY",
+                super::DEFAULT_AGENTS_MAX_RUNS_PER_DAY.to_string(),
+            ),
+            row(
+                "agents",
+                "max_timeout_secs",
+                "DEFAULT_AGENTS_MAX_TIMEOUT_SECS",
+                super::DEFAULT_AGENTS_MAX_TIMEOUT_SECS.to_string(),
             ),
             row(
                 "rate_limit",

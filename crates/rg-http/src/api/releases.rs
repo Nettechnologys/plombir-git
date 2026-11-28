@@ -421,7 +421,14 @@ pub async fn create_release(
             )
             .await?;
             if let Some(tag) = created_tag {
-                owned_state.spawn_post_push_hooks(repo_path, owner, name, Some(user_id), vec![tag]);
+                owned_state.spawn_post_push_hooks(
+                    repo_path,
+                    owner,
+                    name,
+                    Some(user_id),
+                    rg_core::push_hooks::PushOrigin::of_current_credential(),
+                    vec![tag],
+                );
             }
             Ok(release)
         })
@@ -545,6 +552,7 @@ pub async fn update_release(
                         owner,
                         name,
                         Some(actor_id),
+                        rg_core::push_hooks::PushOrigin::of_current_credential(),
                         vec![tag],
                     );
                 }

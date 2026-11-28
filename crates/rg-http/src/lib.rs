@@ -206,6 +206,8 @@ pub struct AppState {
     /// profile may start an agent run (ADR-0001). Profiles are editable either
     /// way; this decides whether they ever run.
     pub agents_enabled: bool,
+    /// `[agents]` ceilings over every profile (ADR-0001 D9).
+    pub agent_limits: rg_core::agent::run::AgentLimits,
     /// Whether this process was started by `plombir-git trial`. Only shown —
     /// `GET /api/v1/instance` → `trial_mode` puts a banner on every page — and
     /// never consulted for an access decision.
@@ -274,6 +276,8 @@ mod tracked_ref_operation_tests {
             token_id: Some(11),
             mcp_tool: Some("create_branch".into()),
             deny_protected_writes: true,
+            write_ref_prefix: Some("refs/heads/agent/bot/".into()),
+            agent_run_attempt_id: Some(13),
         };
         let observed = rg_core::auth::credential_context::scope(context.clone(), async {
             super::run_tracked_ref_operation(&tracker, async {
@@ -362,12 +366,24 @@ impl AppState {
     /// `delivery_tracker()` is what the shutdown drain in [`run`] awaits, so a
     /// SIGTERM in the next few seconds cannot sever the work silently
     /// (card_8d4148774f32).
+    ///
+    /// `origin` says whether an agent run made the moves (ADR-0001 D4), and
+    /// it is a parameter rather than something this helper reads because the
+    /// hooks run detached: decide it where the write was made — from the
+    /// credential that made it, or [`rg_core::push_hooks::PushOrigin::of_current_credential`]
+    /// inside the request — and an agent's write never becomes a person's on
+    /// the way here.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the push itself, who made it and on whose behalf"
+    )]
     pub fn spawn_post_push_hooks(
         &self,
         repo_path: PathBuf,
         owner: String,
         repo_name: String,
         pusher_id: Option<i64>,
+        origin: rg_core::push_hooks::PushOrigin,
         ref_updates: Vec<rg_git::protocol::receive_pack::RefUpdate>,
     ) {
         if ref_updates.is_empty() {
@@ -379,7 +395,15 @@ impl AppState {
 
         self.delivery_tracker.spawn(async move {
             context
-                .run(&db, &repo_path, &owner, &repo_name, pusher_id, &ref_updates)
+                .run_with_origin(
+                    &db,
+                    &repo_path,
+                    &owner,
+                    &repo_name,
+                    pusher_id,
+                    origin,
+                    &ref_updates,
+                )
                 .await;
         });
     }
@@ -409,6 +433,8 @@ impl AppState {
             + 'static,
     {
         let state = self.clone();
+        // Decided here, in the request, before the operation is detached.
+        let origin = rg_core::push_hooks::PushOrigin::of_current_credential();
         self.tracked_ref_operation(async move {
             let update = operation.await?;
             state.spawn_post_push_hooks(
@@ -416,6 +442,7 @@ impl AppState {
                 owner,
                 repo_name,
                 Some(pusher_id),
+                origin,
                 vec![update.clone()],
             );
             Ok(update)
@@ -496,6 +523,17 @@ impl AppState {
 
     /// This process's CI wiring, in the borrowed form a pipeline-triggering
     /// path takes (the merge queue, the pull-request trigger).
+    /// What an assignment to a bot needs to start an agent run
+    /// (`rg_core::agent::run`).
+    pub fn agent_run_launcher(&self) -> rg_core::agent::run::AgentRunLauncher<'_> {
+        rg_core::agent::run::AgentRunLauncher {
+            enabled: self.agents_enabled,
+            limits: self.agent_limits,
+            repo_root: &self.repo_root,
+            ci: self.pipeline_ci(),
+        }
+    }
+
     pub fn pipeline_ci(&self) -> rg_core::pull_request::ci::PipelineCi<'_> {
         rg_core::pull_request::ci::PipelineCi {
             trigger: &*self.ci_engine,
@@ -639,6 +677,8 @@ pub struct HttpServerConfig {
     pub attestation_enabled: bool,
     /// See [`AppState::agents_enabled`].
     pub agents_enabled: bool,
+    /// See [`AppState::agent_limits`].
+    pub agent_limits: rg_core::agent::run::AgentLimits,
     /// Started by `plombir-git trial` — see [`AppState::trial_mode`].
     pub trial_mode: bool,
     /// Repository the UI links as this instance's source, validated by the
@@ -864,6 +904,7 @@ async fn run_with_listener(
         ci_engine: config.ci_engine,
         attestation_enabled: config.attestation_enabled,
         agents_enabled: config.agents_enabled,
+        agent_limits: config.agent_limits,
         trial_mode: config.trial_mode,
         source_url: Arc::from(config.source_url),
         ws_session_recheck_secs: ws::DEFAULT_WS_SESSION_RECHECK_SECS,
@@ -896,6 +937,16 @@ async fn run_with_listener(
         let watchdog_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             run_runner_watchdog(watchdog_state, watchdog_shutdown).await;
+        });
+    }
+
+    // Agent runs whose assignment committed but whose pipeline was never
+    // created, and runs their profile no longer allows (card_b391e92474a0).
+    {
+        let recovery_state = state.clone();
+        let recovery_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            run_agent_run_recovery(recovery_state, recovery_shutdown).await;
         });
     }
 
@@ -1243,6 +1294,42 @@ async fn run_metrics_gauge_sink(
 }
 
 // ── Runner Watchdog ───────────────────────────────────────
+
+/// Bring agent runs back to what their rows say, once at startup and then
+/// every minute ([`rg_core::agent::run::recover`]).
+///
+/// The first pass queues every unqueued run at once: no request of this
+/// process can have written one yet. Later passes leave a run alone for
+/// [`rg_core::agent::run::UNQUEUED_RUN_GRACE`], since the request that wrote
+/// it may still be queueing it — and if both try, the attempt is carried by
+/// one pipeline all the same.
+async fn run_agent_run_recovery(
+    state: AppState,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut min_age = std::time::Duration::ZERO;
+    loop {
+        let pools = state.db_pools();
+        match rg_core::agent::run::recover(&pools, &state.agent_run_launcher(), min_age).await {
+            Ok(recovered) if recovered != rg_core::agent::run::Recovered::default() => {
+                tracing::info!(
+                    queued = recovered.queued,
+                    ended = recovered.ended,
+                    "agent run recovery"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(error = %format!("{error:#}"), "agent run recovery failed");
+            }
+        }
+        min_age = rg_core::agent::run::UNQUEUED_RUN_GRACE;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+            _ = shutdown_rx.changed() => return,
+        }
+    }
+}
 
 /// Background task that periodically checks for:
 /// 1. Stuck jobs (assigned/running for too long) → reset to pending

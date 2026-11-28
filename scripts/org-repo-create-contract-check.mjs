@@ -114,7 +114,7 @@ if (createRepo === null) {
 }
 
 const createOrgRepo = tsFunctionBody(orgPageSource, 'createOrgRepo');
-if (!/let\s+name\s*=\s*\$derived\(\$page\.params\.name!\)/.test(orgPage)) {
+if (!/let\s+name\s*=\s*\$derived\(page\.params\.name!\)/.test(orgPage)) {
   failures.push('Organization page repository owner snapshot must originate from the reactive route name');
 } else if (createOrgRepo === null) {
   failures.push('Organization page no longer defines a readable `createOrgRepo` handler');
