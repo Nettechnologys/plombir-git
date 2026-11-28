@@ -4283,6 +4283,8 @@ pub(crate) mod test_notifier {
                 .expect("recorder mutex")
                 .push((user_id, event_type.to_string()));
         }
+
+        fn job_log(&self, _job_id: i64, _log: &str, _replaced: bool) {}
     }
 
     /// A wiring bundle whose notifier is the returned recorder.

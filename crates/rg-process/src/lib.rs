@@ -18,6 +18,8 @@ pub mod client_policy;
 pub mod docker_job;
 pub mod image_reference;
 pub mod job_environment;
+pub mod live_log;
+pub mod log_mask;
 mod retired_environment;
 pub mod workspace_archive;
 
@@ -448,7 +450,17 @@ impl CappedJobOutput {
 pub async fn output_ci_job_in_process_tree(
     command: &mut tokio::process::Command,
 ) -> std::io::Result<CappedJobOutput> {
-    output_in_process_tree_with_capture_limit(command, MAX_JOB_LOG_BYTES / 2).await
+    output_in_process_tree_with_capture_limit(command, MAX_JOB_LOG_BYTES / 2, None).await
+}
+
+/// [`output_ci_job_in_process_tree`], also offering every read to `live`
+/// while the job runs ([`live_log`]). The captured output is the same either
+/// way; dropping `live` when this returns is what ends the live view.
+pub async fn output_ci_job_in_process_tree_live(
+    command: &mut tokio::process::Command,
+    live: live_log::LiveOutput,
+) -> std::io::Result<CappedJobOutput> {
+    output_in_process_tree_with_capture_limit(command, MAX_JOB_LOG_BYTES / 2, Some(&live)).await
 }
 
 /// [`output_ci_job_in_process_tree`] for one step of a job of steps: half the
@@ -457,12 +469,13 @@ pub async fn output_ci_job_in_process_tree(
 pub async fn output_ci_step_in_process_tree(
     command: &mut tokio::process::Command,
 ) -> std::io::Result<CappedJobOutput> {
-    output_in_process_tree_with_capture_limit(command, MAX_JOB_LOG_BYTES / 4).await
+    output_in_process_tree_with_capture_limit(command, MAX_JOB_LOG_BYTES / 4, None).await
 }
 
 async fn read_to_capture_limit<R: tokio::io::AsyncRead + Unpin>(
     pipe: &mut R,
     captured: &mut CapturedStream,
+    live: Option<(&live_log::LiveOutput, live_log::Stream)>,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncReadExt as _;
 
@@ -476,12 +489,16 @@ async fn read_to_capture_limit<R: tokio::io::AsyncRead + Unpin>(
             return Ok(());
         }
         captured.push(&chunk[..read]);
+        if let Some((live, stream)) = live {
+            live.offer(stream, &chunk[..read]);
+        }
     }
 }
 
 async fn output_in_process_tree_with_capture_limit(
     command: &mut tokio::process::Command,
     limit: usize,
+    live: Option<&live_log::LiveOutput>,
 ) -> std::io::Result<CappedJobOutput> {
     // Match `Command::output`: no inherited stdin, captured stdout/stderr. The
     // direct-child guard remains defense in depth if platform setup fails after
@@ -509,8 +526,16 @@ async fn output_in_process_tree_with_capture_limit(
         // buffer nobody drains blocks forever on its next write.
         let drain = async {
             tokio::try_join!(
-                read_to_capture_limit(&mut stdout_pipe, &mut stdout),
-                read_to_capture_limit(&mut stderr_pipe, &mut stderr),
+                read_to_capture_limit(
+                    &mut stdout_pipe,
+                    &mut stdout,
+                    live.map(|live| (live, live_log::Stream::Stdout)),
+                ),
+                read_to_capture_limit(
+                    &mut stderr_pipe,
+                    &mut stderr,
+                    live.map(|live| (live, live_log::Stream::Stderr)),
+                ),
             )
             .map(drop)
         };
@@ -1062,6 +1087,55 @@ mod bounded_tests {
 #[cfg(all(test, unix))]
 mod ci_job_output_tests {
     use super::*;
+
+    /// card_e925c7cedd46: a line the job prints is in the live view while the
+    /// job is still running, not only in the log it leaves behind.
+    #[tokio::test]
+    async fn a_line_is_live_before_the_job_ends() {
+        let marker = std::env::temp_dir().join(format!(
+            "rg-live-log-{}-{}",
+            std::process::id(),
+            uuid_like()
+        ));
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "echo first-line; while [ ! -e '{}' ]; do sleep 0.05; done; echo last-line >&2",
+                marker.display()
+            ),
+        ]);
+        let (live, mut receiver) = live_log::LiveOutput::channel();
+        let job = tokio::spawn(async move {
+            output_ci_job_in_process_tree_live(&mut command, live)
+                .await
+                .expect("job completed")
+        });
+        let first = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+            .await
+            .expect("the first line arrives while the job waits")
+            .expect("the live view is open");
+        assert_eq!(first.stream, live_log::Stream::Stdout);
+        assert_eq!(first.bytes, b"first-line\n");
+        assert!(!job.is_finished(), "the job is still running");
+        std::fs::write(&marker, b"").unwrap();
+        let output = job.await.unwrap();
+        std::fs::remove_file(&marker).expect("remove the marker");
+        let last = receiver.recv().await.expect("the stderr line");
+        assert_eq!(last.stream, live_log::Stream::Stderr);
+        assert!(
+            receiver.recv().await.is_none(),
+            "the view ends with the job"
+        );
+        assert_eq!(output.log(), "first-line\n\nlast-line\n");
+    }
+
+    fn uuid_like() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    }
 
     #[tokio::test]
     async fn both_streams_are_capped_and_each_cut_is_marked() {

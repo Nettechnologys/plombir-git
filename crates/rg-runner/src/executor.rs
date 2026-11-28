@@ -128,6 +128,7 @@ pub(crate) async fn run_job_local(
     script: &str,
     variables: &[(String, String)],
     workspace: &std::path::Path,
+    live: rg_process::live_log::LiveOutput,
 ) -> (i32, String) {
     #[cfg(unix)]
     let output = {
@@ -140,7 +141,7 @@ pub(crate) async fn run_job_local(
         for (key, value) in variables {
             command.env(key, value);
         }
-        rg_process::output_ci_job_in_process_tree(&mut command).await
+        rg_process::output_ci_job_in_process_tree_live(&mut command, live).await
     };
 
     #[cfg(windows)]
@@ -153,7 +154,7 @@ pub(crate) async fn run_job_local(
         for (key, value) in variables {
             command.env(key, value);
         }
-        rg_process::output_ci_job_in_process_tree(&mut command).await
+        rg_process::output_ci_job_in_process_tree_live(&mut command, live).await
     };
 
     match output {
@@ -183,6 +184,7 @@ pub(crate) async fn run_job_docker(
     workspace: &std::path::Path,
     container_name: &str,
     limits: &rg_process::docker_job::JobLimits,
+    live: rg_process::live_log::LiveOutput,
 ) -> (i32, String) {
     // Check if Docker daemon is running
     let docker_ok = rg_process::docker_job::client("docker")
@@ -232,7 +234,7 @@ pub(crate) async fn run_job_docker(
     };
 
     let mut command = prepared.command;
-    match rg_process::output_ci_job_in_process_tree(&mut command).await {
+    match rg_process::output_ci_job_in_process_tree_live(&mut command, live).await {
         Ok(o) => {
             let code = o.status.code().unwrap_or(-1);
             let mut log = o.log();
@@ -464,6 +466,7 @@ mod tests {
             "test \"$RUNNER_MESSAGE\" = hello && test -z \"$PLOMBIR_GIT_HOST_SECRET\" && echo ok",
             &variables,
             std::path::Path::new("."),
+            rg_process::live_log::LiveOutput::channel().0,
         )
         .await;
         assert_eq!(code, 0, "{log}");
@@ -543,7 +546,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            run_job_local(&script, &job_variables(None), temp.path()),
+            run_job_local(
+                &script,
+                &job_variables(None),
+                temp.path(),
+                rg_process::live_log::LiveOutput::channel().0,
+            ),
         )
         .await;
         assert!(

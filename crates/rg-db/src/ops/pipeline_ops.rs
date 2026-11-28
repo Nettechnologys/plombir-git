@@ -806,6 +806,22 @@ pub async fn update_job_log(db: &DatabaseConnection, id: i64, log: &str) -> Resu
 /// The row update takes the per-job write lock before reading its length, so
 /// concurrent servers cannot allocate the same character offset.
 pub async fn append_job_log(db: &DatabaseConnection, id: i64, text: &str) -> Result<()> {
+    append_job_log_text(db, id, text, true).await
+}
+
+/// Append `text` exactly as given: a piece of a log streamed while the job
+/// runs, which may end and begin mid-line (card_e925c7cedd46). Unlike
+/// [`append_job_log`], no newline is put between it and what came before.
+pub async fn stream_job_log(db: &DatabaseConnection, id: i64, text: &str) -> Result<()> {
+    append_job_log_text(db, id, text, false).await
+}
+
+async fn append_job_log_text(
+    db: &DatabaseConnection,
+    id: i64,
+    text: &str,
+    on_its_own_line: bool,
+) -> Result<()> {
     let tx = db.begin().await.context("db: begin job log append")?;
     let now = chrono::Utc::now().naive_utc();
     let updated = pipeline_job::Entity::update_many()
@@ -832,7 +848,7 @@ pub async fn append_job_log(db: &DatabaseConnection, id: i64, text: &str) -> Res
         - 1;
     let mut end_offset = old_length;
     if !text.is_empty() {
-        let content = if old_length == 0 {
+        let content = if old_length == 0 || !on_its_own_line {
             text.to_owned()
         } else {
             format!("\n{text}")
@@ -1091,6 +1107,14 @@ pub async fn update_job_result(
         active.finished_at = Set(finished_at);
     }
     active.update(db).await.context("db: update job result")?;
+    if log.is_some() {
+        // As in `settle_job_if_active`: the column is the whole log now.
+        job_log_chunk::Entity::delete_many()
+            .filter(job_log_chunk::Column::JobId.eq(id))
+            .exec(db)
+            .await
+            .context("db: delete the streamed log a job result replaced")?;
+    }
     Ok(())
 }
 
@@ -2579,12 +2603,22 @@ pub async fn settle_job_if_active(
     if let Some(finished_at) = finished_at {
         update = update.col_expr(pipeline_job::Column::FinishedAt, Expr::value(finished_at));
     }
-    Ok(update
+    let settled = update
         .exec(db)
         .await
         .context("db: settle job result")?
         .rows_affected
-        > 0)
+        > 0;
+    if settled && log.is_some() {
+        // The log is now the column alone; what was streamed while the job
+        // ran (`stream_job_log`) is superseded by it, as a replacement is.
+        job_log_chunk::Entity::delete_many()
+            .filter(job_log_chunk::Column::JobId.eq(id))
+            .exec(db)
+            .await
+            .context("db: delete the streamed log a settled job replaced")?;
+    }
+    Ok(settled)
 }
 
 /// Database result of one external-runner completion.

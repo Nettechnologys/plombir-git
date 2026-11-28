@@ -84,7 +84,8 @@ export function connectNotificationWebSocket(
 
 export function connectJobLogWebSocket(
   jobId: number,
-  onLog: (chunk: string) => void,
+  /** `replaced`: the log was written whole again (the final log after a live one); read it from the start. */
+  onLog: (chunk: string, replaced: boolean) => void,
   onStatus?: (status: 'connected' | 'closed') => void,
   onError?: (err: Event) => void,
 ): WebSocket | null {
@@ -98,7 +99,7 @@ export function connectJobLogWebSocket(
         return;
       }
       if (data.event_type === 'job_log' && data.data?.job_id === jobId) {
-        onLog(String(data.data.log ?? ''));
+        onLog(String(data.data.log ?? ''), data.data.replaced === true);
       }
     } catch {
       // ignore non-JSON messages

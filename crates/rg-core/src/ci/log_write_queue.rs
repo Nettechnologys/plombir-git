@@ -33,9 +33,21 @@ struct LogWriteRequest {
     pub job_id: i64,
     /// Log text chunk to append.
     pub log_text: String,
-    pub replace: bool,
+    pub mode: WriteMode,
     pub reply: oneshot::Sender<anyhow::Result<()>>,
     _pending_bytes: OwnedSemaphorePermit,
+}
+
+/// How a request's text joins the log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteMode {
+    /// A segment of its own, on a new line (`append_job_log`).
+    Append,
+    /// The whole log (`update_job_log`).
+    Replace,
+    /// The next piece of a log streamed while the job runs, joined as is
+    /// (`stream_job_log`).
+    Stream,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -104,19 +116,25 @@ impl LogWriteQueue {
     /// A successful return means the chunk is committed, not merely buffered.
     /// A full queue is reported to the caller for a retry.
     pub async fn write(&self, job_id: i64, log_text: &str) -> Result<(), LogWriteError> {
-        self.submit(job_id, log_text, false).await
+        self.submit(job_id, log_text, WriteMode::Append).await
     }
 
     /// Serialize a full-log replacement behind already accepted appends.
     pub async fn replace(&self, job_id: i64, log_text: &str) -> Result<(), LogWriteError> {
-        self.submit(job_id, log_text, true).await
+        self.submit(job_id, log_text, WriteMode::Replace).await
+    }
+
+    /// Queue the next piece of a log streamed while its job runs: joined to
+    /// what came before exactly as given, with no newline between them.
+    pub async fn stream(&self, job_id: i64, log_text: &str) -> Result<(), LogWriteError> {
+        self.submit(job_id, log_text, WriteMode::Stream).await
     }
 
     async fn submit(
         &self,
         job_id: i64,
         log_text: &str,
-        replace: bool,
+        mode: WriteMode,
     ) -> Result<(), LogWriteError> {
         let bytes = u32::try_from(log_text.len().max(1)).map_err(|_| LogWriteError::Full)?;
         let permit = self
@@ -128,7 +146,7 @@ impl LogWriteQueue {
         let req = LogWriteRequest {
             job_id,
             log_text: log_text.to_string(),
-            replace,
+            mode,
             reply,
             _pending_bytes: permit,
         };
@@ -191,10 +209,16 @@ impl LogWriteQueue {
 
     /// Persist one request and report its result to the waiting HTTP handler.
     async fn process_request(db: &DatabaseConnection, req: LogWriteRequest) {
-        let result = if req.replace {
-            rg_db::ops::pipeline_ops::update_job_log(db, req.job_id, &req.log_text).await
-        } else {
-            rg_db::ops::pipeline_ops::append_job_log(db, req.job_id, &req.log_text).await
+        let result = match req.mode {
+            WriteMode::Replace => {
+                rg_db::ops::pipeline_ops::update_job_log(db, req.job_id, &req.log_text).await
+            }
+            WriteMode::Append => {
+                rg_db::ops::pipeline_ops::append_job_log(db, req.job_id, &req.log_text).await
+            }
+            WriteMode::Stream => {
+                rg_db::ops::pipeline_ops::stream_job_log(db, req.job_id, &req.log_text).await
+            }
         };
         if let Err(ref e) = result {
             tracing::warn!(
@@ -366,7 +390,7 @@ mod tests {
             LogWriteRequest {
                 job_id: 42,
                 log_text: "some build output".to_string(),
-                replace: false,
+                mode: WriteMode::Append,
                 reply,
                 _pending_bytes: permit,
             },
@@ -409,7 +433,7 @@ mod tests {
             .try_send(LogWriteRequest {
                 job_id: 1,
                 log_text: "first".to_owned(),
-                replace: false,
+                mode: WriteMode::Append,
                 reply,
                 _pending_bytes: permit,
             })
@@ -439,7 +463,7 @@ mod tests {
             .try_send(LogWriteRequest {
                 job_id: 1,
                 log_text: "four".to_owned(),
-                replace: false,
+                mode: WriteMode::Append,
                 reply,
                 _pending_bytes: permit,
             })

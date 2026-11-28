@@ -11,6 +11,8 @@ pub mod jwt;
 pub mod key_check;
 pub mod ldap;
 pub mod lockout;
+/// Lives in `rg-process`, which the external runner shares; see there.
+pub use rg_process::log_mask;
 pub mod oci_token;
 pub mod password;
 pub mod pat_scope;

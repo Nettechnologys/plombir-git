@@ -1504,6 +1504,9 @@ pub async fn job_status(
 /// POST /api/v1/runners/:id/jobs/:job_id/log
 /// Upload job log. A runner posting its complete final log may request
 /// replacement, making retries idempotent; legacy chunk uploads still append.
+/// While the job runs, a runner sends its live log as numbered pieces
+/// (`x-job-log-seq`), masked here across their borders; a piece already
+/// taken is acknowledged and not written again (card_e925c7cedd46).
 #[utoipa::path(
     post,
     path = "/runners/{id}/jobs/{job_id}/log",
@@ -1511,14 +1514,18 @@ pub async fn job_status(
     params(
         ("id" = i64, Path, description = "Runner ID"),
         ("job_id" = i64, Path, description = "Job ID"),
+        ("x-job-log-seq" = Option<u64>, Header, description = "The number of this piece of the live log, from 0; absent for a whole log or a legacy chunk"),
+        ("x-job-log-mode" = Option<String>, Header, description = "`replace` for the complete final log, which replaces the live one"),
     ),
     request_body(
         content = String,
         description = "Log content (plain text), up to 8 MiB per request",
     ),
     responses(
-        (status = 200, description = "Log uploaded", body = serde_json::Value),
+        (status = 200, description = "Log uploaded, or a live piece already taken (`status: duplicate`)", body = serde_json::Value),
+        (status = 400, description = "`x-job-log-seq` is not a piece number", body = serde_json::Value),
         (status = 404, description = "Job not found", body = serde_json::Value),
+        (status = 409, description = "A live piece after the job's final log", body = serde_json::Value),
         (status = 413, description = "Log above the 8 MiB per-request ceiling"),
         (status = 503, description = "Log write queue is full or unavailable; retry the upload"),
     ),
@@ -1534,27 +1541,105 @@ pub async fn upload_log(
         Err(error) => return error.into_response(),
     };
 
+    if let Some(seq) = headers.get(LIVE_LOG_SEQ_HEADER) {
+        let Some(seq) = seq.to_str().ok().and_then(|seq| seq.parse::<u64>().ok()) else {
+            return AppError::bad_request("x-job-log-seq is the piece's number, from 0")
+                .into_response();
+        };
+        return upload_live_log_piece(&state, &job, seq, &body).await;
+    }
+
+    let replace = headers
+        .get("x-job-log-mode")
+        .is_some_and(|value| value == "replace");
     let body = match sanitized_runner_log(&state, &job, &body).await {
         Ok(body) => body,
         Err(response) => return response,
     };
 
-    let result = if headers
-        .get("x-job-log-mode")
-        .is_some_and(|value| value == "replace")
-    {
+    // The final log closes the live one first, under its lock, so no live
+    // piece is written after it (`live_job_log`).
+    let live = replace.then(|| state.live_job_logs.entry(job_id));
+    let mut live = match &live {
+        Some(entry) => Some(entry.lock().await),
+        None => None,
+    };
+    if let Some(live) = live.as_mut() {
+        live.close();
+    }
+    let result = if replace {
         state.log_write_queue.replace(job_id, &body).await
     } else {
         state.log_write_queue.write(job_id, &body).await
     };
+    drop(live);
     if let Err(error) = result {
         tracing::warn!(job_id, error = %format!("{error:#}"), "failed to persist runner log");
         return log_write_failure_response(error);
     }
 
     // Broadcast only the server-sanitized log via WebSocket to frontend.
-    crate::ws::push_job_log(&state.notification_hub, job_id, &body).await;
+    if replace {
+        crate::ws::push_job_log_replaced(&state.notification_hub, job_id, &body).await;
+    } else {
+        crate::ws::push_job_log(&state.notification_hub, job_id, &body).await;
+    }
 
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
+}
+
+/// The header that makes a log upload the next piece of a live log
+/// (card_e925c7cedd46): its number, from 0.
+pub const LIVE_LOG_SEQ_HEADER: &str = "x-job-log-seq";
+
+/// Take piece `seq` of the live log of `job` (see `crate::live_job_log`).
+async fn upload_live_log_piece(
+    state: &AppState,
+    job: &rg_db::entities::pipeline_job::Model,
+    seq: u64,
+    text: &str,
+) -> Response {
+    let entry = state.live_job_logs.entry(job.id);
+    let mut entry = entry.lock().await;
+    // The job's secrets are read only for its first piece.
+    let mask = match entry.state {
+        crate::live_job_log::LiveState::New => match job_mask_secrets(state, job).await {
+            Ok(secrets) => Some(rg_core::auth::log_mask::LogMask::new(&secrets)),
+            Err(response) => return response,
+        },
+        _ => None,
+    };
+    let start = || {
+        mask.unwrap_or_else(|| rg_core::auth::log_mask::LogMask::new(&[]))
+            .stream()
+    };
+    let (piece, stream) = entry.read(seq, text, start);
+    let emitted = match piece {
+        crate::live_job_log::Piece::Closed => {
+            return AppError::conflict("the job's log is complete").into_response()
+        }
+        crate::live_job_log::Piece::Duplicate => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "duplicate"})),
+            )
+                .into_response()
+        }
+        crate::live_job_log::Piece::Take(emitted) => emitted,
+    };
+    let emitted =
+        rg_core::auth::ci_token::mask_job_tokens_in_log(&emitted, &state.jwt_secret, job.id);
+    if !emitted.is_empty() {
+        if let Err(error) = state.log_write_queue.stream(job.id, &emitted).await {
+            tracing::warn!(job_id = job.id, error = %format!("{error:#}"), "failed to persist a live log piece");
+            return log_write_failure_response(error);
+        }
+    }
+    entry.commit(seq, stream.expect("a taken piece has its stream"));
+    drop(entry);
+    if !emitted.is_empty() {
+        crate::ws::push_job_log(&state.notification_hub, job.id, &emitted).await;
+    }
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
 }
 
@@ -1659,6 +1744,17 @@ async fn sanitized_runner_log(
     job: &rg_db::entities::pipeline_job::Model,
     log: &str,
 ) -> Result<String, Response> {
+    let secrets = job_mask_secrets(state, job).await?;
+    let log = rg_core::auth::ci_token::mask_job_tokens_in_log(log, &state.jwt_secret, job.id);
+    Ok(rg_core::auth::encryption::mask_values(&log, &secrets))
+}
+
+/// Every secret the job was issued and every secret it could read now: what a
+/// log a runner sent is masked with, whole or live.
+async fn job_mask_secrets(
+    state: &AppState,
+    job: &rg_db::entities::pipeline_job::Model,
+) -> Result<Vec<String>, Response> {
     let mut secrets = match decrypt_job_mask(state, job) {
         Ok(secrets) => secrets,
         Err(error) => {
@@ -1673,8 +1769,7 @@ async fn sanitized_runner_log(
             return Err(AppError::internal("failed to sanitize job log").into_response());
         }
     }
-    let log = rg_core::auth::ci_token::mask_job_tokens_in_log(log, &state.jwt_secret, job.id);
-    Ok(rg_core::auth::encryption::mask_values(&log, &secrets))
+    Ok(secrets)
 }
 
 fn log_write_failure_response(

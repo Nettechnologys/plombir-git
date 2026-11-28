@@ -1038,6 +1038,11 @@ impl PipelineRunner {
             // whole-graph), so this must not push the stage to `failed`.
             return Ok(Some(false));
         }
+        // The settled log replaced what was streamed live; a subscriber reads
+        // it from the start.
+        if let Some(notifier) = &self.notifications.notifier {
+            notifier.job_log(job.id, &log, true);
+        }
 
         // Post-commit, and only post-commit. The embedded runner is the only
         // executor on a default instance, and it settles its own jobs down here
@@ -1353,10 +1358,11 @@ impl PipelineRunner {
                 )
                 .await
             } else if let Some(img) = image {
-                self.run_job_docker(job_id, script, img, &job_environment)
+                self.run_job_docker(job_id, script, img, &job_environment, &secret_values)
                     .await
             } else {
-                self.run_job_local(script, &job_environment).await
+                self.run_job_local(job_id, script, &job_environment, &secret_values)
+                    .await
             }
         };
 
@@ -1616,8 +1622,10 @@ impl PipelineRunner {
     /// plus CI_JOB_TOKEN for authenticated API access.
     async fn run_job_local(
         &self,
+        job_id: i64,
         script: &str,
         job_environment: &[(String, String)],
+        secret_values: &[String],
     ) -> Result<(i32, String)> {
         #[cfg(unix)]
         let mut cmd = {
@@ -1648,11 +1656,38 @@ impl PipelineRunner {
             c
         };
 
-        let output = rg_process::output_ci_job_in_process_tree(&mut cmd)
+        let output = self
+            .output_with_live_log(job_id, &mut cmd, secret_values)
             .await
             .context("failed to spawn job process")?;
 
         Ok((output.status.code().unwrap_or(-1), output.log()))
+    }
+
+    /// Run `command`, writing its output into the job's log while it runs
+    /// (card_e925c7cedd46): masked with the job's secrets before it reaches
+    /// the database, and announced to the job's WebSocket subscribers. The
+    /// live text is a preview — the log the job settles with replaces it —
+    /// and this returns only once the last of it was written, so none lands
+    /// after that log.
+    async fn output_with_live_log(
+        &self,
+        job_id: i64,
+        command: &mut tokio::process::Command,
+        secret_values: &[String],
+    ) -> std::io::Result<rg_process::CappedJobOutput> {
+        let (live, receiver) = rg_process::live_log::LiveOutput::channel();
+        let mask = rg_core::auth::log_mask::LogMask::new(secret_values);
+        let mut sink = EmbeddedLiveLog {
+            db: &self.db_write,
+            job_id,
+            notifier: self.notifications.notifier.as_deref(),
+        };
+        let (output, ()) = tokio::join!(
+            rg_process::output_ci_job_in_process_tree_live(command, live),
+            rg_process::live_log::forward(receiver, &mask, &mut sink),
+        );
+        output
     }
 
     /// Execute script inside a Docker container.
@@ -1666,6 +1701,7 @@ impl PipelineRunner {
         script: &str,
         image: &str,
         job_environment: &[(String, String)],
+        secret_values: &[String],
     ) -> Result<(i32, String)> {
         let workspace_path = self.workspace_path();
 
@@ -1725,7 +1761,8 @@ impl PipelineRunner {
             }
         };
         let mut command = prepared.command;
-        let output = rg_process::output_ci_job_in_process_tree(&mut command)
+        let output = self
+            .output_with_live_log(job_id, &mut command, secret_values)
             .await
             .context("failed to spawn docker run")?;
 
@@ -2322,6 +2359,31 @@ fn remove_cache_archive(archive: &std::path::Path, why: &str) {
 /// Prefix used for runner-generated lines so they are distinguishable from the
 /// job script's own output.
 const JOB_NOTICE_PREFIX: &str = "[plombir-git] ";
+
+/// The embedded runner's live log: straight into the job's log, as streamed
+/// pieces, and on to the hub.
+struct EmbeddedLiveLog<'a> {
+    db: &'a sea_orm::DatabaseConnection,
+    job_id: i64,
+    notifier: Option<&'a dyn rg_core::push_hooks::PushNotifier>,
+}
+
+impl rg_process::live_log::LiveSink for EmbeddedLiveLog<'_> {
+    async fn send(&mut self, text: String) -> bool {
+        if let Err(error) = pipeline_ops::stream_job_log(self.db, self.job_id, &text).await {
+            tracing::warn!(
+                job_id = self.job_id,
+                error = %format!("{error:#}"),
+                "a live log piece could not be written; the job's log shows when it ends"
+            );
+            return false;
+        }
+        if let Some(notifier) = self.notifier {
+            notifier.job_log(self.job_id, &text, false);
+        }
+        true
+    }
+}
 
 /// Append runner diagnostics to a job's captured output.
 ///
@@ -4920,6 +4982,131 @@ esac
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// card_e925c7cedd46: the embedded runner writes a job's output into its
+    /// log while the job runs, tells the job's subscribers, and settles with
+    /// the whole log once — the live text is replaced, not doubled.
+    #[tokio::test]
+    async fn an_embedded_jobs_log_is_written_while_it_runs_and_replaced_once_at_the_end() {
+        #[derive(Default)]
+        struct Heard(std::sync::Mutex<Vec<(String, bool)>>);
+        impl rg_core::push_hooks::PushNotifier for Heard {
+            fn notify(&self, _user_id: i64, _event_type: &str, _data: serde_json::Value) {}
+            fn job_log(&self, _job_id: i64, log: &str, replaced: bool) {
+                self.0.lock().unwrap().push((log.to_string(), replaced));
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let (db, repo, repo_path, commit_sha, user_id) =
+            repo_with_one_commit(temp.path(), "livelog").await;
+        let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+            &db,
+            repo.id,
+            &commit_sha,
+            "refs/heads/main",
+            "manual",
+            Some(user_id),
+        )
+        .await
+        .unwrap();
+        let stage = rg_db::ops::pipeline_ops::create_stage(&db, pipeline.id, "test", 0)
+            .await
+            .unwrap();
+        let marker = temp.path().join("let-the-job-end");
+        let job = rg_db::ops::pipeline_ops::create_job(
+            &db,
+            stage.id,
+            "live",
+            &format!(
+                "echo first-line; while [ ! -e '{}' ]; do sleep 0.05; done; echo last-line",
+                marker.display()
+            ),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let heard = std::sync::Arc::new(Heard::default());
+        let mut runner = PipelineRunner::new_local_only(
+            db.clone(),
+            &temp.path().join("repos"),
+            &repo_path,
+            pipeline.id,
+        );
+        runner.set_repo_id(repo.id);
+        runner.set_allow_host_runner(true);
+        runner.set_notifications(crate::CiNotifications {
+            notifier: Some(heard.clone()),
+            smtp_config: None,
+        });
+        let execution = tokio::spawn(async move { runner.run().await });
+
+        let stored = |db: rg_db::DatabaseConnection| async move {
+            rg_db::ops::pipeline_ops::get_job_log_slice(&db, job.id, 0, 1 << 20)
+                .await
+                .unwrap()
+                .and_then(|slice| slice.content)
+                .unwrap_or_default()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !stored(db.clone()).await.contains("first-line") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the job's first line never reached its log while it ran"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let running = rg_db::ops::pipeline_ops::get_job(&db, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            running.status, "running",
+            "the line arrived before the job ended"
+        );
+        assert!(
+            heard
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(log, replaced)| !replaced && log.contains("first-line")),
+            "the job's subscribers were told while it ran"
+        );
+
+        std::fs::write(&marker, b"").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(60), execution)
+            .await
+            .expect("the job ends once its marker exists")
+            .expect("runner task panicked")
+            .expect("the pipeline ran");
+        let settled = await_job_status(&db, job.id, "success").await;
+        assert_eq!(settled.log.as_deref(), Some("first-line\nlast-line\n"));
+        assert_eq!(
+            stored(db.clone()).await,
+            "first-line\nlast-line\n",
+            "the live text was replaced by the settled log, not kept beside it"
+        );
+        assert!(
+            heard
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(log, replaced)| *replaced && log == "first-line\nlast-line\n"),
+            "the subscribers were told the log was replaced"
+        );
     }
 
     /// card_34368880dc20: a planned restart must not cost the pipeline ten

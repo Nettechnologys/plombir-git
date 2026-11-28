@@ -5279,6 +5279,7 @@ dependencies = [
 name = "rg-process"
 version = "0.4.4"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "base64 0.22.1",
  "libc",
@@ -5288,6 +5289,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "urlencoding",
  "windows-sys 0.61.2",
 ]
 

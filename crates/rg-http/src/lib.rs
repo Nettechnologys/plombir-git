@@ -26,6 +26,7 @@ pub mod client_ip;
 pub mod error;
 pub mod git_v2;
 pub mod instance;
+pub mod live_job_log;
 pub mod metrics;
 pub mod middleware;
 pub mod oci;
@@ -169,6 +170,8 @@ pub struct AppState {
     pub blob_storage: Arc<dyn rg_core::blob_storage::BlobStorage>,
     pub oci_storage: Arc<OciStorage>,
     pub log_write_queue: rg_core::ci::log_write_queue::LogWriteQueue,
+    /// Where the live logs external runners send stand (`live_job_log`).
+    pub live_job_logs: Arc<live_job_log::LiveJobLogs>,
     /// Tracker for detached delivery/post-push work owned by this app state.
     pub delivery_tracker: rg_core::task_tracker::TaskTracker,
     /// Configured public base URL — `[server].external_url`. Read it through
@@ -893,6 +896,7 @@ async fn run_with_listener(
         blob_storage,
         oci_storage,
         log_write_queue,
+        live_job_logs: Default::default(),
         delivery_tracker: rg_core::task_tracker::delivery_tracker().clone(),
         external_url: config.external_url,
         ssh_clone_port: config.ssh_clone_port,

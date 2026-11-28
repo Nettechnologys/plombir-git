@@ -78,6 +78,7 @@ mod board_tests;
 mod ci_cache_tests;
 mod ci_job_log_boundary_tests;
 mod ci_job_token_tests;
+mod ci_live_job_log_tests;
 mod ci_oidc_tests;
 mod ci_permission_tests;
 mod ci_secret_environment_tests;

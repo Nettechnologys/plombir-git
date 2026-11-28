@@ -33,6 +33,11 @@ use rg_git::protocol::receive_pack::RefUpdate;
 pub trait PushNotifier: Send + Sync {
     /// Push `event_type` + `data` to the given user's channel.
     fn notify(&self, user_id: i64, event_type: &str, data: serde_json::Value);
+
+    /// Tell the subscribers of job `job_id` its log grew by `log`, or, with
+    /// `replaced`, was written whole again (the embedded runner's live log,
+    /// card_e925c7cedd46). No default: a sink that drops it has to say so.
+    fn job_log(&self, job_id: i64, log: &str, replaced: bool);
 }
 
 /// Where a ref move came from beyond the account that made it (ADR-0001 D4).
@@ -2026,6 +2031,8 @@ mod tests {
                     .unwrap()
                     .push((user_id, event_type.to_string()));
             }
+
+            fn job_log(&self, _job_id: i64, _log: &str, _replaced: bool) {}
         }
 
         let (db, _sandbox, personal) = deletion_target("notify-owner").await;

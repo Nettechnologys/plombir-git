@@ -54,6 +54,9 @@
   let logContentEl = $state<HTMLPreElement | null>(null);
   let logSocket: WebSocket | null = null;
   let logOffset = 0;
+  // The server wrote the job's log whole again (the final log after a live
+  // one): the next read starts over instead of appending at the old offset.
+  let logResetPending = false;
   let logSyncingClaim: RepositoryResourceRequestClaim<string> | null = null;
   let logSyncRequestedClaim: RepositoryResourceRequestClaim<string> | null = null;
   let activeLogClaim: RepositoryResourceRequestClaim<string> | null = null;
@@ -659,15 +662,18 @@
     logStreamError = '';
     logSocket = connectJobLogWebSocket(
       jobId,
-      () => void syncJobLog(
-        expectedOwner,
-        expectedRepo,
-        pipelineId,
-        jobId,
-        expectedRoute,
-        expectedSelection,
-        claim,
-      ),
+      (_chunk, replaced) => {
+        if (replaced) logResetPending = true;
+        void syncJobLog(
+          expectedOwner,
+          expectedRepo,
+          pipelineId,
+          jobId,
+          expectedRoute,
+          expectedSelection,
+          claim,
+        );
+      },
       (status) => {
         if (!ownsJobIntent(claim, expectedOwner, expectedRepo, pipelineId, jobId, expectedRoute, expectedSelection)) return;
         logStreamStatus = status;
@@ -721,9 +727,16 @@
         logSyncRequestedClaim = null;
         let more = true;
         while (more) {
+          if (logResetPending) {
+            logResetPending = false;
+            logOffset = 0;
+            logContent = '';
+          }
           const slice = await pipelines.jobLog(expectedOwner, expectedRepo, pipelineId, jobId, logOffset);
           if (!ownsJobIntent(claim, expectedOwner, expectedRepo, pipelineId, jobId,
             expectedRoute, expectedSelection)) return;
+          // Read before the log was replaced: start over.
+          if (logResetPending) continue;
           if (slice.total_length < logOffset) {
             logOffset = 0;
             logContent = '';

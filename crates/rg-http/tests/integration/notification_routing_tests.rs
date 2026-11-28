@@ -266,6 +266,8 @@ async fn notifications_reach_the_people_an_event_is_about() {
                 .unwrap()
                 .push((user_id, event_type.to_string()));
         }
+
+        fn job_log(&self, _job_id: i64, _log: &str, _replaced: bool) {}
     }
     let heard = std::sync::Arc::new(Heard::default());
     let pools = rg_core::db::Db::new(db.clone(), db.clone()).with_notifier(Some(heard.clone()));
