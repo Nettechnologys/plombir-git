@@ -327,6 +327,15 @@ impl std::error::Error for ProcessOutputError {
 /// than waiting for a process the job no longer owns.
 const ORPHANED_PIPE_GRACE: Duration = Duration::from_secs(5);
 
+/// How the log of a job that outran its time limit begins: both runners put
+/// [`job_timed_out_message`] in place of the job's log.
+pub const JOB_TIMED_OUT_PREFIX: &str = "Job timed out after ";
+
+/// The log of a job stopped at its `timeout_secs`.
+pub fn job_timed_out_message(timeout_secs: u64) -> String {
+    format!("{JOB_TIMED_OUT_PREFIX}{timeout_secs} seconds")
+}
+
 /// The total captured stdout and stderr of one CI job. Both streams get half
 /// the budget. Even if every captured byte becomes a three-byte UTF-8
 /// replacement character, the resulting log fits the runner upload's 8 MiB

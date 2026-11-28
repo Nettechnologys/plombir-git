@@ -184,7 +184,10 @@ pub const PIPELINE_EVENTS: [&str; 5] = [
 /// by the server from the bot's profile ([`CiTrigger::enqueue_agent_run`]) and
 /// never asks a workflow file anything, so the name only labels the row: CI
 /// secrets are withheld from it, and a retry refuses it.
-pub const AGENT_RUN_EVENT: &str = "agent_run";
+pub const AGENT_RUN_EVENT: &str = rg_db::ops::pipeline_ops::AGENT_RUN_TRIGGER;
+
+/// How both runners say a job outran its time limit (`rg_process`).
+pub use rg_process::{job_timed_out_message, JOB_TIMED_OUT_PREFIX};
 
 /// Whether a job of a pipeline created under `trigger_type` is handed the
 /// repository's CI secrets.

@@ -461,11 +461,14 @@ pub async fn deregister(
     // watchdog's retirement: a failure answers `5xx` with nothing half-done,
     // and the runner, which does not retry, leaves the rest to that watchdog.
     match rg_db::ops::runner_ops::stop_runner(&state.db, runner_id).await {
-        Ok(true) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "offline"})),
-        )
-            .into_response(),
+        Ok(true) => {
+            settle_lost_agent_runs(&state).await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "offline"})),
+            )
+                .into_response()
+        }
         // The API envelope, not a bare `{"error": "..."}`: that older shape
         // carries no `error.code` to branch on (card_7fe0684198fc sweep).
         Ok(false) => AppError::not_found("runner not found").into_response(),
@@ -473,6 +476,21 @@ pub async fn deregister(
             tracing::error!(runner_id, error = %format!("{e:#}"), "Failed to take a stopping runner offline");
             AppError::from(e).into_response()
         }
+    }
+}
+
+/// End the agent runs whose job a runner took with it — failed by the job
+/// release itself (`fail_agent_run_jobs`) — and delete their tokens now,
+/// rather than at the next agent run pass (card_4e61d764c20c). Logged, never
+/// the caller's failure: that pass does the same a minute later.
+pub(crate) async fn settle_lost_agent_runs(state: &AppState) {
+    match rg_core::agent::run::settle_runs_of_settled_pipelines(&state.db_pools()).await {
+        Ok(0) => {}
+        Ok(ended) => tracing::info!(ended, "ended the agent runs a released runner took with it"),
+        Err(error) => tracing::warn!(
+            error = %format!("{error:#}"),
+            "agent runs of a released runner could not be ended now; the next agent run pass ends them"
+        ),
     }
 }
 
@@ -1546,6 +1564,11 @@ pub async fn upload_log(
             return AppError::bad_request("x-job-log-seq is the piece's number, from 0")
                 .into_response();
         };
+        // A live piece is the job running: a job the server settled (a
+        // cancel, a lost runner's agent job) takes none (409).
+        if let Err(error) = refuse_settled_job(runner_id, &job) {
+            return error.into_response();
+        }
         return upload_live_log_piece(&state, &job, seq, &body).await;
     }
 
@@ -3025,6 +3048,7 @@ pub async fn delete_runner_admin(
 
     match rg_db::ops::runner_ops::deregister_runner(&state.db, runner_id).await {
         Ok(true) => {
+            settle_lost_agent_runs(&state).await;
             record_instance_credential(
                 &state,
                 &actor,

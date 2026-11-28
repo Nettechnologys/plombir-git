@@ -243,6 +243,8 @@ pub struct EndedRun {
     run: agent_run::Model,
     status: &'static str,
     reason: String,
+    /// The person who ended it, when one did (a cancel).
+    by: Option<i64>,
 }
 
 /// Read every check of D6 for an assignment of `issue` to `assignee_id` by
@@ -865,6 +867,7 @@ pub async fn end_run_in(
         run,
         status,
         reason: reason.to_string(),
+        by: None,
     }))
 }
 
@@ -923,7 +926,7 @@ pub async fn after_end(db: &impl crate::db::DbPools, ended: EndedRun, message: S
     };
     record(
         write,
-        None,
+        ended.by,
         "agent.run_finished",
         ended.run.repository_id,
         serde_json::json!({
@@ -1021,6 +1024,112 @@ pub async fn end_runs_withdrawn_by_profile(
     Ok(stopped)
 }
 
+// ── Cancelling a run ───────────────────────────────────────────────────────
+
+/// What a person's request to cancel a run came to (card_231f9eb28ee3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// This request ended the run.
+    Cancelled,
+    /// The run had already ended — by itself, or by another ender first.
+    AlreadyEnded,
+    /// The person may not cancel this run.
+    NotAllowed,
+}
+
+/// Whether `actor_id` may cancel `run`: the person who asked for it, the
+/// bot's owner, or an admin of its repository (`repo_admin`, decided by the
+/// HTTP gate that admitted the request). Never a bot, and never a request
+/// made with an agent run's token — an agent does not cancel runs, its own
+/// or another's.
+///
+/// Write access alone is not enough: anyone who may write could otherwise
+/// stop every run in the repository, and the run spends its bot owner's key
+/// on the assigner's request — those two, and whoever administers the
+/// repository, are the ones it answers to.
+pub async fn may_cancel(
+    db: &DatabaseConnection,
+    run: &agent_run::Model,
+    actor_id: i64,
+    repo_admin: bool,
+) -> Result<bool> {
+    let from_run_token = crate::auth::credential_context::current()
+        .is_some_and(|credential| credential.agent_run_attempt_id.is_some());
+    if from_run_token {
+        return Ok(false);
+    }
+    let Some(actor) = rg_db::ops::user_ops::find_by_id(db, actor_id).await? else {
+        return Ok(false);
+    };
+    if !actor.is_usable() || actor.is_bot() {
+        return Ok(false);
+    }
+    if run.triggered_by == actor_id {
+        return Ok(true);
+    }
+    let bot = rg_db::ops::user_ops::find_by_id(db, run.bot_id).await?;
+    if bot.and_then(|bot| bot.bot_owner_id) == Some(actor_id) {
+        return Ok(true);
+    }
+    Ok(repo_admin)
+}
+
+/// The run whose attempt pipeline `pipeline_id` carries, if any.
+pub async fn run_of_pipeline(
+    db: &DatabaseConnection,
+    pipeline_id: i64,
+) -> Result<Option<agent_run::Model>> {
+    Ok(
+        rg_db::ops::agent_run_ops::attempt_of_pipeline(db, pipeline_id)
+            .await?
+            .map(|(run, _)| run),
+    )
+}
+
+/// Cancel run `run_id` for `actor_id`, queued or running: the one transition
+/// out of active ([`end_run_in`]) cancels its pipeline — which stops its job's
+/// container on either runner — and deletes its attempts' tokens; then the
+/// bot says so on the issue and `agent.run_finished` names who cancelled it.
+pub async fn cancel(
+    db: &impl crate::db::DbPools,
+    run_id: i64,
+    actor_id: i64,
+    repo_admin: bool,
+) -> Result<CancelOutcome> {
+    let pools = db.owned();
+    let Some(run) = agent_run::Entity::find_by_id(run_id)
+        .one(pools.read())
+        .await
+        .context("db: find the agent run to cancel")?
+    else {
+        return Ok(CancelOutcome::AlreadyEnded);
+    };
+    if !may_cancel(pools.read(), &run, actor_id, repo_admin).await? {
+        return Ok(CancelOutcome::NotAllowed);
+    }
+    if run.active != Some(true) {
+        return Ok(CancelOutcome::AlreadyEnded);
+    }
+    let who = rg_db::ops::user_ops::find_by_id(pools.read(), actor_id)
+        .await?
+        .map(|user| user.username)
+        .unwrap_or_else(|| "someone".to_string());
+    let reason = format!("cancelled by @{who}");
+    match end_run(&pools, run_id, "cancelled", &reason).await? {
+        Some(mut ended) => {
+            ended.by = Some(actor_id);
+            after_end(
+                &pools,
+                ended,
+                format!("I stopped working on this: @{who} cancelled my run."),
+            )
+            .await;
+            Ok(CancelOutcome::Cancelled)
+        }
+        None => Ok(CancelOutcome::AlreadyEnded),
+    }
+}
+
 // ── The outcome of a run ───────────────────────────────────────────────────
 
 /// How many lines of the job's log a failure comment quotes.
@@ -1035,6 +1144,10 @@ pub enum Outcome {
     },
     Failed {
         reason: String,
+        message: String,
+    },
+    /// The job ran past the run's time limit.
+    TimedOut {
         message: String,
     },
     Cancelled,
@@ -1082,6 +1195,11 @@ pub async fn pipeline_settled(db: &impl crate::db::DbPools, pipeline_id: i64) ->
     let (status, reason, message) = match outcome {
         Outcome::Succeeded { message } => ("succeeded", "finished".to_string(), message),
         Outcome::Failed { reason, message } => ("failed", reason, message),
+        Outcome::TimedOut { message } => (
+            "timed_out",
+            "the run took longer than its time limit".to_string(),
+            message,
+        ),
         Outcome::Cancelled => (
             "cancelled",
             "the run's pipeline was cancelled".to_string(),
@@ -1108,6 +1226,18 @@ async fn outcome_of(
         "canceled" | "cancelled" => return Ok(Some(Outcome::Cancelled)),
         "failed" | "error" | "timed_out" | "skipped" => {
             let tail = log_tail(db, pipeline.id).await?;
+            // Both runners end a job that outran its limit with this notice
+            // in place of its log.
+            if pipeline.status == "timed_out"
+                || tail
+                    .lines()
+                    .any(|line| line.starts_with(crate::ci::JOB_TIMED_OUT_PREFIX))
+            {
+                return Ok(Some(Outcome::TimedOut {
+                    message: "I could not finish this: my run took longer than its time limit."
+                        .to_string(),
+                }));
+            }
             return Ok(Some(failed("the agent's job failed", &tail)));
         }
         _ => return Ok(None),
@@ -1132,7 +1262,7 @@ async fn outcome_of(
     let opened = match run.result_pull_request_id {
         Some(pr_id) => rg_db::ops::pull_request_ops::find_by_id(db, pr_id)
             .await?
-            .filter(|pr| pr.repo_id == run.repository_id)
+            .filter(|pr| is_the_runs_pull_request(run, pr))
             .map(|pr| pr.number),
         None => None,
     };
@@ -1145,6 +1275,45 @@ async fn outcome_of(
             &log_tail(db, pipeline.id).await?,
         ),
     }))
+}
+
+/// Whether `pr` is one `run` can have opened: in the run's repository, by
+/// its bot, from a branch of the repository itself under the refs the run
+/// may write. Anything else recorded as its result is not counted as a
+/// success (card_231f9eb28ee3).
+fn is_the_runs_pull_request(
+    run: &agent_run::Model,
+    pr: &rg_db::entities::pull_request::Model,
+) -> bool {
+    opened_by_the_run(
+        run,
+        pr.repo_id,
+        pr.author_id,
+        &pr.head_branch,
+        pr.head_repo_id,
+    )
+}
+
+fn opened_by_the_run(
+    run: &agent_run::Model,
+    repo_id: i64,
+    author_id: i64,
+    head_branch: &str,
+    head_repo_id: Option<i64>,
+) -> bool {
+    let Some(prefix) = run.write_ref_prefix.as_deref() else {
+        return false;
+    };
+    let head = format!("refs/heads/{head_branch}");
+    let under_prefix = if prefix.ends_with('/') {
+        head.starts_with(prefix) && head.len() > prefix.len()
+    } else {
+        head == prefix
+    };
+    repo_id == run.repository_id
+        && author_id == run.bot_id
+        && head_repo_id.is_none()
+        && under_prefix
 }
 
 fn failed(reason: &str, tail: &str) -> Outcome {
@@ -1190,6 +1359,45 @@ async fn log_tail(db: &DatabaseConnection, pipeline_id: i64) -> Result<String> {
     let lines: Vec<&str> = log.lines().collect();
     let start = lines.len().saturating_sub(FAILURE_LOG_LINES);
     Ok(lines[start..].join("\n"))
+}
+
+/// How long a run may wait for a runner to take its job before it ends
+/// `failed`, saying which runner it waited for (card_4e61d764c20c).
+pub const RUNNER_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+fn no_runner_reason(labels: &[String]) -> String {
+    let minutes = RUNNER_WAIT_LIMIT.as_secs() / 60;
+    if labels.is_empty() {
+        format!(
+            "no runner took my job within {minutes} minutes: none is online that runs Docker jobs"
+        )
+    } else {
+        format!(
+            "no runner took my job within {minutes} minutes: none is online with the labels `{}`",
+            labels.join("`, `")
+        )
+    }
+}
+
+/// End every active run whose pipeline settled without telling it — a job
+/// failed because its runner was lost (`rg_db::ops::pipeline_ops::fail_agent_run_jobs`),
+/// a pipeline cancelled behind the run's back — so its token goes now rather
+/// than at the next [`recover`] tick. Returns how many it ended.
+pub async fn settle_runs_of_settled_pipelines(db: &impl crate::db::DbPools) -> Result<usize> {
+    let pools = db.owned();
+    let mut ended = 0;
+    for run in rg_db::ops::agent_run_ops::active_runs(pools.read()).await? {
+        let latest = rg_db::ops::agent_run_ops::attempts_of_run(pools.read(), run.id)
+            .await?
+            .into_iter()
+            .last();
+        if let Some(pipeline_id) = latest.and_then(|attempt| attempt.pipeline_id) {
+            if pipeline_settled(&pools, pipeline_id).await? {
+                ended += 1;
+            }
+        }
+    }
+    Ok(ended)
 }
 
 /// What one [`recover`] pass did.
@@ -1278,12 +1486,27 @@ async fn recover_run(
     };
     if let Some(pipeline_id) = attempt.pipeline_id {
         // Settled while nobody told the run (a cancel through the CI page, a
-        // hook a restart cut off): its outcome is read now.
-        return Ok(if pipeline_settled(pools, pipeline_id).await? {
-            RunRecovery::Ended
-        } else {
-            RunRecovery::Untouched
-        });
+        // hook a restart cut off, a runner lost): its outcome is read now.
+        if pipeline_settled(pools, pipeline_id).await? {
+            return Ok(RunRecovery::Ended);
+        }
+        // Queued, and no runner took its job (card_4e61d764c20c).
+        let waited_too_long = Utc::now()
+            - chrono::Duration::from_std(RUNNER_WAIT_LIMIT).unwrap_or_default()
+            > run.created_at;
+        if run.status == "queued" && waited_too_long {
+            let reason = no_runner_reason(&saved.runner_tags());
+            if let Some(ended) = end_run(pools, run.id, "failed", &reason).await? {
+                after_end(
+                    pools,
+                    ended,
+                    format!("I could not start working on this: {reason}."),
+                )
+                .await;
+                return Ok(RunRecovery::Ended);
+            }
+        }
+        return Ok(RunRecovery::Untouched);
     }
     if run.created_at > cutoff {
         return Ok(RunRecovery::Untouched);
@@ -1458,6 +1681,53 @@ mod tests {
         ] {
             assert!(!RUN_MCP_TOOLS.contains(&refused), "{refused} is a run tool");
         }
+    }
+
+    /// card_231f9eb28ee3: a pull request recorded as a run's result counts
+    /// only if the run could have opened it.
+    #[test]
+    fn only_the_runs_own_pull_request_counts_as_its_result() {
+        let now = Utc::now();
+        let run = agent_run::Model {
+            id: 1,
+            bot_id: 7,
+            repository_id: 3,
+            issue_id: Some(4),
+            pull_request_id: None,
+            iteration: 1,
+            triggered_by: 2,
+            trigger_key: "k".into(),
+            status: "running".into(),
+            active: Some(true),
+            result_pull_request_id: Some(9),
+            failure_reason: None,
+            write_ref_prefix: Some("refs/heads/agent/bot/".into()),
+            commit_sha: None,
+            task: None,
+            created_at: now,
+            finished_at: None,
+        };
+        let pr = |repo_id: i64, author_id: i64, head: &'static str, fork: Option<i64>| {
+            (repo_id, author_id, head, fork)
+        };
+        let counts =
+            |run: &agent_run::Model, (repo, author, head, fork): (i64, i64, &str, Option<i64>)| {
+                opened_by_the_run(run, repo, author, head, fork)
+            };
+        assert!(counts(&run, pr(3, 7, "agent/bot/4-fix", None)));
+        for (case, other) in [
+            ("another repository", pr(5, 7, "agent/bot/4-fix", None)),
+            ("another author", pr(3, 2, "agent/bot/4-fix", None)),
+            ("a branch outside the prefix", pr(3, 7, "main", None)),
+            ("the bare prefix", pr(3, 7, "agent/bot", None)),
+            ("a fork's branch", pr(3, 7, "agent/bot/4-fix", Some(8))),
+        ] {
+            assert!(!counts(&run, other), "{case} counted");
+        }
+        let mut iteration = run.clone();
+        iteration.write_ref_prefix = Some("refs/heads/agent/bot/4-fix".into());
+        assert!(counts(&iteration, pr(3, 7, "agent/bot/4-fix", None)));
+        assert!(!counts(&iteration, pr(3, 7, "agent/bot/4-fix2", None)));
     }
 
     #[test]

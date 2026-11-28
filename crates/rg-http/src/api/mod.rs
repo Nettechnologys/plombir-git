@@ -2,6 +2,7 @@ pub mod access_audit;
 pub mod account;
 pub mod admin;
 pub mod agent_profiles;
+pub mod agent_runs;
 pub mod ai;
 pub mod archive;
 pub mod artifacts;

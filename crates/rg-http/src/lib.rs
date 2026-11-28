@@ -1457,6 +1457,11 @@ async fn run_runner_watchdog(state: AppState, mut shutdown_rx: tokio::sync::watc
             }
         }
 
+        // 2b. An agent run's job is never handed back: the two branches above
+        // failed it instead, and the run ends now, its token with it
+        // (card_4e61d764c20c).
+        crate::api::runners::settle_lost_agent_runs(&state).await;
+
         // 3. Restart the pipelines whose embedded runner died in this process.
         //
         // The reset above only renames the row: `pending` means "waiting for an

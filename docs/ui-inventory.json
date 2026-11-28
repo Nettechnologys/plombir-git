@@ -13496,7 +13496,7 @@
         {
           "tag": "form",
           "label": "updateTriggerRef(event.currentTarget.value)} onchange= place",
-          "line": 827,
+          "line": 840,
           "via": null,
           "href": null,
           "handler": "handleTrigger",
@@ -13579,7 +13579,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 856,
+          "line": 869,
           "via": null,
           "href": null,
           "handler": "(event) => setTriggerInput(input.name, event.currentTarget.checked ? 'true' : 'f",
@@ -13589,7 +13589,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 865,
+          "line": 878,
           "via": null,
           "href": null,
           "handler": "(event) => setTriggerInput(input.name, event.currentTarget.value)",
@@ -13599,7 +13599,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.starting",
-          "line": 893,
+          "line": 906,
           "via": null,
           "href": null,
           "handler": null,
@@ -13609,7 +13609,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.retry",
-          "line": 956,
+          "line": 969,
           "via": null,
           "href": null,
           "handler": "() => handleRetry(selectedPipeline.id)",
@@ -13676,7 +13676,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.cancel",
-          "line": 959,
+          "line": 972,
           "via": null,
           "href": null,
           "handler": "() => handleCancel(selectedPipeline.id)",
@@ -13700,7 +13700,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.play_manual",
-          "line": 1020,
+          "line": 1033,
           "via": null,
           "href": null,
           "handler": "(event) => { event.stopPropagation(); handlePlay(job.id); }",
@@ -13752,7 +13752,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.approval_recorded",
-          "line": 1023,
+          "line": 1036,
           "via": null,
           "href": null,
           "handler": "(event) => { event.stopPropagation(); handleApprove(job.id); }",
@@ -13804,7 +13804,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.artifact_downloading",
-          "line": 1059,
+          "line": 1072,
           "via": null,
           "href": null,
           "handler": "() => downloadArtifact(artifact)",
@@ -13829,7 +13829,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.artifact_deleting",
-          "line": 1065,
+          "line": 1078,
           "via": null,
           "href": null,
           "handler": "() => deleteArtifact(artifact)",
@@ -13854,7 +13854,7 @@
         {
           "tag": "button",
           "label": "✕",
-          "line": 1103,
+          "line": 1116,
           "via": null,
           "href": null,
           "handler": "closeLog",
@@ -13864,7 +13864,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.log.all_steps",
-          "line": 1113,
+          "line": 1126,
           "via": null,
           "href": null,
           "handler": "() => showStep(null)",
@@ -13889,7 +13889,7 @@
         {
           "tag": "button",
           "label": ".",
-          "line": 1121,
+          "line": 1134,
           "via": null,
           "href": null,
           "handler": "() => showStep(step.number)",

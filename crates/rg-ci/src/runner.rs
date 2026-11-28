@@ -1382,7 +1382,7 @@ impl PipelineRunner {
                         if image.is_some() || has_services {
                             self.remove_job_container(job_id).await;
                         }
-                        let msg = format!("Job timed out after {} seconds", timeout_secs);
+                        let msg = rg_process::job_timed_out_message(timeout_secs);
                         tracing::warn!(job_id, "{}", msg);
                         Ok((-1, msg))
                     }

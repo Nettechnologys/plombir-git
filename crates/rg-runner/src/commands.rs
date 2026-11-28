@@ -1121,7 +1121,7 @@ pub async fn run_jobs_until_shutdown_checking_every(
                                 if let Some(name) = &container_name {
                                     remove_job_container(name).await;
                                 }
-                                (-1, format!("Job timed out after {timeout_seconds} seconds"))
+                                (-1, rg_process::job_timed_out_message(timeout_seconds))
                             }
                         }
                     };

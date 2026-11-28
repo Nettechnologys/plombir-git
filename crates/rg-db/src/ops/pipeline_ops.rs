@@ -816,8 +816,8 @@ pub async fn stream_job_log(db: &DatabaseConnection, id: i64, text: &str) -> Res
     append_job_log_text(db, id, text, false).await
 }
 
-async fn append_job_log_text(
-    db: &DatabaseConnection,
+async fn append_job_log_text<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
     id: i64,
     text: &str,
     on_its_own_line: bool,
@@ -1954,8 +1954,58 @@ pub async fn touch_running_jobs_for_runner(
     Ok(result.rows_affected)
 }
 
-/// Reset a stuck job back to pending, unassigning the runner.
+/// The trigger an agent run's pipeline carries (`rg_core::ci::AGENT_RUN_EVENT`).
+pub const AGENT_RUN_TRIGGER: &str = "agent_run";
+
+/// What the log of an agent run's job says when its executor was lost.
+pub const AGENT_JOB_LOST_NOTICE: &str = "[plombir-git] This agent run was stopped: the runner \
+executing it was lost or stopped. An agent is not restarted halfway through its work; assign \
+the issue to the bot again for a new run.";
+
+/// Fail, in `db`, every job among `jobs` that belongs to an agent run, with
+/// its pipeline, instead of handing it back to the queue; their ids.
+///
+/// Every path that hands work back — a runner lost or stopped, a job stuck,
+/// an embedded runner shutting down — goes through here, because for an
+/// agent run "again" is not "the same": the attempt already holds a token,
+/// may have pushed half its work and opened its pull request, and a second
+/// runner starting it from the top would do it all again beside what is
+/// there (card_4e61d764c20c). The run ends instead, and the next agent run
+/// pass (`rg_core::agent::run`) ends it as `failed` and deletes its token.
+/// The live log is kept, with [`AGENT_JOB_LOST_NOTICE`] after it.
+pub async fn fail_agent_run_jobs<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    jobs: &[pipeline_job::Model],
+) -> Result<Vec<i64>> {
+    let mut failed = Vec::new();
+    for job in jobs {
+        let Some(stage) = get_stage_by_id(db, job.stage_id).await? else {
+            continue;
+        };
+        let Some(pipeline) = get_pipeline(db, stage.pipeline_id).await? else {
+            continue;
+        };
+        if pipeline.trigger_type != AGENT_RUN_TRIGGER {
+            continue;
+        }
+        append_job_log_text(db, job.id, AGENT_JOB_LOST_NOTICE, true).await?;
+        settle_pipeline_chain_in_transaction(db, pipeline.id, "failed", None).await?;
+        failed.push(job.id);
+    }
+    Ok(failed)
+}
+
+/// Reset a stuck job back to pending, unassigning the runner. A job of an
+/// agent run is failed instead ([`fail_agent_run_jobs`]).
 pub async fn reset_stuck_job(db: &DatabaseConnection, job_id: i64) -> Result<()> {
+    if let Some(job) = get_job(db, job_id).await? {
+        let txn = db.begin().await.context("db: begin stuck job reset")?;
+        let failed = fail_agent_run_jobs(&txn, std::slice::from_ref(&job)).await?;
+        txn.commit().await.context("db: commit stuck job reset")?;
+        if !failed.is_empty() {
+            return Ok(());
+        }
+    }
     let now = chrono::Utc::now().naive_utc();
     pipeline_job::Entity::update_many()
         .filter(pipeline_job::Column::Id.eq(job_id))
@@ -1987,7 +2037,21 @@ pub async fn reset_stuck_job(db: &DatabaseConnection, job_id: i64) -> Result<()>
 /// earlier already settled the row, and reviving it as `pending` would hand a
 /// finished job back to be run a second time. Returns whether the row was still
 /// active and therefore handed back.
-pub async fn hand_back_active_job(db: &impl ConnectionTrait, job_id: i64) -> Result<bool> {
+pub async fn hand_back_active_job<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    job_id: i64,
+) -> Result<bool> {
+    if let Some(job) = get_job(db, job_id)
+        .await?
+        .filter(|job| ["assigned", "running"].contains(&job.status.as_str()))
+    {
+        if !fail_agent_run_jobs(db, std::slice::from_ref(&job))
+            .await?
+            .is_empty()
+        {
+            return Ok(false);
+        }
+    }
     let now = chrono::Utc::now().naive_utc();
     let result = pipeline_job::Entity::update_many()
         .filter(pipeline_job::Column::Id.eq(job_id))
@@ -2031,11 +2095,22 @@ pub async fn find_offline_runners(
 /// work, and a delete that lands without the reset leaves jobs pointing at a
 /// runner row that no longer exists, which nothing but the watchdog will ever
 /// pick up. See `runner_ops::deregister_runner`.
-pub async fn reset_runner_jobs(db: &impl ConnectionTrait, runner_id: i64) -> Result<u64> {
+pub async fn reset_runner_jobs<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    runner_id: i64,
+) -> Result<u64> {
+    let held = pipeline_job::Entity::find()
+        .filter(pipeline_job::Column::RunnerId.eq(Some(runner_id)))
+        .filter(pipeline_job::Column::Status.is_in(["assigned", "running"]))
+        .all(db)
+        .await
+        .context("db: list the jobs a runner holds")?;
+    let failed = fail_agent_run_jobs(db, &held).await?;
     let now = chrono::Utc::now().naive_utc();
     let result = pipeline_job::Entity::update_many()
         .filter(pipeline_job::Column::RunnerId.eq(Some(runner_id)))
         .filter(pipeline_job::Column::Status.is_in(["assigned", "running"]))
+        .filter(pipeline_job::Column::Id.is_not_in(failed))
         .col_expr(pipeline_job::Column::Status, Expr::value("pending"))
         .col_expr(
             pipeline_job::Column::RunnerId,

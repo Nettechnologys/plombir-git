@@ -2512,3 +2512,513 @@ async fn recovery_ends_a_run_whose_pipeline_settled_without_it() {
     f.assign_issue("app", second, Some(f.bot.id)).await;
     assert_eq!(f.runs().await.len(), 2);
 }
+
+// ── Ending a run: cancel, timeout, finish, a lost runner ───────────────────
+// (card_231f9eb28ee3, card_4e61d764c20c)
+
+impl Fixture {
+    /// A person with `permission` on `alice/app`; their token and id.
+    async fn collaborator(&self, name: &str, permission: &str) -> (String, i64) {
+        let (token, id) = register_full(&self.base, name, &format!("{name}@example.test")).await;
+        let response = self
+            .http
+            .post(format!(
+                "{}/api/v1/repos/alice/app/collaborators",
+                self.base
+            ))
+            .bearer_auth(&self.alice)
+            .json(&serde_json::json!({ "username": name, "permission": permission }))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "add {name}");
+        (token, id)
+    }
+
+    /// A launched run, its attempt, and a live token for the attempt.
+    async fn launched_with_token(
+        &self,
+        actor: i64,
+    ) -> (
+        rg_db::entities::agent_run::Model,
+        rg_db::entities::agent_run_attempt::Model,
+        String,
+    ) {
+        self.assign_in_core(actor).await;
+        let run = self.runs().await.remove(0);
+        let attempt = self.attempts(run.id).await.remove(0);
+        let token = self.issue_run_token(attempt.id, PREFIX).await.unwrap();
+        // A live run token is answered over MCP; a dead one is no token at
+        // all (401).
+        assert_eq!(
+            self.mcp_with(&token.raw).await,
+            200,
+            "baseline: the attempt's token is live"
+        );
+        (run, attempt, token.raw)
+    }
+
+    async fn mcp_with(&self, token: &str) -> u16 {
+        self.http
+            .post(format!("{}/api/v1/mcp", self.base))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    /// The agent's job in `pipeline_id`: the recording engine writes the
+    /// pipeline alone, a real one carries one stage with one job.
+    async fn agent_job(&self, pipeline_id: i64) -> rg_db::entities::pipeline_job::Model {
+        let stage = rg_db::ops::pipeline_ops::create_stage(&self.db, pipeline_id, "agent", 0)
+            .await
+            .unwrap();
+        rg_db::ops::pipeline_ops::create_job(
+            &self.db, stage.id, "agent", "true", None, None, None, None, None, None, false, None,
+            None, None,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Cancel run `run_id` the way a person does: the CI cancel of the
+    /// pipeline its latest attempt runs in.
+    async fn cancel_run(&self, token: &str, run_id: i64) -> reqwest::Response {
+        let pipeline_id = self
+            .attempts(run_id)
+            .await
+            .pop()
+            .and_then(|attempt| attempt.pipeline_id)
+            .expect("the run's attempt has its pipeline");
+        self.cancel_pipeline(token, pipeline_id).await
+    }
+
+    async fn cancel_pipeline(&self, token: &str, pipeline_id: i64) -> reqwest::Response {
+        self.http
+            .post(format!(
+                "{}/api/v1/repos/alice/app/pipelines/{pipeline_id}/cancel",
+                self.base
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn assert_token_dead(&self, token: &str) {
+        assert_eq!(
+            self.mcp_with(token).await,
+            401,
+            "the ended attempt's token still works"
+        );
+    }
+
+    async fn pipeline(&self, id: i64) -> rg_db::entities::pipeline::Model {
+        rg_db::entities::pipeline::Entity::find_by_id(id)
+            .one(&self.db)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+}
+
+/// The assigner cancels a queued run: one transition,
+/// the pipeline cancelled, the token dead, the bot says who, the audit names
+/// them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_assigner_cancels_a_queued_run_and_its_token_stops_working() {
+    let f = fixture().await;
+    let (run, attempt, token) = f.launched_with_token(f.alice_id).await;
+    assert_eq!(run.status, "queued");
+
+    let response = f.cancel_run(&f.alice, run.id).await;
+    assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+
+    let ended = f.runs().await.remove(0);
+    assert_eq!((ended.status.as_str(), ended.active), ("cancelled", None));
+    assert_eq!(
+        f.pipeline(attempt.pipeline_id.unwrap()).await.status,
+        "canceled"
+    );
+    f.assert_token_dead(&token).await;
+    let finished = f.audited("agent.run_finished").await;
+    assert_eq!(finished.len(), 1, "{finished:?}");
+    assert_eq!(finished[0]["outcome"], "cancelled");
+    let actor = rg_db::entities::audit_log::Entity::find()
+        .filter(rg_db::entities::audit_log::Column::Action.eq("agent.run_finished"))
+        .one(&f.db)
+        .await
+        .unwrap()
+        .unwrap()
+        .user_id;
+    assert_eq!(actor, Some(f.alice_id), "the audit names who cancelled");
+    let comments = f.bot_comments().await;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(
+        comments[0].contains("@alice cancelled my run"),
+        "{}",
+        comments[0]
+    );
+
+    // A second cancel finds it ended.
+    assert_eq!(f.cancel_run(&f.alice, run.id).await.status(), 409);
+    assert_eq!(f.bot_comments().await.len(), 1);
+}
+
+/// A running run is cancelled through the CI page's cancel of its pipeline
+/// the same way: token dead, run ended, the CI answer unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_a_running_runs_pipeline_cancels_the_run() {
+    let f = fixture().await;
+    let (run, attempt, token) = f.launched_with_token(f.alice_id).await;
+    rg_db::entities::agent_run::Entity::update_many()
+        .col_expr(
+            rg_db::entities::agent_run::Column::Status,
+            sea_orm::sea_query::Expr::value("running"),
+        )
+        .filter(rg_db::entities::agent_run::Column::Id.eq(run.id))
+        .exec(&f.db)
+        .await
+        .unwrap();
+    let pipeline_id = attempt.pipeline_id.unwrap();
+
+    let response = f.cancel_pipeline(&f.alice, pipeline_id).await;
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"id": pipeline_id, "status": "canceled"})
+    );
+
+    let ended = f.runs().await.remove(0);
+    assert_eq!((ended.status.as_str(), ended.active), ("cancelled", None));
+    assert_eq!(f.pipeline(pipeline_id).await.status, "canceled");
+    f.assert_token_dead(&token).await;
+    assert_eq!(f.audited("agent.run_finished").await.len(), 1);
+}
+
+/// Write access alone does not stop someone else's run; a repository admin
+/// may.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_who_did_not_start_the_run_cannot_cancel_it_and_an_admin_can() {
+    let f = fixture().await;
+    let (carol, _) = f.collaborator("carol", "write").await;
+    let (dave, dave_id) = f.collaborator("dave", "admin").await;
+    let (run, attempt, token) = f.launched_with_token(f.alice_id).await;
+    let pipeline_id = attempt.pipeline_id.unwrap();
+
+    assert_eq!(f.cancel_run(&carol, run.id).await.status(), 403);
+    assert_eq!(f.cancel_pipeline(&carol, pipeline_id).await.status(), 403);
+    let still = f.runs().await.remove(0);
+    assert_eq!(still.active, Some(true), "a refused cancel ended the run");
+    assert_eq!(f.pipeline(pipeline_id).await.status, "pending");
+    assert!(f.bot_comments().await.is_empty());
+
+    assert_eq!(f.cancel_run(&dave, run.id).await.status(), 200);
+    assert_eq!(f.runs().await.remove(0).status, "cancelled");
+    f.assert_token_dead(&token).await;
+    let actor = rg_db::entities::audit_log::Entity::find()
+        .filter(rg_db::entities::audit_log::Column::Action.eq("agent.run_finished"))
+        .one(&f.db)
+        .await
+        .unwrap()
+        .unwrap()
+        .user_id;
+    assert_eq!(actor, Some(dave_id));
+}
+
+/// The assigner who is neither the bot's owner nor an admin may cancel the
+/// run they asked for; the run's own token may not cancel anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_assigner_may_cancel_and_the_runs_own_token_may_not() {
+    let f = fixture().await;
+    let (carol, carol_id) = f.collaborator("carol", "write").await;
+    let (run, _attempt, token) = f.launched_with_token(carol_id).await;
+    assert_eq!(run.triggered_by, carol_id);
+
+    let by_run = f
+        .http
+        .post(format!(
+            "{}/api/v1/repos/alice/app/pipelines/{}/cancel",
+            f.base,
+            f.attempts(run.id).await[0].pipeline_id.unwrap()
+        ))
+        .basic_auth(BOT, Some(&token))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        matches!(by_run.status().as_u16(), 401 | 403 | 404),
+        "the run's token cancelled a run: {}",
+        by_run.status()
+    );
+    assert_eq!(f.runs().await.remove(0).active, Some(true));
+
+    assert_eq!(f.cancel_run(&carol, run.id).await.status(), 200);
+    assert_eq!(f.runs().await.remove(0).status, "cancelled");
+}
+
+/// A finish and a cancel at once: one outcome, one comment, one audit row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_finish_racing_a_cancel_leaves_one_outcome_and_one_comment() {
+    let f = fixture().await;
+    let (run, attempt, token) = f.launched_with_token(f.alice_id).await;
+    let pipeline_id = attempt.pipeline_id.unwrap();
+    // The pipeline settled failed: a finish is ready to be read.
+    rg_db::entities::pipeline::Entity::update_many()
+        .col_expr(
+            rg_db::entities::pipeline::Column::Status,
+            sea_orm::sea_query::Expr::value("failed"),
+        )
+        .filter(rg_db::entities::pipeline::Column::Id.eq(pipeline_id))
+        .exec(&f.db)
+        .await
+        .unwrap();
+    let pools = f.state.db_pools();
+    let (finished, cancelled) = tokio::join!(
+        rg_core::agent::run::pipeline_settled(&pools, pipeline_id),
+        rg_core::agent::run::cancel(&pools, run.id, f.alice_id, true),
+    );
+    let finished = finished.unwrap();
+    let cancelled = cancelled.unwrap();
+    assert!(
+        finished != (cancelled == rg_core::agent::run::CancelOutcome::Cancelled),
+        "exactly one ender: finish {finished}, cancel {cancelled:?}"
+    );
+    let ended = f.runs().await.remove(0);
+    assert!(
+        ["failed", "cancelled"].contains(&ended.status.as_str()),
+        "{}",
+        ended.status
+    );
+    assert_eq!(f.audited("agent.run_finished").await.len(), 1);
+    assert_eq!(
+        f.bot_comments().await.len(),
+        1,
+        "{:?}",
+        f.bot_comments().await
+    );
+    f.assert_token_dead(&token).await;
+}
+
+/// A job stopped at its time limit ends the run `timed_out`, and its token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_whose_job_timed_out_ends_timed_out_and_its_token_with_it() {
+    let f = fixture().await;
+    let (run, attempt, token) = f.launched_with_token(f.alice_id).await;
+    let pipeline_id = attempt.pipeline_id.unwrap();
+    f.agent_job(pipeline_id).await;
+    assert!(rg_db::ops::pipeline_ops::fail_pipeline_chain(
+        &f.db,
+        pipeline_id,
+        &rg_core::ci::job_timed_out_message(1200),
+    )
+    .await
+    .unwrap());
+
+    assert!(
+        rg_core::agent::run::pipeline_settled(&f.state.db_pools(), pipeline_id)
+            .await
+            .unwrap()
+    );
+    let ended = f.runs().await.remove(0);
+    assert_eq!(ended.id, run.id);
+    assert_eq!((ended.status.as_str(), ended.active), ("timed_out", None));
+    f.assert_token_dead(&token).await;
+    let finished = f.audited("agent.run_finished").await;
+    assert_eq!(finished[0]["outcome"], "timed_out");
+    assert!(f.bot_comments().await[0].contains("time limit"));
+}
+
+/// A runner lost while it held an agent run's job: the job is failed, not
+/// handed to the next runner; the run ends and its token dies at once. The
+/// runner's other job goes back to the queue as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_runner_fails_the_agent_run_instead_of_restarting_it() {
+    let f = fixture().await;
+    let (run, attempt, token) = f.launched_with_token(f.alice_id).await;
+    let pipeline_id = attempt.pipeline_id.unwrap();
+    let (runner, _) =
+        rg_db::ops::runner_ops::register_runner(&f.db, f.repo_id, "lost", "", None, None, None)
+            .await
+            .unwrap();
+    let agent_job = f.agent_job(pipeline_id).await;
+    // An ordinary job held by the same runner.
+    let other = rg_db::ops::pipeline_ops::create_pipeline(
+        &f.db,
+        f.repo_id,
+        &f.main_sha,
+        "refs/heads/main",
+        "push",
+        Some(f.alice_id),
+    )
+    .await
+    .unwrap();
+    let stage = rg_db::ops::pipeline_ops::create_stage(&f.db, other.id, "build", 0)
+        .await
+        .unwrap();
+    let other_job = rg_db::ops::pipeline_ops::create_job(
+        &f.db, stage.id, "build", "true", None, None, None, None, None, None, false, None, None,
+        None,
+    )
+    .await
+    .unwrap();
+    for job in [agent_job.id, other_job.id] {
+        rg_db::entities::pipeline_job::Entity::update_many()
+            .col_expr(
+                rg_db::entities::pipeline_job::Column::Status,
+                sea_orm::sea_query::Expr::value("running"),
+            )
+            .col_expr(
+                rg_db::entities::pipeline_job::Column::RunnerId,
+                sea_orm::sea_query::Expr::value(runner.id),
+            )
+            .filter(rg_db::entities::pipeline_job::Column::Id.eq(job))
+            .exec(&f.db)
+            .await
+            .unwrap();
+    }
+
+    let released = rg_db::ops::runner_ops::retire_unreachable_runner(&f.db, runner.id)
+        .await
+        .unwrap();
+    assert_eq!(released, 1, "only the ordinary job goes back to the queue");
+    let agent_job = rg_db::ops::pipeline_ops::get_job(&f.db, agent_job.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(agent_job.status, "failed", "the agent job was handed back");
+    assert_eq!(f.pipeline(pipeline_id).await.status, "failed");
+    let other_job = rg_db::ops::pipeline_ops::get_job(&f.db, other_job.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(other_job.status, "pending");
+
+    let ended = rg_core::agent::run::settle_runs_of_settled_pipelines(&f.state.db_pools())
+        .await
+        .unwrap();
+    assert_eq!(ended, 1);
+    let run = f
+        .runs()
+        .await
+        .into_iter()
+        .find(|row| row.id == run.id)
+        .unwrap();
+    assert_eq!((run.status.as_str(), run.active), ("failed", None));
+    f.assert_token_dead(&token).await;
+    let comments = f.bot_comments().await;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(comments[0].contains("runner"), "{}", comments[0]);
+    // No second attempt: nothing new queued, nothing to open a second PR.
+    assert_eq!(f.attempts(run.id).await.len(), 1);
+}
+
+/// A run nobody takes within the wait limit ends `failed`, naming the
+/// runner labels it waited for, and its pipeline is cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_no_runner_takes_fails_after_the_wait_limit_saying_which_runner() {
+    let f = fixture().await;
+    f.save_profile(|profile| profile.runner_tags = Some(vec!["gpu".to_string()]))
+        .await;
+    let (run, attempt, token) = f.launched_with_token(f.alice_id).await;
+    let back_dated = chrono::Utc::now()
+        - chrono::Duration::from_std(rg_core::agent::run::RUNNER_WAIT_LIMIT).unwrap()
+        - chrono::Duration::minutes(1);
+    rg_db::entities::agent_run::Entity::update_many()
+        .col_expr(
+            rg_db::entities::agent_run::Column::CreatedAt,
+            sea_orm::sea_query::Expr::value(back_dated),
+        )
+        .filter(rg_db::entities::agent_run::Column::Id.eq(run.id))
+        .exec(&f.db)
+        .await
+        .unwrap();
+
+    let recovered = rg_core::agent::run::recover(
+        &f.state.db_pools(),
+        &f.state.agent_run_launcher(),
+        rg_core::agent::run::UNQUEUED_RUN_GRACE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered.ended, 1, "{recovered:?}");
+    let ended = f.runs().await.remove(0);
+    assert_eq!((ended.status.as_str(), ended.active), ("failed", None));
+    let reason = ended.failure_reason.unwrap();
+    assert!(reason.contains("no runner took my job"), "{reason}");
+    assert!(reason.contains("`gpu`"), "{reason}");
+    assert_eq!(
+        f.pipeline(attempt.pipeline_id.unwrap()).await.status,
+        "canceled"
+    );
+    f.assert_token_dead(&token).await;
+    assert!(f.bot_comments().await[0].contains("`gpu`"));
+}
+
+/// A run that is still within the wait limit is left waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_run_within_the_wait_limit_keeps_waiting() {
+    let f = fixture().await;
+    f.assign_in_core(f.alice_id).await;
+    let recovered = rg_core::agent::run::recover(
+        &f.state.db_pools(),
+        &f.state.agent_run_launcher(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered, rg_core::agent::run::Recovered::default());
+    assert_eq!(f.runs().await.remove(0).active, Some(true));
+}
+
+/// The bot's owner may cancel its run even with no access to the
+/// repository; a writer who is neither the assigner, the bot's owner nor an
+/// admin may not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_bots_owner_may_cancel_its_run_and_a_bystander_writer_may_not() {
+    let f = fixture().await;
+    let (erin, erin_id) = register_full(&f.base, "erin", "erin@example.test").await;
+    let response = f
+        .http
+        .post(format!("{}/api/v1/users/bots", f.base))
+        .bearer_auth(&erin)
+        .json(&serde_json::json!({ "username": "erin-agent", "display_name": "Erin's agent" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+    let erins_bot = rg_db::ops::user_ops::find_by_username(&f.db, "erin-agent")
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, carol_id) = f.collaborator("carol", "write").await;
+    let attempt = f.run_attempt(f.repo_id, erins_bot.id).await;
+    let run = rg_db::ops::agent_run_ops::run_of_attempt(&f.db, attempt)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(run.triggered_by, erin_id);
+
+    assert!(
+        rg_core::agent::run::may_cancel(&f.db, &run, erin_id, false)
+            .await
+            .unwrap(),
+        "the bot's owner was refused"
+    );
+    assert!(
+        !rg_core::agent::run::may_cancel(&f.db, &run, carol_id, false)
+            .await
+            .unwrap(),
+        "a bystander writer was allowed"
+    );
+    assert!(
+        !rg_core::agent::run::may_cancel(&f.db, &run, erins_bot.id, false)
+            .await
+            .unwrap(),
+        "a bot was allowed"
+    );
+}

@@ -28,7 +28,8 @@ pub struct Model {
     /// nothing.
     #[sea_orm(unique)]
     pub trigger_key: String,
-    /// `queued`, `running`, `succeeded`, `failed` or `cancelled`.
+    /// `queued`, `running`, `succeeded`, `failed`, `timed_out` or
+    /// `cancelled`.
     pub status: String,
     /// `Some(true)` while the run is not finished, `None` after. Part of the
     /// unique `(repository_id, bot_id, active)` index: one active run per bot

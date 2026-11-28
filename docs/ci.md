@@ -353,6 +353,21 @@ the key:
 > trigger-time check is long behind it — the runner's own refusal is what stops
 > those jobs from running here.
 
+## The job log
+
+A job's log is shown while the job runs, on both the embedded runner and an
+external one, not only once it has ended. The live text is masked before it
+is stored or sent to the job page, including a secret that the border of two
+pieces of output cuts in half, and its base64 and percent-encoded forms. When
+the job ends, the runner stores the whole log once more and the job page
+reads it from the start: that log is the one the job keeps.
+
+The live view never holds a job back. A runner whose server is slow or out of
+reach stops showing the log live for the rest of the job; the whole log still
+arrives at the end. An external runner sends the live log as numbered pieces
+(`x-job-log-seq`), so a piece it sends again after a lost answer is written
+once.
+
 ## Secrets and workload identity
 
 Secrets are configured per repository under **Settings → CI secrets**. Each one
