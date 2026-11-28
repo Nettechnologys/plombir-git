@@ -79,6 +79,11 @@ pub struct PushPolicy {
     /// on top of these, by receive-pack itself
     /// ([`CURRENT_BRANCH_DELETION`]).
     pub undeletable_refs: Vec<(String, String)>,
+    /// The refs the pusher's credential may write at all, when it is confined
+    /// to some (a token issued for an agent run, ADR-0001 D3) — see
+    /// [`ref_write_admitted`]. A push with even one update outside is refused
+    /// whole: every update, so a multi-ref push cannot land its admitted half.
+    pub write_ref_scope: Option<String>,
 }
 
 /// One path locked by another person, as [`PushPolicy::foreign_locks`] carries
@@ -749,6 +754,11 @@ const CURRENT_BRANCH_UNKNOWN: &str = "deletion check could not run on the server
 /// Apply the caller's refusals and the deletion rules to every command that
 /// is still `ok`.
 fn enforce_ref_rules(repo_path: &Path, updates: &mut [RefUpdate], policy: &PushPolicy) {
+    if let Some(scope) = &policy.write_ref_scope {
+        if refuse_outside_write_scope(scope, updates) {
+            return;
+        }
+    }
     for update in updates.iter_mut().filter(|update| update.status == "ok") {
         if let Some((_, message)) = policy
             .rejected_refs
@@ -1978,6 +1988,71 @@ pub fn validate_tag_protection_pattern(
     Ok(())
 }
 
+const WRITE_SCOPE_REFUSAL: &str = "this token may not write ref '";
+const WRITE_SCOPE_WHOLE_PUSH: &str = "refused with the whole push: this token may not write ref '";
+
+/// Whether a credential confined to `scope` may write `refname`.
+///
+/// A scope ending in `/` admits every ref under it — `refs/heads/agent/bot/`
+/// admits `refs/heads/agent/bot/42-fix` and its deletion, never the scope
+/// itself, a sibling such as `refs/heads/agent/bot-two/x`, or a tag. Any other
+/// scope admits exactly that one ref, and only to move it: a token held to the
+/// branch of one pull request may push to it but not delete it.
+///
+/// Comparison is on the full ref name as the client sent it. Names are
+/// validated before any rule runs, so `..` and other path tricks never reach
+/// here.
+pub fn ref_write_admitted(scope: &str, refname: &str, deletes: bool) -> bool {
+    if scope.ends_with('/') {
+        refname.len() > scope.len() && refname.starts_with(scope)
+    } else {
+        refname == scope && !deletes
+    }
+}
+
+/// The refusal a credential confined to some refs reads for `refname` — in a
+/// push's `ng` line and in a server-side write's 403 alike.
+pub fn write_scope_refusal(refname: &str) -> String {
+    format!("{WRITE_SCOPE_REFUSAL}{refname}'")
+}
+
+/// The ref a write-scope refusal named, when that is why `update` was
+/// refused — for the transport that journals it. A ref refused only because
+/// another one in the same push was out of scope is not reported: it is the
+/// other ref the credential reached for.
+pub fn write_scope_refused_ref(update: &RefUpdate) -> Option<&str> {
+    if update.status != "error" {
+        return None;
+    }
+    update
+        .message
+        .strip_prefix(WRITE_SCOPE_REFUSAL)?
+        .strip_suffix('\'')
+}
+
+/// Refuse every update of a push that writes outside `scope`, and say whether
+/// it did. Updates already refused keep their own reason; the ones that would
+/// have been admitted name the out-of-scope ref that took them down.
+fn refuse_outside_write_scope(scope: &str, updates: &mut [RefUpdate]) -> bool {
+    let Some(foreign) = updates
+        .iter()
+        .find(|update| !ref_write_admitted(scope, &update.refname, update.new_sha == NULL_SHA1))
+        .map(|update| update.refname.clone())
+    else {
+        return false;
+    };
+    for update in updates.iter_mut().filter(|update| update.status == "ok") {
+        update.status = "error".to_string();
+        update.message = if ref_write_admitted(scope, &update.refname, update.new_sha == NULL_SHA1)
+        {
+            format!("{WRITE_SCOPE_WHOLE_PUSH}{foreign}'")
+        } else {
+            write_scope_refusal(&update.refname)
+        };
+    }
+    true
+}
+
 /// Match a full ref against a rejection pattern. `*` matches any sequence;
 /// patterns without wildcards retain exact-match behavior.
 pub fn ref_matches_rejection_pattern(refname: &str, pattern: &str) -> bool {
@@ -2743,8 +2818,9 @@ mod ref_update_cas_tests {
 #[cfg(test)]
 mod rejection_pattern_tests {
     use super::{
-        enforce_signed_commit_policies, ref_matches_rejection_pattern,
-        signature_is_cryptographically_valid, RefUpdate,
+        enforce_ref_rules, enforce_signed_commit_policies, ref_matches_rejection_pattern,
+        ref_write_admitted, signature_is_cryptographically_valid, write_scope_refused_ref,
+        PushPolicy, RefUpdate, NULL_SHA1,
     };
     #[test]
     fn matches_exact_branches_and_wildcard_tags() {
@@ -2910,6 +2986,115 @@ mod rejection_pattern_tests {
         assert!(updates[0]
             .message
             .contains("cryptographically valid signature"));
+    }
+
+    #[test]
+    fn a_write_scope_admits_refs_under_a_prefix_or_exactly_one_ref() {
+        let prefix = "refs/heads/agent/bot/";
+        assert!(ref_write_admitted(
+            prefix,
+            "refs/heads/agent/bot/1-fix",
+            false
+        ));
+        assert!(ref_write_admitted(
+            prefix,
+            "refs/heads/agent/bot/1-fix",
+            true
+        ));
+        assert!(ref_write_admitted(
+            prefix,
+            "refs/heads/agent/bot/a/b",
+            false
+        ));
+        for outside in [
+            "refs/heads/agent/bot",
+            "refs/heads/agent/bot/",
+            "refs/heads/agent/bot-two/x",
+            "refs/heads/agent/botx/1",
+            "refs/heads/main",
+            "refs/tags/agent/bot/v1",
+            "refs/heads/Agent/bot/1",
+        ] {
+            assert!(!ref_write_admitted(prefix, outside, false), "{outside}");
+        }
+
+        let exact = "refs/heads/agent/bot/7-iterate";
+        assert!(ref_write_admitted(exact, exact, false));
+        assert!(
+            !ref_write_admitted(exact, exact, true),
+            "an iteration may move its branch, not delete it"
+        );
+        assert!(!ref_write_admitted(
+            exact,
+            "refs/heads/agent/bot/8-other",
+            false
+        ));
+        assert!(!ref_write_admitted(
+            exact,
+            "refs/heads/agent/bot/7-iterate/x",
+            false
+        ));
+    }
+
+    #[test]
+    fn a_push_with_one_ref_outside_its_scope_is_refused_whole() {
+        let update = |refname: &str, new_sha: &str| RefUpdate {
+            old_sha: "1".repeat(40),
+            new_sha: new_sha.to_string(),
+            refname: refname.to_string(),
+            status: "ok".into(),
+            message: String::new(),
+        };
+        let policy = PushPolicy {
+            write_ref_scope: Some("refs/heads/agent/bot/".into()),
+            ..PushPolicy::default()
+        };
+        // A deletion asks the repository which branch `HEAD` names.
+        let repo = tempfile::tempdir().unwrap();
+        crate::cli_gateway::global_gateway()
+            .as_ref()
+            .unwrap()
+            .run(
+                &["init", "--bare", "--initial-branch=main"],
+                Some(repo.path()),
+            )
+            .unwrap()
+            .ensure_success()
+            .unwrap();
+
+        let mut inside = vec![
+            update("refs/heads/agent/bot/1", &"2".repeat(40)),
+            update("refs/heads/agent/bot/2", NULL_SHA1),
+        ];
+        enforce_ref_rules(repo.path(), &mut inside, &policy);
+        assert!(
+            inside.iter().all(|update| update.status == "ok"),
+            "{inside:?}"
+        );
+
+        let mut mixed = vec![
+            update("refs/heads/agent/bot/1", &"2".repeat(40)),
+            update("refs/heads/main", &"2".repeat(40)),
+            update("refs/tags/v1", &"2".repeat(40)),
+        ];
+        enforce_ref_rules(repo.path(), &mut mixed, &policy);
+        assert!(
+            mixed.iter().all(|update| update.status == "error"),
+            "{mixed:?}"
+        );
+        assert_eq!(write_scope_refused_ref(&mixed[0]), None);
+        assert!(
+            mixed[0].message.contains("'refs/heads/main'"),
+            "the admitted ref names the one that took it down: {}",
+            mixed[0].message
+        );
+        assert_eq!(write_scope_refused_ref(&mixed[1]), Some("refs/heads/main"));
+        assert_eq!(write_scope_refused_ref(&mixed[2]), Some("refs/tags/v1"));
+
+        let unscoped = PushPolicy::default();
+        let mut plain = vec![update("refs/heads/main", &"2".repeat(40))];
+        enforce_ref_rules(repo.path(), &mut plain, &unscoped);
+        assert_eq!(plain[0].status, "ok", "no scope, no refusal");
     }
 
     #[test]

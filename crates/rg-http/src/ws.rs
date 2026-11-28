@@ -270,11 +270,19 @@ impl NotificationHub {
 
     /// Broadcast a job log update only to subscribers of that job.
     pub async fn push_job_log(&self, job_id: i64, log: &str) {
+        self.push_job_log_event(job_id, log, false).await;
+    }
+
+    /// Broadcast a job log update. `replaced` says the log was written whole
+    /// again — the final log after a live one (card_e925c7cedd46) — so a
+    /// subscriber reads it from the start instead of from where it was.
+    pub async fn push_job_log_event(&self, job_id: i64, log: &str, replaced: bool) {
         let event = NotificationEvent {
             event_type: "job_log".to_string(),
             data: serde_json::json!({
                 "job_id": job_id,
                 "log": log,
+                "replaced": replaced,
             }),
         };
         let channels = self.inner.job_channels.read().await;
@@ -428,6 +436,19 @@ impl rg_core::push_hooks::PushNotifier for NotificationHub {
     fn notify(&self, user_id: i64, event_type: &str, data: serde_json::Value) {
         push_notification(self, user_id, event_type, data);
     }
+
+    fn job_log(&self, job_id: i64, log: &str, replaced: bool) {
+        let hub = self.clone();
+        let log = log.to_string();
+        rg_core::task_tracker::delivery_tracker().spawn(async move {
+            hub.push_job_log_event(job_id, &log, replaced).await;
+        });
+    }
+}
+
+/// Broadcast that a job's log was written whole again.
+pub async fn push_job_log_replaced(hub: &NotificationHub, job_id: i64, log: &str) {
+    hub.push_job_log_event(job_id, log, true).await;
 }
 
 /// Broadcast a job log update to subscribers of that job.

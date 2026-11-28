@@ -9,6 +9,8 @@ export interface Collaborator {
   /** `null` when the collaborator row outlives the account it names. */
   username: string | null;
   display_name: string | null;
+  /** A bot account, which may be an agent (ADR-0001). */
+  is_bot?: boolean;
   permission: 'read' | 'write' | 'admin' | string;
   created_at: string;
 }

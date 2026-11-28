@@ -61,6 +61,9 @@ struct CollaboratorResponse {
     user_id: i64,
     username: Option<String>,
     display_name: Option<String>,
+    /// A bot account: the issue page warns before assigning one an issue
+    /// whose author cannot write (ADR-0001 D7).
+    is_bot: bool,
     permission: String,
     created_at: String,
 }
@@ -76,6 +79,7 @@ impl CollaboratorResponse {
             user_id: row.user_id,
             username: user.map(|u| u.username.clone()),
             display_name: user.and_then(|u| u.display_name.clone()),
+            is_bot: user.is_some_and(|u| u.is_bot()),
             permission: row.permission,
             created_at: row.created_at.to_string(),
         }

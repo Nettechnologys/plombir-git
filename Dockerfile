@@ -31,7 +31,7 @@ COPY web/package.json web/package-lock.json* ./
 RUN npm ci
 
 # Build the SPA (static adapter, output to ./build/)
-COPY web/svelte.config.js web/tsconfig.json web/vite.config.ts ./
+COPY web/kit.config.js web/tsconfig.json web/vite.config.ts ./
 COPY web/src/ ./src/
 COPY web/static/ ./static/
 RUN npm run build

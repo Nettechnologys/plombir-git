@@ -173,6 +173,12 @@ const UPLOAD_LOG_REPORT: Report = Report {
     consequence: "the job output is lost — the job page will show no log at all",
 };
 
+const LIVE_LOG_REPORT: Report = Report {
+    call: "live job log",
+    consequence:
+        "the job page stops showing the log live; the whole log still arrives when the job ends",
+};
+
 const STEP_REPORT: Report = Report {
     call: "job step report",
     consequence: "the job page shows the step in its previous state; the job log still carries it",
@@ -572,6 +578,76 @@ pub async fn upload_log(
         }
     }
 }
+
+/// Where a job's live log goes (card_e925c7cedd46): numbered pieces to
+/// `/runners/{id}/jobs/{job}/log`, one at a time, each retried until it is
+/// answered. The number is what makes a retry safe: the server writes a piece
+/// it has already taken only once.
+pub struct LiveLogUpload<'a> {
+    client: &'a reqwest::Client,
+    server: &'a str,
+    runner_id: i64,
+    job_id: i64,
+    token: &'a str,
+    seq: u64,
+}
+
+impl<'a> LiveLogUpload<'a> {
+    pub fn new(
+        client: &'a reqwest::Client,
+        server: &'a str,
+        runner_id: i64,
+        job_id: i64,
+        token: &'a str,
+    ) -> Self {
+        Self {
+            client,
+            server,
+            runner_id,
+            job_id,
+            token,
+            seq: 0,
+        }
+    }
+}
+
+impl rg_process::live_log::LiveSink for LiveLogUpload<'_> {
+    async fn send(&mut self, text: String) -> bool {
+        let url = format!(
+            "{}/api/v1/runners/{}/jobs/{}/log",
+            self.server, self.runner_id, self.job_id
+        );
+        let mut backoff = LOG_UPLOAD_RETRY_BACKOFF;
+        for attempt in 1..=LOG_UPLOAD_ATTEMPTS {
+            let request = self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", self.token))
+                .header(LIVE_LOG_SEQ_HEADER, self.seq.to_string())
+                .timeout(LOG_UPLOAD_TIMEOUT)
+                .body(text.clone());
+            match describe_send_failure(request).await {
+                None => {
+                    self.seq += 1;
+                    return true;
+                }
+                Some(failure) if failure.retryable && attempt < LOG_UPLOAD_ATTEMPTS => {
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                }
+                Some(failure) => {
+                    warn_report_lost(LIVE_LOG_REPORT, self.runner_id, Some(self.job_id), &failure);
+                    return false;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// The header that numbers a piece of a live log; the server's twin is
+/// `rg_http::api::runners::LIVE_LOG_SEQ_HEADER`.
+pub const LIVE_LOG_SEQ_HEADER: &str = "x-job-log-seq";
 
 /// Tell the server one step of a job of steps started, or how it ended.
 ///
@@ -2232,6 +2308,97 @@ mod archive_download_tests {
         assert!(
             !crate::workspace::cache_download_spool_path(&workspace).exists(),
             "the download spool must not stay on the runner's disk"
+        );
+    }
+}
+
+#[cfg(test)]
+mod live_log_upload_tests {
+    use std::sync::{Arc, Mutex};
+
+    use rg_process::live_log::LiveSink as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{LiveLogUpload, LIVE_LOG_SEQ_HEADER};
+
+    /// Answers the first request `503` and every later one `200`, recording
+    /// each request's piece number and body.
+    async fn flaky_server() -> (String, Arc<Mutex<Vec<(String, String)>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                let (head, body) = loop {
+                    let read = stream.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        break (String::new(), String::new());
+                    }
+                    buf.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    let Some(end) = text.find("\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = text[..end].to_ascii_lowercase();
+                    let length = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + length {
+                        break (head, text[end + 4..end + 4 + length].to_string());
+                    }
+                };
+                let seq = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix(&format!("{LIVE_LOG_SEQ_HEADER}:")))
+                    .map(|value| value.trim().to_string())
+                    .unwrap_or_default();
+                let first = {
+                    let mut seen = recorded.lock().unwrap();
+                    seen.push((seq, body));
+                    seen.len() == 1
+                };
+                let status = if first {
+                    "503 Service Unavailable"
+                } else {
+                    "200 OK"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                );
+                if stream.write_all(response.as_bytes()).await.is_err() {
+                    continue;
+                }
+                if stream.shutdown().await.is_err() {
+                    // The client closed first; it already has the answer.
+                }
+            }
+        });
+        (url, seen)
+    }
+
+    /// card_e925c7cedd46: a piece the server did not answer is sent again
+    /// under the same number — which is what lets the server write it once —
+    /// and only an answered piece moves the number on.
+    #[tokio::test]
+    async fn a_retried_piece_keeps_its_number_and_an_answered_one_moves_it_on() {
+        let (server, seen) = flaky_server().await;
+        let client = reqwest::Client::new();
+        let mut upload = LiveLogUpload::new(&client, &server, 7, 11, "token");
+        assert!(upload.send("first piece\n".into()).await);
+        assert!(upload.send("second piece\n".into()).await);
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                ("0".to_string(), "first piece\n".to_string()),
+                ("0".to_string(), "first piece\n".to_string()),
+                ("1".to_string(), "second piece\n".to_string()),
+            ]
         );
     }
 }

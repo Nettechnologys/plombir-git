@@ -175,6 +175,31 @@ pub const PIPELINE_EVENTS: [&str; 5] = [
     SCHEDULE_EVENT,
 ];
 
+/// The event an agent run's pipeline is created under (ADR-0001 D1).
+///
+/// Deliberately **not** one of [`PIPELINE_EVENTS`]. That list is what a
+/// workflow may declare in `on:`, and a workflow that could declare
+/// `on: agent_run` would put the repository's own jobs — with its CI secrets —
+/// next to code an agent was steered to write. An agent run's pipeline is built
+/// by the server from the bot's profile ([`CiTrigger::enqueue_agent_run`]) and
+/// never asks a workflow file anything, so the name only labels the row: CI
+/// secrets are withheld from it, and a retry refuses it.
+pub const AGENT_RUN_EVENT: &str = rg_db::ops::pipeline_ops::AGENT_RUN_TRIGGER;
+
+/// How both runners say a job outran its time limit (`rg_process`).
+pub use rg_process::{job_timed_out_message, JOB_TIMED_OUT_PREFIX};
+
+/// Whether a job of a pipeline created under `trigger_type` is handed the
+/// repository's CI secrets.
+///
+/// Every pipeline is, except an agent run's (ADR-0001 D5): it runs a command
+/// steered by text anybody may have written into an issue, so it gets its
+/// model key and its own token and nothing of the repository's. Both runners
+/// ask this before they read a secret, so neither can forget it alone.
+pub fn receives_ci_secrets(trigger_type: &str) -> bool {
+    trigger_type != AGENT_RUN_EVENT
+}
+
 /// The event a cron tick of `on: schedule` runs a workflow under.
 ///
 /// Produced by [`schedule`] alone, once per tick of one `- cron:` entry of one
@@ -517,6 +542,41 @@ pub struct TriggerPipelineParams<'a> {
     /// made every stored CI secret undecryptable and each job failed on its own
     /// with "failed to decrypt CI secret". `None` = no key, so no repository
     /// secrets are injected into the job environment.
+    pub encryption_key: Option<&'a str>,
+    pub external_url: Option<&'a str>,
+}
+
+/// What an agent run's pipeline is built from (ADR-0001 D1): the bot's
+/// profile and the commit the run starts at, never a file in the repository.
+pub struct AgentRunPipelineParams<'a> {
+    pub db: &'a DatabaseConnection,
+    pub repo_root: &'a Path,
+    pub repo_path: &'a Path,
+    pub repo_id: i64,
+    /// The default branch's head when the run was asked for.
+    pub commit_sha: &'a str,
+    /// `refs/heads/<default branch>`.
+    pub ref_name: &'a str,
+    /// The image the run's one job starts from.
+    pub image: &'a str,
+    /// The command it runs.
+    pub command: &'a str,
+    /// Runner labels the job needs; empty for any runner.
+    pub runner_tags: &'a [String],
+    /// The profile's run timeout, the job's timeout.
+    pub timeout_secs: i64,
+    /// The person who assigned the issue.
+    pub triggered_by: Option<i64>,
+    /// The attempt the pipeline carries. The engine points it at the pipeline
+    /// in the transaction that writes the pipeline
+    /// ([`rg_db::ops::agent_run_ops::link_attempt_pipeline`]), and refuses the
+    /// whole pipeline when another one already carries the attempt — so an
+    /// attempt is queued at most once, however many callers try.
+    pub attempt_id: i64,
+    pub docker_enabled: bool,
+    pub external_runners: bool,
+    pub allow_host_runner: bool,
+    pub jwt_secret: Option<&'a str>,
     pub encryption_key: Option<&'a str>,
     pub external_url: Option<&'a str>,
 }
@@ -981,6 +1041,20 @@ pub trait CiTrigger: Send + Sync {
         &'a self,
         params: ResumePipelineParams<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+
+    /// Queue an agent run as a pipeline of one job (ADR-0001 D1): `pipeline →
+    /// stage → job` written from `params`, under [`AGENT_RUN_EVENT`], without
+    /// reading any CI configuration. Returns the pipeline id.
+    ///
+    /// Fails loudly by default, for the reason
+    /// [`Self::expand_deferred_matrix`] does: an engine that inherited a quiet
+    /// answer would report a run as started that no runner will ever see.
+    fn enqueue_agent_run<'a>(
+        &'a self,
+        _params: AgentRunPipelineParams<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<i64>> + Send + 'a>> {
+        Box::pin(async { anyhow::bail!("this CI engine cannot run an agent") })
+    }
 }
 
 /// Operator-facing wording for "this commit carries no pipeline definition".

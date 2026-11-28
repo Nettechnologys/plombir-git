@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import BotBadge from '$lib/components/BotBadge.svelte';
   import ImportedBadge from '$lib/components/ImportedBadge.svelte';
@@ -14,8 +14,8 @@
 
   const t = createT();
 
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
   let issueList = $state<any[]>([]);
   let loading = $state(true);
   let error = $state('');

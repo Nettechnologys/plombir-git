@@ -403,6 +403,9 @@ fn after_suggestions_applied(
         source_namespace.to_string(),
         source_repo.name.clone(),
         Some(actor_id),
+        // Inside the request that applied the suggestion: an agent run's
+        // suggestion commit starts no pipeline by itself (ADR-0001 D4).
+        rg_core::push_hooks::PushOrigin::of_current_credential(),
         vec![rg_git::protocol::receive_pack::RefUpdate {
             old_sha: old_sha.to_string(),
             new_sha: commit_sha.to_string(),

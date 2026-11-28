@@ -118,8 +118,8 @@ async fn cookie_session_reads_its_own_private_repo() {
         ] {
             let status = status(&url, Some(auth)).await;
             // The endpoints answer differently once past the gate (an empty
-            // list, a 404 for an archive of a repo with no commits, a 501 for
-            // an unimplemented AI route) — the assertion is only that the gate
+            // list, a 404 for an archive of a repo with no commits) — the
+            // assertion is only that the gate
             // itself did not deny the repository's own owner.
             assert!(
                 status != 401 && status != 403,

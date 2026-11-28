@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { onDestroy } from 'svelte';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import PipelineBadge from '$lib/components/PipelineBadge.svelte';
@@ -23,8 +23,8 @@
   const t = createT();
   const confirmer = createConfirmer();
 
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
   // Running, retrying, cancelling, playing a manual job and deleting an
   // artifact are `RepoWrite`; approving an environment is `RepoAuthRead` and
   // the server checks the reviewer list itself (card_270a0a77fd79).
@@ -54,6 +54,9 @@
   let logContentEl = $state<HTMLPreElement | null>(null);
   let logSocket: WebSocket | null = null;
   let logOffset = 0;
+  // The server wrote the job's log whole again (the final log after a live
+  // one): the next read starts over instead of appending at the old offset.
+  let logResetPending = false;
   let logSyncingClaim: RepositoryResourceRequestClaim<string> | null = null;
   let logSyncRequestedClaim: RepositoryResourceRequestClaim<string> | null = null;
   let activeLogClaim: RepositoryResourceRequestClaim<string> | null = null;
@@ -213,7 +216,7 @@
 
   /** The pipeline `?pipeline=<id>` names, when it names a valid id. */
   function linkedPipelineId(): number | null {
-    return linkedId($page.url.searchParams.get('pipeline'));
+    return linkedId(page.url.searchParams.get('pipeline'));
   }
 
   async function loadPipelines(expectedOwner: string, expectedRepo: string) {
@@ -659,15 +662,18 @@
     logStreamError = '';
     logSocket = connectJobLogWebSocket(
       jobId,
-      () => void syncJobLog(
-        expectedOwner,
-        expectedRepo,
-        pipelineId,
-        jobId,
-        expectedRoute,
-        expectedSelection,
-        claim,
-      ),
+      (_chunk, replaced) => {
+        if (replaced) logResetPending = true;
+        void syncJobLog(
+          expectedOwner,
+          expectedRepo,
+          pipelineId,
+          jobId,
+          expectedRoute,
+          expectedSelection,
+          claim,
+        );
+      },
       (status) => {
         if (!ownsJobIntent(claim, expectedOwner, expectedRepo, pipelineId, jobId, expectedRoute, expectedSelection)) return;
         logStreamStatus = status;
@@ -721,9 +727,16 @@
         logSyncRequestedClaim = null;
         let more = true;
         while (more) {
+          if (logResetPending) {
+            logResetPending = false;
+            logOffset = 0;
+            logContent = '';
+          }
           const slice = await pipelines.jobLog(expectedOwner, expectedRepo, pipelineId, jobId, logOffset);
           if (!ownsJobIntent(claim, expectedOwner, expectedRepo, pipelineId, jobId,
             expectedRoute, expectedSelection)) return;
+          // Read before the log was replaced: start over.
+          if (logResetPending) continue;
           if (slice.total_length < logOffset) {
             logOffset = 0;
             logContent = '';

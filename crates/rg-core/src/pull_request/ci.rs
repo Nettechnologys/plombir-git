@@ -142,6 +142,36 @@ async fn reconcile_published_pull_request_pipeline(
     false
 }
 
+/// Whether the head of `pr` is a branch an agent run wrote, or may have.
+///
+/// Two ways to be one (ADR-0001 D4). The pull request a run opened, or the one
+/// an iteration works on, is the run's for good. And a pull request anybody
+/// opens from a branch under a run's write prefix carries what the agent
+/// pushed there: a person who opens it from `agent/<bot>/…` vouches for the
+/// title, not for the workflow files the agent left on the branch
+/// (card_49c845088d31). The prefix is the run's, kept after its token is gone,
+/// so the answer does not change when the attempt ends.
+///
+/// A fork pull request is not asked: its head is another repository's, which
+/// no run of this one writes, and it is held as a fork already.
+pub async fn holds_agent_writes(db: &DatabaseConnection, pr: &pull_request::Model) -> Result<bool> {
+    if rg_db::ops::agent_run_ops::is_agent_pull_request(db, pr.id).await? {
+        return Ok(true);
+    }
+    if pr.head_repo_id.is_some() {
+        return Ok(false);
+    }
+    let head_ref = format!("refs/heads/{}", pr.head_branch);
+    Ok(
+        rg_db::ops::agent_run_ops::write_ref_prefixes(db, pr.repo_id)
+            .await?
+            .iter()
+            .any(|prefix| {
+                rg_git::protocol::receive_pack::ref_write_admitted(prefix, &head_ref, false)
+            }),
+    )
+}
+
 /// Whether this exact fork head may run with the base repository's CI authority.
 /// Both ordinary PR CI and merge-group CI must use this gate, including when
 /// reusing an existing pipeline. An enqueue is not a fork-CI approval.
@@ -173,14 +203,28 @@ pub(super) async fn fork_head_ci_is_approved(
     // Before that gate existed the refusal was unconditional, which meant the
     // one contribution shape that most needs a check — code from someone without
     // write access — was the only one that never got one.
-    if let Some(head_repo_id) = pr.head_repo_id {
+    //
+    // An agent's pull request waits the same way (ADR-0001 D4). Its head lives
+    // in the base repository, but the code on it — workflow files included —
+    // was written by a run whose instructions came from an issue anyone may
+    // have filed. The run row says so for good: it outlives the run's token
+    // and the bot, so the gate holds after both are gone.
+    let held_as = if pr.head_repo_id.is_some() {
+        Some("fork")
+    } else if holds_agent_writes(db, pr).await? {
+        Some("agent")
+    } else {
+        None
+    };
+    if let Some(held_as) = held_as {
         if pr.ci_approved_sha.as_deref() != Some(head_sha) {
             tracing::info!(
                 pr_id = pr.id,
-                head_repo_id,
+                held_as,
+                head_repo_id = ?pr.head_repo_id,
                 approved_sha = pr.ci_approved_sha.as_deref().unwrap_or("<none>"),
                 head_sha,
-                "pull_request CI held for a fork PR: this head is not approved to run with this repository's CI secrets"
+                "pull_request CI held: this head is not approved to run with this repository's CI secrets"
             );
             return Ok(false);
         }
@@ -196,26 +240,26 @@ pub(super) async fn fork_head_ci_is_approved(
         if !human_approver {
             tracing::info!(
                 pr_id = pr.id,
-                head_repo_id,
-                "pull_request CI held for a fork PR: approval has no active human approver"
+                held_as,
+                "pull_request CI held: approval has no active human approver"
             );
             return Ok(false);
         }
         if !crate::repo::service::can_write_repo(db, repository, pr.ci_approved_by).await? {
             tracing::info!(
                 pr_id = pr.id,
-                head_repo_id,
+                held_as,
                 approved_by = pr.ci_approved_by,
-                "pull_request CI held for a fork PR: approver no longer has write access to the base repository"
+                "pull_request CI held: approver no longer has write access to the base repository"
             );
             return Ok(false);
         }
         tracing::info!(
             pr_id = pr.id,
-            head_repo_id,
+            held_as,
             head_sha,
             approved_by = pr.ci_approved_by,
-            "pull_request CI released for a fork PR: a maintainer approved this head"
+            "pull_request CI released: a maintainer approved this head"
         );
     }
 

@@ -80,7 +80,7 @@ describe('commit history ref and paging', () => {
 		expect(trigger.getAttribute('aria-expanded')).toBe('false');
 		expect(navigation.goto).toHaveBeenCalledWith(
 			'/alice/demo/commits?ref=dev',
-			expect.objectContaining({ replaceState: true }),
+			expect.objectContaining({ replace: true, reset: false }),
 		);
 
 		setTestPage('/alice/demo/commits?ref=dev', { owner: 'alice', repo: 'demo' });

@@ -63,6 +63,7 @@ mod shared_docker_daemon_tests {
                 &first_path,
                 &first_container,
                 &rg_process::docker_job::JobLimits::default(),
+                rg_process::live_log::LiveOutput::channel().0,
             )
             .await
         });
@@ -76,6 +77,7 @@ mod shared_docker_daemon_tests {
                 &second_path,
                 &second_container,
                 &rg_process::docker_job::JobLimits::default(),
+                rg_process::live_log::LiveOutput::channel().0,
             )
             .await
         });
@@ -129,6 +131,7 @@ mod shared_docker_daemon_tests {
             workspace.path(),
             &name,
             &rg_process::docker_job::JobLimits::default(),
+            rg_process::live_log::LiveOutput::channel().0,
         )
         .await;
         remove_job_container(&name).await;
@@ -149,46 +152,22 @@ const POLLED_TIMEOUT_FALLBACK_SECS: u64 = 3600;
 /// The external runner knows the exact CI token minted for this poll. Sanitize
 /// its captured output before upload, including a script's base64 encoding of
 /// the token. The server independently verifies and removes raw signed tokens.
-fn mask_polled_job_token(log: &str, variables: Option<&serde_json::Value>) -> String {
-    use base64::{
-        engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
-        Engine as _,
-    };
-
-    let Some(token) = variables
+/// The job token a poll handed this runner, if it is long enough to mask.
+fn polled_job_token(variables: Option<&serde_json::Value>) -> Option<String> {
+    variables
         .and_then(|value| value.get("CI_JOB_TOKEN"))
         .and_then(serde_json::Value::as_str)
         .filter(|token| token.len() >= 4)
-    else {
-        return log.to_owned();
-    };
-    let mut variants = vec![token.to_owned()];
-    for bytes in [token.as_bytes().to_vec(), format!("{token}\n").into_bytes()] {
-        for encoded in [
-            STANDARD.encode(&bytes),
-            STANDARD_NO_PAD.encode(&bytes),
-            URL_SAFE.encode(&bytes),
-            URL_SAFE_NO_PAD.encode(&bytes),
-        ] {
-            if encoded.len() > 76 {
-                variants.push(
-                    encoded
-                        .as_bytes()
-                        .chunks(76)
-                        .map(|chunk| std::str::from_utf8(chunk).expect("base64 is ASCII"))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                );
-            }
-            variants.push(encoded);
-        }
+        .map(str::to_string)
+}
+
+fn mask_polled_job_token(log: &str, variables: Option<&serde_json::Value>) -> String {
+    // The same rule the live view masks with, so the final log and what was
+    // shown live agree.
+    match polled_job_token(variables) {
+        Some(token) => rg_process::log_mask::LogMask::new(&[token]).mask(log),
+        None => log.to_owned(),
     }
-    variants.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    let mut masked = log.to_owned();
-    for variant in variants {
-        masked = masked.replace(&variant, "***");
-    }
-    masked
 }
 
 #[cfg(test)]
@@ -1090,20 +1069,43 @@ pub async fn run_jobs_until_shutdown_checking_every(
                             .await;
                             job_outputs = run.outputs;
                             (run.exit_code, run.log)
-                        } else if let Some(img) = &job.image {
-                            run_job_docker(
-                                img,
-                                &script_str,
-                                &variables,
-                                &workspace,
-                                container_name
-                                    .as_deref()
-                                    .expect("docker job has a container name"),
-                                job_limits,
-                            )
-                            .await
                         } else {
-                            run_job_local(&script_str, &variables, &workspace).await
+                            // The log is shown while the job runs, masked of
+                            // the job token here and of the job's secrets on
+                            // the server (card_e925c7cedd46). The live view
+                            // ends before the whole log is uploaded below.
+                            let (live, receiver) = rg_process::live_log::LiveOutput::channel();
+                            let mask = rg_process::log_mask::LogMask::new(
+                                &polled_job_token(job.variables.as_ref())
+                                    .into_iter()
+                                    .collect::<Vec<_>>(),
+                            );
+                            let mut sink = crate::api::LiveLogUpload::new(
+                                &client, server, runner_id, job.job_id, token,
+                            );
+                            let run = async {
+                                if let Some(img) = &job.image {
+                                    run_job_docker(
+                                        img,
+                                        &script_str,
+                                        &variables,
+                                        &workspace,
+                                        container_name
+                                            .as_deref()
+                                            .expect("docker job has a container name"),
+                                        job_limits,
+                                        live,
+                                    )
+                                    .await
+                                } else {
+                                    run_job_local(&script_str, &variables, &workspace, live).await
+                                }
+                            };
+                            let (ran, ()) = tokio::join!(
+                                run,
+                                rg_process::live_log::forward(receiver, &mask, &mut sink)
+                            );
+                            ran
                         }
                     };
                     let timeout_seconds = resolve_polled_timeout(job.job_id, job.timeout);
@@ -1119,7 +1121,7 @@ pub async fn run_jobs_until_shutdown_checking_every(
                                 if let Some(name) = &container_name {
                                     remove_job_container(name).await;
                                 }
-                                (-1, format!("Job timed out after {timeout_seconds} seconds"))
+                                (-1, rg_process::job_timed_out_message(timeout_seconds))
                             }
                         }
                     };

@@ -1122,6 +1122,7 @@ struct ServeSettings {
     registration_source: RegistrationSource,
     attestation_enabled: bool,
     agents_enabled: bool,
+    agent_limits: rg_core::agent::run::AgentLimits,
     source_url: String,
     rate_limits: RateLimits,
     package_upload_max_bytes: usize,
@@ -1275,6 +1276,7 @@ impl ServeSettings {
                 .as_ref()
                 .and_then(|c| c.agents.enabled)
                 .unwrap_or(DEFAULT_AGENTS_ENABLED),
+            agent_limits: crate::config::resolve_agent_limits(cfg.as_ref())?,
             source_url,
             rate_limits,
             package_upload_max_bytes: resolve_package_upload_max_bytes(cfg.as_ref())?,
@@ -2268,6 +2270,7 @@ fn build_transports(
         shutdown_grace_secs: settings.timeouts.shutdown_grace,
         attestation_enabled: settings.attestation_enabled,
         agents_enabled: settings.agents_enabled,
+        agent_limits: settings.agent_limits,
         trial_mode: settings.trial.is_some(),
         source_url: settings.source_url,
         notification_hub: Some(notification_hub),

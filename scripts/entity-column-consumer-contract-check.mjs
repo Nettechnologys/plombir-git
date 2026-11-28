@@ -185,6 +185,13 @@ const ALLOWED_WITHOUT_CONSUMER = new Map([
       '`(package_id, version, protocol_variant_key)`, which is what keeps two rubygems platform ' +
       'variants of one version from colliding; no Rust has to read it back for that to work',
   ],
+  [
+    'agent_run.iteration',
+    'written as 1 by the first run of an issue (`rg_core::agent::run`). Its reader is the iteration ' +
+      'limit of ADR-0001 D9 and the review-driven iterations of D11 (card_b391e92474a0, ' +
+      'card_5123a85574c3), which count runs on one pull request by it; until they land nothing ' +
+      'starts a second iteration to count',
+  ],
 ]);
 
 const orphans = columns.filter((column) => hasWriter(column) && !hasReader(column));

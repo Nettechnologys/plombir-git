@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { goto } from '$app/navigation';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import AttachmentPanel from '$lib/components/AttachmentPanel.svelte';
@@ -21,9 +21,9 @@
 
   const t = createT();
 
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
-  let number = $derived(parseInt($page.params.number!));
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
+  let number = $derived(parseInt(page.params.number!));
   let pr = $state<any>(null);
   let diffData = $state<PrDiff | null>(null);
   // Which optional sections of this page did not load. A read that failed is

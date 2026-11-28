@@ -4,10 +4,7 @@ use aes_gcm::{
     aead::{Aead, OsRng},
     Aes256Gcm, Key, KeyInit, Nonce,
 };
-use base64::{
-    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
-    Engine as _,
-};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
@@ -94,61 +91,18 @@ pub fn decrypt(encoded: &str, key: &[u8; 32]) -> Result<String, anyhow::Error> {
 /// long individual lines, and their common transport encodings. Fragments
 /// shorter than four bytes are deliberately skipped: replacing such fragments
 /// would corrupt ordinary output without providing useful secrecy.
+///
+/// The whole-text driver of [`crate::auth::log_mask::LogMask`]; a log that
+/// arrives in pieces is masked by its [`stream`](crate::auth::log_mask::LogMask::stream),
+/// with the same result.
 pub fn mask_values(input: &str, secrets: &[String]) -> String {
-    let mut masked = input.to_owned();
-    let mut values = std::collections::HashSet::new();
-    for secret in secrets {
-        for value in std::iter::once(secret.as_str()).chain(secret.lines()) {
-            if value.len() < 4 {
-                continue;
-            }
-            values.insert(value.to_owned());
-            for bytes in [value.as_bytes().to_vec(), format!("{value}\n").into_bytes()] {
-                for encoded in [
-                    STANDARD.encode(&bytes),
-                    STANDARD_NO_PAD.encode(&bytes),
-                    URL_SAFE.encode(&bytes),
-                    URL_SAFE_NO_PAD.encode(&bytes),
-                ] {
-                    // GNU `base64` wraps its output at 76 columns by default.
-                    // `echo "$SECRET" | base64` also encodes a final newline.
-                    if encoded.len() > 76 {
-                        values.insert(
-                            encoded
-                                .as_bytes()
-                                .chunks(76)
-                                .map(|chunk| std::str::from_utf8(chunk).expect("base64 is ASCII"))
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        );
-                    }
-                    values.insert(encoded);
-                }
-            }
-            let encoded = urlencoding::encode(value).into_owned();
-            // Both `%2F` and `%2f` are valid percent encodings.
-            let mut lower_hex = encoded.as_bytes().to_vec();
-            for index in 0..lower_hex.len().saturating_sub(2) {
-                if lower_hex[index] == b'%' {
-                    lower_hex[index + 1] = lower_hex[index + 1].to_ascii_lowercase();
-                    lower_hex[index + 2] = lower_hex[index + 2].to_ascii_lowercase();
-                }
-            }
-            values.insert(String::from_utf8(lower_hex).expect("percent encoding is ASCII"));
-            values.insert(encoded);
-        }
-    }
-    let mut values = values.into_iter().collect::<Vec<_>>();
-    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    for value in values {
-        masked = masked.replace(&value, "***");
-    }
-    masked
+    crate::auth::log_mask::LogMask::new(secrets).mask(input)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE};
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {

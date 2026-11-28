@@ -2708,6 +2708,274 @@ async fn agent_profile_round_trip_is_portable() {
     );
 }
 
+/// The agent-run rows (card_621be18a01e5) hold their keys and cascades the
+/// same way on every backend: one run per trigger, one active run per bot in a
+/// repository beside any number of finished ones, one row per attempt, one
+/// token per attempt; deleting the issue, the pull requests or the pipeline
+/// keeps the run, deleting the run takes its attempts and their token, and
+/// deleting the repository takes the runs.
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn agent_run_keys_and_cascades_are_portable() {
+    use rg_db::entities::{access_token, agent_run, agent_run_attempt, issue, pull_request};
+
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 2)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("runowner{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Agent Run Smoke",
+    )
+    .await
+    .expect("create run owner");
+    let repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("runrepo{suffix}")),
+    )
+    .await
+    .expect("create repository");
+    let bot = rg_core::user::bots::create_bot(
+        &db,
+        rg_core::user::service::LdapDirectories {
+            encryption_key: "test-encryption-key",
+            transport_policy: &Default::default(),
+        },
+        owner.id,
+        &format!("runbot{suffix}"),
+        None,
+    )
+    .await
+    .expect("create bot");
+    let now = chrono::Utc::now();
+    let issue = issue::ActiveModel {
+        repo_id: Set(repo.id),
+        number: Set(1),
+        title: Set("give the bot something".to_string()),
+        state: Set("open".to_string()),
+        author_id: Set(owner.id),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .expect("create issue");
+    let iterated = portable_merge_queue_pr(&db, repo.id, bot.id, 2).await;
+    let opened = portable_merge_queue_pr(&db, repo.id, bot.id, 3).await;
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        &db,
+        repo.id,
+        "0000000000000000000000000000000000000000",
+        "refs/heads/main",
+        "push",
+        Some(owner.id),
+    )
+    .await
+    .expect("create pipeline");
+
+    let run = |key: String, active: Option<bool>| agent_run::ActiveModel {
+        bot_id: Set(bot.id),
+        repository_id: Set(repo.id),
+        issue_id: Set(Some(issue.id)),
+        pull_request_id: Set(Some(iterated.id)),
+        iteration: Set(2),
+        triggered_by: Set(owner.id),
+        trigger_key: Set(key),
+        status: Set(if active.is_some() {
+            "running"
+        } else {
+            "succeeded"
+        }
+        .to_string()),
+        active: Set(active),
+        result_pull_request_id: Set(Some(opened.id)),
+        write_ref_prefix: Set(Some(format!("refs/heads/agent/runbot{suffix}/"))),
+        created_at: Set(chrono::Utc::now()),
+        ..Default::default()
+    };
+    // A trigger key as long as the column allows reads back whole.
+    let long_key = format!("mention:{suffix}:{}", "k".repeat(200));
+    let live = run(long_key.clone(), Some(true))
+        .insert(&db)
+        .await
+        .expect("the active run");
+    assert_eq!(live.trigger_key, long_key);
+    assert!(
+        run(long_key.clone(), None).insert(&db).await.is_err(),
+        "a second delivery of one trigger inserted a second run"
+    );
+    assert!(
+        run(format!("assigned:{suffix}:2"), Some(true))
+            .insert(&db)
+            .await
+            .is_err(),
+        "a second active run of one bot in one repository"
+    );
+    for n in 3..5 {
+        run(format!("assigned:{suffix}:{n}"), None)
+            .insert(&db)
+            .await
+            .expect("finished runs sit beside the active one");
+    }
+    // Three runs under one prefix: the CI gate reads it once.
+    assert_eq!(
+        rg_db::ops::agent_run_ops::write_ref_prefixes(&db, repo.id)
+            .await
+            .expect("list the prefixes"),
+        vec![format!("refs/heads/agent/runbot{suffix}/")]
+    );
+    // Disarming is conditional on the flag, so a second writer records nothing.
+    assert!(
+        !rg_db::ops::pull_request_ops::disarm_auto_merge(&db, opened.id)
+            .await
+            .expect("disarm a pull request with no auto-merge")
+    );
+    pull_request::Entity::update_many()
+        .col_expr(
+            pull_request::Column::AutoMergeEnabled,
+            sea_orm::sea_query::Expr::value(true),
+        )
+        .filter(pull_request::Column::Id.eq(opened.id))
+        .exec(&db)
+        .await
+        .expect("arm auto-merge");
+    assert!(
+        rg_db::ops::pull_request_ops::disarm_auto_merge(&db, opened.id)
+            .await
+            .expect("disarm auto-merge")
+    );
+    assert!(
+        !rg_db::ops::pull_request_ops::disarm_auto_merge(&db, opened.id)
+            .await
+            .expect("disarm it again")
+    );
+
+    let attempt = |number: i64| agent_run_attempt::ActiveModel {
+        run_id: Set(live.id),
+        attempt: Set(number),
+        pipeline_id: Set(Some(pipeline.id)),
+        created_at: Set(chrono::Utc::now()),
+        ..Default::default()
+    };
+    let first = attempt(1).insert(&db).await.expect("the first attempt");
+    assert!(
+        attempt(1).insert(&db).await.is_err(),
+        "two attempts with one number"
+    );
+    attempt(2).insert(&db).await.expect("a retry is a new row");
+
+    let token = |name: &str, attempt_id: i64| {
+        rg_core::auth::access_token::issue(
+            &db,
+            rg_core::auth::access_token::NewAccessToken {
+                user_id: bot.id,
+                name: name.to_string(),
+                scopes: "repo".to_string(),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                repository_ids: Some(vec![repo.id]),
+                mcp_tools: Some("create_pr,read_file".to_string()),
+                deny_protected_merge: true,
+                write_ref_prefix: Some(format!("refs/heads/agent/runbot{suffix}/")),
+                allow_git: true,
+                agent_run_attempt_id: Some(attempt_id),
+            },
+        )
+    };
+    let issued = token("run", first.id).await.expect("the attempt's token");
+    assert_eq!(
+        issued.token.write_ref_prefix.as_deref(),
+        Some(format!("refs/heads/agent/runbot{suffix}/").as_str())
+    );
+    assert!(issued.token.allow_git);
+    assert!(
+        token("second", first.id).await.is_err(),
+        "one attempt held two tokens"
+    );
+
+    // The record of what the agent did outlives what it worked on.
+    rg_db::entities::pipeline::Entity::delete_by_id(pipeline.id)
+        .exec(&db)
+        .await
+        .expect("delete the pipeline");
+    issue::Entity::delete_by_id(issue.id)
+        .exec(&db)
+        .await
+        .expect("delete the issue");
+    for pr in [iterated.id, opened.id] {
+        pull_request::Entity::delete_by_id(pr)
+            .exec(&db)
+            .await
+            .expect("delete a pull request");
+    }
+    let kept = agent_run::Entity::find_by_id(live.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("the run outlived its issue and pull requests");
+    assert_eq!(
+        (
+            kept.issue_id,
+            kept.pull_request_id,
+            kept.result_pull_request_id
+        ),
+        (None, None, None)
+    );
+    let attempts = agent_run_attempt::Entity::find()
+        .filter(agent_run_attempt::Column::RunId.eq(live.id))
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts.iter().all(|attempt| attempt.pipeline_id.is_none()));
+
+    // The run takes its attempts and their token with it.
+    agent_run::Entity::delete_by_id(live.id)
+        .exec(&db)
+        .await
+        .expect("delete the run");
+    assert!(agent_run_attempt::Entity::find()
+        .filter(agent_run_attempt::Column::RunId.eq(live.id))
+        .one(&db)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        access_token::Entity::find_by_id(issued.token.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_none(),
+        "the run's token outlived the run"
+    );
+
+    // The runs outlive the bot, and go with the repository.
+    rg_db::entities::user::Entity::delete_by_id(bot.id)
+        .exec(&db)
+        .await
+        .expect("delete the bot row");
+    let runs_of = |repository_id: i64| {
+        agent_run::Entity::find()
+            .filter(agent_run::Column::RepositoryId.eq(repository_id))
+            .all(&db)
+    };
+    assert_eq!(runs_of(repo.id).await.unwrap().len(), 2);
+    rg_db::entities::repository::Entity::delete_by_id(repo.id)
+        .exec(&db)
+        .await
+        .expect("delete the repository row");
+    assert!(runs_of(repo.id).await.unwrap().is_empty());
+}
+
 #[tokio::test]
 #[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
 async fn commit_status_parent_delete_is_portable() {
@@ -4146,6 +4414,9 @@ async fn assert_free_text_columns_are_wide(db: &DatabaseConnection) {
 /// the same answer.
 const NARROW_MYSQL_COLUMNS: &[(&str, &[&str])] = &[
     ("access_tokens", &["name", "scopes", "token_hash"]),
+    // A key the server builds from an event kind and ids, under a unique
+    // index MySQL cannot put on TEXT (card_621be18a01e5).
+    ("agent_runs", &["trigger_key"]),
     ("artifacts", &["name", "sha256"]),
     ("attachments", &["content_type", "filename", "sha256"]),
     ("audit_log", &["resource_name", "username"]),
@@ -6827,6 +7098,7 @@ async fn neighbouring_issue_relabels_all_land() {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .map_err(|error| format!("issue {number}, round {round}: {error:#}"))?;
@@ -7482,4 +7754,361 @@ async fn held_jobs_are_portable() {
     assert!(pipeline_ops::assign_job(&db, released, runner.id)
         .await
         .unwrap());
+}
+
+/// Put `main` and `feature` into a bare repository at `repo_root/<owner>/<name>.git`
+/// through the git gateway, so a pull request has a head to resolve.
+fn bare_repository_with_a_feature_branch(repo_root: &std::path::Path, owner: &str, name: &str) {
+    let bare = repo_root.join(owner).join(format!("{name}.git"));
+    std::fs::create_dir_all(&bare).expect("create the repository directory");
+    let work = tempfile::tempdir().expect("work tree");
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        rg_git::cli_gateway::global_gateway()
+            .as_ref()
+            .expect("git gateway")
+            .run(args, Some(dir))
+            .expect("run git")
+            .ensure_success()
+            .unwrap_or_else(|error| panic!("git {args:?}: {error:#}"));
+    };
+    git(&bare, &["init", "--bare", "-q", "-b", "main"]);
+    git(work.path(), &["init", "-q", "-b", "main"]);
+    git(work.path(), &["config", "user.name", "Smoke"]);
+    git(
+        work.path(),
+        &["config", "user.email", "smoke@example.invalid"],
+    );
+    std::fs::write(work.path().join("README.md"), "smoke\n").unwrap();
+    git(work.path(), &["add", "README.md"]);
+    git(work.path(), &["commit", "-q", "-m", "main"]);
+    git(work.path(), &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(work.path().join("feature.txt"), "feature\n").unwrap();
+    git(work.path(), &["add", "feature.txt"]);
+    git(work.path(), &["commit", "-q", "-m", "feature"]);
+    let bare_text = bare.to_string_lossy().into_owned();
+    git(work.path(), &["push", "-q", &bare_text, "main", "feature"]);
+}
+
+/// card_105b91bd40c2: the fifth criterion of the local-numbers phase on the
+/// server databases. Two halves of the same promise, run against the backend
+/// the CI job points at:
+///
+/// - `db_retry` — eight issues and eight pull requests filed at once on one
+///   repository take eight distinct, consecutive numbers each, and every
+///   correct create succeeds; a lost `(repo_id, number)` race is re-read, not
+///   answered 5xx;
+/// - `repo_number_floors` — deleting the newest issue and the newest pull
+///   request leaves their numbers spent: the next filing gets the number after
+///   them, not theirs again.
+///
+/// The migration itself runs on this database by `rg_db::run_migrations` above
+/// every smoke test; this one is the runtime behaviour the table exists for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn local_numbers_are_unique_under_concurrency_and_never_reused_after_delete() {
+    const FILINGS: usize = 8;
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 8)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("numbers{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Numbers Smoke",
+    )
+    .await
+    .expect("create the owner");
+    let repo_name = format!("numbersrepo{suffix}");
+    let repository = rg_db::ops::repo_ops::create(&db, namespace_repo(owner.id, None, &repo_name))
+        .await
+        .expect("create the repository");
+    let repo_root = tempfile::tempdir().expect("repository root");
+    bare_repository_with_a_feature_branch(repo_root.path(), &username, &repo_name);
+
+    let (repo_id, owner_id) = (repository.id, owner.id);
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(FILINGS * 2));
+    let mut issues = Vec::new();
+    let mut pulls = Vec::new();
+    for index in 0..FILINGS {
+        let (db_issue, start_issue) = (db.clone(), start.clone());
+        issues.push(tokio::spawn(async move {
+            start_issue.wait().await;
+            rg_core::issue::service::create_issue(
+                &db_issue,
+                repo_id,
+                owner_id,
+                format!("concurrent issue {index}"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .map(|issue| issue.number)
+        }));
+        let (db_pull, start_pull) = (db.clone(), start.clone());
+        let root = repo_root.path().to_path_buf();
+        pulls.push(tokio::spawn(async move {
+            start_pull.wait().await;
+            rg_core::pull_request::service::create_pr(
+                &db_pull,
+                &root,
+                repo_id,
+                owner_id,
+                format!("concurrent pull request {index}"),
+                None,
+                "feature".to_string(),
+                "main".to_string(),
+                None,
+                false,
+                None,
+            )
+            .await
+            .map(|pr| pr.number)
+        }));
+    }
+    for (what, handles) in [("issue", issues), ("pull request", pulls)] {
+        let mut numbers = Vec::new();
+        for handle in handles {
+            let number = handle
+                .await
+                .expect("the filing task joins")
+                .unwrap_or_else(|error| panic!("a concurrent {what} filing failed: {error:#}"));
+            numbers.push(number);
+        }
+        numbers.sort_unstable();
+        assert_eq!(
+            numbers,
+            (1..=FILINGS as i64).collect::<Vec<_>>(),
+            "concurrent {what} filings must take distinct consecutive numbers"
+        );
+    }
+
+    let storage = rg_core::blob_storage::LocalBlobStorage::new(repo_root.path());
+    let newest = FILINGS as i64;
+    rg_core::issue::moderation::delete_issue(&db, &storage, repository.id, newest)
+        .await
+        .expect("delete the newest issue");
+    rg_core::issue::moderation::delete_pull_request(
+        &db,
+        &storage,
+        repo_root.path(),
+        &repository,
+        newest,
+        owner.id,
+    )
+    .await
+    .expect("delete the newest pull request");
+
+    let next_issue = rg_core::issue::service::create_issue(
+        &db,
+        repository.id,
+        owner.id,
+        "after the deletion".to_string(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("file an issue after the deletion");
+    assert_eq!(
+        next_issue.number,
+        newest + 1,
+        "the deleted issue's number must stay spent"
+    );
+    let next_pull = rg_core::pull_request::service::create_pr(
+        &db,
+        repo_root.path(),
+        repository.id,
+        owner.id,
+        "after the deletion".to_string(),
+        None,
+        "feature".to_string(),
+        "main".to_string(),
+        None,
+        false,
+        None,
+    )
+    .await
+    .expect("open a pull request after the deletion");
+    assert_eq!(
+        next_pull.number,
+        newest + 1,
+        "the deleted pull request's number must stay spent"
+    );
+}
+
+/// Starting an agent run is decided by conditional writes, and they hold on
+/// every backend with real concurrency (card_b391e92474a0):
+///
+/// - the day's last run is taken once: a second transaction asking for it
+///   waits on the first one's row and then finds the day spent, instead of
+///   passing a count both of them read;
+/// - an attempt names one pipeline, whoever queues it;
+/// - a run ends once, whoever ends it.
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn agent_run_launch_writes_are_race_free() {
+    use rg_db::entities::{agent_run, agent_run_attempt, agent_run_quota};
+
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    // No foreign key on the allowance: any bot id will do, and a fresh one
+    // keeps reruns apart.
+    let bot_id = i64::from(uuid::Uuid::new_v4().as_fields().0 & 0x7fff_ffff) + 1_000_000;
+    let day = "2026-11-28";
+    assert!(
+        rg_db::ops::agent_run_ops::reserve_daily_run(&db, bot_id, day, 2)
+            .await
+            .expect("open the day")
+    );
+
+    let first = db.begin().await.expect("begin the first launch");
+    assert!(
+        rg_db::ops::agent_run_ops::reserve_daily_run(&first, bot_id, day, 2)
+            .await
+            .expect("take the last run"),
+        "the first transaction did not get the last run"
+    );
+    let mut second = {
+        let db = db.clone();
+        tokio::spawn(async move {
+            let txn = db.begin().await.expect("begin the second launch");
+            let taken = rg_db::ops::agent_run_ops::reserve_daily_run(&txn, bot_id, day, 2)
+                .await
+                .expect("ask for the last run");
+            txn.commit().await.expect("commit the second launch");
+            taken
+        })
+    };
+    assert_probe_stays_blocked(
+        &mut second,
+        "the second launch read the allowance past an uncommitted reservation",
+    )
+    .await;
+    first.commit().await.expect("commit the first launch");
+    assert!(
+        !second.await.expect("the second launch finished"),
+        "the day's last run was taken twice"
+    );
+    let row = agent_run_quota::Entity::find()
+        .filter(agent_run_quota::Column::BotId.eq(bot_id))
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("the day's row");
+    assert_eq!((row.day.as_str(), row.used), (day, 2));
+    assert!(
+        rg_db::ops::agent_run_ops::reserve_daily_run(&db, bot_id, "2026-11-29", 2)
+            .await
+            .unwrap(),
+        "the next day starts fresh"
+    );
+
+    // One pipeline per attempt, one end per run.
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("launchowner{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Agent Launch Smoke",
+    )
+    .await
+    .expect("create run owner");
+    let repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("launchrepo{suffix}")),
+    )
+    .await
+    .expect("create repository");
+    let pipeline = |n: u8| {
+        rg_db::ops::pipeline_ops::create_pipeline(
+            &db,
+            repo.id,
+            "0000000000000000000000000000000000000000",
+            "refs/heads/main",
+            if n == 0 { "agent_run" } else { "push" },
+            Some(owner.id),
+        )
+    };
+    let (carrier, rival) = (
+        pipeline(0).await.expect("the carrier"),
+        pipeline(1).await.expect("the rival"),
+    );
+    let run = agent_run::ActiveModel {
+        bot_id: Set(bot_id),
+        repository_id: Set(repo.id),
+        iteration: Set(1),
+        triggered_by: Set(owner.id),
+        trigger_key: Set(format!("launch:{suffix}")),
+        status: Set("queued".to_string()),
+        active: Set(Some(true)),
+        commit_sha: Set(Some("0000000000000000000000000000000000000000".to_string())),
+        created_at: Set(chrono::Utc::now()),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .expect("the run");
+    assert_eq!(
+        run.commit_sha.as_deref(),
+        Some("0000000000000000000000000000000000000000")
+    );
+    let attempt = agent_run_attempt::ActiveModel {
+        run_id: Set(run.id),
+        attempt: Set(1),
+        created_at: Set(chrono::Utc::now()),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .expect("the attempt");
+    assert!(
+        rg_db::ops::agent_run_ops::link_attempt_pipeline(&db, attempt.id, carrier.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !rg_db::ops::agent_run_ops::link_attempt_pipeline(&db, attempt.id, rival.id)
+            .await
+            .unwrap(),
+        "a second pipeline took an attempt another one carries"
+    );
+    let now = chrono::Utc::now();
+    assert!(rg_db::ops::agent_run_ops::finish_run(
+        &db,
+        run.id,
+        "cancelled",
+        Some("unassigned"),
+        now
+    )
+    .await
+    .unwrap());
+    assert!(
+        !rg_db::ops::agent_run_ops::finish_run(&db, run.id, "succeeded", None, now)
+            .await
+            .unwrap(),
+        "a run ended twice"
+    );
+    let ended = agent_run::Entity::find_by_id(run.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((ended.status.as_str(), ended.active), ("cancelled", None));
 }

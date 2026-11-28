@@ -249,6 +249,7 @@ pub async fn run_post_push_hooks(
             owner,
             repo_name,
             pusher_id,
+            origin: rg_core::push_hooks::PushOrigin::default(),
             docker_enabled: false,
             external_runners: false,
             allow_host_runner: false,

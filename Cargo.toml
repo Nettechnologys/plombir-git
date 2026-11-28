@@ -243,6 +243,8 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 semver = "1"
 regex = "1"
+# Every form of every secret found in one pass over a job log (`rg_core::auth::log_mask`).
+aho-corasick = "1"
 home = "0.5"
 
 # DB migration

@@ -71,6 +71,11 @@ export interface Issue {
    * logins there, not accounts here. Only on the issue itself, never in a list.
    */
   original_assignees?: ImportedPerson[];
+  /**
+   * Whether the author is a person who can write to the repository, whose
+   * text an agent run trusts. Only on the issue itself, never in a list.
+   */
+  author_can_write?: boolean;
   milestone_id: number | null;
   labels: string[];
   created_at: string;

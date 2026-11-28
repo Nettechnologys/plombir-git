@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { createT } from '$lib/i18n';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { viewerPermission } from '$lib/viewerPermission.svelte';
@@ -8,9 +8,9 @@
 
   let { children } = $props();
 
-  const owner = $derived($page.params.owner!);
-  const repo = $derived($page.params.repo!);
-  const currentPath = $derived($page.url.pathname);
+  const owner = $derived(page.params.owner!);
+  const repo = $derived(page.params.repo!);
+  const currentPath = $derived(page.url.pathname);
 
   // Each section names the level its server routes require (card_270a0a77fd79):
   // labels and LFS locks are `RepoWrite`, everything else here — both

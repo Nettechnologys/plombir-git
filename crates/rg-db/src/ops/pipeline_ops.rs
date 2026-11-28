@@ -806,6 +806,22 @@ pub async fn update_job_log(db: &DatabaseConnection, id: i64, log: &str) -> Resu
 /// The row update takes the per-job write lock before reading its length, so
 /// concurrent servers cannot allocate the same character offset.
 pub async fn append_job_log(db: &DatabaseConnection, id: i64, text: &str) -> Result<()> {
+    append_job_log_text(db, id, text, true).await
+}
+
+/// Append `text` exactly as given: a piece of a log streamed while the job
+/// runs, which may end and begin mid-line (card_e925c7cedd46). Unlike
+/// [`append_job_log`], no newline is put between it and what came before.
+pub async fn stream_job_log(db: &DatabaseConnection, id: i64, text: &str) -> Result<()> {
+    append_job_log_text(db, id, text, false).await
+}
+
+async fn append_job_log_text<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    id: i64,
+    text: &str,
+    on_its_own_line: bool,
+) -> Result<()> {
     let tx = db.begin().await.context("db: begin job log append")?;
     let now = chrono::Utc::now().naive_utc();
     let updated = pipeline_job::Entity::update_many()
@@ -832,7 +848,7 @@ pub async fn append_job_log(db: &DatabaseConnection, id: i64, text: &str) -> Res
         - 1;
     let mut end_offset = old_length;
     if !text.is_empty() {
-        let content = if old_length == 0 {
+        let content = if old_length == 0 || !on_its_own_line {
             text.to_owned()
         } else {
             format!("\n{text}")
@@ -1091,6 +1107,14 @@ pub async fn update_job_result(
         active.finished_at = Set(finished_at);
     }
     active.update(db).await.context("db: update job result")?;
+    if log.is_some() {
+        // As in `settle_job_if_active`: the column is the whole log now.
+        job_log_chunk::Entity::delete_many()
+            .filter(job_log_chunk::Column::JobId.eq(id))
+            .exec(db)
+            .await
+            .context("db: delete the streamed log a job result replaced")?;
+    }
     Ok(())
 }
 
@@ -1930,8 +1954,58 @@ pub async fn touch_running_jobs_for_runner(
     Ok(result.rows_affected)
 }
 
-/// Reset a stuck job back to pending, unassigning the runner.
+/// The trigger an agent run's pipeline carries (`rg_core::ci::AGENT_RUN_EVENT`).
+pub const AGENT_RUN_TRIGGER: &str = "agent_run";
+
+/// What the log of an agent run's job says when its executor was lost.
+pub const AGENT_JOB_LOST_NOTICE: &str = "[plombir-git] This agent run was stopped: the runner \
+executing it was lost or stopped. An agent is not restarted halfway through its work; assign \
+the issue to the bot again for a new run.";
+
+/// Fail, in `db`, every job among `jobs` that belongs to an agent run, with
+/// its pipeline, instead of handing it back to the queue; their ids.
+///
+/// Every path that hands work back — a runner lost or stopped, a job stuck,
+/// an embedded runner shutting down — goes through here, because for an
+/// agent run "again" is not "the same": the attempt already holds a token,
+/// may have pushed half its work and opened its pull request, and a second
+/// runner starting it from the top would do it all again beside what is
+/// there (card_4e61d764c20c). The run ends instead, and the next agent run
+/// pass (`rg_core::agent::run`) ends it as `failed` and deletes its token.
+/// The live log is kept, with [`AGENT_JOB_LOST_NOTICE`] after it.
+pub async fn fail_agent_run_jobs<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    jobs: &[pipeline_job::Model],
+) -> Result<Vec<i64>> {
+    let mut failed = Vec::new();
+    for job in jobs {
+        let Some(stage) = get_stage_by_id(db, job.stage_id).await? else {
+            continue;
+        };
+        let Some(pipeline) = get_pipeline(db, stage.pipeline_id).await? else {
+            continue;
+        };
+        if pipeline.trigger_type != AGENT_RUN_TRIGGER {
+            continue;
+        }
+        append_job_log_text(db, job.id, AGENT_JOB_LOST_NOTICE, true).await?;
+        settle_pipeline_chain_in_transaction(db, pipeline.id, "failed", None).await?;
+        failed.push(job.id);
+    }
+    Ok(failed)
+}
+
+/// Reset a stuck job back to pending, unassigning the runner. A job of an
+/// agent run is failed instead ([`fail_agent_run_jobs`]).
 pub async fn reset_stuck_job(db: &DatabaseConnection, job_id: i64) -> Result<()> {
+    if let Some(job) = get_job(db, job_id).await? {
+        let txn = db.begin().await.context("db: begin stuck job reset")?;
+        let failed = fail_agent_run_jobs(&txn, std::slice::from_ref(&job)).await?;
+        txn.commit().await.context("db: commit stuck job reset")?;
+        if !failed.is_empty() {
+            return Ok(());
+        }
+    }
     let now = chrono::Utc::now().naive_utc();
     pipeline_job::Entity::update_many()
         .filter(pipeline_job::Column::Id.eq(job_id))
@@ -1963,7 +2037,21 @@ pub async fn reset_stuck_job(db: &DatabaseConnection, job_id: i64) -> Result<()>
 /// earlier already settled the row, and reviving it as `pending` would hand a
 /// finished job back to be run a second time. Returns whether the row was still
 /// active and therefore handed back.
-pub async fn hand_back_active_job(db: &impl ConnectionTrait, job_id: i64) -> Result<bool> {
+pub async fn hand_back_active_job<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    job_id: i64,
+) -> Result<bool> {
+    if let Some(job) = get_job(db, job_id)
+        .await?
+        .filter(|job| ["assigned", "running"].contains(&job.status.as_str()))
+    {
+        if !fail_agent_run_jobs(db, std::slice::from_ref(&job))
+            .await?
+            .is_empty()
+        {
+            return Ok(false);
+        }
+    }
     let now = chrono::Utc::now().naive_utc();
     let result = pipeline_job::Entity::update_many()
         .filter(pipeline_job::Column::Id.eq(job_id))
@@ -2007,11 +2095,22 @@ pub async fn find_offline_runners(
 /// work, and a delete that lands without the reset leaves jobs pointing at a
 /// runner row that no longer exists, which nothing but the watchdog will ever
 /// pick up. See `runner_ops::deregister_runner`.
-pub async fn reset_runner_jobs(db: &impl ConnectionTrait, runner_id: i64) -> Result<u64> {
+pub async fn reset_runner_jobs<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    runner_id: i64,
+) -> Result<u64> {
+    let held = pipeline_job::Entity::find()
+        .filter(pipeline_job::Column::RunnerId.eq(Some(runner_id)))
+        .filter(pipeline_job::Column::Status.is_in(["assigned", "running"]))
+        .all(db)
+        .await
+        .context("db: list the jobs a runner holds")?;
+    let failed = fail_agent_run_jobs(db, &held).await?;
     let now = chrono::Utc::now().naive_utc();
     let result = pipeline_job::Entity::update_many()
         .filter(pipeline_job::Column::RunnerId.eq(Some(runner_id)))
         .filter(pipeline_job::Column::Status.is_in(["assigned", "running"]))
+        .filter(pipeline_job::Column::Id.is_not_in(failed))
         .col_expr(pipeline_job::Column::Status, Expr::value("pending"))
         .col_expr(
             pipeline_job::Column::RunnerId,
@@ -2060,14 +2159,33 @@ pub async fn assign_job(db: &DatabaseConnection, job_id: i64, runner_id: i64) ->
 /// Claim a job and persist its sealed log mask in the same conditional write.
 /// The runner must never receive secret values without the matching durable
 /// snapshot; a refused claim stores neither ownership nor the snapshot.
+///
+/// `hand_out` is what an agent run's job writes when it is handed out — its
+/// token ([`assign_agent_job`]); `None` for every other job.
 pub async fn assign_job_with_mask_snapshot(
     db: &DatabaseConnection,
     job_id: i64,
     runner_id: i64,
     encrypted_snapshot: &str,
+    hand_out: Option<HandOut<'_>>,
 ) -> Result<bool> {
-    assign_job_with_snapshot(db, job_id, runner_id, Some(encrypted_snapshot)).await
+    match hand_out {
+        Some(hand_out) => {
+            assign_agent_job(db, job_id, runner_id, encrypted_snapshot, hand_out).await
+        }
+        None => assign_job_with_snapshot(db, job_id, runner_id, Some(encrypted_snapshot)).await,
+    }
 }
+
+/// What a job writes in the transaction of the claim that hands it out.
+pub type HandOutFn = dyn for<'t> Fn(
+        &'t sea_orm::DatabaseTransaction,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 't>>
+    + Send
+    + Sync;
+
+/// A borrowed [`HandOutFn`].
+pub type HandOut<'a> = &'a HandOutFn;
 
 async fn assign_job_with_snapshot(
     db: &DatabaseConnection,
@@ -2113,6 +2231,44 @@ async fn assign_job_with_snapshot(
         .await;
     }
     claim_pending_job(db, job_id, runner_id, encrypted_snapshot).await
+}
+
+/// Claim agent run job `job_id` for `runner_id`, as
+/// [`assign_job_with_mask_snapshot`] does, and — only when this claim is the
+/// one that wins — run `hand_out` in the same transaction: the run's token is
+/// written there, so a poller that lost the claim never wrote one, and the
+/// winner's is never replaced by a loser's (card_47195d097b79).
+async fn assign_agent_job(
+    db: &DatabaseConnection,
+    job_id: i64,
+    runner_id: i64,
+    encrypted_snapshot: &str,
+    hand_out: HandOut<'_>,
+) -> Result<bool> {
+    crate::contention::retry_transaction("claim an agent run job", || async {
+        let tx = db.begin().await.context("db: begin agent run job claim")?;
+        let claimed = async {
+            if !claim_pending_job(&tx, job_id, runner_id, Some(encrypted_snapshot)).await? {
+                return Ok(false);
+            }
+            hand_out(&tx).await?;
+            Ok(true)
+        }
+        .await;
+        match claimed {
+            Ok(claimed) => {
+                tx.commit().await.context("db: commit agent run job claim")?;
+                Ok(claimed)
+            }
+            Err(error) => {
+                if let Err(rollback) = tx.rollback().await {
+                    tracing::error!(error = %format!("{rollback:#}"), "an agent run job claim could not be rolled back");
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
 }
 
 async fn claim_pending_job(
@@ -2522,12 +2678,22 @@ pub async fn settle_job_if_active(
     if let Some(finished_at) = finished_at {
         update = update.col_expr(pipeline_job::Column::FinishedAt, Expr::value(finished_at));
     }
-    Ok(update
+    let settled = update
         .exec(db)
         .await
         .context("db: settle job result")?
         .rows_affected
-        > 0)
+        > 0;
+    if settled && log.is_some() {
+        // The log is now the column alone; what was streamed while the job
+        // ran (`stream_job_log`) is superseded by it, as a replacement is.
+        job_log_chunk::Entity::delete_many()
+            .filter(job_log_chunk::Column::JobId.eq(id))
+            .exec(db)
+            .await
+            .context("db: delete the streamed log a settled job replaced")?;
+    }
+    Ok(settled)
 }
 
 /// Database result of one external-runner completion.

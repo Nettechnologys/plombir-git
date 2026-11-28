@@ -461,20 +461,36 @@ pub async fn deregister(
     // watchdog's retirement: a failure answers `5xx` with nothing half-done,
     // and the runner, which does not retry, leaves the rest to that watchdog.
     match rg_db::ops::runner_ops::stop_runner(&state.db, runner_id).await {
-        Ok(true) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "offline"})),
-        )
-            .into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "runner not found"})),
-        )
-            .into_response(),
+        Ok(true) => {
+            settle_lost_agent_runs(&state).await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "offline"})),
+            )
+                .into_response()
+        }
+        // The API envelope, not a bare `{"error": "..."}`: that older shape
+        // carries no `error.code` to branch on (card_7fe0684198fc sweep).
+        Ok(false) => AppError::not_found("runner not found").into_response(),
         Err(e) => {
             tracing::error!(runner_id, error = %format!("{e:#}"), "Failed to take a stopping runner offline");
             AppError::from(e).into_response()
         }
+    }
+}
+
+/// End the agent runs whose job a runner took with it — failed by the job
+/// release itself (`fail_agent_run_jobs`) — and delete their tokens now,
+/// rather than at the next agent run pass (card_4e61d764c20c). Logged, never
+/// the caller's failure: that pass does the same a minute later.
+pub(crate) async fn settle_lost_agent_runs(state: &AppState) {
+    match rg_core::agent::run::settle_runs_of_settled_pipelines(&state.db_pools()).await {
+        Ok(0) => {}
+        Ok(ended) => tracing::info!(ended, "ended the agent runs a released runner took with it"),
+        Err(error) => tracing::warn!(
+            error = %format!("{error:#}"),
+            "agent runs of a released runner could not be ended now; the next agent run pass ends them"
+        ),
     }
 }
 
@@ -535,7 +551,7 @@ pub async fn poll_job(
                     return Err(steps_protocol_refusal(runner_id, &job));
                 }
                 Ok(rg_db::ops::pipeline_ops::PendingPick::Job(job)) => {
-                    let (resp, encrypted_mask) =
+                    let (resp, encrypted_mask, run_token) =
                         prepare_dispatch(&state, runner_id, job.clone()).await?;
                     if !resp.services.is_empty() && !runs_services {
                         return Err(services_protocol_refusal(runner_id, &job));
@@ -557,7 +573,14 @@ pub async fn poll_job(
                     // or server shutdown); claiming earlier stranded the row as
                     // `assigned` while the only response carrying it vanished.
                     // Keep this as the final await before returning the body.
-                    if claim_dispatched_job(&state, runner_id, resp.job_id, &encrypted_mask).await?
+                    if claim_dispatched_job(
+                        &state,
+                        runner_id,
+                        resp.job_id,
+                        &encrypted_mask,
+                        run_token.as_ref(),
+                    )
+                    .await?
                     {
                         return Ok((StatusCode::OK, Json(resp)));
                     }
@@ -608,6 +631,11 @@ async fn pipeline_finished(
     }
     if completed_now {
         crate::metrics::recorder::ci_pipeline_finished(&pipeline.status);
+        if let Err(error) =
+            rg_core::agent::run::pipeline_settled(&state.db_pools(), pipeline.id).await
+        {
+            tracing::error!(pipeline_id = pipeline.id, error = %format!("{error:#}"), "an agent run's outcome could not be recorded; recovery will retry");
+        }
         if let Err(hook_error) = rg_core::webhook::service::trigger_ci_status(
             &state.db_pools(),
             pipeline.repo_id,
@@ -1038,7 +1066,9 @@ async fn candidate_pipeline(
 
 /// Lay the server-owned environment over the job's declared variables: the
 /// repository's secrets (each one also a value the log mask hides), the
-/// built-in `CI_*` variables and the job token. Returns the secrets to mask.
+/// built-in `CI_*` variables and the job token — or, for an agent run's job,
+/// its model key and its attempt's token instead of any secret. Returns the
+/// values to mask, and the run token the claim is to store.
 async fn add_server_variables(
     state: &AppState,
     job: &rg_db::entities::pipeline_job::Model,
@@ -1047,13 +1077,19 @@ async fn add_server_variables(
     secret_scope: Option<&std::collections::BTreeSet<String>>,
     token_scopes: &str,
     variables: &mut serde_json::Map<String, serde_json::Value>,
-) -> Result<Vec<String>, Response> {
+) -> Result<(Vec<String>, Option<rg_core::agent::job::PreparedToken>), Response> {
     let pipeline_id = pipeline.id;
     for reserved in rg_core::ci::BUILTIN_CI_VARIABLES {
         variables.remove(reserved);
     }
     let mut mask_secrets = Vec::new();
-    match decrypted_repo_secrets(state, pipeline.repo_id, job.environment_id).await {
+    // An agent run's job is handed none of them (ADR-0001 D5).
+    let secrets = if rg_core::ci::receives_ci_secrets(&pipeline.trigger_type) {
+        decrypted_repo_secrets(state, pipeline.repo_id, job.environment_id).await
+    } else {
+        Ok(Vec::new())
+    };
+    match secrets {
         Ok(secrets) => {
             for (name, value) in secrets {
                 mask_secrets.push(value.clone());
@@ -1152,7 +1188,54 @@ async fn add_server_variables(
             )),
         );
     }
-    Ok(mask_secrets)
+    let run_token = agent_run_variables(state, pipeline, &mut mask_secrets, variables).await?;
+    Ok((mask_secrets, run_token))
+}
+
+/// An agent run's model key and attempt token, laid into `variables` and
+/// `mask` (ADR-0001 D5, card_47195d097b79). A job whose attempt the run has
+/// moved past, or whose run is over, is settled failed with the reason and
+/// handed to nobody.
+async fn agent_run_variables(
+    state: &AppState,
+    pipeline: &rg_db::entities::pipeline::Model,
+    mask: &mut Vec<String>,
+    variables: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<rg_core::agent::job::PreparedToken>, Response> {
+    let credentials = rg_core::agent::job::job_credentials(
+        &state.db,
+        &state.encryption_key,
+        state.external_url.as_deref(),
+        pipeline,
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(
+            pipeline_id = pipeline.id,
+            error = %format!("{error:#}"),
+            "poll_job: the agent run's credentials could not be prepared"
+        );
+        AppError::from(error).into_response()
+    })?;
+    match credentials {
+        None => Ok(None),
+        Some(Ok(credentials)) => {
+            for (name, value) in credentials.variables {
+                variables.insert(name, serde_json::json!(value));
+            }
+            mask.extend(credentials.masked);
+            Ok(Some(credentials.token))
+        }
+        Some(Err(rg_core::agent::job::NotHandedOut(why))) => {
+            let log = format!("This agent run job was not started: {why}.");
+            if let Err(error) =
+                rg_db::ops::pipeline_ops::fail_pipeline_chain(&state.db, pipeline.id, &log).await
+            {
+                tracing::error!(pipeline_id = pipeline.id, error = %format!("{error:#}"), "poll_job: a stale agent run job could not be settled");
+            }
+            Err(AppError::conflict(log).into_response())
+        }
+    }
 }
 
 /// Everything a runner is handed for `job`, and the sealed log mask the claim
@@ -1161,7 +1244,14 @@ async fn prepare_dispatch(
     state: &AppState,
     runner_id: i64,
     job: rg_db::entities::pipeline_job::Model,
-) -> Result<(PollJobResponse, String), Response> {
+) -> Result<
+    (
+        PollJobResponse,
+        String,
+        Option<rg_core::agent::job::PreparedToken>,
+    ),
+    Response,
+> {
     let DecodedJobColumns {
         mut variables,
         cache_paths,
@@ -1186,7 +1276,7 @@ async fn prepare_dispatch(
             return Err(AppError::internal("invalid stored job context").into_response());
         }
     };
-    let mask_secrets = add_server_variables(
+    let (mask_secrets, run_token) = add_server_variables(
         state,
         &job,
         &pipeline,
@@ -1270,7 +1360,7 @@ async fn prepare_dispatch(
         artifact_paths,
         timeout: rg_core::ci::dispatched_job_timeout_secs(timeout_secs),
     };
-    Ok((resp, encrypted_mask))
+    Ok((resp, encrypted_mask, run_token))
 }
 
 /// Claim a prepared job for `runner_id`: `Ok(false)` when another poller or a
@@ -1285,12 +1375,17 @@ async fn claim_dispatched_job(
     runner_id: i64,
     job_id: i64,
     encrypted_mask: &str,
+    run_token: Option<&rg_core::agent::job::PreparedToken>,
 ) -> Result<bool, Response> {
+    // An agent run's token is written by the claim that wins, in its own
+    // transaction: a poller that lost never wrote one (card_47195d097b79).
+    let hand_out = run_token.map(|token| rg_core::agent::job::hand_out(token.clone()));
     match rg_db::ops::pipeline_ops::assign_job_with_mask_snapshot(
         &state.db,
         job_id,
         runner_id,
         encrypted_mask,
+        hand_out.as_deref(),
     )
     .await
     {
@@ -1427,6 +1522,9 @@ pub async fn job_status(
 /// POST /api/v1/runners/:id/jobs/:job_id/log
 /// Upload job log. A runner posting its complete final log may request
 /// replacement, making retries idempotent; legacy chunk uploads still append.
+/// While the job runs, a runner sends its live log as numbered pieces
+/// (`x-job-log-seq`), masked here across their borders; a piece already
+/// taken is acknowledged and not written again (card_e925c7cedd46).
 #[utoipa::path(
     post,
     path = "/runners/{id}/jobs/{job_id}/log",
@@ -1434,14 +1532,18 @@ pub async fn job_status(
     params(
         ("id" = i64, Path, description = "Runner ID"),
         ("job_id" = i64, Path, description = "Job ID"),
+        ("x-job-log-seq" = Option<u64>, Header, description = "The number of this piece of the live log, from 0; absent for a whole log or a legacy chunk"),
+        ("x-job-log-mode" = Option<String>, Header, description = "`replace` for the complete final log, which replaces the live one"),
     ),
     request_body(
         content = String,
         description = "Log content (plain text), up to 8 MiB per request",
     ),
     responses(
-        (status = 200, description = "Log uploaded", body = serde_json::Value),
+        (status = 200, description = "Log uploaded, or a live piece already taken (`status: duplicate`)", body = serde_json::Value),
+        (status = 400, description = "`x-job-log-seq` is not a piece number", body = serde_json::Value),
         (status = 404, description = "Job not found", body = serde_json::Value),
+        (status = 409, description = "A live piece after the job's final log", body = serde_json::Value),
         (status = 413, description = "Log above the 8 MiB per-request ceiling"),
         (status = 503, description = "Log write queue is full or unavailable; retry the upload"),
     ),
@@ -1457,27 +1559,110 @@ pub async fn upload_log(
         Err(error) => return error.into_response(),
     };
 
+    if let Some(seq) = headers.get(LIVE_LOG_SEQ_HEADER) {
+        let Some(seq) = seq.to_str().ok().and_then(|seq| seq.parse::<u64>().ok()) else {
+            return AppError::bad_request("x-job-log-seq is the piece's number, from 0")
+                .into_response();
+        };
+        // A live piece is the job running: a job the server settled (a
+        // cancel, a lost runner's agent job) takes none (409).
+        if let Err(error) = refuse_settled_job(runner_id, &job) {
+            return error.into_response();
+        }
+        return upload_live_log_piece(&state, &job, seq, &body).await;
+    }
+
+    let replace = headers
+        .get("x-job-log-mode")
+        .is_some_and(|value| value == "replace");
     let body = match sanitized_runner_log(&state, &job, &body).await {
         Ok(body) => body,
         Err(response) => return response,
     };
 
-    let result = if headers
-        .get("x-job-log-mode")
-        .is_some_and(|value| value == "replace")
-    {
+    // The final log closes the live one first, under its lock, so no live
+    // piece is written after it (`live_job_log`).
+    let live = replace.then(|| state.live_job_logs.entry(job_id));
+    let mut live = match &live {
+        Some(entry) => Some(entry.lock().await),
+        None => None,
+    };
+    if let Some(live) = live.as_mut() {
+        live.close();
+    }
+    let result = if replace {
         state.log_write_queue.replace(job_id, &body).await
     } else {
         state.log_write_queue.write(job_id, &body).await
     };
+    drop(live);
     if let Err(error) = result {
         tracing::warn!(job_id, error = %format!("{error:#}"), "failed to persist runner log");
         return log_write_failure_response(error);
     }
 
     // Broadcast only the server-sanitized log via WebSocket to frontend.
-    crate::ws::push_job_log(&state.notification_hub, job_id, &body).await;
+    if replace {
+        crate::ws::push_job_log_replaced(&state.notification_hub, job_id, &body).await;
+    } else {
+        crate::ws::push_job_log(&state.notification_hub, job_id, &body).await;
+    }
 
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
+}
+
+/// The header that makes a log upload the next piece of a live log
+/// (card_e925c7cedd46): its number, from 0.
+pub const LIVE_LOG_SEQ_HEADER: &str = "x-job-log-seq";
+
+/// Take piece `seq` of the live log of `job` (see `crate::live_job_log`).
+async fn upload_live_log_piece(
+    state: &AppState,
+    job: &rg_db::entities::pipeline_job::Model,
+    seq: u64,
+    text: &str,
+) -> Response {
+    let entry = state.live_job_logs.entry(job.id);
+    let mut entry = entry.lock().await;
+    // The job's secrets are read only for its first piece.
+    let mask = match entry.state {
+        crate::live_job_log::LiveState::New => match job_mask_secrets(state, job).await {
+            Ok(secrets) => Some(rg_core::auth::log_mask::LogMask::new(&secrets)),
+            Err(response) => return response,
+        },
+        _ => None,
+    };
+    let start = || {
+        mask.unwrap_or_else(|| rg_core::auth::log_mask::LogMask::new(&[]))
+            .stream()
+    };
+    let (piece, stream) = entry.read(seq, text, start);
+    let emitted = match piece {
+        crate::live_job_log::Piece::Closed => {
+            return AppError::conflict("the job's log is complete").into_response()
+        }
+        crate::live_job_log::Piece::Duplicate => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "duplicate"})),
+            )
+                .into_response()
+        }
+        crate::live_job_log::Piece::Take(emitted) => emitted,
+    };
+    let emitted =
+        rg_core::auth::ci_token::mask_job_tokens_in_log(&emitted, &state.jwt_secret, job.id);
+    if !emitted.is_empty() {
+        if let Err(error) = state.log_write_queue.stream(job.id, &emitted).await {
+            tracing::warn!(job_id = job.id, error = %format!("{error:#}"), "failed to persist a live log piece");
+            return log_write_failure_response(error);
+        }
+    }
+    entry.commit(seq, stream.expect("a taken piece has its stream"));
+    drop(entry);
+    if !emitted.is_empty() {
+        crate::ws::push_job_log(&state.notification_hub, job.id, &emitted).await;
+    }
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
 }
 
@@ -1582,6 +1767,17 @@ async fn sanitized_runner_log(
     job: &rg_db::entities::pipeline_job::Model,
     log: &str,
 ) -> Result<String, Response> {
+    let secrets = job_mask_secrets(state, job).await?;
+    let log = rg_core::auth::ci_token::mask_job_tokens_in_log(log, &state.jwt_secret, job.id);
+    Ok(rg_core::auth::encryption::mask_values(&log, &secrets))
+}
+
+/// Every secret the job was issued and every secret it could read now: what a
+/// log a runner sent is masked with, whole or live.
+async fn job_mask_secrets(
+    state: &AppState,
+    job: &rg_db::entities::pipeline_job::Model,
+) -> Result<Vec<String>, Response> {
     let mut secrets = match decrypt_job_mask(state, job) {
         Ok(secrets) => secrets,
         Err(error) => {
@@ -1596,8 +1792,7 @@ async fn sanitized_runner_log(
             return Err(AppError::internal("failed to sanitize job log").into_response());
         }
     }
-    let log = rg_core::auth::ci_token::mask_job_tokens_in_log(log, &state.jwt_secret, job.id);
-    Ok(rg_core::auth::encryption::mask_values(&log, &secrets))
+    Ok(secrets)
 }
 
 fn log_write_failure_response(
@@ -2853,6 +3048,7 @@ pub async fn delete_runner_admin(
 
     match rg_db::ops::runner_ops::deregister_runner(&state.db, runner_id).await {
         Ok(true) => {
+            settle_lost_agent_runs(&state).await;
             record_instance_credential(
                 &state,
                 &actor,

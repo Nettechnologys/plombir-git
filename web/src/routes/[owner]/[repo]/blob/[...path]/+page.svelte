@@ -2,7 +2,7 @@
   import { copyToClipboard } from '$lib/clipboard';
   import { goto, replaceState } from '$app/navigation';
   import { tick } from 'svelte';
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import GoToFile from '$lib/components/GoToFile.svelte';
   import { repos } from '$lib/api/client.svelte';
@@ -43,13 +43,13 @@
     | { kind: 'text'; content: string }
     | { kind: 'download' };
 
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
   // Editing and deleting a file are `RepoWrite` (card_e1baa94866ed); a reader
   // is offered neither, rather than a button that ends in a 403.
   const permission = viewerPermission(() => owner, () => repo);
-  let filePath = $derived($page.params.path!);
-  let queryRef = $derived($page.url.searchParams.get('ref') || '');
+  let filePath = $derived(page.params.path!);
+  let queryRef = $derived(page.url.searchParams.get('ref') || '');
 
   let blobData = $state<BlobData | null>(null);
   let lfsView = $state<LfsView | null>(null);
@@ -114,7 +114,7 @@
   let selectedLines = $state<LineRange | null>(null);
   let scrolledToSelection = false;
   $effect(() => {
-    selectedLines = parseLineHash($page.url.hash);
+    selectedLines = parseLineHash(page.url.hash);
   });
   $effect(() => {
     // Once per page: bring the linked line into view when the code arrives.
@@ -134,7 +134,7 @@
     event.preventDefault();
     const next = selectLine(selectedLines, line, event.shiftKey);
     selectedLines = next;
-    replaceState(`${$page.url.pathname}${$page.url.search}${formatLineHash(next)}`, {});
+    replaceState(`${page.url.pathname}${page.url.search}${formatLineHash(next)}`, {});
   }
 
   function buildRepoQuery(nextRef: string, nextPath: string) {

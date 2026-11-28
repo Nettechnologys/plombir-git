@@ -91,6 +91,41 @@ describe('pipeline job steps', () => {
 		await vi.waitFor(() => expect(element(dialog, '.log-content').textContent).toContain('the whole job'));
 	});
 
+	// card_e925c7cedd46: a job's log arrives live, then the runner writes the
+	// whole log once more when the job ends. That one replaces the live text,
+	// so it is read from the start, not appended at the live text's offset.
+	it('reads a replaced log from the start instead of appending to the live one', async () => {
+		const pipeline = {
+			id: 1, status: 'running', commit_sha: 'abcdef1', commit_message: 'Pipeline 1',
+			ref_name: 'main', started_at: timestamp, finished_at: null,
+		};
+		const job = { id: 5, name: 'agent', status: 'running', started_at: timestamp, finished_at: null, steps: [] };
+		pipelines.list.mockResolvedValue({ data: [pipeline], pagination: { total_pages: 1 } });
+		pipelines.get.mockResolvedValue({
+			pipeline,
+			stages: [{ id: 2, name: 'agent', status: 'running', started_at: timestamp, finished_at: null, jobs: [job] }],
+		});
+		let stored = 'live part';
+		pipelines.jobLog.mockImplementation(
+			async (_owner: string, _repo: string, _pipeline: number, _job: number, offset = 0) => ({
+				content: stored.slice(offset),
+				offset,
+				next_offset: stored.length,
+				total_length: stored.length,
+			}),
+		);
+		setTestPage('/alice/demo/pipelines', { owner: 'alice', repo: 'demo' });
+		rendered = await renderComponent(PipelinesPage);
+		await click(element(rendered.container, '.pipeline-item'));
+		const dialog = await openModalFrom(rendered.container, element<HTMLElement>(rendered.container, '.job-card'));
+		await vi.waitFor(() => expect(element(dialog, '.log-content').textContent).toBe('live part'));
+
+		const onLog = connectJobLogWebSocket.mock.calls[0]?.[1] as (chunk: string, replaced: boolean) => void;
+		stored = 'the final whole log';
+		onLog(stored, true);
+		await vi.waitFor(() => expect(element(dialog, '.log-content').textContent).toBe('the final whole log'));
+	});
+
 	it('shows no step list for a job that runs one script', async () => {
 		const pipeline = {
 			id: 1, status: 'success', commit_sha: 'abcdef1', commit_message: 'Pipeline 1',

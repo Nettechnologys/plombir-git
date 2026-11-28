@@ -1,6 +1,6 @@
 <script lang="ts">
   import { copyToClipboard } from '$lib/clipboard';
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import RepoHeader from '$lib/components/RepoHeader.svelte';
   import { packages } from '$lib/api/client.svelte';
   import { LatestRepositoryResourceRequestFence } from '$lib/asyncStateOwnership';
@@ -10,9 +10,9 @@
 
   const t = createT();
 
-  let owner = $derived($page.params.owner!);
-  let repo = $derived($page.params.repo!);
-  let format = $derived($page.params.format!);
+  let owner = $derived(page.params.owner!);
+  let repo = $derived(page.params.repo!);
+  let format = $derived(page.params.format!);
 
   let packageList = $state<any[]>([]);
   let loading = $state(true);
@@ -55,7 +55,7 @@
         repo: repo!,
         name: pkg.name,
         version: pkg.latest_version || undefined,
-        origin: $page.url.origin,
+        origin: page.url.origin,
       }),
     );
   }

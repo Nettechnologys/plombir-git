@@ -83,6 +83,8 @@ impl rg_core::push_hooks::PushNotifier for RecordingNotifier {
             .unwrap()
             .push((user_id, event_type.to_string()));
     }
+
+    fn job_log(&self, _job_id: i64, _log: &str, _replaced: bool) {}
 }
 
 fn git(args: &[&str], cwd: Option<&Path>) -> String {

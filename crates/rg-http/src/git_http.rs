@@ -519,14 +519,14 @@ async fn current_git_push_policy(
     credential: Option<&GitCredential>,
 ) -> Result<rg_git::protocol::receive_pack::PushPolicy, Response> {
     let actor_id = credential.map(|credential| credential.user_id);
-    let token_kept_off_protected = credential
-        .and_then(|credential| credential.grant.as_ref())
-        .is_some_and(|grant| grant.denies_protected_writes());
+    let grant = credential.and_then(|credential| credential.grant.as_ref());
+    let token_kept_off_protected = grant.is_some_and(|grant| grant.denies_protected_writes());
     rg_core::branch_protection::push_rules::load_receive_pack_policy(
         &state.db,
         repo_id,
         actor_id,
         token_kept_off_protected,
+        grant.and_then(|grant| grant.write_ref_prefix()),
     )
     .await
     .map_err(|error| {
@@ -546,8 +546,9 @@ async fn current_git_push_policy(
 ///
 /// Git is not behind the REST PAT middleware or the per-route layer, so the two
 /// confinements a token can carry are applied here: a token confined to MCP
-/// tools has no business on the git transport at all, and a token confined to
-/// repositories reaches only those. An unknown repository and one outside the
+/// tools has no business on the git transport unless it was issued with
+/// `allow_git` (a token for an agent run, which clones and pushes its branch —
+/// ADR-0001 D3), and a token confined to repositories reaches only those. An unknown repository and one outside the
 /// allow-list answer alike, so the confinement is not an existence oracle.
 async fn git_grant_refusal(
     state: &AppState,
@@ -566,7 +567,7 @@ async fn git_grant_refusal(
             message,
         )
     };
-    if grant.is_mcp_only() {
+    if grant.is_mcp_only() && !grant.allows_git() {
         grant
             .record_denial(
                 headers,
@@ -1740,6 +1741,15 @@ pub(crate) async fn handle_git_receive_pack(
         Err(response) => return response,
     };
     let actor_id = credential.as_ref().map(|credential| credential.user_id);
+    // Whether an agent run's token is pushing (ADR-0001 D4): its push starts
+    // no pipeline of its own. Read off the credential this request resolved,
+    // not the task-local context, which the post-push task does not see.
+    let push_origin = rg_core::push_hooks::PushOrigin {
+        agent_run_attempt_id: credential
+            .as_ref()
+            .and_then(|credential| credential.grant.as_ref())
+            .and_then(|grant| grant.agent_run_attempt_id()),
+    };
     let push_policy =
         match current_git_push_policy(&state, repo_model.id, credential.as_ref()).await {
             Ok(policy) => policy,
@@ -1818,6 +1828,7 @@ pub(crate) async fn handle_git_receive_pack(
                 owner.clone(),
                 repo.clone(),
                 actor_id,
+                push_origin,
                 ref_updates,
             );
 
@@ -1856,6 +1867,7 @@ pub(crate) async fn handle_git_receive_pack(
                     owner.clone(),
                     repo.clone(),
                     actor_id,
+                    push_origin,
                     ref_updates,
                 );
             }
@@ -1865,8 +1877,10 @@ pub(crate) async fn handle_git_receive_pack(
     }
 }
 
-/// Journal each ref a token kept off protected branches was refused, as
-/// `agent.scope_denied` — one row per refused ref (card_270b42fd0297).
+/// Journal each ref a token's narrowing refused, as `agent.scope_denied` — one
+/// row per refused ref: a protected branch (card_270b42fd0297), or a ref
+/// outside the token's write scope (ADR-0001 D3). A ref refused only because
+/// another in the same push was out of scope gets no row of its own.
 ///
 /// The refusal itself happens inside `receive-pack`, which answers the client
 /// with an `ng` line and knows nothing of tokens. The REST and MCP doors write
@@ -1885,6 +1899,23 @@ async fn record_token_push_denials(
         return;
     };
     for update in ref_updates {
+        if let Some(refname) = rg_git::protocol::receive_pack::write_scope_refused_ref(update) {
+            grant
+                .record_denial(
+                    headers,
+                    serde_json::json!({
+                        "reason": "write_ref_prefix",
+                        "transport": "git",
+                        "repository": format!("{owner}/{repo}"),
+                        "repo_id": repo_id,
+                        "ref": refname,
+                        "deletes": update.new_sha.bytes().all(|byte| byte == b'0'),
+                        "write_ref_prefix": grant.write_ref_prefix(),
+                    }),
+                )
+                .await;
+            continue;
+        }
         let Some(rule) = rg_core::branch_protection::push_rules::token_narrowing_refusal(update)
         else {
             continue;
@@ -2320,7 +2351,9 @@ mod tests {
                 "spawn_post_push_hooks",
                 "self.delivery_tracker.spawn",
             )?;
-            let run = one_call(app_source, "spawn_post_push_hooks", "run")?;
+            // `run_with_origin`: the hand-off carries whether an agent run made
+            // the moves (ADR-0001 D4).
+            let run = one_call(app_source, "spawn_post_push_hooks", "run_with_origin")?;
             if !rust_source::call_site_contains(app_source, spawn, run) {
                 return Err(format!(
                     "post-push run at lib.rs:{} is outside the tracked spawn at lib.rs:{}",
@@ -2400,7 +2433,7 @@ mod tests {
 
         for (function, name) in [
             ("spawn_post_push_hooks", "self.delivery_tracker.spawn"),
-            ("spawn_post_push_hooks", "run"),
+            ("spawn_post_push_hooks", "run_with_origin"),
         ] {
             let mutated = without_call(app_source, function, name);
             assert!(

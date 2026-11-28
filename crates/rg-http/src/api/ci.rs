@@ -992,6 +992,15 @@ pub async fn retry_pipeline(
         Ok(pipeline) => pipeline,
         Err(error) => return error.into_response(),
     };
+    // An agent run is started by an assignment, after the checks of ADR-0001
+    // D6; rebuilding its pipeline from the row would skip every one of them,
+    // and there is no workflow for a retry to re-read either.
+    if pipeline.trigger_type == rg_core::ci::AGENT_RUN_EVENT {
+        return AppError::conflict(
+            "an agent run is not retried as a pipeline; assign the issue to the bot again",
+        )
+        .into_response();
+    }
 
     let owner_display = match resolve_repo_storage_owner(&state, &repo, &owner).await {
         Ok(owner) => owner,
@@ -1132,16 +1141,49 @@ pub async fn retry_pipeline(
     responses(
         (status = 201, description = "Created", body = serde_json::Value),
         (status = 401, description = "Unauthorized", body = serde_json::Value),
+        (status = 403, description = "An agent run's pipeline, and the caller may not cancel the run", body = serde_json::Value),
         (status = 409, description = "Pipeline is not active", body = serde_json::Value),
     ),
 )]
 pub async fn cancel_pipeline(
     State(state): State<AppState>,
     Path((_, _, id)): Path<(String, String, i64)>,
-    RepoWrite { repo, .. }: RepoWrite,
+    RepoWrite { repo, actor_id }: RepoWrite,
 ) -> impl IntoResponse {
-    if let Err(error) = pipeline_in_repo(&state, &repo, id).await {
-        return error.into_response();
+    let pipeline = match pipeline_in_repo(&state, &repo, id).await {
+        Ok(pipeline) => pipeline,
+        Err(error) => return error.into_response(),
+    };
+    // An agent run's pipeline is cancelled as the run: by the same people the
+    // run's own cancel admits, and through the same transition, so its token
+    // goes and the bot says so (card_231f9eb28ee3).
+    if pipeline.trigger_type == rg_core::ci::AGENT_RUN_EVENT {
+        match rg_core::agent::run::run_of_pipeline(&state.db, pipeline.id).await {
+            Ok(Some(run)) if run.active == Some(true) => {
+                return crate::api::agent_runs::cancel_response(
+                    &state,
+                    &repo,
+                    run.id,
+                    actor_id,
+                    || Json(serde_json::json!({"id": id, "status": "canceled"})).into_response(),
+                )
+                .await;
+            }
+            Ok(Some(run)) => {
+                let repo_admin =
+                    match crate::api::repo_access::administers(&state, &repo, actor_id).await {
+                        Ok(admin) => admin,
+                        Err(error) => return error.into_response(),
+                    };
+                match rg_core::agent::run::may_cancel(&state.db, &run, actor_id, repo_admin).await {
+                    Ok(true) => {}
+                    Ok(false) => return crate::api::agent_runs::not_allowed().into_response(),
+                    Err(error) => return AppError::from(error).into_response(),
+                }
+            }
+            Ok(None) => {}
+            Err(error) => return AppError::from(error).into_response(),
+        }
     }
 
     match rg_db::ops::pipeline_ops::cancel_pipeline_chain(&state.db, id).await {

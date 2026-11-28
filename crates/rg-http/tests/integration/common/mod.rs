@@ -486,6 +486,7 @@ pub fn build_test_app_state_with(
             Some(oci_legacy_root),
         )),
         log_write_queue: rg_core::ci::log_write_queue::LogWriteQueue::spawn(db_for_queue),
+        live_job_logs: Default::default(),
         delivery_tracker: overrides.delivery_tracker.unwrap_or_default(),
         external_url: overrides.external_url,
         ssh_clone_port: overrides.ssh_clone_port,
@@ -502,6 +503,7 @@ pub fn build_test_app_state_with(
         attestation_enabled: true,
         // Off as in production; a test that needs runs turns it on.
         agents_enabled: false,
+        agent_limits: rg_core::agent::run::AgentLimits::default(),
         trial_mode: overrides.trial_mode,
         source_url: std::sync::Arc::from(TEST_SOURCE_URL),
         ws_session_recheck_secs: overrides

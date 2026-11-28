@@ -705,9 +705,11 @@ fn spawn_delivery(
             Ok(resp_status) => (Some(resp_status), None::<String>),
             Err(e) => {
                 // The reason is persisted on the delivery and shown in the
-                // hook's own delivery list, and `reqwest` quotes the URL it
-                // failed on. A hook registered before the userinfo check
-                // existed still carries a credential there.
+                // hook's own delivery list. `deliver` has already taken the
+                // URL out of a transport failure (`delivery_transport_error`);
+                // the mask stays as the last net for any other error text that
+                // might echo one — a hook registered before the userinfo check
+                // existed still carries a credential in its URL.
                 let reason = crate::net::mask_url_credentials(&format!("{e:#}"));
                 tracing::warn!(webhook_id = hook_id, error = %reason, "webhook delivery failed");
                 (None, Some(format!("delivery error: {reason}")))
@@ -793,8 +795,37 @@ async fn deliver(
         builder = builder.header("X-Hub-Signature-256", format!("sha256={}", sig));
     }
 
-    let resp = builder.send().await.context("webhook POST failed")?;
+    let resp = builder
+        .send()
+        .await
+        .map_err(|error| delivery_transport_error(url, error))?;
     Ok(resp.status().as_u16() as i32)
+}
+
+/// A failed POST as something that may be logged and stored: the target's
+/// origin and what went wrong, never the URL itself.
+///
+/// card_0c749c62f7ab: `reqwest` quotes the full URL it failed on, and this
+/// text goes to `tracing` and into `webhook_delivery.response_body`, which the
+/// hook's delivery list shows. [`crate::net::mask_url_credentials`] only takes
+/// out `user:password@` — but a Slack, Discord or Teams style hook keeps its
+/// secret in the *path* (`/services/T…/B…/XXXX`), and plenty of receivers take
+/// a `?token=`. The URL is dropped from the error before anything formats it,
+/// and the origin (scheme, host, port) stays so the failure still says where.
+fn delivery_transport_error(url: &str, error: reqwest::Error) -> anyhow::Error {
+    let what = if error.is_timeout() {
+        "timed out"
+    } else if error.is_connect() {
+        "could not connect"
+    } else if error.is_redirect() {
+        "was redirected"
+    } else {
+        "failed"
+    };
+    let origin = reqwest::Url::parse(url)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_else(|_| "the webhook target".to_string());
+    anyhow::Error::new(error.without_url()).context(format!("webhook POST to {origin} {what}"))
 }
 
 /// List recent deliveries for a webhook.
@@ -813,6 +844,43 @@ pub async fn get_delivery(
     webhook_ops::find_delivery_by_id(db, id).await
 }
 
+/// The format a recorded delivery body went out in — `"form"` or `"json"` —
+/// or an error when the body is neither.
+///
+/// card_ff08224f0a30: a replay used to be read and sent by the hook's
+/// `content_type` *today*. A form delivery became unreplayable once the hook
+/// moved to JSON ("is not valid JSON"), and in the other direction a JSON body
+/// went out under a form header: the request arriving wrong, which is what
+/// redelivery must never do.
+///
+/// No column is needed to know which it was. Every format renders either the
+/// form body `payload=<urlencoded JSON>` or a JSON document (`json`, and the
+/// `slack` / `discord` / `matrix` chat messages), and no JSON document starts
+/// with `payload=`. Older releases labeled raw JSON as form data; those bytes
+/// are JSON and are replayed as JSON, the only header a receiver could ever
+/// have parsed them under. Only the wire header depends on the answer — the
+/// replay sends the recorded bytes as they are.
+fn recorded_wire_format(delivery_id: i64, payload: &str) -> Result<&'static str> {
+    if let Some(encoded) = payload.strip_prefix("payload=") {
+        let json = urlencoding::decode(encoded).with_context(|| {
+            format!(
+                "stored request_payload of webhook delivery {delivery_id} is not valid form encoding"
+            )
+        })?;
+        serde_json::from_str::<Value>(&json).with_context(|| {
+            format!(
+                "stored request_payload of webhook delivery {delivery_id} has invalid form JSON"
+            )
+        })?;
+        Ok("form")
+    } else {
+        serde_json::from_str::<Value>(payload).with_context(|| {
+            format!("stored request_payload of webhook delivery {delivery_id} is not valid JSON")
+        })?;
+        Ok("json")
+    }
+}
+
 /// Redeliver a webhook (re-post the original payload).
 pub async fn redeliver(db: &impl crate::db::DbPools, delivery_id: i64) -> Result<()> {
     redeliver_with_tracker(db, delivery_id, crate::task_tracker::delivery_tracker()).await
@@ -827,7 +895,7 @@ async fn redeliver_with_tracker(
         .await?
         .ok_or_else(|| crate::error::not_found("webhook delivery"))?;
 
-    let hook = webhook_ops::find_by_id(db.read(), delivery.webhook_id)
+    let mut hook = webhook_ops::find_by_id(db.read(), delivery.webhook_id)
         .await?
         .ok_or_else(|| crate::error::not_found("webhook"))?;
 
@@ -843,28 +911,9 @@ async fn redeliver_with_tracker(
             "webhook delivery {delivery_id} has no recorded request payload to resend"
         ))
     })?;
-    if hook.content_type == "form" {
-        // Older releases labeled raw JSON as form data. Replay those bytes as
-        // recorded instead of silently changing a historical request.
-        let json = if let Some(encoded) = payload.strip_prefix("payload=") {
-            urlencoding::decode(encoded)
-                .with_context(|| {
-                    format!("stored request_payload of webhook delivery {delivery_id} is not valid form encoding")
-                })?
-                .into_owned()
-        } else {
-            payload.clone()
-        };
-        serde_json::from_str::<Value>(&json).with_context(|| {
-            format!(
-                "stored request_payload of webhook delivery {delivery_id} has invalid form JSON"
-            )
-        })?;
-    } else {
-        serde_json::from_str::<Value>(&payload).with_context(|| {
-            format!("stored request_payload of webhook delivery {delivery_id} is not valid JSON")
-        })?;
-    }
+    // card_ff08224f0a30: replayed in the format it was recorded in, not in
+    // the hook's format today — see `recorded_wire_format`.
+    hook.content_type = recorded_wire_format(delivery_id, &payload)?.to_string();
 
     // Replay the exact recorded request body to the exact recorded hook. This
     // is an explicit operator action, so it does not inherit the automatic
@@ -1119,6 +1168,127 @@ mod tests {
         assert_eq!(bodies[1]["repository"], "team/app");
         assert_eq!(bodies[1]["repository_id"], repo.id);
         assert_eq!(bodies[1]["pipeline_id"], 7);
+    }
+
+    /// card_0c749c62f7ab: a Slack/Discord/Teams style hook keeps its secret
+    /// in the URL path, and many receivers take one in the query. A transport
+    /// failure used to store `reqwest`'s text — which quotes the whole URL —
+    /// in the delivery's `response_body` (shown on the hook's delivery list)
+    /// and in the warning log, with only `user:password@` masked out.
+    #[tokio::test]
+    async fn a_failed_delivery_records_the_origin_but_not_the_url_secrets() {
+        let (db, mut hook) = update_fixture().await;
+        // `.invalid` never resolves (RFC 6761), so this fails in transport,
+        // before any response — the branch that formats the reqwest error.
+        hook.url =
+            "https://hooks.example.invalid/services/PATH_BEARER_SECRET?token=QUERY_BEARER_SECRET"
+                .into();
+        let id = hook.id;
+        let tracker = crate::task_tracker::TaskTracker::new();
+        spawn_delivery(&db, hook, "push".into(), "{}".into(), &tracker, true);
+        tracker.close();
+        tokio::time::timeout(std::time::Duration::from_secs(40), tracker.wait())
+            .await
+            .expect("the delivery task finishes");
+
+        let rows = webhook_ops::list_deliveries_by_webhook(&db, id)
+            .await
+            .expect("read the delivery journal");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].response_status.is_none(), "{:?}", rows[0]);
+        let error = rows[0]
+            .response_body
+            .as_deref()
+            .expect("a transport failure is recorded");
+        assert!(
+            !error.contains("PATH_BEARER_SECRET")
+                && !error.contains("QUERY_BEARER_SECRET")
+                && !error.contains("/services/"),
+            "the webhook URL's path or query reached the delivery diagnostics: {error}"
+        );
+        assert!(
+            error.contains("https://hooks.example.invalid"),
+            "the diagnostic must still say where the POST went: {error}"
+        );
+    }
+
+    /// The reqwest error itself is what carried the URL; the helper must take
+    /// it off every kind, not only the DNS failure the test above produces.
+    #[tokio::test]
+    async fn a_transport_error_is_formatted_without_its_url() {
+        let url = "https://hooks.example.com/services/T0/B0/PATH_SECRET?token=QUERY_SECRET";
+        // Refusing a non-HTTP scheme is a `reqwest::Error` that carries the
+        // URL and is produced before any connection is attempted.
+        let error = reqwest::Client::new()
+            .get("ftp://hooks.example.com/services/T0/B0/PATH_SECRET?token=QUERY_SECRET")
+            .send()
+            .await
+            .expect_err("reqwest refuses an ftp URL");
+        assert!(
+            format!("{error:#}").contains("PATH_SECRET"),
+            "the fixture must carry the URL, or this proves nothing: {error:#}"
+        );
+        let formatted = format!("{:#}", delivery_transport_error(url, error));
+        assert!(
+            !formatted.contains("PATH_SECRET") && !formatted.contains("QUERY_SECRET"),
+            "{formatted}"
+        );
+        assert!(
+            formatted.starts_with("webhook POST to https://hooks.example.com failed"),
+            "{formatted}"
+        );
+    }
+
+    /// card_ff08224f0a30: a delivery recorded while the hook sent form data
+    /// stays replayable after the hook moves to JSON.
+    #[tokio::test]
+    async fn a_form_delivery_stays_replayable_after_the_hook_moves_to_json() {
+        let (db, hook) = update_fixture().await;
+        assert_eq!(hook.content_type, "json", "the hook's format today");
+        let delivery = webhook_ops::create_delivery(
+            &db,
+            webhook_delivery::ActiveModel {
+                webhook_id: Set(hook.id),
+                event: Set("push".into()),
+                delivery_id: Set(uuid::Uuid::new_v4().to_string()),
+                request_payload: Set(Some(
+                    "payload=%7B%22ref%22%3A%22refs%2Fheads%2Fmain%22%7D".into(),
+                )),
+                created_at: Set(Utc::now()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("record a form delivery");
+        let tracker = crate::task_tracker::TaskTracker::new();
+        let result = redeliver_with_tracker(&db, delivery.id, &tracker).await;
+        tracker.close();
+        tracker.wait().await;
+        result.expect("a valid recorded form delivery must stay replayable");
+    }
+
+    /// The format of a replay is read off the recorded bytes in both
+    /// directions — a JSON body under a hook that is `form` today goes out as
+    /// JSON, not as raw JSON with a form header — and a body that is neither
+    /// is refused rather than sent.
+    #[test]
+    fn a_replay_is_sent_in_the_format_it_was_recorded_in() {
+        let form = render_delivery_payload("form", "push", r#"{"ref":"main"}"#).unwrap();
+        assert_eq!(recorded_wire_format(1, &form).unwrap(), "form");
+        for format in ["json", "slack", "discord", "matrix"] {
+            let body = render_delivery_payload(format, "push", r#"{"repository":"a/b"}"#).unwrap();
+            assert_eq!(
+                recorded_wire_format(1, &body).unwrap(),
+                "json",
+                "{format} renders a JSON body"
+            );
+        }
+        for broken in ["payload=%7Bnot-json", "payload=%E0%A4%A", "not json", ""] {
+            assert!(
+                recorded_wire_format(1, broken).is_err(),
+                "`{broken}` is neither a form body nor JSON"
+            );
+        }
     }
 
     async fn update_fixture() -> (DatabaseConnection, webhook::Model) {

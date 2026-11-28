@@ -103,7 +103,7 @@ if (
 // and the edit page read the file at a ref that did not exist
 // (card_2e320f5287d7).
 for (const [label, source] of [['New file page', newPage], ['Edit page', editPage]]) {
-  if (!/let\s+branch\s*=\s*\$derived\(\$page\.url\.searchParams\.get\('ref'\)\s*\|\|\s*''\)/.test(source)) {
+  if (!/let\s+branch\s*=\s*\$derived\(page\.url\.searchParams\.get\('ref'\)\s*\|\|\s*''\)/.test(source)) {
     failures.push(`${label} must initialize branch from the ref query parameter.`);
   }
   if (/searchParams\.get\('ref'\)\s*\|\|\s*['"]main['"]/.test(source)) {

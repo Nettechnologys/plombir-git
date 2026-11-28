@@ -691,6 +691,7 @@
       "access": "User",
       "handler": "api::agent_profiles::put_agent_profile",
       "testedIn": [
+        "rust",
         "web"
       ],
       "reachedFromUi": true
@@ -1799,6 +1800,7 @@
       "access": "RepoWrite",
       "handler": "api::pulls::approve_pr_ci",
       "testedIn": [
+        "rust",
         "web"
       ],
       "reachedFromUi": true
@@ -2231,7 +2233,9 @@
       "url": "/api/v1/repos/{owner}/{name}/lfs/locks/verify",
       "access": "Foreign:api/lfs_locks.rs",
       "handler": "api::lfs_locks::verify_locks",
-      "testedIn": [],
+      "testedIn": [
+        "rust"
+      ],
       "reachedFromUi": false
     },
     {
@@ -3320,6 +3324,7 @@
       "access": "RepoWrite",
       "handler": "api::repo_content::create_branch",
       "testedIn": [
+        "rust",
         "web"
       ],
       "reachedFromUi": true
@@ -7924,6 +7929,7 @@
               "handler": "api::repo_content::create_branch",
               "matched": true,
               "testedIn": [
+                "rust",
                 "web"
               ]
             },
@@ -10038,7 +10044,7 @@
         {
           "tag": "select",
           "label": "i18n:issues.unassigned",
-          "line": 405,
+          "line": 416,
           "via": null,
           "href": null,
           "handler": null,
@@ -10048,7 +10054,7 @@
         {
           "tag": "select",
           "label": "· `, undefined, formatTranslationFallback(milestone.state))}",
-          "line": 414,
+          "line": 425,
           "via": null,
           "href": null,
           "handler": null,
@@ -10058,7 +10064,7 @@
         {
           "tag": "button",
           "label": "i18n:common.loading",
-          "line": 422,
+          "line": 436,
           "via": null,
           "href": null,
           "handler": "saveLinks",
@@ -10083,7 +10089,7 @@
         {
           "tag": "button",
           "label": "i18n:common.edit",
-          "line": 453,
+          "line": 467,
           "via": null,
           "href": null,
           "handler": "() => startEdit(comment)",
@@ -10093,7 +10099,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 454,
+          "line": 468,
           "via": null,
           "href": null,
           "handler": "() => askDeleteComment(comment)",
@@ -10103,7 +10109,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 460,
+          "line": 474,
           "via": null,
           "href": null,
           "handler": null,
@@ -10113,7 +10119,7 @@
         {
           "tag": "button",
           "label": "i18n:common.saving",
-          "line": 465,
+          "line": 479,
           "via": null,
           "href": null,
           "handler": "() => saveEdit(comment)",
@@ -10141,7 +10147,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 468,
+          "line": 482,
           "via": null,
           "href": null,
           "handler": "cancelEdit",
@@ -10151,7 +10157,7 @@
         {
           "tag": "form",
           "label": "i18n:issues.comment_placeholder",
-          "line": 482,
+          "line": 496,
           "via": null,
           "href": null,
           "handler": "handleComment",
@@ -10280,7 +10286,7 @@
         {
           "tag": "textarea",
           "label": "",
-          "line": 483,
+          "line": 497,
           "via": null,
           "href": null,
           "handler": null,
@@ -10290,7 +10296,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.comment",
-          "line": 485,
+          "line": 499,
           "via": null,
           "href": null,
           "handler": null,
@@ -10300,7 +10306,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.close_issue",
-          "line": 487,
+          "line": 501,
           "via": null,
           "href": null,
           "handler": "toggleState",
@@ -10414,7 +10420,7 @@
         {
           "tag": "button",
           "label": "i18n:issues.delete.button",
-          "line": 499,
+          "line": 513,
           "via": null,
           "href": null,
           "handler": "() => { issueDeleteOpen = true; issueDeleteError = ''; }",
@@ -10424,7 +10430,7 @@
         {
           "tag": "button",
           "label": "i18n:common.deleting",
-          "line": 516,
+          "line": 530,
           "via": null,
           "href": null,
           "handler": "confirmDeleteComment",
@@ -10453,7 +10459,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 519,
+          "line": 533,
           "via": null,
           "href": null,
           "handler": "closeDeleteComment",
@@ -10463,7 +10469,7 @@
         {
           "tag": "button",
           "label": "i18n:common.deleting",
-          "line": 532,
+          "line": 546,
           "via": null,
           "href": null,
           "handler": "confirmDeleteIssue",
@@ -10491,7 +10497,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 535,
+          "line": 549,
           "via": null,
           "href": null,
           "handler": "closeDeleteIssue",
@@ -13490,7 +13496,7 @@
         {
           "tag": "form",
           "label": "updateTriggerRef(event.currentTarget.value)} onchange= place",
-          "line": 827,
+          "line": 840,
           "via": null,
           "href": null,
           "handler": "handleTrigger",
@@ -13573,7 +13579,7 @@
         {
           "tag": "input",
           "label": "",
-          "line": 856,
+          "line": 869,
           "via": null,
           "href": null,
           "handler": "(event) => setTriggerInput(input.name, event.currentTarget.checked ? 'true' : 'f",
@@ -13583,7 +13589,7 @@
         {
           "tag": "select",
           "label": "",
-          "line": 865,
+          "line": 878,
           "via": null,
           "href": null,
           "handler": "(event) => setTriggerInput(input.name, event.currentTarget.value)",
@@ -13593,7 +13599,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.starting",
-          "line": 893,
+          "line": 906,
           "via": null,
           "href": null,
           "handler": null,
@@ -13603,7 +13609,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.retry",
-          "line": 956,
+          "line": 969,
           "via": null,
           "href": null,
           "handler": "() => handleRetry(selectedPipeline.id)",
@@ -13670,7 +13676,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.cancel",
-          "line": 959,
+          "line": 972,
           "via": null,
           "href": null,
           "handler": "() => handleCancel(selectedPipeline.id)",
@@ -13694,7 +13700,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.play_manual",
-          "line": 1020,
+          "line": 1033,
           "via": null,
           "href": null,
           "handler": "(event) => { event.stopPropagation(); handlePlay(job.id); }",
@@ -13746,7 +13752,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.approval_recorded",
-          "line": 1023,
+          "line": 1036,
           "via": null,
           "href": null,
           "handler": "(event) => { event.stopPropagation(); handleApprove(job.id); }",
@@ -13798,7 +13804,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.artifact_downloading",
-          "line": 1059,
+          "line": 1072,
           "via": null,
           "href": null,
           "handler": "() => downloadArtifact(artifact)",
@@ -13823,7 +13829,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.artifact_deleting",
-          "line": 1065,
+          "line": 1078,
           "via": null,
           "href": null,
           "handler": "() => deleteArtifact(artifact)",
@@ -13848,7 +13854,7 @@
         {
           "tag": "button",
           "label": "✕",
-          "line": 1103,
+          "line": 1116,
           "via": null,
           "href": null,
           "handler": "closeLog",
@@ -13858,7 +13864,7 @@
         {
           "tag": "button",
           "label": "i18n:pipeline.log.all_steps",
-          "line": 1113,
+          "line": 1126,
           "via": null,
           "href": null,
           "handler": "() => showStep(null)",
@@ -13883,7 +13889,7 @@
         {
           "tag": "button",
           "label": ".",
-          "line": 1121,
+          "line": 1134,
           "via": null,
           "href": null,
           "handler": "() => showStep(step.number)",
@@ -15055,6 +15061,7 @@
               "handler": "api::pulls::approve_pr_ci",
               "matched": true,
               "testedIn": [
+                "rust",
                 "web"
               ]
             },
@@ -15177,6 +15184,7 @@
               "handler": "api::pulls::approve_pr_ci",
               "matched": true,
               "testedIn": [
+                "rust",
                 "web"
               ]
             },
@@ -17714,7 +17722,32 @@
         {
           "tag": "button",
           "label": "i18n:releases.attestation.signing",
-          "line": 630,
+          "line": 637,
+          "via": null,
+          "href": null,
+          "handler": "() => handleSignAsset(asset)",
+          "calls": [
+            {
+              "symbol": "releases.attestation.sign",
+              "method": "POST",
+              "url": "/api/v1/repos/{owner}/{repo}/releases/assets/{assetId}/attestation",
+              "opaque": false,
+              "routeUrl": "/api/v1/repos/{owner}/{name}/releases/assets/{asset_id}/attestation",
+              "access": "RepoWrite",
+              "handler": "api::releases::sign_asset_attestation",
+              "matched": true,
+              "testedIn": [
+                "rust",
+                "web"
+              ]
+            }
+          ],
+          "unresolved": false
+        },
+        {
+          "tag": "button",
+          "label": "i18n:releases.attestation.signing",
+          "line": 649,
           "via": null,
           "href": null,
           "handler": "() => handleSignAsset(asset)",
@@ -17739,7 +17772,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 656,
+          "line": 675,
           "via": null,
           "href": null,
           "handler": "() => handleAssetDelete(release.id, asset.id)",
@@ -17768,7 +17801,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 664,
+          "line": 683,
           "via": null,
           "href": null,
           "handler": "() => (confirmDeleteAssetId = null)",
@@ -17778,7 +17811,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.asset_delete",
-          "line": 669,
+          "line": 688,
           "via": null,
           "href": null,
           "handler": "() => (confirmDeleteAssetId = asset.id)",
@@ -17788,7 +17821,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.browse_files",
-          "line": 685,
+          "line": 704,
           "via": null,
           "href": "buildBrowseLink(release.tag_name)",
           "handler": null,
@@ -17798,7 +17831,7 @@
         {
           "tag": "a",
           "label": "i18n:releases.edit",
-          "line": 687,
+          "line": 706,
           "via": null,
           "href": "buildEditReleaseLink(release.id)",
           "handler": null,
@@ -17808,7 +17841,7 @@
         {
           "tag": "button",
           "label": "i18n:common.delete",
-          "line": 693,
+          "line": 712,
           "via": null,
           "href": null,
           "handler": "() => handleDelete(release.id)",
@@ -17908,7 +17941,7 @@
         {
           "tag": "button",
           "label": "i18n:common.cancel",
-          "line": 696,
+          "line": 715,
           "via": null,
           "href": null,
           "handler": "cancelDelete",
@@ -17918,7 +17951,7 @@
         {
           "tag": "button",
           "label": "i18n:releases.delete",
-          "line": 699,
+          "line": 718,
           "via": null,
           "href": null,
           "handler": "() => showConfirm(release.id)",
@@ -17928,7 +17961,7 @@
         {
           "tag": "button",
           "label": "i18n:common.previous",
-          "line": 708,
+          "line": 727,
           "via": null,
           "href": null,
           "handler": "() => changePage(currentPage - 1)",
@@ -18010,7 +18043,7 @@
         {
           "tag": "button",
           "label": "i18n:common.next",
-          "line": 716,
+          "line": 735,
           "via": null,
           "href": null,
           "handler": "() => changePage(currentPage + 1)",
@@ -28617,6 +28650,7 @@
               "handler": "api::agent_profiles::put_agent_profile",
               "matched": true,
               "testedIn": [
+                "rust",
                 "web"
               ]
             }
@@ -30326,7 +30360,7 @@
       "outsider"
     ],
     "scenarios": 52,
-    "inventoryEntries": 858,
+    "inventoryEntries": 859,
     "coveredEntries": 197,
     "coveredRoutes": 187,
     "maxUiRoutesWithoutFrontendTest": 22
