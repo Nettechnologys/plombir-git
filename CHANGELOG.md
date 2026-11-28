@@ -6,7 +6,20 @@ This project records user-facing changes here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- With `[agents] enabled = true`, assigning an issue to a bot whose agent
+  profile lists the repository queues an `agent_run` pipeline built from the
+  profile. Only a person with write access starts one, the bot must be a
+  writer and the instance must run CI in Docker or on external runners; any
+  refusal is a comment from the bot and an `agent.run_refused` audit row. The
+  run's job is handed none of the repository's CI secrets, and its pipeline
+  cannot be retried.
+
 ### Fixed
+
+- Saving a bot's agent profile no longer fails with a server error when
+  another write lands at the same moment on SQLite.
 
 - Stop showing merge requests imported from GitLab before 0.4.4 as fork pull
   requests from an unrelated or missing repository: a migration clears the

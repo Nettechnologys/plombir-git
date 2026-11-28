@@ -185,7 +185,15 @@ pub(crate) async fn pat_auth_middleware(
     // Which tool an inner call may serve was decided by the MCP endpoint, the
     // only producer of `McpToolCall`, before it dispatched; what is left here is
     // the token used anywhere else.
-    if mcp_call.is_none() && grant.is_mcp_only() && !crate::agent_scope::is_mcp_endpoint(&path) {
+    // A token allowed the git transport also reaches the LFS routes `git lfs`
+    // moves objects through; nothing else (`agent_scope::is_git_lfs_transfer`).
+    let lfs_for_git =
+        grant.allows_git() && crate::agent_scope::is_git_lfs_transfer(req.method(), &path);
+    if mcp_call.is_none()
+        && grant.is_mcp_only()
+        && !crate::agent_scope::is_mcp_endpoint(&path)
+        && !lfs_for_git
+    {
         return grant
             .deny(
                 req.headers(),

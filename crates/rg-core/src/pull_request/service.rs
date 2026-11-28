@@ -4477,6 +4477,89 @@ pub async fn disable_auto_merge(
     Ok(updated)
 }
 
+/// Withdraw the merge consent a person gave `pr` once an agent run has moved
+/// its head (ADR-0001 D4, card_07ec0cf0c06a): auto-merge goes off and a queued
+/// entry is cancelled, each with its timeline event.
+///
+/// The consent was for the head the person saw. The CI gate already refuses an
+/// agent's new head until a person approves it — but approving a head's CI is
+/// not approving its merge, and without this the old auto-merge would merge
+/// the new head the moment its CI is released. GitHub does the same for a push
+/// by someone without write access; a run's bot has write access, so the rule
+/// is keyed on the run instead.
+///
+/// Best-effort per half: the push is already accepted, and a half that could
+/// not be written is logged rather than stopping the other.
+pub async fn disarm_merges_after_agent_move(
+    db: &DatabaseConnection,
+    repo_root: &std::path::Path,
+    pr: &PullRequest,
+    agent_run_attempt_id: i64,
+) {
+    match pull_request_ops::disarm_auto_merge(db, pr.id).await {
+        Ok(true) => {
+            if let Err(error) = rg_db::ops::pr_event_ops::record(
+                db,
+                pr.repo_id,
+                pr.id,
+                None,
+                "auto_merge_disabled",
+                None,
+                serde_json::json!({
+                    "reason": "agent_push",
+                    "agent_run_attempt_id": agent_run_attempt_id,
+                }),
+            )
+            .await
+            {
+                tracing::error!(
+                    pr_id = pr.id,
+                    error = %format!("{error:#}"),
+                    "auto-merge was disarmed after an agent's push, but its timeline event could not be recorded"
+                );
+            }
+            tracing::info!(
+                pr_id = pr.id,
+                agent_run_attempt_id,
+                "auto-merge disarmed: an agent run moved the head it was enabled for"
+            );
+        }
+        Ok(false) => {}
+        Err(error) => tracing::error!(
+            pr_id = pr.id,
+            error = %format!("{error:#}"),
+            "auto-merge could not be disarmed after an agent's push"
+        ),
+    }
+    let repository = match rg_db::ops::repo_ops::find_by_id(db, pr.repo_id).await {
+        Ok(Some(repository)) => repository,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::error!(
+                pr_id = pr.id,
+                error = %format!("{error:#}"),
+                "the merge queue entry of a pull request an agent moved could not be checked"
+            );
+            return;
+        }
+    };
+    if let Err(error) = super::merge_queue::cancel_after_agent_move(
+        db,
+        repo_root,
+        &repository,
+        pr,
+        agent_run_attempt_id,
+    )
+    .await
+    {
+        tracing::error!(
+            pr_id = pr.id,
+            error = %format!("{error:#}"),
+            "the merge queue entry of a pull request an agent moved could not be cancelled"
+        );
+    }
+}
+
 /// Attempt an enabled auto-merge. A protection rule that refused is returned as
 /// a pending outcome, while a rule that could not be *checked* — and every other
 /// Git/DB failure — remains an error: "not yet" and "unknown" are different

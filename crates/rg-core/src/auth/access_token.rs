@@ -94,6 +94,118 @@ pub async fn issue(db: &DatabaseConnection, new: NewAccessToken) -> Result<Issue
     Ok(IssuedAccessToken { raw, token })
 }
 
+/// How long a run token outlives the run's own timeout.
+///
+/// The token is deleted when the attempt ends ([`revoke_for_agent_run_attempt`]);
+/// `expires_at` is the backstop for an end that never got that far — a server
+/// restarted mid-run, a runner that vanished. The margin covers the clone, the
+/// image pull and the final push after the agent's last turn.
+pub const AGENT_RUN_TOKEN_GRACE_SECS: i64 = 10 * 60;
+
+/// What a token for one attempt of an agent run is issued for.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentRunGrant<'a> {
+    /// The bot the run works as.
+    pub bot: &'a rg_db::entities::user::Model,
+    /// The one repository the run works in.
+    pub repository_id: i64,
+    /// The attempt the token belongs to; deleting it deletes the token.
+    pub attempt_id: i64,
+    /// What the token may write: `refs/heads/agent/<bot>/` for a first run, the
+    /// pull request's branch for an iteration ([`crate::agent::run::branch_prefix`]).
+    pub write_ref_prefix: &'a str,
+    /// The run's timeout, from the bot's profile.
+    pub timeout_secs: i64,
+}
+
+/// Mint the token one attempt of an agent run works with (ADR-0001 D3).
+///
+/// Nobody asks for it over HTTP: there is no `SudoUser` here because the only
+/// caller is the core that starts an attempt. What it can do is fixed here and
+/// nowhere else:
+///
+/// - one repository, `repo` scope, kept off protected branches;
+/// - only the MCP tools of [`crate::agent::run::RUN_MCP_TOOLS`], plus the git
+///   transport (`allow_git`) — no other REST route;
+/// - writes only under `write_ref_prefix`, which must be the bot's own
+///   `refs/heads/agent/<bot>/` or a branch under it, so no caller can hand a
+///   run `main`;
+/// - tied to the attempt, so the CI gate knows its writes for an agent's
+///   (`push_hooks::PushOrigin`), and gone with it;
+/// - expiring [`AGENT_RUN_TOKEN_GRACE_SECS`] after the run's timeout.
+///
+/// The attempt must be one of a run of this bot in this repository: a token
+/// tied to somebody else's run would have its writes counted as that run's.
+pub async fn issue_for_agent_run(
+    db: &DatabaseConnection,
+    grant: AgentRunGrant<'_>,
+) -> Result<IssuedAccessToken> {
+    if !grant.bot.is_bot() {
+        return Err(crate::error::forbidden(
+            "an agent run token is issued only to a bot account",
+        ));
+    }
+    if !crate::agent::run::prefix_is_the_bots(&grant.bot.username, grant.write_ref_prefix) {
+        return Err(crate::error::invalid_request(format!(
+            "an agent run of '{}' may write only under '{}'",
+            grant.bot.username,
+            crate::agent::run::branch_prefix(&grant.bot.username)
+        )));
+    }
+    if grant.timeout_secs <= 0 {
+        return Err(crate::error::invalid_request(
+            "an agent run token needs a positive run timeout",
+        ));
+    }
+    let run = rg_db::ops::agent_run_ops::run_of_attempt(db, grant.attempt_id)
+        .await?
+        .ok_or_else(|| crate::error::not_found("agent run attempt"))?;
+    if run.bot_id != grant.bot.id || run.repository_id != grant.repository_id {
+        return Err(crate::error::forbidden(
+            "the attempt belongs to another bot's run or another repository",
+        ));
+    }
+    issue(
+        db,
+        NewAccessToken {
+            user_id: grant.bot.id,
+            name: format!("agent run {} attempt {}", run.id, grant.attempt_id),
+            scopes: "repo".to_string(),
+            expires_at: Some(
+                Utc::now()
+                    + chrono::Duration::seconds(grant.timeout_secs + AGENT_RUN_TOKEN_GRACE_SECS),
+            ),
+            repository_ids: Some(vec![grant.repository_id]),
+            mcp_tools: Some(crate::agent::run::RUN_MCP_TOOLS.join(",")),
+            deny_protected_merge: true,
+            write_ref_prefix: Some(grant.write_ref_prefix.to_string()),
+            allow_git: true,
+            agent_run_attempt_id: Some(grant.attempt_id),
+        },
+    )
+    .await
+}
+
+/// Delete the token of agent run attempt `attempt_id`; `false` when it had
+/// none left.
+///
+/// Called when the attempt ends, however it ends. Deleting the attempt (or its
+/// run) takes the token too — the foreign key cascades — so this is for the
+/// attempt that ends and stays on record.
+pub async fn revoke_for_agent_run_attempt(
+    db: &DatabaseConnection,
+    attempt_id: i64,
+) -> Result<bool> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    let deleted = access_token::Entity::delete_many()
+        .filter(access_token::Column::AgentRunAttemptId.eq(attempt_id))
+        .exec(db)
+        .await
+        .map_err(anyhow::Error::from)
+        .map_err(|error| error.context("db: delete the token of an agent run attempt"))?;
+    Ok(deleted.rows_affected > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

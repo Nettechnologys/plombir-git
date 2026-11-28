@@ -40,6 +40,30 @@ pub async fn is_agent_pull_request(db: &DatabaseConnection, pr_id: i64) -> Resul
     Ok(runs > 0)
 }
 
+/// Every ref prefix a run in `repository_id` was given to write under, once
+/// each.
+///
+/// The CI gate asks it for a pull request that belongs to no run: one a person
+/// opened from a branch the agent pushed to. A handful of rows — one per bot
+/// for first runs, one per iterated pull request — however many runs there
+/// were.
+pub async fn write_ref_prefixes(
+    db: &DatabaseConnection,
+    repository_id: i64,
+) -> Result<Vec<String>> {
+    let prefixes: Vec<Option<String>> = RunEntity::find()
+        .select_only()
+        .column(agent_run::Column::WriteRefPrefix)
+        .distinct()
+        .filter(agent_run::Column::RepositoryId.eq(repository_id))
+        .filter(agent_run::Column::WriteRefPrefix.is_not_null())
+        .into_tuple()
+        .all(db)
+        .await
+        .context("db: list the ref prefixes agent runs wrote under")?;
+    Ok(prefixes.into_iter().flatten().collect())
+}
+
 /// Record that run `run_id` opened pull request `pr_id`.
 ///
 /// Conditional on the run having opened none yet, so two pull requests racing

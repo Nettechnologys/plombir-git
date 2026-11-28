@@ -142,6 +142,36 @@ async fn reconcile_published_pull_request_pipeline(
     false
 }
 
+/// Whether the head of `pr` is a branch an agent run wrote, or may have.
+///
+/// Two ways to be one (ADR-0001 D4). The pull request a run opened, or the one
+/// an iteration works on, is the run's for good. And a pull request anybody
+/// opens from a branch under a run's write prefix carries what the agent
+/// pushed there: a person who opens it from `agent/<bot>/…` vouches for the
+/// title, not for the workflow files the agent left on the branch
+/// (card_49c845088d31). The prefix is the run's, kept after its token is gone,
+/// so the answer does not change when the attempt ends.
+///
+/// A fork pull request is not asked: its head is another repository's, which
+/// no run of this one writes, and it is held as a fork already.
+pub async fn holds_agent_writes(db: &DatabaseConnection, pr: &pull_request::Model) -> Result<bool> {
+    if rg_db::ops::agent_run_ops::is_agent_pull_request(db, pr.id).await? {
+        return Ok(true);
+    }
+    if pr.head_repo_id.is_some() {
+        return Ok(false);
+    }
+    let head_ref = format!("refs/heads/{}", pr.head_branch);
+    Ok(
+        rg_db::ops::agent_run_ops::write_ref_prefixes(db, pr.repo_id)
+            .await?
+            .iter()
+            .any(|prefix| {
+                rg_git::protocol::receive_pack::ref_write_admitted(prefix, &head_ref, false)
+            }),
+    )
+}
+
 /// Whether this exact fork head may run with the base repository's CI authority.
 /// Both ordinary PR CI and merge-group CI must use this gate, including when
 /// reusing an existing pipeline. An enqueue is not a fork-CI approval.
@@ -181,7 +211,7 @@ pub(super) async fn fork_head_ci_is_approved(
     // and the bot, so the gate holds after both are gone.
     let held_as = if pr.head_repo_id.is_some() {
         Some("fork")
-    } else if rg_db::ops::agent_run_ops::is_agent_pull_request(db, pr.id).await? {
+    } else if holds_agent_writes(db, pr).await? {
         Some("agent")
     } else {
         None

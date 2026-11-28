@@ -723,6 +723,7 @@ pub async fn update_issue(
         req.milestone_id,
         Some(&state.delivery_tracker),
         Some(user_id),
+        Some(&state.agent_run_launcher()),
     )
     .await
     {

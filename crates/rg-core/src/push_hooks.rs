@@ -788,6 +788,7 @@ async fn run_ref_move_hooks(
                 branch_name,
                 &update,
                 announced && !agent_move,
+                agent_move,
             )
             .await;
             // A merge the maintenance above performed advanced *another* branch,
@@ -1149,12 +1150,18 @@ async fn synchronize_open_pr_heads(
 /// `trigger_pull_request_ci` is `false` for a move a mirror pass made: the pull
 /// requests are still synchronised and evaluated, but the upstream's workflows
 /// are not run on this instance (see [`RefMoveOrigin::MirrorPass`]).
+///
+/// `agent_move` is a move an agent run made itself: before anything evaluates
+/// a merge of the new head, the merge consent people gave the pull requests
+/// it moved is withdrawn
+/// ([`crate::pull_request::disarm_merges_after_agent_move`]).
 async fn post_push_branch_maintenance(
     params: &PostPushParams<'_>,
     target: &HookTarget,
     branch_name: &str,
     update: &RefUpdate,
     trigger_pull_request_ci: bool,
+    agent_move: bool,
 ) -> Vec<crate::pull_request::MergedRef> {
     let mut merged_refs = Vec::new();
     match synchronize_open_pr_heads(params, target, branch_name).await {
@@ -1217,6 +1224,19 @@ async fn post_push_branch_maintenance(
                             &params.pipeline_ci(),
                         )
                         .await;
+                    }
+                }
+                if let (true, Some(attempt_id)) = (agent_move, params.origin.agent_run_attempt_id) {
+                    if update.old_sha != update.new_sha {
+                        for pr in &synchronized.open_prs {
+                            crate::pull_request::disarm_merges_after_agent_move(
+                                params.write_pool.unwrap_or(params.db),
+                                params.repo_root,
+                                pr,
+                                attempt_id,
+                            )
+                            .await;
+                        }
                     }
                 }
                 merged_refs = evaluate_merges_for_head_commit(
@@ -2562,7 +2582,8 @@ mod tests {
         let (logs, _guard) = CapturedLogs::capture();
 
         let merged =
-            post_push_branch_maintenance(&params, &target, "feature", &stale_update, true).await;
+            post_push_branch_maintenance(&params, &target, "feature", &stale_update, true, false)
+                .await;
         assert!(merged.is_empty());
 
         let stored = rg_db::ops::pull_request_ops::find_by_id(&db, pr.id)

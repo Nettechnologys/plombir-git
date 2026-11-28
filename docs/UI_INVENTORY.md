@@ -46,7 +46,7 @@
 | `Foreign:RUNNER_AUTH_LAYER` | 14 | 0 | 0 | 0 |
 | `Foreign:git_http.rs` | 6 | 0 | 0 | 0 |
 | `OrgRead` | 5 | 4 | 0 | 0 |
-| `Foreign:api/lfs_locks.rs` | 4 | 2 | 0 | 1 |
+| `Foreign:api/lfs_locks.rs` | 4 | 2 | 0 | 0 |
 | `PublicFiltered` | 3 | 3 | 0 | 0 |
 | `Foreign:api/lfs.rs` | 3 | 0 | 0 | 0 |
 | `RepoOwner` | 2 | 2 | 0 | 0 |
@@ -1414,7 +1414,7 @@ CI runners, and webhooks. A browser test cannot cover these routes.
 | GET | `/api/v1/repos/{owner}/{name}/lfs/objects/{oid}` | `Foreign:api/lfs.rs` | rust+smoke |
 | PUT | `/api/v1/repos/{owner}/{name}/lfs/objects/{oid}` | `Foreign:api/lfs.rs` | rust |
 | POST | `/api/v1/repos/{owner}/{name}/lfs/locks` | `Foreign:api/lfs_locks.rs` | rust |
-| POST | `/api/v1/repos/{owner}/{name}/lfs/locks/verify` | `Foreign:api/lfs_locks.rs` | **—** |
+| POST | `/api/v1/repos/{owner}/{name}/lfs/locks/verify` | `Foreign:api/lfs_locks.rs` | rust |
 | GET | `/api/v1/orgs/{name}/actions/variables` | `OrgAdmin` | **—** |
 | GET | `/api/v1/orgs/{name}/actions/variables/{variable_name}` | `OrgAdmin` | **—** |
 | PUT | `/api/v1/orgs/{name}/actions/variables/{variable_name}` | `OrgAdmin` | rust |

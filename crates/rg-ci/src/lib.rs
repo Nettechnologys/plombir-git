@@ -379,6 +379,139 @@ impl rg_core::ci::CiTrigger for CiEngine {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(resume_pipeline_with_engine(params, self))
     }
+
+    fn enqueue_agent_run<'a>(
+        &'a self,
+        params: rg_core::ci::AgentRunPipelineParams<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64>> + Send + 'a>> {
+        Box::pin(enqueue_agent_run_with_engine(params, self))
+    }
+}
+
+/// The stage, and the job, an agent run's pipeline holds.
+const AGENT_RUN_JOB: &str = "agent";
+
+/// The one-job graph an agent run is (ADR-0001 D1), built from the bot's
+/// profile through the same types a native `.plombir-git-ci.yml` becomes — so
+/// it is validated, routed and stored by the code every other pipeline is.
+///
+/// Built by deserialising rather than by hand: `JobConfig` refuses unknown
+/// keys and every field this does not set takes the meaning an absent key has
+/// in a file. Nothing of the repository is read.
+fn agent_run_config(
+    image: &str,
+    command: &str,
+    runner_tags: &[String],
+    timeout_secs: i64,
+) -> Result<CiConfig> {
+    let job = serde_json::json!({
+        "stage": AGENT_RUN_JOB,
+        "script": [command],
+        "image": image,
+        "tags": (!runner_tags.is_empty()).then_some(runner_tags),
+        "timeout_seconds": timeout_secs,
+    });
+    serde_json::from_value(serde_json::json!({
+        "stages": [AGENT_RUN_JOB],
+        AGENT_RUN_JOB: job,
+    }))
+    .context("build the agent run's job")
+}
+
+async fn enqueue_agent_run_with_engine(
+    params: rg_core::ci::AgentRunPipelineParams<'_>,
+    engine: &CiEngine,
+) -> Result<i64> {
+    let rg_core::ci::AgentRunPipelineParams {
+        db,
+        repo_root,
+        repo_path,
+        repo_id,
+        commit_sha,
+        ref_name,
+        image,
+        command,
+        runner_tags,
+        timeout_secs,
+        triggered_by,
+        docker_enabled,
+        external_runners,
+        allow_host_runner,
+        jwt_secret,
+        encryption_key,
+        external_url,
+    } = params;
+    // Only Docker (ADR-0001 D2). The job always names an image, so an external
+    // runner takes its Docker path; in-process, the image is only honoured
+    // when CI runs in Docker here, and anything else would run the agent's
+    // command on this host.
+    if !docker_enabled && !external_runners {
+        return Err(rg_core::error::invalid_request(
+            "an agent run needs Docker for CI or external runners",
+        ));
+    }
+    let config = agent_run_config(image, command, runner_tags, timeout_secs)?;
+    validate_execution_semantics(&config)?;
+    validate_runner_routing(&config, external_runners, engine.runner_labels())?;
+    let (repo_owner, repo_name) = rg_core::repo::service::repository_identity(db, repo_id).await?;
+
+    let tx = db
+        .begin()
+        .await
+        .context("db: begin agent run pipeline transaction")?;
+    let created = PipelineGraph {
+        repo_id,
+        repository: RepositoryName {
+            owner: &repo_owner,
+            name: &repo_name,
+        },
+        commit_sha,
+        ref_name,
+        trigger_type: rg_core::ci::AGENT_RUN_EVENT,
+        triggered_by,
+        concurrency_group: None,
+        dispatch_inputs: None,
+        base_branch: None,
+        head_branch: None,
+        previous_sha: None,
+        schedule: None,
+        config: &config,
+    }
+    .create(&tx)
+    .await;
+    let pipeline_id = match created {
+        Ok(pipeline_id) => pipeline_id,
+        Err(error) => {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::error!(
+                    repo_id,
+                    error = %format!("{rollback_error:#}"),
+                    "an agent run's pipeline could not be written and its transaction could not be rolled back"
+                );
+            }
+            return Err(error);
+        }
+    };
+    tx.commit()
+        .await
+        .context("db: commit agent run pipeline transaction")?;
+
+    start_published_pipeline(PublishedPipeline {
+        db,
+        repo_root,
+        repo_path,
+        repo_id,
+        commit_sha,
+        pipeline_id,
+        docker_enabled,
+        external_runners,
+        allow_host_runner,
+        jwt_secret,
+        encryption_key,
+        external_url,
+        engine,
+    })
+    .await
 }
 
 // Metrics observers are process-global OnceLocks. Tests which install distinct
@@ -964,6 +1097,62 @@ async fn trigger_pipeline_with_barrier_and_engine(
         .await
         .context("db: commit pipeline creation transaction")?;
 
+    start_published_pipeline(PublishedPipeline {
+        db,
+        repo_root,
+        repo_path,
+        repo_id,
+        commit_sha,
+        pipeline_id,
+        docker_enabled,
+        external_runners,
+        allow_host_runner,
+        jwt_secret,
+        encryption_key,
+        external_url,
+        engine,
+    })
+    .await
+}
+
+/// A pipeline whose graph has just been committed, and what starting it needs.
+struct PublishedPipeline<'a> {
+    db: &'a sea_orm::DatabaseConnection,
+    repo_root: &'a std::path::Path,
+    repo_path: &'a std::path::Path,
+    repo_id: i64,
+    commit_sha: &'a str,
+    pipeline_id: i64,
+    docker_enabled: bool,
+    external_runners: bool,
+    allow_host_runner: bool,
+    jwt_secret: Option<&'a str>,
+    encryption_key: Option<&'a str>,
+    external_url: Option<&'a str>,
+    engine: &'a CiEngine,
+}
+
+/// Settle what was terminal on arrival, then hand the pipeline to the runner
+/// that will run it: the in-process one, or the registered ones.
+///
+/// Shared by the workflow trigger and the agent run's synthetic pipeline, so
+/// a pipeline the server built itself starts exactly as one read from a file.
+async fn start_published_pipeline(published: PublishedPipeline<'_>) -> Result<i64> {
+    let PublishedPipeline {
+        db,
+        repo_root,
+        repo_path,
+        repo_id,
+        commit_sha,
+        pipeline_id,
+        docker_enabled,
+        external_runners,
+        allow_host_runner,
+        jwt_secret,
+        encryption_key,
+        external_url,
+        engine,
+    } = published;
     // The graph is published; work that was terminal on arrival — a matrix leg
     // its `if:` excluded, a stage every job of which was skipped — still needs
     // the verdict no job result will produce for it. One transaction, because

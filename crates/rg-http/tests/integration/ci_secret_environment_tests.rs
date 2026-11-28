@@ -72,12 +72,22 @@ async fn delete_secret(
 
 /// One pending job in a fresh pipeline.
 async fn pending_job(db: &rg_db::DatabaseConnection, repo_id: i64, name: &str) -> i64 {
+    pending_job_under(db, repo_id, name, "push").await
+}
+
+/// [`pending_job`] in a pipeline created under `trigger_type`.
+async fn pending_job_under(
+    db: &rg_db::DatabaseConnection,
+    repo_id: i64,
+    name: &str,
+    trigger_type: &str,
+) -> i64 {
     let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
         db,
         repo_id,
         "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
         "refs/heads/main",
-        "push",
+        trigger_type,
         None,
     )
     .await
@@ -322,6 +332,60 @@ async fn a_job_reads_its_own_environment_scope_and_the_environment_value_wins() 
     assert!(
         variables.get("STAGING_KEY").is_none(),
         "production read staging: {variables}"
+    );
+}
+
+/// An agent run's job reaches an external runner with none of the
+/// repository's secrets (ADR-0001 D5); the `push` job before it gets them.
+#[tokio::test]
+async fn an_agent_run_job_reaches_a_runner_without_repository_secrets() {
+    let (base, db) = spawn_test_app_with_db().await;
+    let client = reqwest::Client::new();
+    let (token, _) = register_full(&base, "scope-owner", "scope-owner@example.com").await;
+    let repo_id = create_repo(&base, &token, "agents").await;
+    let response = put_secret(
+        &client,
+        &base,
+        &token,
+        "agents",
+        "REPO_KEY",
+        "repo-value",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), 201);
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+        &db,
+        repo_id,
+        "agent-runner",
+        "[]",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let control = pending_job(&db, repo_id, "control").await;
+    let polled = poll(&client, &base, runner.id, &runner_token)
+        .await
+        .expect("control job");
+    assert_eq!(polled["job_id"], control);
+    assert_eq!(polled["variables"]["REPO_KEY"], "repo-value");
+
+    let agent = pending_job_under(&db, repo_id, "agent", rg_core::ci::AGENT_RUN_EVENT).await;
+    let polled = poll(&client, &base, runner.id, &runner_token)
+        .await
+        .expect("agent run job");
+    assert_eq!(polled["job_id"], agent);
+    assert!(
+        polled["variables"].get("REPO_KEY").is_none(),
+        "an agent run's job was handed a CI secret: {}",
+        polled["variables"]
+    );
+    assert!(
+        !polled.to_string().contains("repo-value"),
+        "the secret's value travelled with the agent run's job"
     );
 }
 

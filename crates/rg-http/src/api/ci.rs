@@ -992,6 +992,15 @@ pub async fn retry_pipeline(
         Ok(pipeline) => pipeline,
         Err(error) => return error.into_response(),
     };
+    // An agent run is started by an assignment, after the checks of ADR-0001
+    // D6; rebuilding its pipeline from the row would skip every one of them,
+    // and there is no workflow for a retry to re-read either.
+    if pipeline.trigger_type == rg_core::ci::AGENT_RUN_EVENT {
+        return AppError::conflict(
+            "an agent run is not retried as a pipeline; assign the issue to the bot again",
+        )
+        .into_response();
+    }
 
     let owner_display = match resolve_repo_storage_owner(&state, &repo, &owner).await {
         Ok(owner) => owner,

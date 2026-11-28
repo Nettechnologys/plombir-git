@@ -564,6 +564,10 @@ pub async fn get_issue(
 
 /// Update an issue's title, body, state, labels, assignee, or milestone.
 ///
+/// `agent_runs` is how an assignment to a bot starts an agent run
+/// ([`crate::agent::run`]); `None` for a caller with no CI wiring, whose
+/// assignments start nothing.
+///
 /// `delivery_tracker` is where the milestone-completion watch fan-out is
 /// detached to; `None` = the process-global delivery tracker. See
 /// [`crate::notification::spawn_notify_watchers`].
@@ -581,6 +585,7 @@ pub async fn update_issue(
     milestone_id: Option<Option<i64>>,
     delivery_tracker: Option<&crate::task_tracker::TaskTracker>,
     actor_id: Option<i64>,
+    agent_runs: Option<&crate::agent::run::AgentRunLauncher<'_>>,
 ) -> Result<Issue> {
     crate::text_limits::check_optional(
         "title",
@@ -748,6 +753,15 @@ pub async fn update_issue(
             )
             .to(assignee, crate::notification::thread::Reason::Assigned),
         );
+        // An assignment to a bot with an agent profile asks it for a run
+        // (ADR-0001 D6). Awaited here, inside the request: whether a person or
+        // a run's token made the assignment is read from the request's
+        // credential, which a detached task no longer has. It never fails the
+        // assignment; a refusal is the bot's comment on the issue.
+        if let Some(launcher) = agent_runs {
+            crate::agent::run::start_for_assignment(&pools, launcher, &updated, assignee, actor_id)
+                .await;
+        }
     }
     if let Some(ref s) = state {
         if was_open && s == "closed" {

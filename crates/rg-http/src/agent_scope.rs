@@ -55,6 +55,39 @@ pub(crate) fn is_mcp_endpoint(path: &str) -> bool {
     path == MCP_ENDPOINT_PATH || Some(path) == MCP_ENDPOINT_PATH.strip_prefix("/api/v1")
 }
 
+/// Whether `method path` is one of the Git LFS routes `git lfs` itself calls
+/// to move objects — the batch request, an object's upload or download, and
+/// the lock check its pre-push hook makes — as a layer inside or outside the
+/// `/api/v1` nest sees it.
+///
+/// A token confined to MCP tools but allowed the git transport (`allow_git`,
+/// ADR-0001 D3) is let through to these and no other REST route: without them
+/// a push to a repository that tracks files in LFS fails in the pre-push hook
+/// and never reaches receive-pack (card_0316854ae5c3). Writing an object moves
+/// no ref, so the token's `write_ref_prefix` has nothing to say about it; the
+/// repository confinement and the read/write gates of the LFS handlers still
+/// apply as they do to anybody. Locking, unlocking, listing and the storage
+/// administration routes are not transfers and stay closed.
+pub(crate) fn is_git_lfs_transfer(method: &axum::http::Method, path: &str) -> bool {
+    use axum::http::Method;
+    let path = path.strip_prefix("/api/v1").unwrap_or(path);
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let ["repos", owner, name, "lfs", rest @ ..] = segments.as_slice() else {
+        return false;
+    };
+    if owner.is_empty() || name.is_empty() {
+        return false;
+    }
+    match rest {
+        ["objects", "batch"] => method == Method::POST,
+        ["objects", oid] if !oid.is_empty() && *oid != "batch" => {
+            method == Method::GET || method == Method::PUT
+        }
+        ["locks", "verify"] => method == Method::POST,
+        _ => false,
+    }
+}
+
 /// Marks a request the MCP endpoint dispatched in-process on an agent's behalf,
 /// names the tool it serves, and carries the API routes that tool may call.
 ///

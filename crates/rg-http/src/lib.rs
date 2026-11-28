@@ -521,6 +521,16 @@ impl AppState {
 
     /// This process's CI wiring, in the borrowed form a pipeline-triggering
     /// path takes (the merge queue, the pull-request trigger).
+    /// What an assignment to a bot needs to start an agent run
+    /// (`rg_core::agent::run`).
+    pub fn agent_run_launcher(&self) -> rg_core::agent::run::AgentRunLauncher<'_> {
+        rg_core::agent::run::AgentRunLauncher {
+            enabled: self.agents_enabled,
+            repo_root: &self.repo_root,
+            ci: self.pipeline_ci(),
+        }
+    }
+
     pub fn pipeline_ci(&self) -> rg_core::pull_request::ci::PipelineCi<'_> {
         rg_core::pull_request::ci::PipelineCi {
             trigger: &*self.ci_engine,

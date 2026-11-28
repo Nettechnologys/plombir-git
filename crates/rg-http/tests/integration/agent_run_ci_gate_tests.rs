@@ -191,6 +191,16 @@ async fn fixture() -> Fixture {
 impl Fixture {
     /// An agent run of the bot in `alice/app` with one attempt; the attempt's id.
     async fn run_attempt(&self, trigger_key: &str) -> (i64, i64) {
+        self.run_attempt_under(trigger_key, None).await
+    }
+
+    /// [`Self::run_attempt`] for a run given `write_ref_prefix`, as a run the
+    /// server starts always is.
+    async fn run_attempt_under(
+        &self,
+        trigger_key: &str,
+        write_ref_prefix: Option<&str>,
+    ) -> (i64, i64) {
         let now = chrono::Utc::now();
         let run = rg_db::entities::agent_run::ActiveModel {
             bot_id: Set(self.bot_id),
@@ -204,6 +214,7 @@ impl Fixture {
             active: Set(Some(true)),
             result_pull_request_id: Set(None),
             failure_reason: Set(None),
+            write_ref_prefix: Set(write_ref_prefix.map(str::to_string)),
             created_at: Set(now),
             finished_at: Set(None),
             ..Default::default()
@@ -410,6 +421,37 @@ impl Fixture {
             .await
             .unwrap();
         assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+    }
+
+    async fn set_auto_merge(&self, number: i64) -> serde_json::Value {
+        let response = self
+            .http
+            .put(format!(
+                "{}/api/v1/repos/alice/app/pulls/{number}/auto-merge",
+                self.base
+            ))
+            .bearer_auth(&self.alice)
+            .json(&serde_json::json!({ "strategy": "merge" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+        response.json().await.unwrap()
+    }
+
+    /// The timeline events of PR #1 named `event_type`, with their metadata.
+    async fn pr_events(&self, event_type: &str) -> Vec<serde_json::Value> {
+        use sea_orm::{ColumnTrait, QueryFilter};
+        let pr = self.pr(1).await;
+        rg_db::entities::pr_event::Entity::find()
+            .filter(rg_db::entities::pr_event::Column::PrId.eq(pr.id))
+            .filter(rg_db::entities::pr_event::Column::EventType.eq(event_type))
+            .all(&self.db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| serde_json::from_str(&event.metadata).unwrap())
+            .collect()
     }
 
     fn events(entries: &[(String, String, String)]) -> Vec<&str> {
@@ -638,4 +680,176 @@ async fn a_run_opens_one_pull_request() {
         .unwrap()
         .unwrap();
     assert_eq!(run.result_pull_request_id, Some(first.id));
+}
+
+/// A person's merge consent is for the head they saw (card_07ec0cf0c06a).
+///
+/// Alice turns auto-merge on for the agent's pull request; the gate keeps it
+/// pending, since nobody has approved the head's CI. Then the agent pushes a
+/// new head and Alice releases that head's CI. Had the consent survived the
+/// push, the next merge evaluation — what a green pipeline runs — would merge
+/// a version she never agreed to merge. The same push with a plain token of
+/// the bot leaves the consent alone, so the withdrawal is the agent's move,
+/// not any push.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_push_withdraws_the_auto_merge_a_person_enabled() {
+    let f = fixture().await;
+    let (_, attempt) = f.run_attempt("auto-merge").await;
+    let (_, agent) = f.token(Some(attempt)).await;
+    let (_, plain) = f.token(None).await;
+    assert_eq!(f.open_pr(&agent, "agent work").await.status(), 201);
+    f.settle().await;
+
+    let enabled = f.set_auto_merge(1).await;
+    assert_eq!(enabled["status"], "pending", "{enabled}");
+    assert!(f.pr(1).await.auto_merge_enabled);
+
+    // Control: the bot's plain token is not an agent run.
+    f.push_commit(&plain, "plain.txt");
+    f.settle().await;
+    assert!(
+        f.pr(1).await.auto_merge_enabled,
+        "a push that was not an agent run's withdrew the consent"
+    );
+
+    let head = f.push_commit(&agent, "agent.txt");
+    f.settle().await;
+    let pr = f.pr(1).await;
+    assert_eq!(pr.head_sha.as_deref(), Some(head.as_str()));
+    assert!(
+        !pr.auto_merge_enabled,
+        "auto-merge outlived the agent's push"
+    );
+    let disabled = f.pr_events("auto_merge_disabled").await;
+    assert_eq!(disabled.len(), 1, "{disabled:?}");
+    assert_eq!(disabled[0]["reason"], "agent_push");
+    assert_eq!(disabled[0]["agent_run_attempt_id"], attempt);
+
+    // Alice releases the new head's CI; whatever evaluates merges next must
+    // not merge it.
+    f.approve(1).await;
+    f.settle().await;
+    f.state
+        .evaluate_merges_and_spawn_hooks(f.repo_id, &head, None)
+        .await;
+    f.settle().await;
+    let pr = f.pr(1).await;
+    assert_eq!(pr.state, "open", "the agent's new head was merged");
+    assert_ne!(
+        f.head("refs/heads/main"),
+        head,
+        "main moved to the agent's head"
+    );
+}
+
+/// The merge queue is the other merge consent, and goes the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_push_takes_its_pull_request_out_of_the_merge_queue() {
+    let f = fixture().await;
+    let (_, attempt) = f.run_attempt("merge-queue").await;
+    let (_, agent) = f.token(Some(attempt)).await;
+    assert_eq!(f.open_pr(&agent, "agent work").await.status(), 201);
+    f.settle().await;
+
+    let repository = rg_db::ops::repo_ops::find_by_id(&f.db, f.repo_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let alice_id = rg_db::ops::user_ops::find_by_username(&f.db, "alice")
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    let entry = rg_core::pull_request::merge_queue::enqueue(
+        &f.db,
+        &repository,
+        &f.pr(1).await,
+        alice_id,
+        rg_core::pull_request::MergeStrategy::Merge,
+    )
+    .await
+    .expect("enqueue the agent's pull request");
+    assert_eq!(entry.status, "queued");
+
+    f.push_commit(&agent, "agent.txt");
+    f.settle().await;
+    let entry = rg_db::ops::merge_queue_ops::find_by_pr(&f.db, f.pr(1).await.id)
+        .await
+        .unwrap()
+        .expect("the entry is kept on record");
+    assert_eq!(
+        entry.status, "canceled",
+        "the queue kept a head nobody enqueued"
+    );
+    let canceled = f.pr_events("merge_queue_canceled").await;
+    assert_eq!(canceled.len(), 1, "{canceled:?}");
+    assert_eq!(canceled[0]["reason"], "agent_push");
+}
+
+/// A pull request a person opens from a branch the agent pushed to is held
+/// like the agent's own (card_49c845088d31): the person vouches for opening
+/// it, not for the workflow files the agent left on the branch. The run's
+/// write prefix is what says so, after its token is gone. A person's pull
+/// request from a branch no run could write runs CI as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pull_request_a_person_opens_from_an_agents_branch_waits_for_approval() {
+    let f = fixture().await;
+    let (_, attempt) = f.run_attempt_under("human-pr", Some(PREFIX)).await;
+    let (_, agent) = f.token(Some(attempt)).await;
+    f.push_commit(&agent, "agent.txt");
+    f.settle().await;
+    assert!(f.ci.take().is_empty());
+    // The attempt ends; its token goes with it.
+    assert!(
+        rg_core::auth::access_token::revoke_for_agent_run_attempt(&f.db, attempt)
+            .await
+            .unwrap()
+    );
+
+    git(
+        &[
+            "--git-dir",
+            f.bare.to_str().unwrap(),
+            "branch",
+            "feature",
+            "main",
+        ],
+        None,
+    );
+    let control = f
+        .http
+        .post(format!("{}/api/v1/repos/alice/app/pulls", f.base))
+        .bearer_auth(&f.alice)
+        .json(&serde_json::json!({ "title": "mine", "head": "feature", "base": "main" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(control.status(), 201, "{}", control.text().await.unwrap());
+    f.settle().await;
+    assert_eq!(
+        Fixture::events(&f.ci.take()),
+        ["pull_request"],
+        "a person's own pull request did not run CI"
+    );
+
+    assert_eq!(
+        f.open_pr(&f.alice, "from the agent's branch")
+            .await
+            .status(),
+        201
+    );
+    f.settle().await;
+    let triggered = f.ci.take();
+    assert!(
+        triggered.is_empty(),
+        "opening a pull request from the agent's branch ran CI: {triggered:?}"
+    );
+    assert!(
+        !f.pull_request_ci_runs(2).await,
+        "an unapproved head of the agent's branch ran"
+    );
+
+    f.approve(2).await;
+    f.settle().await;
+    assert_eq!(Fixture::events(&f.ci.take()), ["pull_request"]);
 }

@@ -37,6 +37,11 @@ pub struct Model {
     /// The pull request the run opened or updated.
     pub result_pull_request_id: Option<i64>,
     pub failure_reason: Option<String>,
+    /// The refs the run's tokens may write: `refs/heads/agent/<bot>/` for the
+    /// first run of an issue, the pull request's branch for an iteration. Kept
+    /// after the token is gone, so the CI gate still knows which branches hold
+    /// the agent's code (ADR-0001 D4). `None` for a run that never had one.
+    pub write_ref_prefix: Option<String>,
     pub created_at: DateTimeUtc,
     pub finished_at: Option<DateTimeUtc>,
 }

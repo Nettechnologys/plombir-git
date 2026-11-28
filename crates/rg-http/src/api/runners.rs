@@ -1051,7 +1051,13 @@ async fn add_server_variables(
         variables.remove(reserved);
     }
     let mut mask_secrets = Vec::new();
-    match decrypted_repo_secrets(state, pipeline.repo_id, job.environment_id).await {
+    // An agent run's job is handed none of them (ADR-0001 D5).
+    let secrets = if rg_core::ci::receives_ci_secrets(&pipeline.trigger_type) {
+        decrypted_repo_secrets(state, pipeline.repo_id, job.environment_id).await
+    } else {
+        Ok(Vec::new())
+    };
+    match secrets {
         Ok(secrets) => {
             for (name, value) in secrets {
                 mask_secrets.push(value.clone());

@@ -40,6 +40,23 @@ pub async fn upsert(
     model: AgentProfile,
     repository_ids: &[i64],
 ) -> Result<AgentProfile> {
+    // The write reads the stored profile first, so on SQLite its transaction
+    // upgrades from a read snapshot to a write lock, and loses with
+    // `SQLITE_BUSY_SNAPSHOT` (517) to any writer that committed in between —
+    // a notification delivery, the bot's own token use. That is contention,
+    // not a failed save, so the whole transaction runs again on a fresh
+    // snapshot rather than answering 500.
+    crate::contention::retry_transaction("write an agent profile", || {
+        upsert_once(db, model.clone(), repository_ids)
+    })
+    .await
+}
+
+async fn upsert_once(
+    db: &DatabaseConnection,
+    model: AgentProfile,
+    repository_ids: &[i64],
+) -> Result<AgentProfile> {
     let transaction = db.begin().await.context("db: begin agent profile write")?;
     let existing = ProfileEntity::find()
         .filter(agent_profile::Column::BotId.eq(model.bot_id))

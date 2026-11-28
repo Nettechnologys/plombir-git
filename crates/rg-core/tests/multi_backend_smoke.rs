@@ -2799,6 +2799,7 @@ async fn agent_run_keys_and_cascades_are_portable() {
         .to_string()),
         active: Set(active),
         result_pull_request_id: Set(Some(opened.id)),
+        write_ref_prefix: Set(Some(format!("refs/heads/agent/runbot{suffix}/"))),
         created_at: Set(chrono::Utc::now()),
         ..Default::default()
     };
@@ -2826,6 +2827,38 @@ async fn agent_run_keys_and_cascades_are_portable() {
             .await
             .expect("finished runs sit beside the active one");
     }
+    // Three runs under one prefix: the CI gate reads it once.
+    assert_eq!(
+        rg_db::ops::agent_run_ops::write_ref_prefixes(&db, repo.id)
+            .await
+            .expect("list the prefixes"),
+        vec![format!("refs/heads/agent/runbot{suffix}/")]
+    );
+    // Disarming is conditional on the flag, so a second writer records nothing.
+    assert!(
+        !rg_db::ops::pull_request_ops::disarm_auto_merge(&db, opened.id)
+            .await
+            .expect("disarm a pull request with no auto-merge")
+    );
+    pull_request::Entity::update_many()
+        .col_expr(
+            pull_request::Column::AutoMergeEnabled,
+            sea_orm::sea_query::Expr::value(true),
+        )
+        .filter(pull_request::Column::Id.eq(opened.id))
+        .exec(&db)
+        .await
+        .expect("arm auto-merge");
+    assert!(
+        rg_db::ops::pull_request_ops::disarm_auto_merge(&db, opened.id)
+            .await
+            .expect("disarm auto-merge")
+    );
+    assert!(
+        !rg_db::ops::pull_request_ops::disarm_auto_merge(&db, opened.id)
+            .await
+            .expect("disarm it again")
+    );
 
     let attempt = |number: i64| agent_run_attempt::ActiveModel {
         run_id: Set(live.id),
@@ -7061,6 +7094,7 @@ async fn neighbouring_issue_relabels_all_land() {
                     None,
                     None,
                     Some(labels),
+                    None,
                     None,
                     None,
                     None,
