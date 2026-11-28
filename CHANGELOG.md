@@ -41,6 +41,18 @@ This project records user-facing changes here. The format follows
   replaced attempt is settled failed instead of handed out, the embedded
   runner never runs one without Docker, and an instance without
   `[server] external_url` refuses the assignment.
+- An agent run's job starts with a prologue the server writes: it clones the
+  repository with the run's token in an `http.extraHeader` (never in the URL
+  or a file), checks out the commit the run recorded, and writes the task and
+  an MCP configuration outside the runner's workspace. The `claude_code`
+  preset runs `claude -p --bare --dangerously-skip-permissions --mcp-config
+  … --strict-mcp-config` (checked on Claude Code 2.1.332), the `codex` preset
+  `codex exec --dangerously-bypass-approvals-and-sandbox` with the server's
+  MCP endpoint (codex-cli 0.172.0), both in `node:22-bookworm` unless the
+  profile names an image. When the pipeline settles the run ends once: a
+  first run succeeds only with the pull request it opened, an iteration with
+  a commit on its branch; anything else fails with the end of the log in the
+  bot's comment. Recovery ends a run whose pipeline was cancelled elsewhere.
 
 ### Fixed
 

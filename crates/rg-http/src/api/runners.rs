@@ -613,6 +613,11 @@ async fn pipeline_finished(
     }
     if completed_now {
         crate::metrics::recorder::ci_pipeline_finished(&pipeline.status);
+        if let Err(error) =
+            rg_core::agent::run::pipeline_settled(&state.db_pools(), pipeline.id).await
+        {
+            tracing::error!(pipeline_id = pipeline.id, error = %format!("{error:#}"), "an agent run's outcome could not be recorded; recovery will retry");
+        }
         if let Err(hook_error) = rg_core::webhook::service::trigger_ci_status(
             &state.db_pools(),
             pipeline.repo_id,

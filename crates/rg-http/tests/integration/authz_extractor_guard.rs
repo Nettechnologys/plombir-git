@@ -411,6 +411,13 @@ const WORKSPACE_FUNCTION_SIGNED_OFF: &[(&str, &str, &str)] = &[
          gate cannot stand in for the bot's",
     ),
     (
+        "rg-core/src/agent/trust.rs",
+        "trusted_authors",
+        "ADR-0001 D7: whose text an agent run may read is decided by each author's write access, \
+         not the caller's — the subjects are the commenters, and the task file is written while \
+         the assignment is planned, with no request for an extractor to gate",
+    ),
+    (
         "rg-core/src/pull_request/fork_source.rs",
         "may_publish",
         "checks the PR author's current authority to publish a private fork; \

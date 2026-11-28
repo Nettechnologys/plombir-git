@@ -491,7 +491,12 @@ async fn assigning_an_issue_to_an_agent_queues_its_run() {
     assert_eq!(job.repo_id, f.repo_id);
     assert_eq!(job.commit_sha, f.main_sha);
     assert_eq!(job.ref_name, "refs/heads/main");
-    assert_eq!((job.image.as_str(), job.command.as_str()), (IMAGE, COMMAND));
+    assert_eq!(job.image, IMAGE);
+    assert_eq!(
+        job.command,
+        rg_core::agent::job::job_script(COMMAND),
+        "the profile's command runs after the server's prologue"
+    );
     assert_eq!(job.timeout_secs, 1200);
     assert_eq!(job.triggered_by, Some(f.alice_id));
 
@@ -2157,4 +2162,353 @@ async fn only_the_winning_claim_writes_the_hand_out() {
         1,
         "the losing claim wrote its hand-out"
     );
+}
+
+// ── The run on a runner: the prologue, the agent and its outcome
+//    (card_f42b96e48e66) ───────────────────────────────────────────────────
+
+/// A fake agent: a branch under the bot's prefix, one commit, a push through
+/// the clone the prologue made, and — with `open_pr` — `create_pr` over MCP
+/// with the run's own token, the way a real agent's tool call goes.
+fn fake_agent(open_pr: bool) -> String {
+    let mut script = String::from(
+        r#"echo "agent: working on $PLOMBIR_REPOSITORY#$PLOMBIR_ISSUE_NUMBER"
+test -s "$PLOMBIR_TASK_FILE"
+test "$(git rev-parse HEAD)" = "$PLOMBIR_COMMIT_SHA"
+if git remote -v | grep -q "$PLOMBIR_AGENT_TOKEN"; then echo "token in the remote" >&2; exit 3; fi
+branch="${PLOMBIR_AGENT_BRANCH_PREFIX}${PLOMBIR_ISSUE_NUMBER}-fake"
+git switch --quiet -c "$branch"
+echo fixed > FIXED.md
+git add FIXED.md
+git commit --quiet -m "Fix #$PLOMBIR_ISSUE_NUMBER"
+git push --quiet origin "HEAD:refs/heads/$branch"
+"#,
+    );
+    if open_pr {
+        script.push_str(
+            r#"answer=$(curl -fsS -H "Authorization: Bearer $PLOMBIR_AGENT_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"create_pr\",\"arguments\":{\"owner\":\"alice\",\"repo\":\"app\",\"title\":\"Fix it\",\"head\":\"$branch\",\"base\":\"main\",\"body\":\"Fixes #$PLOMBIR_ISSUE_NUMBER\"}}}" \
+  "$PLOMBIR_MCP_URL")
+echo "$answer" | grep -q '"isError":false' || { echo "create_pr: $answer" >&2; exit 4; }
+"#,
+        );
+    }
+    script.push_str("echo \"agent: done, the key was ${PLOMBIR_MODEL_KEY:-none}\"\n");
+    script
+}
+
+impl Fixture {
+    /// The job of the run's attempt, as `enqueue_agent_run` builds it, taken
+    /// by an external runner: the polled response.
+    async fn hand_out_to_a_runner(&self, run_id: i64) -> (i64, String, serde_json::Value) {
+        let attempt = self.attempts(run_id).await.remove(0);
+        let pipeline_id = attempt.pipeline_id.expect("queued");
+        let stage = rg_db::ops::pipeline_ops::create_stage(&self.db, pipeline_id, "agent", 0)
+            .await
+            .unwrap();
+        let enqueued = self.ci.take().pop().expect("the run was queued");
+        rg_db::ops::pipeline_ops::create_job(
+            &self.db,
+            stage.id,
+            "agent",
+            &enqueued.command,
+            Some(&enqueued.image),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+            &self.db,
+            self.repo_id,
+            "agent-runner",
+            "[]",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let response = self
+            .http
+            .get(format!(
+                "{}/api/v1/runners/{}/jobs/poll?timeout=2",
+                self.base, runner.id
+            ))
+            .bearer_auth(&runner_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        (runner.id, runner_token, response.json().await.unwrap())
+    }
+
+    /// Execute the polled job as the runner's container would — its script
+    /// under `sh -c` with exactly the variables it was handed — then report
+    /// the log and the exit status back.
+    async fn execute(&self, runner_id: i64, runner_token: &str, polled: &serde_json::Value) -> i32 {
+        let job_id = polled["job_id"].as_i64().unwrap();
+        // The runner joins the lines it was handed (`rg-runner`'s
+        // `job.script.join("\n")`).
+        let script = polled["script"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|line| line.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let home = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(&script)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", home.path())
+            // A container has a /tmp of its own; tests running side by side
+            // on one host do not.
+            .env("TMPDIR", home.path());
+        for (name, value) in polled["variables"].as_object().unwrap() {
+            command.env(name, value.as_str().unwrap_or_default());
+        }
+        let output = tokio::task::spawn_blocking(move || command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        let exit_code = output.status.code().unwrap_or(-1);
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Shown when the test fails: what the job printed.
+        eprintln!("job {job_id} exited {exit_code}:\n{log}");
+        let runner = |path: String| {
+            self.http
+                .post(format!(
+                    "{}/api/v1/runners/{runner_id}/jobs/{job_id}/{path}",
+                    self.base
+                ))
+                .bearer_auth(runner_token)
+        };
+        assert!(runner("start".into())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        assert!(runner("log".into())
+            .body(log.clone())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        let finished = runner("finish".into())
+            .json(&serde_json::json!({
+                "status": if exit_code == 0 { "success" } else { "failed" },
+                "exit_code": exit_code,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            finished.status().is_success(),
+            "{}",
+            finished.text().await.unwrap()
+        );
+        assert!(!log.contains("Authorization: Basic"), "{log}");
+        exit_code
+    }
+
+    async fn pull_requests(&self) -> Vec<rg_db::entities::pull_request::Model> {
+        rg_db::entities::pull_request::Entity::find()
+            .filter(rg_db::entities::pull_request::Column::RepoId.eq(self.repo_id))
+            .all(&self.db)
+            .await
+            .unwrap()
+    }
+}
+
+/// The whole path on an external runner: the prologue clones at the run's
+/// commit with the token in a header, the agent pushes under its prefix and
+/// opens a pull request over MCP as the bot, and the run succeeds with the
+/// bot saying which pull request it opened. The key printed into the log
+/// reaches the stored log masked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fake_agent_opens_its_pull_request_through_an_external_runner() {
+    let f = fixture().await;
+    f.save_profile(|update| {
+        update.command = Some(fake_agent(true));
+        update.model_key = rg_core::agent::profile::ModelKey::Set(MODEL_KEY.to_string());
+    })
+    .await;
+    f.assign_in_core(f.alice_id).await;
+    let run = f.runs().await.remove(0);
+    let (runner_id, runner_token, polled) = f.hand_out_to_a_runner(run.id).await;
+    let exit = f.execute(runner_id, &runner_token, &polled).await;
+    assert_eq!(exit, 0, "the fake agent failed");
+
+    let opened: Vec<_> = f
+        .pull_requests()
+        .await
+        .into_iter()
+        .filter(|pr| pr.head_branch.ends_with("-fake"))
+        .collect();
+    assert_eq!(opened.len(), 1);
+    assert_eq!(
+        opened[0].author_id, f.bot.id,
+        "the pull request is not the bot's"
+    );
+    let ended = f.runs().await.remove(0);
+    assert_eq!((ended.status.as_str(), ended.active), ("succeeded", None));
+    assert_eq!(ended.result_pull_request_id, Some(opened[0].id));
+    let comments = f.bot_comments().await;
+    assert!(
+        comments
+            .iter()
+            .any(|c| c.contains(&format!("I opened #{}", opened[0].number))),
+        "{comments:?}"
+    );
+    let log = rg_db::ops::pipeline_ops::get_job_log_slice(
+        &f.db,
+        polled["job_id"].as_i64().unwrap(),
+        0,
+        100_000,
+    )
+    .await
+    .unwrap()
+    .and_then(|slice| slice.content)
+    .unwrap_or_default();
+    assert!(log.contains("agent: done"), "{log}");
+    assert!(
+        !log.contains(MODEL_KEY),
+        "the key reached the stored log: {log}"
+    );
+    // The attempt ended, and its token with it.
+    assert!(rg_db::entities::access_token::Entity::find()
+        .filter(
+            rg_db::entities::access_token::Column::AgentRunAttemptId
+                .eq(f.attempts(run.id).await[0].id)
+        )
+        .one(&f.db)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// Exit 0 without a pull request is a failed run, with the end of its log in
+/// the bot's comment — not a quiet success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fake_agent_that_opens_nothing_fails_with_its_log() {
+    let f = fixture().await;
+    f.save_profile(|update| update.command = Some(fake_agent(false)))
+        .await;
+    f.assign_in_core(f.alice_id).await;
+    let run = f.runs().await.remove(0);
+    let (runner_id, runner_token, polled) = f.hand_out_to_a_runner(run.id).await;
+    assert_eq!(f.execute(runner_id, &runner_token, &polled).await, 0);
+    let ended = f.runs().await.remove(0);
+    assert_eq!(ended.status, "failed");
+    assert_eq!(
+        ended.failure_reason.as_deref(),
+        Some("the agent finished without opening a pull request")
+    );
+    let comments = f.bot_comments().await;
+    assert!(
+        comments
+            .iter()
+            .any(|c| c.contains("without opening a pull request") && c.contains("agent: done")),
+        "the failure does not quote the log: {comments:?}"
+    );
+}
+
+/// An iteration needs no new pull request: a commit on the pull request's
+/// branch is the run's success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_iteration_that_pushes_to_its_branch_succeeds_without_a_new_pull_request() {
+    let f = fixture().await;
+    let response = f
+        .http
+        .post(format!("{}/api/v1/repos/alice/app/pulls", f.base))
+        .bearer_auth(&f.alice)
+        .json(&serde_json::json!({
+            "title": "Fix", "head": "agent/alice-agent/1-fix", "base": "main",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let number = response.json::<serde_json::Value>().await.unwrap()["number"]
+        .as_i64()
+        .unwrap();
+    let pr = rg_db::ops::pull_request_ops::find_by_repo_and_number(&f.db, f.repo_id, number)
+        .await
+        .unwrap()
+        .unwrap();
+    // An iteration run, as the mention of the bot on its pull request will
+    // write it (card_5123a85574c3): the branch, the head it starts from.
+    let iteration = "cd \"$PLOMBIR_WORKDIR\"\ngit fetch --quiet origin agent/alice-agent/1-fix\ngit switch --quiet -c work FETCH_HEAD\necho more > MORE.md\ngit add MORE.md\ngit commit --quiet -m more\ngit push --quiet origin HEAD:refs/heads/agent/alice-agent/1-fix\n";
+    f.save_profile(|update| update.command = Some(iteration.to_string()))
+        .await;
+    f.assign_in_core(f.alice_id).await;
+    let run = f.runs().await.remove(0);
+    let mut as_iteration: rg_db::entities::agent_run::ActiveModel = run.clone().into();
+    as_iteration.pull_request_id = Set(Some(pr.id));
+    as_iteration.iteration = Set(2);
+    as_iteration.commit_sha = Set(pr.head_sha.clone());
+    as_iteration.update(&f.db).await.unwrap();
+    let before = f.pull_requests().await.len();
+
+    let (runner_id, runner_token, polled) = f.hand_out_to_a_runner(run.id).await;
+    assert_eq!(f.execute(runner_id, &runner_token, &polled).await, 0);
+
+    assert_eq!(
+        f.pull_requests().await.len(),
+        before,
+        "an iteration opened a pull request"
+    );
+    let ended = f.runs().await.remove(0);
+    assert_eq!(ended.status, "succeeded", "{:?}", ended.failure_reason);
+    assert!(f
+        .bot_comments()
+        .await
+        .iter()
+        .any(|c| c.contains(&format!("I pushed changes to #{number}"))));
+}
+
+/// A pipeline cancelled behind the run's back (the CI page's cancel) ends
+/// the run when recovery reads it, instead of holding the bot's slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovery_ends_a_run_whose_pipeline_settled_without_it() {
+    let f = fixture().await;
+    f.assign_in_core(f.alice_id).await;
+    let run = f.runs().await.remove(0);
+    let pipeline_id = f.attempts(run.id).await[0].pipeline_id.unwrap();
+    assert!(
+        rg_db::ops::pipeline_ops::cancel_pipeline_chain(&f.db, pipeline_id)
+            .await
+            .unwrap()
+    );
+    let recovered = rg_core::agent::run::recover(
+        &f.state.db_pools(),
+        &f.state.agent_run_launcher(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered.ended, 1, "{recovered:?}");
+    let ended = f.runs().await.remove(0);
+    assert_eq!((ended.status.as_str(), ended.active), ("cancelled", None));
+    // The bot is free again.
+    let second = f.open_issue("app").await;
+    f.assign_issue("app", second, Some(f.bot.id)).await;
+    assert_eq!(f.runs().await.len(), 2);
 }

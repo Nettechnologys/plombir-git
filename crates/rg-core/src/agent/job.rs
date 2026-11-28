@@ -36,6 +36,50 @@ pub const MODEL_KEY_VARIABLE: &str = "PLOMBIR_MODEL_KEY";
 /// The task the server wrote for the run.
 pub const TASK_VARIABLE: &str = "PLOMBIR_TASK";
 
+/// The shell the run's one job executes: [`PROLOGUE`], then `command`.
+pub fn job_script(command: &str) -> String {
+    format!("{PROLOGUE}\n# The agent.\n{command}\n")
+}
+
+/// What every run's job does before the agent: clone the repository with the
+/// run's token at the commit the run recorded, and write the task and the MCP
+/// configuration — all outside the runner's workspace, which on the external
+/// runner has no `.git` (`git archive`) and on the embedded one has a `.git`
+/// pointing at the server's bare repository.
+///
+/// The token travels as an `http.extraHeader` in git's environment
+/// (`GIT_CONFIG_*`), never in the clone URL or a file in the repository, so
+/// `git remote -v` and the clone's `.git/config` hold no credential. The CLI
+/// a preset installs goes under a prefix the job's unprivileged user owns.
+pub const PROLOGUE: &str = r#"set -eu
+# plombir-git agent prologue (ADR-0001 D7, card_f42b96e48e66).
+command -v git >/dev/null 2>&1 || { echo "plombir-git: the agent's image has no git" >&2; exit 127; }
+umask 077
+PLOMBIR_AGENT_HOME="${TMPDIR:-/tmp}/plombir-agent"
+PLOMBIR_WORKDIR="$PLOMBIR_AGENT_HOME/repo"
+PLOMBIR_TASK_FILE="$PLOMBIR_AGENT_HOME/task.md"
+PLOMBIR_MCP_CONFIG="$PLOMBIR_AGENT_HOME/mcp.json"
+NPM_CONFIG_PREFIX="$PLOMBIR_AGENT_HOME/npm"
+PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
+export PLOMBIR_WORKDIR PLOMBIR_TASK_FILE PLOMBIR_MCP_CONFIG NPM_CONFIG_PREFIX PATH
+rm -rf "$PLOMBIR_AGENT_HOME"
+mkdir -p "$PLOMBIR_AGENT_HOME"
+printf '%s
+' "$PLOMBIR_TASK" > "$PLOMBIR_TASK_FILE"
+printf '{"mcpServers":{"plombir":{"type":"http","url":"%s","headers":{"Authorization":"Bearer %s"}}}}
+'   "$PLOMBIR_MCP_URL" "$PLOMBIR_AGENT_TOKEN" > "$PLOMBIR_MCP_CONFIG"
+GIT_CONFIG_COUNT=1
+GIT_CONFIG_KEY_0=http.extraHeader
+GIT_CONFIG_VALUE_0="Authorization: Basic $(printf '%s:%s' "$PLOMBIR_AGENT_BOT" "$PLOMBIR_AGENT_TOKEN" | base64 | tr -d '
+')"
+export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+git clone --quiet --no-checkout "$PLOMBIR_REPO_URL" "$PLOMBIR_WORKDIR"
+cd "$PLOMBIR_WORKDIR"
+git checkout --quiet --detach "$PLOMBIR_COMMIT_SHA"
+git config user.name "$PLOMBIR_AGENT_BOT"
+git config user.email "$PLOMBIR_AGENT_BOT@agents.invalid"
+"#;
+
 /// The model key under the name a preset's CLI reads it by, besides
 /// [`MODEL_KEY_VARIABLE`].
 fn preset_key_variables(preset: Preset) -> &'static [&'static str] {
@@ -172,10 +216,6 @@ pub async fn job_credentials(
                 .strip_prefix("refs/heads/")
                 .unwrap_or(&prefix)
                 .to_string(),
-        ),
-        (
-            "PLOMBIR_AGENT_MAX_TURNS".to_string(),
-            super::run::max_turns(timeout_secs).to_string(),
         ),
         (
             TASK_VARIABLE.to_string(),

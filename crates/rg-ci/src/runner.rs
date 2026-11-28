@@ -557,6 +557,7 @@ impl PipelineRunner {
             match pipeline_ops::fail_pipeline_chain(&self.db_write, self.pipeline_id, &log).await {
                 Ok(true) => {
                     rg_core::metrics_hook::record_ci_pipeline_finished("failed");
+                    self.settle_agent_run().await;
                     if let Err(hook_error) = rg_core::webhook::service::trigger_ci_status(
                         &rg_core::db::Db::new(self.db.clone(), self.db_write.clone()),
                         self.repo_id,
@@ -690,6 +691,7 @@ impl PipelineRunner {
         // else settled (a cancel that raced the last stage) is their outcome,
         // not a second one.
         rg_core::metrics_hook::record_ci_pipeline_finished(pipeline_status);
+        self.settle_agent_run().await;
         if let Err(hook_error) = rg_core::webhook::service::trigger_ci_status(
             &rg_core::db::Db::new(self.db.clone(), self.db_write.clone()),
             self.repo_id,
@@ -1869,6 +1871,24 @@ impl PipelineRunner {
             secret_values,
             ignored.into_iter().collect(),
         ))
+    }
+
+    /// Hand an agent run the result of the pipeline that carried it
+    /// (`rg_core::agent::run::pipeline_settled`). Logged, never fatal: the
+    /// recovery loop reads the same outcome later.
+    async fn settle_agent_run(&self) {
+        if let Err(error) = rg_core::agent::run::pipeline_settled(
+            &rg_core::db::Db::new(self.db.clone(), self.db_write.clone()),
+            self.pipeline_id,
+        )
+        .await
+        {
+            tracing::error!(
+                pipeline_id = self.pipeline_id,
+                error = %format!("{error:#}"),
+                "an agent run's outcome could not be recorded; recovery will retry"
+            );
+        }
     }
 
     /// The model key and attempt token an agent run's job is handed, with
@@ -4471,6 +4491,134 @@ esac
         assert_process_stops(fixture.pid("client.pid"), "docker client").await;
         assert_process_stops(fixture.pid("container.pid"), "docker container").await;
         assert!(!fixture.root.join("container.live").exists());
+    }
+
+    /// card_f42b96e48e66: the embedded runner hands an agent run the result
+    /// of the pipeline that carried it. A job that exited 0 without the run
+    /// opening a pull request ends the run `failed`, says why, and takes the
+    /// attempt's token with it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_embedded_runner_hands_an_agent_run_its_outcome() {
+        use sea_orm::{
+            ActiveModelTrait as _, ColumnTrait as _, EntityTrait as _, QueryFilter as _,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = DockerFixture::new(&temp.path().join("fake-docker"));
+        let (mut runner, db, _job) = runner_with_one_job(
+            temp.path(),
+            "agent-outcome",
+            "true",
+            Some("fixture:success"),
+            60,
+        )
+        .await;
+        runner.set_docker_program(&fixture.program);
+        let encryption_key = "runner-at-rest-encryption-key";
+        runner.set_encryption_key(encryption_key.into());
+        runner.set_oidc_token_url("https://forge.example/api/v1/ci/oidc/token".into());
+        let pipeline = rg_db::entities::pipeline::Entity::find_by_id(runner.pipeline_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let owner = rg_db::ops::repo_ops::find_by_id(&db, runner.repo_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .owner_id;
+        let bot = rg_core::user::bots::create_bot(
+            &db,
+            rg_core::user::service::LdapDirectories {
+                encryption_key: "test-encryption-key",
+                transport_policy: &Default::default(),
+            },
+            owner,
+            "outcome-agent",
+            None,
+        )
+        .await
+        .unwrap();
+        rg_core::agent::profile::save(
+            &db,
+            &rg_core::auth::encryption::derive_key(encryption_key),
+            &bot,
+            rg_core::agent::profile::ProfileUpdate {
+                enabled: true,
+                preset: "custom".into(),
+                image: Some("fixture:success".into()),
+                command: Some("true".into()),
+                runner_tags: None,
+                model_key: rg_core::agent::profile::ModelKey::Keep,
+                timeout_secs: Some(600),
+                max_runs_per_day: None,
+                max_iterations: None,
+                repository_ids: vec![runner.repo_id],
+            },
+        )
+        .await
+        .unwrap();
+        let mut agent_run: rg_db::entities::pipeline::ActiveModel = pipeline.clone().into();
+        agent_run.trigger_type = Set(rg_core::ci::AGENT_RUN_EVENT.to_string());
+        agent_run.update(&db).await.unwrap();
+        let run = rg_db::entities::agent_run::ActiveModel {
+            bot_id: Set(bot.id),
+            repository_id: Set(runner.repo_id),
+            iteration: Set(1),
+            triggered_by: Set(owner),
+            trigger_key: Set("test:outcome-agent".into()),
+            status: Set("queued".into()),
+            active: Set(Some(true)),
+            write_ref_prefix: Set(Some("refs/heads/agent/outcome-agent/".into())),
+            commit_sha: Set(Some(pipeline.commit_sha.clone())),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let attempt = rg_db::entities::agent_run_attempt::ActiveModel {
+            run_id: Set(run.id),
+            attempt: Set(1),
+            pipeline_id: Set(Some(runner.pipeline_id)),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        runner.run().await.unwrap();
+
+        let ended = rg_db::entities::agent_run::Entity::find_by_id(run.id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((ended.status.as_str(), ended.active), ("failed", None));
+        assert_eq!(
+            ended.failure_reason.as_deref(),
+            Some("the agent finished without opening a pull request")
+        );
+        assert!(
+            rg_db::entities::access_token::Entity::find()
+                .filter(rg_db::entities::access_token::Column::AgentRunAttemptId.eq(attempt.id))
+                .one(&db)
+                .await
+                .unwrap()
+                .is_none(),
+            "the attempt's token outlived the run"
+        );
+        let run_args = std::fs::read_to_string(fixture.root.join("run.args")).unwrap();
+        assert!(
+            run_args.lines().any(|arg| arg == "PLOMBIR_AGENT_TOKEN"),
+            "{run_args}"
+        );
+        assert!(
+            !run_args.contains("ifp_"),
+            "the token's value is on docker's command line: {run_args}"
+        );
     }
 
     /// card_a84b25c9efbe: everything the embedded runner writes about the job

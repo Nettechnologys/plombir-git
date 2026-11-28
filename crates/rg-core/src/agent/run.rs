@@ -97,13 +97,6 @@ pub const RUN_MCP_TOOLS: &[&str] = &[
 /// had every chance to queue it itself.
 pub const UNQUEUED_RUN_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// How many turns a preset's agent may take in a run of `timeout_secs`: one
-/// for every half minute, between 10 and 200 — a backstop beside the timeout,
-/// so an agent stuck in a loop ends before it spends the whole run.
-pub fn max_turns(timeout_secs: i64) -> i64 {
-    (timeout_secs / 30).clamp(10, 200)
-}
-
 /// The refs every run of `bot` may write under: `refs/heads/agent/<bot>/`.
 pub fn branch_prefix(bot: &str) -> String {
     format!("refs/heads/agent/{bot}/")
@@ -699,8 +692,17 @@ fn runnable_job(
         )));
     }
     let preset = Preset::parse(&saved.profile.preset)?;
-    let (Some(image), Some(command)) = (saved.profile.image.clone(), saved.profile.command.clone())
-    else {
+    let image = saved
+        .profile
+        .image
+        .clone()
+        .or_else(|| preset.default_image().map(str::to_string));
+    let command = saved
+        .profile
+        .command
+        .clone()
+        .or_else(|| preset.command().map(str::to_string));
+    let (Some(image), Some(command)) = (image, command) else {
         return Ok(Err(Refusal::new(
             "preset_not_runnable",
             format!(
@@ -711,7 +713,7 @@ fn runnable_job(
     };
     Ok(Ok(RunJob {
         image,
-        command,
+        command: super::job::job_script(&command),
         runner_tags: saved.runner_tags(),
         timeout_secs: launcher.limits.timeout_secs(saved),
     }))
@@ -1019,6 +1021,177 @@ pub async fn end_runs_withdrawn_by_profile(
     Ok(stopped)
 }
 
+// ── The outcome of a run ───────────────────────────────────────────────────
+
+/// How many lines of the job's log a failure comment quotes.
+pub const FAILURE_LOG_LINES: usize = 30;
+
+/// What a settled pipeline makes of the run whose attempt it carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// The first run opened its pull request; an iteration moved its branch.
+    Succeeded {
+        message: String,
+    },
+    Failed {
+        reason: String,
+        message: String,
+    },
+    Cancelled,
+}
+
+/// End the run of the attempt pipeline `pipeline_id` carries, now that the
+/// pipeline settled — the one place both runners hand a run's result to
+/// (card_f42b96e48e66). Nothing for a pipeline of no run, a pipeline still
+/// active, a run another ender already ended, or an attempt the run has moved
+/// past.
+///
+/// - First run: the job succeeded **and** the run opened a pull request →
+///   `succeeded`. A job that exited 0 without one is `failed`, with the tail
+///   of its log, never a quiet success.
+/// - Iteration (the run works on a pull request): the job succeeded and the
+///   branch's head moved since the run started → `succeeded`, no new pull
+///   request asked for.
+/// - The job failed → `failed` with the tail of its log; the pipeline was
+///   cancelled → `cancelled`.
+pub async fn pipeline_settled(db: &impl crate::db::DbPools, pipeline_id: i64) -> Result<bool> {
+    let pools = db.owned();
+    let read = pools.read();
+    let Some((run, attempt)) =
+        rg_db::ops::agent_run_ops::attempt_of_pipeline(read, pipeline_id).await?
+    else {
+        return Ok(false);
+    };
+    if run.active != Some(true) {
+        return Ok(false);
+    }
+    let latest = rg_db::ops::agent_run_ops::attempts_of_run(read, run.id)
+        .await?
+        .into_iter()
+        .map(|attempt| attempt.id)
+        .max();
+    if latest != Some(attempt.id) {
+        return Ok(false);
+    }
+    let Some(pipeline) = rg_db::ops::pipeline_ops::get_pipeline(read, pipeline_id).await? else {
+        return Ok(false);
+    };
+    let Some(outcome) = outcome_of(read, &run, &pipeline).await? else {
+        return Ok(false);
+    };
+    let (status, reason, message) = match outcome {
+        Outcome::Succeeded { message } => ("succeeded", "finished".to_string(), message),
+        Outcome::Failed { reason, message } => ("failed", reason, message),
+        Outcome::Cancelled => (
+            "cancelled",
+            "the run's pipeline was cancelled".to_string(),
+            "I stopped working on this: my run was cancelled.".to_string(),
+        ),
+    };
+    match end_run(&pools, run.id, status, &reason).await? {
+        Some(ended) => {
+            after_end(&pools, ended, message).await;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// [`pipeline_settled`]'s reading of `pipeline`; `None` while it is active.
+async fn outcome_of(
+    db: &DatabaseConnection,
+    run: &agent_run::Model,
+    pipeline: &rg_db::entities::pipeline::Model,
+) -> Result<Option<Outcome>> {
+    match pipeline.status.as_str() {
+        "success" => {}
+        "canceled" | "cancelled" => return Ok(Some(Outcome::Cancelled)),
+        "failed" | "error" | "timed_out" | "skipped" => {
+            let tail = log_tail(db, pipeline.id).await?;
+            return Ok(Some(failed("the agent's job failed", &tail)));
+        }
+        _ => return Ok(None),
+    }
+    if let Some(pr_id) = run.pull_request_id {
+        // An iteration: the branch moved, or nothing was done.
+        let head = rg_db::ops::pull_request_ops::find_by_id(db, pr_id)
+            .await?
+            .and_then(|pr| pr.head_sha.map(|sha| (pr.number, sha)));
+        return Ok(Some(match head {
+            Some((number, sha)) if run.commit_sha.as_deref() != Some(sha.as_str()) => {
+                Outcome::Succeeded {
+                    message: format!("I pushed changes to #{number}."),
+                }
+            }
+            _ => failed(
+                "the agent finished without pushing to the pull request's branch",
+                &log_tail(db, pipeline.id).await?,
+            ),
+        }));
+    }
+    let opened = match run.result_pull_request_id {
+        Some(pr_id) => rg_db::ops::pull_request_ops::find_by_id(db, pr_id)
+            .await?
+            .filter(|pr| pr.repo_id == run.repository_id)
+            .map(|pr| pr.number),
+        None => None,
+    };
+    Ok(Some(match opened {
+        Some(number) => Outcome::Succeeded {
+            message: format!("I opened #{number} for this."),
+        },
+        None => failed(
+            "the agent finished without opening a pull request",
+            &log_tail(db, pipeline.id).await?,
+        ),
+    }))
+}
+
+fn failed(reason: &str, tail: &str) -> Outcome {
+    let mut message = format!("I could not finish this: {reason}.");
+    if !tail.trim().is_empty() {
+        message.push_str(&format!(
+            "\n\nThe end of my log:\n\n```\n{}\n```",
+            tail.trim_end().replace("```", "'''")
+        ));
+    }
+    Outcome::Failed {
+        reason: reason.to_string(),
+        message,
+    }
+}
+
+/// How much of the end of a job's log is read for its tail, in characters.
+const FAILURE_LOG_CHARS: i64 = 8 * 1024;
+
+/// The last [`FAILURE_LOG_LINES`] lines of the pipeline's jobs' logs, as
+/// stored — masked by the runner that wrote them. Read through the log's
+/// chunks (`get_job_log_slice`), where the runners' appends land, and only
+/// the end of each.
+async fn log_tail(db: &DatabaseConnection, pipeline_id: i64) -> Result<String> {
+    let mut log = String::new();
+    for job in rg_db::ops::pipeline_ops::list_jobs_by_pipeline(db, pipeline_id).await? {
+        let total = rg_db::ops::pipeline_ops::get_job_log_slice(db, job.id, 0, 0)
+            .await?
+            .and_then(|slice| slice.total_length)
+            .unwrap_or(0);
+        let start = (total - FAILURE_LOG_CHARS).max(0);
+        if let Some(content) =
+            rg_db::ops::pipeline_ops::get_job_log_slice(db, job.id, start, FAILURE_LOG_CHARS)
+                .await?
+                .and_then(|slice| slice.content)
+        {
+            if !log.is_empty() {
+                log.push('\n');
+            }
+            log.push_str(&content);
+        }
+    }
+    let lines: Vec<&str> = log.lines().collect();
+    let start = lines.len().saturating_sub(FAILURE_LOG_LINES);
+    Ok(lines[start..].join("\n"))
+}
+
 /// What one [`recover`] pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Recovered {
@@ -1103,7 +1276,16 @@ async fn recover_run(
     else {
         return Ok(RunRecovery::Untouched);
     };
-    if attempt.pipeline_id.is_some() || run.created_at > cutoff {
+    if let Some(pipeline_id) = attempt.pipeline_id {
+        // Settled while nobody told the run (a cancel through the CI page, a
+        // hook a restart cut off): its outcome is read now.
+        return Ok(if pipeline_settled(pools, pipeline_id).await? {
+            RunRecovery::Ended
+        } else {
+            RunRecovery::Untouched
+        });
+    }
+    if run.created_at > cutoff {
         return Ok(RunRecovery::Untouched);
     }
     let give_up = |reason: &'static str| async move {
