@@ -31,6 +31,16 @@ This project records user-facing changes here. The format follows
   reviews of people with write access; every other reader sees all of them.
   The issue page warns before an issue whose author cannot write is assigned
   to a bot.
+- An agent run's job is handed, in its environment only and masked in its
+  log, the bot's model key (as `PLOMBIR_MODEL_KEY`, and `ANTHROPIC_API_KEY`
+  or `CODEX_API_KEY` / `OPENAI_API_KEY` for a preset) and `PLOMBIR_AGENT_TOKEN`,
+  a token minted for its attempt when the job is handed out, together with
+  `PLOMBIR_SERVER_URL`, `PLOMBIR_MCP_URL`, `PLOMBIR_REPO_URL`,
+  `PLOMBIR_COMMIT_SHA` and `PLOMBIR_TASK`. An external runner's token is
+  written in the transaction of the claim that wins. A job of an ended or
+  replaced attempt is settled failed instead of handed out, the embedded
+  runner never runs one without Docker, and an instance without
+  `[server] external_url` refuses the assignment.
 
 ### Fixed
 

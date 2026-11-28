@@ -66,9 +66,15 @@ async fn create_assigned_job(db: &DatabaseConnection, repo_id: i64, runner_id: i
     .unwrap();
     let key = rg_core::auth::encryption::derive_key(crate::common::TEST_ENCRYPTION_KEY);
     let empty_mask = rg_core::auth::encryption::encrypt("[]", &key).unwrap();
-    rg_db::ops::pipeline_ops::assign_job_with_mask_snapshot(db, job.id, runner_id, &empty_mask)
-        .await
-        .unwrap();
+    rg_db::ops::pipeline_ops::assign_job_with_mask_snapshot(
+        db,
+        job.id,
+        runner_id,
+        &empty_mask,
+        None,
+    )
+    .await
+    .unwrap();
     job.id
 }
 

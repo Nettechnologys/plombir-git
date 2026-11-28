@@ -158,19 +158,20 @@ async fn fixture() -> Fixture {
     let repo_root = dir.path().join("repos");
     std::fs::create_dir_all(&repo_root).unwrap();
     let ci = Arc::new(RecordingCiEngine::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
     let mut state = build_test_app_state_with(
         db.clone(),
         repo_root.clone(),
         StateOverrides {
             ci_engine: Some(ci.clone()),
+            external_url: Some(format!("http://{addr}")),
             ..StateOverrides::default()
         },
     );
     state.agents_enabled = true;
     state.docker_enabled = true;
     let app = rg_http::create_router_for_test(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -667,6 +668,19 @@ async fn an_instance_without_docker_or_runners_starts_nothing() {
         f.audited("agent.run_refused").await[0]["reason"],
         "no_docker"
     );
+}
+
+/// The agent's container reaches the server by its public address; an
+/// instance without one says so instead of starting a run that cannot clone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_instance_without_a_public_address_starts_nothing() {
+    let f = fixture().await;
+    let mut launcher = f.state.agent_run_launcher();
+    launcher.ci.external_url = None;
+    f.assign_in_core_with(f.alice_id, &launcher).await;
+    assert!(f.runs().await.is_empty());
+    assert_eq!(f.refusals().await, vec!["no_server_url".to_string()]);
+    assert!(f.bot_comments().await[0].contains("external_url"));
 }
 
 /// One active run per bot in a repository (D9).
@@ -1812,4 +1826,335 @@ async fn the_issue_page_learns_whether_its_author_can_write() {
         .collect();
     assert!(flags.contains(&(BOT.to_string(), true)), "{flags:?}");
     assert!(flags.contains(&("bob".to_string(), false)), "{flags:?}");
+}
+
+// ── The model key and the run token reach the job, and nothing else does
+//    (card_47195d097b79) ───────────────────────────────────────────────────
+
+const MODEL_KEY: &str = "sk-model-key-0123456789abcdef";
+
+/// An external runner takes an agent run's job: its environment holds the
+/// model key and a token minted for the attempt — stored by the claim, masked
+/// in the job's log — and no repository or environment secret. Neither value
+/// is in the job's stored row, the pipeline API or the audit log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_external_runner_gets_the_key_and_token_and_no_secret() {
+    use sea_orm::ConnectionTrait as _;
+    let f = fixture().await;
+    f.save_profile(|update| {
+        update.model_key = rg_core::agent::profile::ModelKey::Set(MODEL_KEY.to_string());
+    })
+    .await;
+    let key = rg_core::auth::encryption::derive_key(&f.state.encryption_key);
+    let environment = rg_db::entities::ci_environment::ActiveModel {
+        repo_id: Set(f.repo_id),
+        name: Set("production".to_string()),
+        created_at: Set(chrono::Utc::now()),
+        updated_at: Set(chrono::Utc::now()),
+        ..Default::default()
+    }
+    .insert(&f.db)
+    .await
+    .expect("an environment");
+    for (scope, name, value) in [
+        (None, "REPO_SECRET", "repo-secret-value"),
+        (Some(environment.id), "ENV_SECRET", "env-secret-value"),
+    ] {
+        let sealed = rg_core::auth::encryption::encrypt(value, &key).unwrap();
+        rg_db::ops::ci_secret_ops::upsert(&f.db, f.repo_id, scope, name, &sealed, f.alice_id)
+            .await
+            .unwrap();
+    }
+
+    f.assign_in_core(f.alice_id).await;
+    let run = f.runs().await.remove(0);
+    let attempt = f.attempts(run.id).await.remove(0);
+    let pipeline_id = attempt.pipeline_id.expect("queued");
+    let stage = rg_db::ops::pipeline_ops::create_stage(&f.db, pipeline_id, "agent", 0)
+        .await
+        .unwrap();
+    let job = rg_db::ops::pipeline_ops::create_job(
+        &f.db,
+        stage.id,
+        "agent",
+        COMMAND,
+        Some(IMAGE),
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+        &f.db,
+        f.repo_id,
+        "agent-runner",
+        "[]",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let response = f
+        .http
+        .get(format!(
+            "{}/api/v1/runners/{}/jobs/poll?timeout=2",
+            f.base, runner.id
+        ))
+        .bearer_auth(&runner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let polled: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(polled["job_id"], job.id);
+    let variables = &polled["variables"];
+    assert_eq!(variables["PLOMBIR_MODEL_KEY"], MODEL_KEY);
+    let token = variables["PLOMBIR_AGENT_TOKEN"]
+        .as_str()
+        .expect("the run token")
+        .to_string();
+    for secret in ["repo-secret-value", "env-secret-value"] {
+        assert!(
+            !polled.to_string().contains(secret),
+            "{secret} reached the agent's job"
+        );
+    }
+    assert_eq!(
+        variables["PLOMBIR_REPO_URL"],
+        format!("{}/alice/app.git", f.base)
+    );
+    assert!(variables["PLOMBIR_TASK"]
+        .as_str()
+        .unwrap()
+        .contains("Fix the thing"));
+    assert!(
+        !polled["script"].to_string().contains(MODEL_KEY),
+        "the key travelled in the script, not the environment"
+    );
+
+    // The claim stored exactly this token, for this attempt, and the run runs.
+    let stored = rg_db::entities::access_token::Entity::find()
+        .filter(rg_db::entities::access_token::Column::AgentRunAttemptId.eq(attempt.id))
+        .all(&f.db)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].token_hash, rg_db::token_digest(&token));
+    assert_eq!(f.runs().await.remove(0).status, "running");
+    let (status, _) = (
+        f.http
+            .post(format!("{}/api/v1/mcp", f.base))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        (),
+    );
+    assert_eq!(status, 200, "the handed-out token does not work");
+
+    // Both values are in the log mask the claim sealed.
+    let claimed = rg_db::ops::pipeline_ops::get_job(&f.db, job.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mask: Vec<String> = serde_json::from_str(
+        &rg_core::auth::encryption::decrypt(
+            claimed.mask_secrets_encrypted.as_deref().unwrap(),
+            &key,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        mask.contains(&token) && mask.contains(&MODEL_KEY.to_string()),
+        "{mask:?}"
+    );
+
+    // Neither value is written anywhere it could be read back in the clear.
+    for table in ["pipeline_jobs", "pipelines", "audit_log", "agent_runs"] {
+        let rows =
+            f.db.query_all(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                format!("SELECT * FROM {table}"),
+            ))
+            .await
+            .unwrap();
+        let dump = format!("{rows:?}");
+        for value in [MODEL_KEY, token.as_str()] {
+            assert!(
+                !dump.contains(value),
+                "{table} holds a run secret in the clear"
+            );
+        }
+    }
+    let api = f
+        .http
+        .get(format!(
+            "{}/api/v1/repos/alice/app/pipelines/{pipeline_id}",
+            f.base
+        ))
+        .bearer_auth(&f.alice)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!api.contains(MODEL_KEY) && !api.contains(&token), "{api}");
+}
+
+/// A job of an attempt the run has finished is handed to nobody: the poll
+/// says why, and the pipeline is settled failed instead of offered again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ended_attempt_is_handed_to_no_runner() {
+    let f = fixture().await;
+    f.assign_in_core(f.alice_id).await;
+    let run = f.runs().await.remove(0);
+    let attempt = f.attempts(run.id).await.remove(0);
+    let pipeline_id = attempt.pipeline_id.unwrap();
+    let stage = rg_db::ops::pipeline_ops::create_stage(&f.db, pipeline_id, "agent", 0)
+        .await
+        .unwrap();
+    rg_db::ops::pipeline_ops::create_job(
+        &f.db,
+        stage.id,
+        "agent",
+        COMMAND,
+        Some(IMAGE),
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let mut finished: rg_db::entities::agent_run_attempt::ActiveModel = attempt.clone().into();
+    finished.finished_at = Set(Some(chrono::Utc::now()));
+    finished.update(&f.db).await.unwrap();
+    let (runner, runner_token) = rg_db::ops::runner_ops::register_runner(
+        &f.db,
+        f.repo_id,
+        "agent-runner",
+        "[]",
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let response = f
+        .http
+        .get(format!(
+            "{}/api/v1/runners/{}/jobs/poll?timeout=2",
+            f.base, runner.id
+        ))
+        .bearer_auth(&runner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    assert!(response.text().await.unwrap().contains("has ended"));
+    let pipeline = rg_db::entities::pipeline::Entity::find_by_id(pipeline_id)
+        .one(&f.db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pipeline.status, "failed");
+    assert!(
+        rg_db::entities::access_token::Entity::find()
+            .filter(rg_db::entities::access_token::Column::AgentRunAttemptId.eq(attempt.id))
+            .one(&f.db)
+            .await
+            .unwrap()
+            .is_none(),
+        "an ended attempt got a token"
+    );
+}
+
+/// The hand-out write runs only for the claim that wins: a second poller
+/// that prepared the same job and lost writes no token over the winner's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_the_winning_claim_writes_the_hand_out() {
+    let f = fixture().await;
+    let pipeline = rg_db::ops::pipeline_ops::create_pipeline(
+        &f.db,
+        f.repo_id,
+        &f.main_sha,
+        "refs/heads/main",
+        rg_core::ci::AGENT_RUN_EVENT,
+        None,
+    )
+    .await
+    .unwrap();
+    let stage = rg_db::ops::pipeline_ops::create_stage(&f.db, pipeline.id, "agent", 0)
+        .await
+        .unwrap();
+    let job = rg_db::ops::pipeline_ops::create_job(
+        &f.db,
+        stage.id,
+        "agent",
+        COMMAND,
+        Some(IMAGE),
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let (first, _) =
+        rg_db::ops::runner_ops::register_runner(&f.db, f.repo_id, "a", "[]", None, None, None)
+            .await
+            .unwrap();
+    let (second, _) =
+        rg_db::ops::runner_ops::register_runner(&f.db, f.repo_id, "b", "[]", None, None, None)
+            .await
+            .unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hand_out: Box<rg_db::ops::pipeline_ops::HandOutFn> = {
+        let calls = calls.clone();
+        Box::new(move |_tx| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        })
+    };
+    for (runner, won) in [(first.id, true), (second.id, false)] {
+        assert_eq!(
+            rg_db::ops::pipeline_ops::assign_job_with_mask_snapshot(
+                &f.db,
+                job.id,
+                runner,
+                "mask",
+                Some(&*hand_out),
+            )
+            .await
+            .unwrap(),
+            won
+        );
+    }
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the losing claim wrote its hand-out"
+    );
 }

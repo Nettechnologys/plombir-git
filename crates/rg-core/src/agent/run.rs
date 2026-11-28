@@ -97,6 +97,13 @@ pub const RUN_MCP_TOOLS: &[&str] = &[
 /// had every chance to queue it itself.
 pub const UNQUEUED_RUN_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How many turns a preset's agent may take in a run of `timeout_secs`: one
+/// for every half minute, between 10 and 200 — a backstop beside the timeout,
+/// so an agent stuck in a loop ends before it spends the whole run.
+pub fn max_turns(timeout_secs: i64) -> i64 {
+    (timeout_secs / 30).clamp(10, 200)
+}
+
 /// The refs every run of `bot` may write under: `refs/heads/agent/<bot>/`.
 pub fn branch_prefix(bot: &str) -> String {
     format!("refs/heads/agent/{bot}/")
@@ -683,6 +690,12 @@ fn runnable_job(
         return Ok(Err(Refusal::new(
             "no_docker",
             "I run only in a Docker container, and this instance has neither Docker for CI nor external runners.",
+        )));
+    }
+    if ci.external_url.is_none() {
+        return Ok(Err(Refusal::new(
+            "no_server_url",
+            "I cannot reach this instance from my container: it has no public address. An admin can set `[server] external_url`.",
         )));
     }
     let preset = Preset::parse(&saved.profile.preset)?;

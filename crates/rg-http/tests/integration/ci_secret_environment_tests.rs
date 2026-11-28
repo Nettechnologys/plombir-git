@@ -373,19 +373,29 @@ async fn an_agent_run_job_reaches_a_runner_without_repository_secrets() {
     assert_eq!(polled["job_id"], control);
     assert_eq!(polled["variables"]["REPO_KEY"], "repo-value");
 
-    let agent = pending_job_under(&db, repo_id, "agent", rg_core::ci::AGENT_RUN_EVENT).await;
-    let polled = poll(&client, &base, runner.id, &runner_token)
+    // A pipeline under `agent_run` that no run's attempt carries is nobody's
+    // agent: it is refused and settled, and its job is handed no secret. The
+    // hand-out of a real run's job is `agent_run_launch_tests`.
+    pending_job_under(&db, repo_id, "agent", rg_core::ci::AGENT_RUN_EVENT).await;
+    let response = client
+        .get(format!(
+            "{base}/api/v1/runners/{}/jobs/poll?timeout=1",
+            runner.id
+        ))
+        .bearer_auth(&runner_token)
+        .send()
         .await
-        .expect("agent run job");
-    assert_eq!(polled["job_id"], agent);
+        .unwrap();
+    assert_eq!(response.status(), 409);
     assert!(
-        polled["variables"].get("REPO_KEY").is_none(),
-        "an agent run's job was handed a CI secret: {}",
-        polled["variables"]
+        !response.text().await.unwrap().contains("repo-value"),
+        "the secret's value travelled with the agent run's job"
     );
     assert!(
-        !polled.to_string().contains("repo-value"),
-        "the secret's value travelled with the agent run's job"
+        poll(&client, &base, runner.id, &runner_token)
+            .await
+            .is_none(),
+        "the refused job was offered again"
     );
 }
 

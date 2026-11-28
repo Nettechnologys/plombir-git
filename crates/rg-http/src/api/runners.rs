@@ -533,7 +533,7 @@ pub async fn poll_job(
                     return Err(steps_protocol_refusal(runner_id, &job));
                 }
                 Ok(rg_db::ops::pipeline_ops::PendingPick::Job(job)) => {
-                    let (resp, encrypted_mask) =
+                    let (resp, encrypted_mask, run_token) =
                         prepare_dispatch(&state, runner_id, job.clone()).await?;
                     if !resp.services.is_empty() && !runs_services {
                         return Err(services_protocol_refusal(runner_id, &job));
@@ -555,7 +555,14 @@ pub async fn poll_job(
                     // or server shutdown); claiming earlier stranded the row as
                     // `assigned` while the only response carrying it vanished.
                     // Keep this as the final await before returning the body.
-                    if claim_dispatched_job(&state, runner_id, resp.job_id, &encrypted_mask).await?
+                    if claim_dispatched_job(
+                        &state,
+                        runner_id,
+                        resp.job_id,
+                        &encrypted_mask,
+                        run_token.as_ref(),
+                    )
+                    .await?
                     {
                         return Ok((StatusCode::OK, Json(resp)));
                     }
@@ -1036,7 +1043,9 @@ async fn candidate_pipeline(
 
 /// Lay the server-owned environment over the job's declared variables: the
 /// repository's secrets (each one also a value the log mask hides), the
-/// built-in `CI_*` variables and the job token. Returns the secrets to mask.
+/// built-in `CI_*` variables and the job token — or, for an agent run's job,
+/// its model key and its attempt's token instead of any secret. Returns the
+/// values to mask, and the run token the claim is to store.
 async fn add_server_variables(
     state: &AppState,
     job: &rg_db::entities::pipeline_job::Model,
@@ -1045,7 +1054,7 @@ async fn add_server_variables(
     secret_scope: Option<&std::collections::BTreeSet<String>>,
     token_scopes: &str,
     variables: &mut serde_json::Map<String, serde_json::Value>,
-) -> Result<Vec<String>, Response> {
+) -> Result<(Vec<String>, Option<rg_core::agent::job::PreparedToken>), Response> {
     let pipeline_id = pipeline.id;
     for reserved in rg_core::ci::BUILTIN_CI_VARIABLES {
         variables.remove(reserved);
@@ -1156,7 +1165,54 @@ async fn add_server_variables(
             )),
         );
     }
-    Ok(mask_secrets)
+    let run_token = agent_run_variables(state, pipeline, &mut mask_secrets, variables).await?;
+    Ok((mask_secrets, run_token))
+}
+
+/// An agent run's model key and attempt token, laid into `variables` and
+/// `mask` (ADR-0001 D5, card_47195d097b79). A job whose attempt the run has
+/// moved past, or whose run is over, is settled failed with the reason and
+/// handed to nobody.
+async fn agent_run_variables(
+    state: &AppState,
+    pipeline: &rg_db::entities::pipeline::Model,
+    mask: &mut Vec<String>,
+    variables: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<rg_core::agent::job::PreparedToken>, Response> {
+    let credentials = rg_core::agent::job::job_credentials(
+        &state.db,
+        &state.encryption_key,
+        state.external_url.as_deref(),
+        pipeline,
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(
+            pipeline_id = pipeline.id,
+            error = %format!("{error:#}"),
+            "poll_job: the agent run's credentials could not be prepared"
+        );
+        AppError::from(error).into_response()
+    })?;
+    match credentials {
+        None => Ok(None),
+        Some(Ok(credentials)) => {
+            for (name, value) in credentials.variables {
+                variables.insert(name, serde_json::json!(value));
+            }
+            mask.extend(credentials.masked);
+            Ok(Some(credentials.token))
+        }
+        Some(Err(rg_core::agent::job::NotHandedOut(why))) => {
+            let log = format!("This agent run job was not started: {why}.");
+            if let Err(error) =
+                rg_db::ops::pipeline_ops::fail_pipeline_chain(&state.db, pipeline.id, &log).await
+            {
+                tracing::error!(pipeline_id = pipeline.id, error = %format!("{error:#}"), "poll_job: a stale agent run job could not be settled");
+            }
+            Err(AppError::conflict(log).into_response())
+        }
+    }
 }
 
 /// Everything a runner is handed for `job`, and the sealed log mask the claim
@@ -1165,7 +1221,14 @@ async fn prepare_dispatch(
     state: &AppState,
     runner_id: i64,
     job: rg_db::entities::pipeline_job::Model,
-) -> Result<(PollJobResponse, String), Response> {
+) -> Result<
+    (
+        PollJobResponse,
+        String,
+        Option<rg_core::agent::job::PreparedToken>,
+    ),
+    Response,
+> {
     let DecodedJobColumns {
         mut variables,
         cache_paths,
@@ -1190,7 +1253,7 @@ async fn prepare_dispatch(
             return Err(AppError::internal("invalid stored job context").into_response());
         }
     };
-    let mask_secrets = add_server_variables(
+    let (mask_secrets, run_token) = add_server_variables(
         state,
         &job,
         &pipeline,
@@ -1274,7 +1337,7 @@ async fn prepare_dispatch(
         artifact_paths,
         timeout: rg_core::ci::dispatched_job_timeout_secs(timeout_secs),
     };
-    Ok((resp, encrypted_mask))
+    Ok((resp, encrypted_mask, run_token))
 }
 
 /// Claim a prepared job for `runner_id`: `Ok(false)` when another poller or a
@@ -1289,12 +1352,17 @@ async fn claim_dispatched_job(
     runner_id: i64,
     job_id: i64,
     encrypted_mask: &str,
+    run_token: Option<&rg_core::agent::job::PreparedToken>,
 ) -> Result<bool, Response> {
+    // An agent run's token is written by the claim that wins, in its own
+    // transaction: a poller that lost never wrote one (card_47195d097b79).
+    let hand_out = run_token.cloned().map(rg_core::agent::job::hand_out);
     match rg_db::ops::pipeline_ops::assign_job_with_mask_snapshot(
         &state.db,
         job_id,
         runner_id,
         encrypted_mask,
+        hand_out.as_deref(),
     )
     .await
     {

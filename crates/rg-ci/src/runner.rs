@@ -1758,6 +1758,7 @@ impl PipelineRunner {
         let pipeline = pipeline_ops::get_pipeline(&self.db, self.pipeline_id)
             .await?
             .context("pipeline not found while preparing job environment")?;
+        let agent_credentials = self.agent_run_credentials(&pipeline).await?;
         let mut env = std::collections::BTreeMap::new();
         let mut secret_values = Vec::new();
         let mut ignored = std::collections::BTreeSet::new();
@@ -1845,6 +1846,14 @@ impl PipelineRunner {
                 env.insert("CI_OIDC_TOKEN_URL".into(), url.clone());
             }
         }
+        // An agent run's model key and its attempt's token (ADR-0001 D5): in
+        // the environment and the mask, nowhere else.
+        if let Some(credentials) = agent_credentials {
+            for (name, value) in credentials.variables {
+                env.insert(name, value);
+            }
+            secret_values.extend(credentials.masked);
+        }
         if let Ok(path) = std::env::var("PATH") {
             env.insert("PATH".into(), path);
         }
@@ -1860,6 +1869,46 @@ impl PipelineRunner {
             secret_values,
             ignored.into_iter().collect(),
         ))
+    }
+
+    /// The model key and attempt token an agent run's job is handed, with
+    /// the token stored — `None` for any other pipeline (ADR-0001 D2, D5;
+    /// card_47195d097b79). An agent job is refused here, with the reason, when
+    /// this runner has no Docker (the command would run on this host) or when
+    /// its attempt is not the run's current one.
+    async fn agent_run_credentials(
+        &self,
+        pipeline: &rg_db::entities::pipeline::Model,
+    ) -> Result<Option<rg_core::agent::job::JobCredentials>> {
+        if pipeline.trigger_type != rg_core::ci::AGENT_RUN_EVENT {
+            return Ok(None);
+        }
+        if !self.docker_enabled {
+            anyhow::bail!(
+                "an agent run runs only in a Docker container, and Docker is disabled on this \
+                 runner (ci.docker = false); it is never run on the host"
+            );
+        }
+        let encryption_key = self
+            .encryption_key
+            .as_deref()
+            .context("an agent run needs the server's encryption key to unseal its model key")?;
+        let server_url = self
+            .oidc_token_url
+            .as_deref()
+            .and_then(|url| url.strip_suffix("/api/v1/ci/oidc/token"));
+        match rg_core::agent::job::job_credentials(&self.db, encryption_key, server_url, pipeline)
+            .await?
+        {
+            None => Ok(None),
+            Some(Err(rg_core::agent::job::NotHandedOut(why))) => {
+                anyhow::bail!("this agent run job was not started: {why}")
+            }
+            Some(Ok(credentials)) => {
+                rg_core::agent::job::store_token(&self.db, &credentials.token).await?;
+                Ok(Some(credentials))
+            }
+        }
     }
 
     fn workspace_path(&self) -> std::path::PathBuf {
@@ -2992,18 +3041,23 @@ mod tests {
         cache_runner_on(db, root, repository.id, "refs/heads/main").await
     }
 
-    /// ADR-0001 D5: a job of an agent run's pipeline is handed none of the
-    /// repository's secrets — not even masked into its log list, since it
-    /// never reads them. The same job under `push` gets them, so the empty
-    /// answer is the event's doing.
+    /// ADR-0001 D2, D5 (card_47195d097b79): a job of an agent run's pipeline
+    /// is handed none of the repository's secrets — not even masked into its
+    /// log list, since it never reads them — and exactly the bot's model key
+    /// and a token minted for its attempt, both masked. The same job under
+    /// `push` gets the secret, so the difference is the event's doing.
     #[tokio::test]
-    async fn an_agent_run_job_is_handed_no_repository_secret() {
-        use sea_orm::{ActiveModelTrait as _, EntityTrait as _};
+    async fn an_agent_run_job_is_handed_its_key_and_token_and_no_secret() {
+        use sea_orm::{
+            ActiveModelTrait as _, ColumnTrait as _, EntityTrait as _, QueryFilter as _,
+        };
 
         let temp = tempfile::tempdir().unwrap();
         let mut runner = cache_runner(temp.path()).await;
         let encryption_key = "runner-at-rest-encryption-key";
         runner.set_encryption_key(encryption_key.into());
+        runner.set_oidc_token_url("https://forge.example/api/v1/ci/oidc/token".into());
+        runner.docker_enabled = true;
         let key = rg_core::auth::encryption::derive_key(encryption_key);
         let owner = rg_db::ops::repo_ops::find_by_id(&runner.db, runner.repo_id)
             .await
@@ -3023,24 +3077,49 @@ mod tests {
         .unwrap();
 
         let read = || async {
-            let (variables, masked, _) = runner
+            runner
                 .job_environment(None, None, None, None, DEFAULT_CI_TOKEN_SCOPES)
                 .await
-                .unwrap();
-            let secret = variables
-                .into_iter()
-                .find(|(name, _)| name == "REPO_KEY")
-                .map(|(_, value)| value);
-            (secret, masked)
         };
-        let (secret, masked) = read().await;
-        assert_eq!(
-            secret.as_deref(),
-            Some("repo-value"),
-            "the control job got no secret"
-        );
+        let (variables, masked, _) = read().await.unwrap();
+        assert!(variables
+            .iter()
+            .any(|(name, value)| name == "REPO_KEY" && value == "repo-value"));
         assert!(masked.contains(&"repo-value".to_string()));
 
+        // Turn the pipeline into an agent run's: a bot with a key, its run and
+        // the attempt this pipeline carries.
+        let bot = rg_core::user::bots::create_bot(
+            &runner.db,
+            rg_core::user::service::LdapDirectories {
+                encryption_key: "test-encryption-key",
+                transport_policy: &Default::default(),
+            },
+            owner,
+            "cache-agent",
+            None,
+        )
+        .await
+        .unwrap();
+        rg_core::agent::profile::save(
+            &runner.db,
+            &key,
+            &bot,
+            rg_core::agent::profile::ProfileUpdate {
+                enabled: true,
+                preset: "claude_code".into(),
+                image: Some("ghcr.io/acme/agent:1".into()),
+                command: None,
+                runner_tags: None,
+                model_key: rg_core::agent::profile::ModelKey::Set("sk-model-0123456789".into()),
+                timeout_secs: Some(600),
+                max_runs_per_day: None,
+                max_iterations: None,
+                repository_ids: vec![runner.repo_id],
+            },
+        )
+        .await
+        .unwrap();
         let pipeline = rg_db::entities::pipeline::Entity::find_by_id(runner.pipeline_id)
             .one(&runner.db)
             .await
@@ -3049,13 +3128,131 @@ mod tests {
         let mut agent_run: rg_db::entities::pipeline::ActiveModel = pipeline.into();
         agent_run.trigger_type = Set(rg_core::ci::AGENT_RUN_EVENT.to_string());
         agent_run.update(&runner.db).await.unwrap();
+        let run = rg_db::entities::agent_run::ActiveModel {
+            bot_id: Set(bot.id),
+            repository_id: Set(runner.repo_id),
+            iteration: Set(1),
+            triggered_by: Set(owner),
+            trigger_key: Set("test:cache-agent".into()),
+            status: Set("queued".into()),
+            active: Set(Some(true)),
+            write_ref_prefix: Set(Some("refs/heads/agent/cache-agent/".into())),
+            commit_sha: Set(Some("0".repeat(40))),
+            task: Set(Some("# Task".into())),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(&runner.db)
+        .await
+        .unwrap();
+        let attempt = rg_db::entities::agent_run_attempt::ActiveModel {
+            run_id: Set(run.id),
+            attempt: Set(1),
+            pipeline_id: Set(Some(runner.pipeline_id)),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(&runner.db)
+        .await
+        .unwrap();
 
-        let (secret, masked) = read().await;
-        assert_eq!(secret, None, "an agent run's job was handed a CI secret");
+        let (variables, masked, _) = read().await.unwrap();
+        let env: std::collections::BTreeMap<_, _> = variables.into_iter().collect();
+        assert_eq!(
+            env.get("REPO_KEY"),
+            None,
+            "an agent run's job was handed a CI secret"
+        );
         assert!(
             !masked.contains(&"repo-value".to_string()),
-            "an agent run's job read the secret to mask it"
+            "it read the secret to mask it"
         );
+        assert_eq!(
+            env.get("PLOMBIR_MODEL_KEY").map(String::as_str),
+            Some("sk-model-0123456789")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("sk-model-0123456789"),
+            "the preset's CLI reads the key by its own name"
+        );
+        let token = env
+            .get("PLOMBIR_AGENT_TOKEN")
+            .expect("the run token")
+            .clone();
+        assert!(masked.contains(&token) && masked.contains(&"sk-model-0123456789".to_string()));
+        assert_eq!(
+            env.get("PLOMBIR_REPO_URL").map(String::as_str),
+            Some("https://forge.example/cache-owner/repo.git")
+        );
+        assert_eq!(
+            env.get("PLOMBIR_MCP_URL").map(String::as_str),
+            Some("https://forge.example/api/v1/mcp")
+        );
+        assert_eq!(env.get("PLOMBIR_TASK").map(String::as_str), Some("# Task"));
+        let stored = rg_db::entities::access_token::Entity::find()
+            .filter(rg_db::entities::access_token::Column::AgentRunAttemptId.eq(attempt.id))
+            .all(&runner.db)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1, "the attempt's token is stored once");
+        assert_eq!(stored[0].token_hash, rg_db::token_digest(&token));
+        let running = rg_db::entities::agent_run::Entity::find_by_id(run.id)
+            .one(&runner.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.status, "running");
+
+        // Handed out again: the earlier token is gone, the new one stands.
+        let (again, _, _) = read().await.unwrap();
+        let second = again
+            .into_iter()
+            .find(|(name, _)| name == "PLOMBIR_AGENT_TOKEN")
+            .unwrap()
+            .1;
+        assert_ne!(second, token);
+        let stored = rg_db::entities::access_token::Entity::find()
+            .filter(rg_db::entities::access_token::Column::AgentRunAttemptId.eq(attempt.id))
+            .all(&runner.db)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].token_hash, rg_db::token_digest(&second));
+
+        // A finished attempt gets nothing, with the reason.
+        let mut finished: rg_db::entities::agent_run_attempt::ActiveModel = attempt.into();
+        finished.finished_at = Set(Some(chrono::Utc::now()));
+        finished.update(&runner.db).await.unwrap();
+        let refused = read().await.expect_err("a finished attempt was handed out");
+        assert!(format!("{refused:#}").contains("has ended"), "{refused:#}");
+
+        // And never without Docker: the command would run on this host. Back
+        // on a fresh attempt, so Docker is the only thing it lacks.
+        let fresh = rg_db::entities::agent_run_attempt::ActiveModel {
+            run_id: Set(run.id),
+            attempt: Set(2),
+            pipeline_id: Set(Some(runner.pipeline_id)),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        };
+        rg_db::entities::agent_run_attempt::Entity::update_many()
+            .col_expr(
+                rg_db::entities::agent_run_attempt::Column::PipelineId,
+                sea_orm::sea_query::Expr::value(Option::<i64>::None),
+            )
+            .exec(&runner.db)
+            .await
+            .unwrap();
+        fresh.insert(&runner.db).await.unwrap();
+        assert!(read().await.is_ok(), "the fresh attempt is not handed out");
+        let mut runner = runner;
+        runner.docker_enabled = false;
+        let refused = runner
+            .job_environment(None, None, None, None, DEFAULT_CI_TOKEN_SCOPES)
+            .await
+            .expect_err("an agent job was prepared for the host");
+        assert!(format!("{refused:#}").contains("Docker"), "{refused:#}");
     }
 
     /// PR #16: the embedded runner hands a job the repository-wide secrets,

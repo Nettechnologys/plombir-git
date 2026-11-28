@@ -72,11 +72,31 @@ pub fn generate_access_token() -> String {
 /// verifier looks a presented token up by.
 pub async fn issue(db: &DatabaseConnection, new: NewAccessToken) -> Result<IssuedAccessToken> {
     let raw = generate_access_token();
+    let (model, repository_ids) = token_row(&raw, new);
+    let token = rg_db::ops::token_ops::create(db, model, &repository_ids).await?;
+    Ok(IssuedAccessToken { raw, token })
+}
+
+/// Store a token whose raw value `raw` was generated earlier
+/// ([`generate_access_token`]) and already handed to its holder, inside the
+/// caller's transaction — an agent run job's claim, which hands the raw value
+/// out only if it wins.
+pub async fn store_prepared(
+    db: &impl sea_orm::ConnectionTrait,
+    raw: &str,
+    new: NewAccessToken,
+) -> Result<access_token::Model> {
+    let (model, repository_ids) = token_row(raw, new);
+    rg_db::ops::token_ops::create_in(db, model, &repository_ids).await
+}
+
+fn token_row(raw: &str, new: NewAccessToken) -> (access_token::ActiveModel, Vec<i64>) {
+    let repository_ids = new.repository_ids.clone().unwrap_or_default();
     let model = access_token::ActiveModel {
         id: NotSet,
         user_id: Set(new.user_id),
         name: Set(new.name),
-        token_hash: Set(rg_db::token_digest(&raw)),
+        token_hash: Set(rg_db::token_digest(raw)),
         scopes: Set(new.scopes),
         expires_at: Set(new.expires_at),
         last_used_at: Set(None),
@@ -88,10 +108,7 @@ pub async fn issue(db: &DatabaseConnection, new: NewAccessToken) -> Result<Issue
         allow_git: Set(new.allow_git),
         agent_run_attempt_id: Set(new.agent_run_attempt_id),
     };
-    let token =
-        rg_db::ops::token_ops::create(db, model, new.repository_ids.as_deref().unwrap_or_default())
-            .await?;
-    Ok(IssuedAccessToken { raw, token })
+    (model, repository_ids)
 }
 
 /// How long a run token outlives the run's own timeout.
@@ -140,6 +157,18 @@ pub async fn issue_for_agent_run(
     db: &DatabaseConnection,
     grant: AgentRunGrant<'_>,
 ) -> Result<IssuedAccessToken> {
+    let run = rg_db::ops::agent_run_ops::run_of_attempt(db, grant.attempt_id)
+        .await?
+        .ok_or_else(|| crate::error::not_found("agent run attempt"))?;
+    issue(db, agent_run_token_row(grant, &run)?).await
+}
+
+/// The row of the token [`issue_for_agent_run`] mints for `grant`, `run`
+/// being the run the grant's attempt belongs to — checked, not stored.
+pub fn agent_run_token_row(
+    grant: AgentRunGrant<'_>,
+    run: &rg_db::entities::agent_run::Model,
+) -> Result<NewAccessToken> {
     if !grant.bot.is_bot() {
         return Err(crate::error::forbidden(
             "an agent run token is issued only to a bot account",
@@ -157,33 +186,25 @@ pub async fn issue_for_agent_run(
             "an agent run token needs a positive run timeout",
         ));
     }
-    let run = rg_db::ops::agent_run_ops::run_of_attempt(db, grant.attempt_id)
-        .await?
-        .ok_or_else(|| crate::error::not_found("agent run attempt"))?;
     if run.bot_id != grant.bot.id || run.repository_id != grant.repository_id {
         return Err(crate::error::forbidden(
             "the attempt belongs to another bot's run or another repository",
         ));
     }
-    issue(
-        db,
-        NewAccessToken {
-            user_id: grant.bot.id,
-            name: format!("agent run {} attempt {}", run.id, grant.attempt_id),
-            scopes: "repo".to_string(),
-            expires_at: Some(
-                Utc::now()
-                    + chrono::Duration::seconds(grant.timeout_secs + AGENT_RUN_TOKEN_GRACE_SECS),
-            ),
-            repository_ids: Some(vec![grant.repository_id]),
-            mcp_tools: Some(crate::agent::run::RUN_MCP_TOOLS.join(",")),
-            deny_protected_merge: true,
-            write_ref_prefix: Some(grant.write_ref_prefix.to_string()),
-            allow_git: true,
-            agent_run_attempt_id: Some(grant.attempt_id),
-        },
-    )
-    .await
+    Ok(NewAccessToken {
+        user_id: grant.bot.id,
+        name: format!("agent run {} attempt {}", run.id, grant.attempt_id),
+        scopes: "repo".to_string(),
+        expires_at: Some(
+            Utc::now() + chrono::Duration::seconds(grant.timeout_secs + AGENT_RUN_TOKEN_GRACE_SECS),
+        ),
+        repository_ids: Some(vec![grant.repository_id]),
+        mcp_tools: Some(crate::agent::run::RUN_MCP_TOOLS.join(",")),
+        deny_protected_merge: true,
+        write_ref_prefix: Some(grant.write_ref_prefix.to_string()),
+        allow_git: true,
+        agent_run_attempt_id: Some(grant.attempt_id),
+    })
 }
 
 /// Delete the token of agent run attempt `attempt_id`; `false` when it had

@@ -6,6 +6,7 @@
 //! run's record and its synthetic pipeline. The runner side comes in later
 //! cards of `phase_948358cdfcf6`.
 
+pub mod job;
 pub mod profile;
 pub mod run;
 pub mod trust;
