@@ -2540,7 +2540,7 @@ const AFTER: &str = "after";
     /// Built-in defaults with no operator-facing spelling, each with the reason.
     /// The list exists so that a new `DEFAULT_*` nobody documented is a decision
     /// someone made, rather than something that quietly escaped both pages.
-    const NOT_NAMED_IN_HELP: [(&str, &str); 31] = [
+    const NOT_NAMED_IN_HELP: [(&str, &str); 33] = [
         (
             "DEFAULT_LOG_MAX_SIZE_MB",
             "the size cap is inactive until explicitly set; presenting 10 MB as an active default would mislead operators",
@@ -2580,6 +2580,14 @@ const AFTER: &str = "after";
         (
             "DEFAULT_AGENTS_ENABLED",
             "config-file-only: `[agents].enabled` has no CLI flag",
+        ),
+        (
+            "DEFAULT_AGENTS_MAX_RUNS_PER_DAY",
+            "config-file-only: `[agents].max_runs_per_day` has no CLI flag",
+        ),
+        (
+            "DEFAULT_AGENTS_MAX_TIMEOUT_SECS",
+            "config-file-only: `[agents].max_timeout_secs` has no CLI flag",
         ),
         (
             "DEFAULT_HSTS_PRELOAD",

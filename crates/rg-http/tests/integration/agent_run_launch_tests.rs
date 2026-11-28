@@ -38,6 +38,9 @@ struct Enqueued {
 #[derive(Default)]
 struct RecordingCiEngine {
     enqueued: Mutex<Vec<Enqueued>>,
+    /// Never answer an enqueue: the request is stuck between the assignment's
+    /// commit and the run's pipeline until it is dropped — a fault there.
+    hang: std::sync::atomic::AtomicBool,
 }
 
 impl RecordingCiEngine {
@@ -83,8 +86,16 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
             triggered_by: params.triggered_by,
         };
         let db = params.db.clone();
+        let attempt_id = params.attempt_id;
+        let hang = self.hang.load(std::sync::atomic::Ordering::SeqCst);
         Box::pin(async move {
-            // A real row: the attempt points at its pipeline by foreign key.
+            if hang {
+                std::future::pending::<()>().await;
+            }
+            // A real row, linked to its attempt in the same transaction as the
+            // engine does: the attempt points at it by foreign key.
+            use sea_orm::TransactionTrait as _;
+            let tx = db.begin().await?;
             let pipeline = rg_db::entities::pipeline::ActiveModel {
                 repo_id: Set(entry.repo_id),
                 commit_sha: Set(entry.commit_sha.clone()),
@@ -94,8 +105,15 @@ impl rg_core::ci::CiTrigger for RecordingCiEngine {
                 triggered_by: Set(entry.triggered_by),
                 ..Default::default()
             }
-            .insert(&db)
+            .insert(&tx)
             .await?;
+            if !rg_db::ops::agent_run_ops::link_attempt_pipeline(&tx, attempt_id, pipeline.id)
+                .await?
+            {
+                tx.rollback().await?;
+                anyhow::bail!("attempt {attempt_id} is already carried by a pipeline");
+            }
+            tx.commit().await?;
             self.enqueued.lock().unwrap().push(entry);
             Ok(pipeline.id)
         })
@@ -967,4 +985,549 @@ async fn the_attempt_token_moves_lfs_objects_of_its_repository_only() {
     .raw;
     let refused = f.lfs_batch(&mcp_only, "app", "download", payload).await;
     assert_eq!(refused.status(), 403, "{}", refused.text().await.unwrap());
+}
+
+// ── A start is never lost and never doubled (card_b391e92474a0) ────────────
+
+impl Fixture {
+    /// Open issue `#number` in `alice/<repo>`, titled after it.
+    async fn open_issue(&self, repo: &str) -> i64 {
+        let response = self
+            .http
+            .post(format!("{}/api/v1/repos/alice/{repo}/issues", self.base))
+            .bearer_auth(&self.alice)
+            .json(&serde_json::json!({ "title": "Another thing", "body": "Also broken." }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 201, "{}", response.text().await.unwrap());
+        response.json::<serde_json::Value>().await.unwrap()["number"]
+            .as_i64()
+            .unwrap()
+    }
+
+    /// The bot becomes a writer on `alice/other` too, and its profile lists
+    /// both repositories, allowing `per_day` runs a day.
+    async fn work_in_both_repositories(&self, per_day: i64) {
+        let response = self
+            .http
+            .post(format!(
+                "{}/api/v1/repos/alice/other/collaborators",
+                self.base
+            ))
+            .bearer_auth(&self.alice)
+            .json(&serde_json::json!({ "username": BOT, "permission": "write" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let other = self.other_repo_id;
+        self.save_profile(|update| {
+            update.repository_ids.push(other);
+            update.max_runs_per_day = Some(per_day);
+        })
+        .await;
+    }
+
+    async fn issue_model(&self, repo: &str, number: i64) -> rg_db::entities::issue::Model {
+        rg_core::issue::service::get_issue(&self.db, "alice", repo, number)
+            .await
+            .unwrap()
+    }
+
+    /// Assign `alice/<repo>#number` to the bot as Alice, through the core.
+    async fn assign_issue(&self, repo: &str, number: i64, assignee: Option<i64>) {
+        rg_core::issue::service::update_issue(
+            &self.state.db_pools(),
+            "alice",
+            repo,
+            number,
+            None,
+            None,
+            None,
+            None,
+            Some(assignee),
+            None,
+            Some(&self.state.delivery_tracker),
+            Some(self.alice_id),
+            Some(&self.state.agent_run_launcher()),
+        )
+        .await
+        .expect("the assignment itself succeeds");
+    }
+
+    /// The checks of D6 for assigning `alice/<repo>#number` to the bot.
+    async fn plan(&self, repo: &str, number: i64) -> rg_core::agent::run::AssignmentPlan {
+        let issue = self.issue_model(repo, number).await;
+        rg_core::agent::run::plan_assignment(
+            &self.state.db_pools(),
+            &self.state.agent_run_launcher(),
+            &issue,
+            self.bot.id,
+            Some(self.alice_id),
+        )
+        .await
+    }
+
+    /// Write the run `plan` describes in a transaction of its own, as the
+    /// assignment's transaction would.
+    async fn reserve(
+        &self,
+        plan: &rg_core::agent::run::AssignmentPlan,
+        repo: &str,
+        number: i64,
+    ) -> rg_core::agent::run::Reservation {
+        use sea_orm::TransactionTrait as _;
+        let issue = self.issue_model(repo, number).await;
+        let planned = plan.planned().expect("every check passed");
+        let txn = self.db.begin().await.unwrap();
+        let key =
+            rg_core::agent::run::assignment_trigger_key(issue.id, self.bot.id, chrono::Utc::now());
+        let reserved = rg_core::agent::run::reserve(&txn, planned, issue.id, &key)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        reserved
+    }
+
+    async fn attempts(&self, run_id: i64) -> Vec<rg_db::entities::agent_run_attempt::Model> {
+        rg_db::entities::agent_run_attempt::Entity::find()
+            .filter(rg_db::entities::agent_run_attempt::Column::RunId.eq(run_id))
+            .all(&self.db)
+            .await
+            .unwrap()
+    }
+
+    async fn refusals(&self) -> Vec<String> {
+        self.audited("agent.run_refused")
+            .await
+            .into_iter()
+            .map(|details| details["reason"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn today() -> String {
+        chrono::Utc::now().format("%Y-%m-%d").to_string()
+    }
+}
+
+/// Two issues assigned to one bot at the same moment: both pass the checks
+/// read before the write, and still only one run exists — the unique index
+/// decides it, and the loser says so on its issue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_concurrent_assignments_start_one_run() {
+    let f = fixture().await;
+    let second = f.open_issue("app").await;
+    tokio::join!(
+        f.assign_issue("app", 1, Some(f.bot.id)),
+        f.assign_issue("app", second, Some(f.bot.id)),
+    );
+    assert_eq!(
+        f.runs().await.len(),
+        1,
+        "two runs of one bot in one repository"
+    );
+    assert_eq!(f.ci.take().len(), 1, "two pipelines were queued");
+    assert_eq!(f.refusals().await, vec!["run_in_progress".to_string()]);
+    let comments = f.bot_comments().await;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(comments[0].contains("already working"), "{}", comments[0]);
+}
+
+/// The same race, with the order pinned: both plans passed every check
+/// before either was written, so the refusal can only come from the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_one_active_slot_is_decided_by_the_write() {
+    let f = fixture().await;
+    let second = f.open_issue("app").await;
+    let first_plan = f.plan("app", 1).await;
+    let second_plan = f.plan("app", second).await;
+    assert!(
+        matches!(
+            f.reserve(&first_plan, "app", 1).await,
+            rg_core::agent::run::Reservation::Run { .. }
+        ),
+        "the first write did not take the slot"
+    );
+    match f.reserve(&second_plan, "app", second).await {
+        rg_core::agent::run::Reservation::Refused(refusal) => {
+            assert_eq!(refusal.reason, "run_in_progress")
+        }
+        other => panic!("the second write took a second slot: {other:?}"),
+    }
+    assert_eq!(f.runs().await.len(), 1);
+}
+
+/// One run left today, two repositories asking for it at once: one gets it,
+/// the other is refused for the day — and the allowance is not overspent by a
+/// count both of them read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_last_run_of_the_day_is_taken_once() {
+    let f = fixture().await;
+    f.work_in_both_repositories(2).await;
+    let elsewhere = f.open_issue("other").await;
+    assert!(
+        rg_db::ops::agent_run_ops::reserve_daily_run(&f.db, f.bot.id, &Fixture::today(), 2)
+            .await
+            .unwrap()
+    );
+
+    let here = f.plan("app", 1).await;
+    let there = f.plan("other", elsewhere).await;
+    assert!(matches!(
+        f.reserve(&here, "app", 1).await,
+        rg_core::agent::run::Reservation::Run { .. }
+    ));
+    match f.reserve(&there, "other", elsewhere).await {
+        rg_core::agent::run::Reservation::Refused(refusal) => {
+            assert_eq!(refusal.reason, "daily_limit")
+        }
+        other => panic!("a third run of a two-run day was written: {other:?}"),
+    }
+    let quota = rg_db::entities::agent_run_quota::Entity::find()
+        .filter(rg_db::entities::agent_run_quota::Column::BotId.eq(f.bot.id))
+        .all(&f.db)
+        .await
+        .unwrap();
+    assert_eq!(quota.len(), 1);
+    assert_eq!(quota[0].used, 2, "a refused write kept its reservation");
+}
+
+/// The same day spent through the assignment itself, concurrently: one run,
+/// and the bot says on the other issue that the day is over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_assignments_on_the_last_run_of_the_day_start_one() {
+    let f = fixture().await;
+    f.work_in_both_repositories(2).await;
+    let elsewhere = f.open_issue("other").await;
+    assert!(
+        rg_db::ops::agent_run_ops::reserve_daily_run(&f.db, f.bot.id, &Fixture::today(), 2)
+            .await
+            .unwrap()
+    );
+    tokio::join!(
+        f.assign_issue("app", 1, Some(f.bot.id)),
+        f.assign_issue("other", elsewhere, Some(f.bot.id)),
+    );
+    assert_eq!(
+        f.runs().await.len(),
+        1,
+        "the day's last run was taken twice"
+    );
+    assert_eq!(f.refusals().await, vec!["daily_limit".to_string()]);
+    let comments = f.bot_comments().await;
+    assert_eq!(comments.len(), 1);
+    assert!(comments[0].contains("runs for today"), "{}", comments[0]);
+}
+
+/// `[agents].max_runs_per_day` caps a profile that allows more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_instance_ceiling_caps_the_profiles_day() {
+    let f = fixture().await;
+    assert!(
+        rg_db::ops::agent_run_ops::reserve_daily_run(&f.db, f.bot.id, &Fixture::today(), 20)
+            .await
+            .unwrap()
+    );
+    let mut launcher = f.state.agent_run_launcher();
+    launcher.limits.max_runs_per_day = 1;
+    f.assign_in_core_with(f.alice_id, &launcher).await;
+    assert!(f.runs().await.is_empty());
+    assert_eq!(f.refusals().await, vec!["daily_limit".to_string()]);
+    assert!(f.bot_comments().await[0].contains("all 1 of my runs"));
+}
+
+/// The request stops dead after the assignment committed and before the
+/// run's pipeline exists — the server died, the client hung up. The run is
+/// on record all the same, and recovery queues it exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fault_between_the_assignment_and_the_queue_loses_no_run() {
+    let f = fixture().await;
+    f.ci.hang.store(true, std::sync::atomic::Ordering::SeqCst);
+    let request = {
+        let state = f.state.clone();
+        let (alice_id, bot_id) = (f.alice_id, f.bot.id);
+        tokio::spawn(async move {
+            rg_core::issue::service::update_issue(
+                &state.db_pools(),
+                "alice",
+                "app",
+                1,
+                None,
+                None,
+                None,
+                None,
+                Some(Some(bot_id)),
+                None,
+                Some(&state.delivery_tracker),
+                Some(alice_id),
+                Some(&state.agent_run_launcher()),
+            )
+            .await
+        })
+    };
+    let run = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if let Some(run) = f.runs().await.into_iter().next() {
+                return run;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the assignment's transaction wrote the run");
+    request.abort();
+    assert!(
+        request.await.is_err_and(|join| join.is_cancelled()),
+        "the stuck request finished instead of being dropped"
+    );
+    f.ci.hang.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    assert_eq!(
+        f.issue_model("app", 1).await.assignee_id,
+        Some(f.bot.id),
+        "the assignment committed"
+    );
+    assert_eq!((run.status.as_str(), run.active), ("queued", Some(true)));
+    assert_eq!(run.commit_sha.as_deref(), Some(f.main_sha.as_str()));
+    assert!(f.ci.take().is_empty());
+    assert!(f.attempts(run.id).await[0].pipeline_id.is_none());
+
+    let pools = f.state.db_pools();
+    let launcher = f.state.agent_run_launcher();
+    let early =
+        rg_core::agent::run::recover(&pools, &launcher, std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+    assert_eq!(
+        early.queued, 0,
+        "recovery queued a run still inside its grace"
+    );
+
+    let recovered = rg_core::agent::run::recover(&pools, &launcher, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(recovered.queued, 1, "{recovered:?}");
+    let enqueued = f.ci.take();
+    assert_eq!(enqueued.len(), 1);
+    assert_eq!(
+        enqueued[0].commit_sha, f.main_sha,
+        "queued from another commit"
+    );
+    assert!(f.attempts(run.id).await[0].pipeline_id.is_some());
+    assert_eq!(f.audited("agent.run_started").await.len(), 1);
+
+    let again = rg_core::agent::run::recover(&pools, &launcher, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(again, rg_core::agent::run::Recovered::default());
+    assert!(f.ci.take().is_empty(), "the attempt was queued twice");
+}
+
+/// One attempt, two callers queueing it: the second pipeline is refused in
+/// its own transaction, so the agent never runs twice for one attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attempt_is_carried_by_one_pipeline() {
+    let f = fixture().await;
+    f.assign_in_core(f.alice_id).await;
+    let run = f.runs().await.remove(0);
+    let attempt = f.attempts(run.id).await.remove(0);
+    let carried = attempt.pipeline_id.expect("queued");
+    assert!(
+        !rg_db::ops::agent_run_ops::link_attempt_pipeline(&f.db, attempt.id, carried + 1000)
+            .await
+            .unwrap()
+    );
+    assert_eq!(f.attempts(run.id).await[0].pipeline_id, Some(carried));
+}
+
+/// Taking the issue off the bot ends its run in the same transaction: the
+/// run is cancelled once, its token stops working, its pipeline is cancelled,
+/// and the bot says it stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unassigning_the_issue_cancels_its_run() {
+    let f = fixture().await;
+    f.assign_in_core(f.alice_id).await;
+    let run = f.runs().await.remove(0);
+    let attempt = f.attempts(run.id).await.remove(0);
+    let token = f.issue_run_token(attempt.id, PREFIX).await.unwrap();
+
+    f.assign_issue("app", 1, None).await;
+
+    let ended = f.runs().await.remove(0);
+    assert_eq!((ended.status.as_str(), ended.active), ("cancelled", None));
+    assert!(ended.finished_at.is_some());
+    let attempt = f.attempts(run.id).await.remove(0);
+    assert!(attempt.finished_at.is_some());
+    assert!(
+        rg_db::entities::access_token::Entity::find_by_id(token.token.id)
+            .one(&f.db)
+            .await
+            .unwrap()
+            .is_none(),
+        "the cancelled run's token still exists"
+    );
+    let pipeline = rg_db::entities::pipeline::Entity::find_by_id(attempt.pipeline_id.unwrap())
+        .one(&f.db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pipeline.status, "canceled");
+    let finished = f.audited("agent.run_finished").await;
+    assert_eq!(finished.len(), 1, "{finished:?}");
+    assert_eq!(finished[0]["outcome"], "cancelled");
+    assert_eq!(
+        f.bot_comments().await,
+        vec![rg_core::agent::run::UNASSIGNED_MESSAGE.to_string()]
+    );
+
+    // An edit that leaves the assignee alone ends nothing further.
+    f.assign_issue("app", 1, None).await;
+    assert_eq!(f.audited("agent.run_finished").await.len(), 1);
+}
+
+/// Reassigning to a person ends the bot's run as well.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reassigning_the_issue_to_a_person_cancels_the_bots_run() {
+    let f = fixture().await;
+    f.assign_in_core(f.alice_id).await;
+    f.assign_issue("app", 1, Some(f.alice_id)).await;
+    let run = f.runs().await.remove(0);
+    assert_eq!((run.status.as_str(), run.active), ("cancelled", None));
+}
+
+/// The owner switching the profile off, or taking the repository off it,
+/// stops a live run through the profile route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_owner_withdrawing_consent_cancels_the_run() {
+    for change in ["switched off", "repository removed"] {
+        let f = fixture().await;
+        f.assign_in_core(f.alice_id).await;
+        let body = match change {
+            "switched off" => serde_json::json!({
+                "enabled": false, "preset": "custom", "image": IMAGE, "command": COMMAND,
+                "repositories": ["alice/app"],
+            }),
+            _ => serde_json::json!({
+                "enabled": true, "preset": "custom", "image": IMAGE, "command": COMMAND,
+                "repositories": ["alice/other"],
+            }),
+        };
+        let response = f
+            .http
+            .put(format!("{}/api/v1/users/bots/{BOT}/agent", f.base))
+            .bearer_auth(&f.alice)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{}", response.text().await.unwrap());
+        let run = f.runs().await.remove(0);
+        assert_eq!(
+            (run.status.as_str(), run.active),
+            ("cancelled", None),
+            "{change}"
+        );
+        let comments = f.bot_comments().await;
+        assert_eq!(comments.len(), 1, "{change}: {comments:?}");
+        assert!(
+            comments[0].starts_with("I stopped working on this"),
+            "{change}"
+        );
+    }
+}
+
+/// Recovery asks the profile too, so a run is stopped even when the profile
+/// was changed by a path that did not stop it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovery_cancels_a_run_its_profile_no_longer_allows() {
+    let f = fixture().await;
+    f.assign_in_core(f.alice_id).await;
+    f.save_profile(|update| update.enabled = false).await;
+    let recovered = rg_core::agent::run::recover(
+        &f.state.db_pools(),
+        &f.state.agent_run_launcher(),
+        std::time::Duration::ZERO,
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered.ended, 1);
+    let run = f.runs().await.remove(0);
+    assert_eq!(run.status, "cancelled");
+}
+
+/// One assignment written twice (a retried commit) is one run: the trigger
+/// key names it, and the second write finds it instead of refusing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_same_assignment_written_twice_is_one_run() {
+    use sea_orm::TransactionTrait as _;
+    let f = fixture().await;
+    let plan = f.plan("app", 1).await;
+    let issue = f.issue_model("app", 1).await;
+    let key = rg_core::agent::run::assignment_trigger_key(issue.id, f.bot.id, chrono::Utc::now());
+    let mut reserved = Vec::new();
+    for _ in 0..2 {
+        let txn = f.db.begin().await.unwrap();
+        reserved.push(
+            rg_core::agent::run::reserve(&txn, plan.planned().unwrap(), issue.id, &key)
+                .await
+                .unwrap(),
+        );
+        txn.commit().await.unwrap();
+    }
+    assert_eq!(reserved[0], reserved[1]);
+    assert_eq!(f.runs().await.len(), 1);
+}
+
+/// The run is written in the assignment's own transaction: when writing it
+/// fails, the assignment does not commit without it. Before, the assignment
+/// committed first and the run was written after — a failure in between was a
+/// start nobody would ever see.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_assignment_never_commits_without_its_run() {
+    use sea_orm::ConnectionTrait as _;
+    let f = fixture().await;
+    f.db.execute_unprepared(
+        "CREATE TRIGGER refuse_agent_runs BEFORE INSERT ON agent_runs \
+         BEGIN SELECT RAISE(ABORT, 'injected: the run could not be written'); END",
+    )
+    .await
+    .unwrap();
+    let assigned = rg_core::issue::service::update_issue(
+        &f.state.db_pools(),
+        "alice",
+        "app",
+        1,
+        None,
+        None,
+        None,
+        None,
+        Some(Some(f.bot.id)),
+        None,
+        Some(&f.state.delivery_tracker),
+        Some(f.alice_id),
+        Some(&f.state.agent_run_launcher()),
+    )
+    .await;
+    assert!(
+        assigned.is_err(),
+        "the assignment succeeded without its run"
+    );
+    assert_eq!(
+        f.issue_model("app", 1).await.assignee_id,
+        None,
+        "the assignment committed without its run"
+    );
+    assert!(f.runs().await.is_empty());
+    assert!(f.ci.take().is_empty());
+
+    f.db.execute_unprepared("DROP TRIGGER refuse_agent_runs")
+        .await
+        .unwrap();
+    f.assign_in_core(f.alice_id).await;
+    assert_eq!(
+        f.runs().await.len(),
+        1,
+        "a retried assignment starts its run"
+    );
 }

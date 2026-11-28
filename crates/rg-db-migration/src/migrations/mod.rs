@@ -183,6 +183,7 @@ pub mod m20261127_000001_agent_runs;
 pub mod m20261127_000002_gitlab_merge_requests_head_in_target;
 pub mod m20261127_000003_reviews_reference_their_pull_request;
 pub mod m20261128_000001_agent_run_write_ref_prefix;
+pub mod m20261128_000002_agent_run_launch_state;
 
 use sea_orm_migration::prelude::*;
 
@@ -456,6 +457,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261127_000002_gitlab_merge_requests_head_in_target::Migration),
             Box::new(m20261127_000003_reviews_reference_their_pull_request::Migration),
             Box::new(m20261128_000001_agent_run_write_ref_prefix::Migration),
+            Box::new(m20261128_000002_agent_run_launch_state::Migration),
         ]
     }
 }

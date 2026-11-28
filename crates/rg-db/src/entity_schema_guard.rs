@@ -72,6 +72,7 @@ probed_entities!(
     agent_profile_repository,
     agent_run,
     agent_run_attempt,
+    agent_run_quota,
     artifact,
     attachment,
     audit_log,

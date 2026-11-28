@@ -6,6 +6,7 @@ pub mod agent_profile;
 pub mod agent_profile_repository;
 pub mod agent_run;
 pub mod agent_run_attempt;
+pub mod agent_run_quota;
 pub mod artifact;
 pub mod attachment;
 pub mod audit_log;

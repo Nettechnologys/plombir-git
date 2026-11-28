@@ -15,6 +15,13 @@ This project records user-facing changes here. The format follows
   refusal is a comment from the bot and an `agent.run_refused` audit row. The
   run's job is handed none of the repository's CI secrets, and its pipeline
   cannot be retried.
+- An agent run is written in the same transaction as the assignment that
+  starts it, together with the bot's run for the day: two assignments at once
+  start one run, the day's last run is taken once, and a server that stops
+  between the assignment and the queue queues the run when it comes back.
+  Unassigning the issue, switching the bot's profile off or taking the
+  repository off the profile cancels a live run and deletes its token.
+  `[agents] max_runs_per_day` and `max_timeout_secs` cap every profile.
 
 ### Fixed
 

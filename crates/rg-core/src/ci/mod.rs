@@ -564,6 +564,12 @@ pub struct AgentRunPipelineParams<'a> {
     pub timeout_secs: i64,
     /// The person who assigned the issue.
     pub triggered_by: Option<i64>,
+    /// The attempt the pipeline carries. The engine points it at the pipeline
+    /// in the transaction that writes the pipeline
+    /// ([`rg_db::ops::agent_run_ops::link_attempt_pipeline`]), and refuses the
+    /// whole pipeline when another one already carries the attempt — so an
+    /// attempt is queued at most once, however many callers try.
+    pub attempt_id: i64,
     pub docker_enabled: bool,
     pub external_runners: bool,
     pub allow_host_runner: bool,

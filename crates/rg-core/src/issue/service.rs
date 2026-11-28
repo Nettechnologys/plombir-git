@@ -601,6 +601,22 @@ pub async fn update_issue(
     let db = pools.read();
     let existing = get_issue(db, owner, repo_name, number).await?;
     let previous_assignee = existing.assignee_id;
+    let new_assignee = assignee_id
+        .flatten()
+        .filter(|id| Some(*id) != previous_assignee);
+    let unassigned = previous_assignee
+        .filter(|_| assignee_id.is_some_and(|assignee| assignee != previous_assignee));
+    // An assignment to a bot asks it for a run (ADR-0001 D6). Its checks are
+    // read here, inside the request: whether a person or a run's token made
+    // the assignment is the request's credential. The run itself is written
+    // below, in the assignment's own transaction (card_b391e92474a0).
+    let agent_plan = match (agent_runs, new_assignee) {
+        (Some(launcher), Some(assignee)) => Some(
+            crate::agent::run::plan_assignment(&pools, launcher, &existing, assignee, actor_id)
+                .await,
+        ),
+        _ => None,
+    };
     let issue_id = existing.id;
     let issue_repo_id = existing.repo_id;
     let issue_milestone_id = existing.milestone_id;
@@ -659,7 +675,10 @@ pub async fn update_issue(
         active.milestone_id = Set(m);
     }
 
-    active.updated_at = Set(Utc::now());
+    let assigned_at = Utc::now();
+    active.updated_at = Set(assigned_at);
+    let trigger_key = new_assignee
+        .map(|bot| crate::agent::run::assignment_trigger_key(issue_id, bot, assigned_at));
 
     // The label junction is replaced by delete-then-insert on `issue_id`. On
     // MySQL two edits of neighbouring issues take next-key locks on that index
@@ -667,37 +686,57 @@ pub async fn update_issue(
     // chosen as a deadlock victim (1213) — the same gap pattern the backup
     // codes had (card_d71c4875993c). A correct edit must not answer 5xx for
     // it, so the whole transaction is retried (card_a673a3823085).
-    let updated = rg_db::contention::retry_transaction("update an issue", || {
-        let active = active.clone();
-        let label_ids = label_ids.clone();
-        async move {
-            let txn = db.begin().await.context("db: begin transaction")?;
-            let written: Result<Issue> = async {
-                let updated = active.update(&txn).await.context("db: update issue")?;
-                if let Some(ids) = label_ids {
-                    issue_label_ops::set_labels(&txn, issue_id, ids).await?;
-                }
-                Ok(updated)
-            }
-            .await;
-            match written {
-                Ok(updated) => {
-                    txn.commit().await.context("db: commit transaction")?;
-                    Ok(updated)
-                }
-                Err(error) => {
-                    if let Err(rollback_error) = txn.rollback().await {
-                        return Err(error).context(format!(
-                            "issue update failed and its transaction could not be rolled \
-                             back: {rollback_error}"
-                        ));
+    let planned_run = agent_plan
+        .as_ref()
+        .and_then(crate::agent::run::AssignmentPlan::planned);
+    let (updated, reservation, ended_runs) =
+        rg_db::contention::retry_transaction("update an issue", || {
+            let active = active.clone();
+            let label_ids = label_ids.clone();
+            let trigger_key = trigger_key.clone();
+            async move {
+                let txn = db.begin().await.context("db: begin transaction")?;
+                let written: Result<_> = async {
+                    let updated = active.update(&txn).await.context("db: update issue")?;
+                    if let Some(ids) = label_ids {
+                        issue_label_ops::set_labels(&txn, issue_id, ids).await?;
                     }
-                    Err(error)
+                    // A run of the bot the issue is taken from ends with the
+                    // assignment that started it, in the same transaction.
+                    let ended = match unassigned {
+                        Some(previous) => {
+                            crate::agent::run::end_for_unassignment(&txn, issue_id, previous)
+                                .await?
+                        }
+                        None => Vec::new(),
+                    };
+                    let reservation = match (planned_run, trigger_key.as_deref()) {
+                        (Some(planned), Some(key)) => {
+                            Some(crate::agent::run::reserve(&txn, planned, issue_id, key).await?)
+                        }
+                        _ => None,
+                    };
+                    Ok((updated, reservation, ended))
+                }
+                .await;
+                match written {
+                    Ok(updated) => {
+                        txn.commit().await.context("db: commit transaction")?;
+                        Ok(updated)
+                    }
+                    Err(error) => {
+                        if let Err(rollback_error) = txn.rollback().await {
+                            return Err(error).context(format!(
+                                "issue update failed and its transaction could not be rolled \
+                             back: {rollback_error}"
+                            ));
+                        }
+                        Err(error)
+                    }
                 }
             }
-        }
-    })
-    .await?;
+        })
+        .await?;
 
     // FTS sync is handled by database triggers created in the migration chain.
 
@@ -753,15 +792,20 @@ pub async fn update_issue(
             )
             .to(assignee, crate::notification::thread::Reason::Assigned),
         );
-        // An assignment to a bot with an agent profile asks it for a run
-        // (ADR-0001 D6). Awaited here, inside the request: whether a person or
-        // a run's token made the assignment is read from the request's
-        // credential, which a detached task no longer has. It never fails the
-        // assignment; a refusal is the bot's comment on the issue.
-        if let Some(launcher) = agent_runs {
-            crate::agent::run::start_for_assignment(&pools, launcher, &updated, assignee, actor_id)
-                .await;
-        }
+    }
+    for ended in ended_runs {
+        crate::agent::run::after_end(
+            &pools,
+            ended,
+            crate::agent::run::UNASSIGNED_MESSAGE.to_string(),
+        )
+        .await;
+    }
+    // The run is written; queue its pipeline, or say why there is none. It
+    // never fails the assignment. A fault before this line delays the run,
+    // and `agent::run::recover` queues it.
+    if let (Some(launcher), Some(plan)) = (agent_runs, agent_plan) {
+        crate::agent::run::launch(&pools, launcher, &updated, plan, reservation).await;
     }
     if let Some(ref s) = state {
         if was_open && s == "closed" {

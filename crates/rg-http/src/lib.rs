@@ -206,6 +206,8 @@ pub struct AppState {
     /// profile may start an agent run (ADR-0001). Profiles are editable either
     /// way; this decides whether they ever run.
     pub agents_enabled: bool,
+    /// `[agents]` ceilings over every profile (ADR-0001 D9).
+    pub agent_limits: rg_core::agent::run::AgentLimits,
     /// Whether this process was started by `plombir-git trial`. Only shown —
     /// `GET /api/v1/instance` → `trial_mode` puts a banner on every page — and
     /// never consulted for an access decision.
@@ -526,6 +528,7 @@ impl AppState {
     pub fn agent_run_launcher(&self) -> rg_core::agent::run::AgentRunLauncher<'_> {
         rg_core::agent::run::AgentRunLauncher {
             enabled: self.agents_enabled,
+            limits: self.agent_limits,
             repo_root: &self.repo_root,
             ci: self.pipeline_ci(),
         }
@@ -674,6 +677,8 @@ pub struct HttpServerConfig {
     pub attestation_enabled: bool,
     /// See [`AppState::agents_enabled`].
     pub agents_enabled: bool,
+    /// See [`AppState::agent_limits`].
+    pub agent_limits: rg_core::agent::run::AgentLimits,
     /// Started by `plombir-git trial` — see [`AppState::trial_mode`].
     pub trial_mode: bool,
     /// Repository the UI links as this instance's source, validated by the
@@ -899,6 +904,7 @@ async fn run_with_listener(
         ci_engine: config.ci_engine,
         attestation_enabled: config.attestation_enabled,
         agents_enabled: config.agents_enabled,
+        agent_limits: config.agent_limits,
         trial_mode: config.trial_mode,
         source_url: Arc::from(config.source_url),
         ws_session_recheck_secs: ws::DEFAULT_WS_SESSION_RECHECK_SECS,
@@ -931,6 +937,16 @@ async fn run_with_listener(
         let watchdog_shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             run_runner_watchdog(watchdog_state, watchdog_shutdown).await;
+        });
+    }
+
+    // Agent runs whose assignment committed but whose pipeline was never
+    // created, and runs their profile no longer allows (card_b391e92474a0).
+    {
+        let recovery_state = state.clone();
+        let recovery_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            run_agent_run_recovery(recovery_state, recovery_shutdown).await;
         });
     }
 
@@ -1278,6 +1294,42 @@ async fn run_metrics_gauge_sink(
 }
 
 // ── Runner Watchdog ───────────────────────────────────────
+
+/// Bring agent runs back to what their rows say, once at startup and then
+/// every minute ([`rg_core::agent::run::recover`]).
+///
+/// The first pass queues every unqueued run at once: no request of this
+/// process can have written one yet. Later passes leave a run alone for
+/// [`rg_core::agent::run::UNQUEUED_RUN_GRACE`], since the request that wrote
+/// it may still be queueing it — and if both try, the attempt is carried by
+/// one pipeline all the same.
+async fn run_agent_run_recovery(
+    state: AppState,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut min_age = std::time::Duration::ZERO;
+    loop {
+        let pools = state.db_pools();
+        match rg_core::agent::run::recover(&pools, &state.agent_run_launcher(), min_age).await {
+            Ok(recovered) if recovered != rg_core::agent::run::Recovered::default() => {
+                tracing::info!(
+                    queued = recovered.queued,
+                    ended = recovered.ended,
+                    "agent run recovery"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(error = %format!("{error:#}"), "agent run recovery failed");
+            }
+        }
+        min_age = rg_core::agent::run::UNQUEUED_RUN_GRACE;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+            _ = shutdown_rx.changed() => return,
+        }
+    }
+}
 
 /// Background task that periodically checks for:
 /// 1. Stuck jobs (assigned/running for too long) → reset to pending

@@ -7944,3 +7944,171 @@ async fn local_numbers_are_unique_under_concurrency_and_never_reused_after_delet
         "the deleted pull request's number must stay spent"
     );
 }
+
+/// Starting an agent run is decided by conditional writes, and they hold on
+/// every backend with real concurrency (card_b391e92474a0):
+///
+/// - the day's last run is taken once: a second transaction asking for it
+///   waits on the first one's row and then finds the day spent, instead of
+///   passing a count both of them read;
+/// - an attempt names one pipeline, whoever queues it;
+/// - a run ends once, whoever ends it.
+#[tokio::test]
+#[ignore = "requires PLOMBIR_GIT_TEST_DATABASE_URL pointing at a disposable database"]
+async fn agent_run_launch_writes_are_race_free() {
+    use rg_db::entities::{agent_run, agent_run_attempt, agent_run_quota};
+
+    let database_url = std::env::var("PLOMBIR_GIT_TEST_DATABASE_URL")
+        .expect("PLOMBIR_GIT_TEST_DATABASE_URL must be set");
+    let db = rg_db::connect_with_pool(&database_url, rg_db::TEST_CONNECT_TIMEOUT_SECS, 60, 4)
+        .await
+        .expect("connect to test database");
+    rg_db::run_migrations(&db).await.expect("run migrations");
+
+    // No foreign key on the allowance: any bot id will do, and a fresh one
+    // keeps reruns apart.
+    let bot_id = i64::from(uuid::Uuid::new_v4().as_fields().0 & 0x7fff_ffff) + 1_000_000;
+    let day = "2026-11-28";
+    assert!(
+        rg_db::ops::agent_run_ops::reserve_daily_run(&db, bot_id, day, 2)
+            .await
+            .expect("open the day")
+    );
+
+    let first = db.begin().await.expect("begin the first launch");
+    assert!(
+        rg_db::ops::agent_run_ops::reserve_daily_run(&first, bot_id, day, 2)
+            .await
+            .expect("take the last run"),
+        "the first transaction did not get the last run"
+    );
+    let mut second = {
+        let db = db.clone();
+        tokio::spawn(async move {
+            let txn = db.begin().await.expect("begin the second launch");
+            let taken = rg_db::ops::agent_run_ops::reserve_daily_run(&txn, bot_id, day, 2)
+                .await
+                .expect("ask for the last run");
+            txn.commit().await.expect("commit the second launch");
+            taken
+        })
+    };
+    assert_probe_stays_blocked(
+        &mut second,
+        "the second launch read the allowance past an uncommitted reservation",
+    )
+    .await;
+    first.commit().await.expect("commit the first launch");
+    assert!(
+        !second.await.expect("the second launch finished"),
+        "the day's last run was taken twice"
+    );
+    let row = agent_run_quota::Entity::find()
+        .filter(agent_run_quota::Column::BotId.eq(bot_id))
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("the day's row");
+    assert_eq!((row.day.as_str(), row.used), (day, 2));
+    assert!(
+        rg_db::ops::agent_run_ops::reserve_daily_run(&db, bot_id, "2026-11-29", 2)
+            .await
+            .unwrap(),
+        "the next day starts fresh"
+    );
+
+    // One pipeline per attempt, one end per run.
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let suffix = &suffix[..10];
+    let username = format!("launchowner{suffix}");
+    let owner = rg_db::ops::user_ops::create_user(
+        &db,
+        &username,
+        &format!("{username}@example.invalid"),
+        "unused",
+        "Agent Launch Smoke",
+    )
+    .await
+    .expect("create run owner");
+    let repo = rg_db::ops::repo_ops::create(
+        &db,
+        namespace_repo(owner.id, None, &format!("launchrepo{suffix}")),
+    )
+    .await
+    .expect("create repository");
+    let pipeline = |n: u8| {
+        rg_db::ops::pipeline_ops::create_pipeline(
+            &db,
+            repo.id,
+            "0000000000000000000000000000000000000000",
+            "refs/heads/main",
+            if n == 0 { "agent_run" } else { "push" },
+            Some(owner.id),
+        )
+    };
+    let (carrier, rival) = (
+        pipeline(0).await.expect("the carrier"),
+        pipeline(1).await.expect("the rival"),
+    );
+    let run = agent_run::ActiveModel {
+        bot_id: Set(bot_id),
+        repository_id: Set(repo.id),
+        iteration: Set(1),
+        triggered_by: Set(owner.id),
+        trigger_key: Set(format!("launch:{suffix}")),
+        status: Set("queued".to_string()),
+        active: Set(Some(true)),
+        commit_sha: Set(Some("0000000000000000000000000000000000000000".to_string())),
+        created_at: Set(chrono::Utc::now()),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .expect("the run");
+    assert_eq!(
+        run.commit_sha.as_deref(),
+        Some("0000000000000000000000000000000000000000")
+    );
+    let attempt = agent_run_attempt::ActiveModel {
+        run_id: Set(run.id),
+        attempt: Set(1),
+        created_at: Set(chrono::Utc::now()),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .expect("the attempt");
+    assert!(
+        rg_db::ops::agent_run_ops::link_attempt_pipeline(&db, attempt.id, carrier.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !rg_db::ops::agent_run_ops::link_attempt_pipeline(&db, attempt.id, rival.id)
+            .await
+            .unwrap(),
+        "a second pipeline took an attempt another one carries"
+    );
+    let now = chrono::Utc::now();
+    assert!(rg_db::ops::agent_run_ops::finish_run(
+        &db,
+        run.id,
+        "cancelled",
+        Some("unassigned"),
+        now
+    )
+    .await
+    .unwrap());
+    assert!(
+        !rg_db::ops::agent_run_ops::finish_run(&db, run.id, "succeeded", None, now)
+            .await
+            .unwrap(),
+        "a run ended twice"
+    );
+    let ended = agent_run::Entity::find_by_id(run.id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((ended.status.as_str(), ended.active), ("cancelled", None));
+}

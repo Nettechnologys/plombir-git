@@ -434,6 +434,7 @@ async fn enqueue_agent_run_with_engine(
         runner_tags,
         timeout_secs,
         triggered_by,
+        attempt_id,
         docker_enabled,
         external_runners,
         allow_host_runner,
@@ -479,6 +480,23 @@ async fn enqueue_agent_run_with_engine(
     }
     .create(&tx)
     .await;
+    // The attempt names its pipeline in the transaction that writes it: an
+    // attempt with a pipeline always says so, and an attempt another caller
+    // already queued refuses this second pipeline whole (card_b391e92474a0).
+    let created = match created {
+        Ok(pipeline_id) => {
+            match rg_db::ops::agent_run_ops::link_attempt_pipeline(&tx, attempt_id, pipeline_id)
+                .await
+            {
+                Ok(true) => Ok(pipeline_id),
+                Ok(false) => Err(anyhow::anyhow!(
+                    "agent run attempt {attempt_id} is already carried by another pipeline"
+                )),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
     let pipeline_id = match created {
         Ok(pipeline_id) => pipeline_id,
         Err(error) => {

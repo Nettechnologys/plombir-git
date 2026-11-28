@@ -42,6 +42,9 @@ pub struct Model {
     /// after the token is gone, so the CI gate still knows which branches hold
     /// the agent's code (ADR-0001 D4). `None` for a run that never had one.
     pub write_ref_prefix: Option<String>,
+    /// The commit the run starts from; `None` for a run recorded before it
+    /// was kept (`m20261128_000002`).
+    pub commit_sha: Option<String>,
     pub created_at: DateTimeUtc,
     pub finished_at: Option<DateTimeUtc>,
 }

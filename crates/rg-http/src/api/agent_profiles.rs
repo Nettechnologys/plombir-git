@@ -258,6 +258,9 @@ pub async fn put_agent_profile(
         })),
     )
     .await;
+    // A run the profile no longer allows — switched off, or its repository
+    // taken off the list — stops now (card_b391e92474a0).
+    stop_withdrawn_runs(&state, &bot).await;
     match response(&state, saved).await {
         Ok(body) => (StatusCode::OK, Json(body)).into_response(),
         Err(error) => error.into_response(),
@@ -310,5 +313,21 @@ pub async fn delete_agent_profile(
         None,
     )
     .await;
+    stop_withdrawn_runs(&state, &bot).await;
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Stop the active runs of `bot` its profile, as just written, no longer
+/// allows. The profile write already happened, so a failure here does not undo
+/// it: it is logged, and the recovery loop asks the same question every minute.
+async fn stop_withdrawn_runs(state: &AppState, bot: &rg_db::entities::user::Model) {
+    if let Err(error) =
+        rg_core::agent::run::end_runs_withdrawn_by_profile(&state.db_pools(), bot).await
+    {
+        tracing::error!(
+            bot = %bot.username,
+            error = %format!("{error:#}"),
+            "the runs an agent profile no longer allows could not be stopped; recovery will retry"
+        );
+    }
 }

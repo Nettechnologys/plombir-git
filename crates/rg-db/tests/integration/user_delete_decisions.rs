@@ -312,6 +312,14 @@ const DECISIONS: &[(&str, &str, &str, &str)] = &[
         "card_621be18a01e5: who asked for the run, kept as a ghost snapshot beside the run",
     ),
     (
+        "agent_run_quotas",
+        "bot_id",
+        "NO FOREIGN KEY",
+        "card_b391e92474a0: a count of the runs a bot started on one UTC day, kept beside the \
+         runs it counts, which outlive the bot the same way (agent_runs.bot_id); a few rows per \
+         bot and day, which nothing reads once the day is over",
+    ),
+    (
         "audit_log",
         "user_id",
         "NO FOREIGN KEY",

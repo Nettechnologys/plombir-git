@@ -193,7 +193,7 @@ pub async fn issue_for_agent_run(
 /// run) takes the token too — the foreign key cascades — so this is for the
 /// attempt that ends and stays on record.
 pub async fn revoke_for_agent_run_attempt(
-    db: &DatabaseConnection,
+    db: &impl sea_orm::ConnectionTrait,
     attempt_id: i64,
 ) -> Result<bool> {
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
