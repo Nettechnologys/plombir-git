@@ -10,6 +10,7 @@
   import Modal from '$lib/components/Modal.svelte';
   import ThreadSubscription from '$lib/components/ThreadSubscription.svelte';
   import {
+    agentReadsUntrustedAuthor,
     buildIssueLinksPayload,
     collaborators,
     issues,
@@ -39,6 +40,12 @@
   let commentList = $state<IssueComment[]>([]);
   let milestoneList = $state<Milestone[]>([]);
   let assigneeOptions = $state<Array<{ id: number; label: string }>>([]);
+  /** The collaborators that are bots, which may be agents (ADR-0001 D7). */
+  let botIds = $state<Set<number>>(new Set());
+  let warnUntrustedAuthor = $derived(
+    issue !== null &&
+      agentReadsUntrustedAuthor(linkForm, issue.assignee_id, botIds, issue.author_can_write),
+  );
   let loading = $state(true);
   let mutationBusy = $state(false);
   let error = $state('');
@@ -78,6 +85,7 @@
     milestoneList = [];
     labelColors = new Map();
     assigneeOptions = [];
+    botIds = new Set();
     newComment = '';
     linkForm = { assigneeId: '', milestoneId: '' };
     mutationBusy = false;
@@ -201,6 +209,9 @@
         candidates.set(issueData.assignee_id, issueData.assignee ?? unnamed(issueData.assignee_id));
       }
       assigneeOptions = Array.from(candidates, ([id, label]) => ({ id, label }));
+      botIds = new Set(
+        collaboratorData.filter((collaborator) => collaborator.is_bot).map((collaborator) => collaborator.user_id),
+      );
     } catch (e: any) {
       if (issueRequests.owns(claim, owner, repo, number) && isCurrentRoute(route)) {
         error = e.message;
@@ -418,6 +429,9 @@
               {/each}
             </select>
           </label>
+          {#if warnUntrustedAuthor}
+            <p class="agent-untrusted-author" role="note">{t('issues.agent_untrusted_author')}</p>
+          {/if}
           {#if canWrite}
             <button class="btn-primary save-links" type="button" onclick={saveLinks} disabled={mutationBusy}>
               {mutationBusy ? t('common.loading') : t('issues.save_links')}

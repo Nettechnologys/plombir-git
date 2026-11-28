@@ -45,6 +45,9 @@ pub struct Model {
     /// The commit the run starts from; `None` for a run recorded before it
     /// was kept (`m20261128_000002`).
     pub commit_sha: Option<String>,
+    /// The task file written for the run when it was assigned
+    /// (`rg_core::agent::trust`); `None` for a run recorded before it was kept.
+    pub task: Option<String>,
     pub created_at: DateTimeUtc,
     pub finished_at: Option<DateTimeUtc>,
 }

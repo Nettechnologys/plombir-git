@@ -16,7 +16,7 @@ export {
 	parseStoredStringList,
 	parseStringList,
 } from '../api/branchProtectionForm';
-export { buildIssueLinksPayload } from '../api/issueForm';
+export { agentReadsUntrustedAuthor, buildIssueLinksPayload } from '../api/issueForm';
 export { splitList } from '../api/tokens';
 export { buildLabelPayload } from '../api/labelForm';
 export {

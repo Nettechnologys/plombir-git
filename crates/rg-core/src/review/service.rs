@@ -262,6 +262,11 @@ pub fn notify_review_requested(
 }
 
 /// List all reviews for a PR.
+///
+/// An agent run reading with its token sees only the reviews of people with
+/// write access, and none imported from another platform
+/// ([`crate::agent::trust::visible_to_run`]); every other reader sees all of
+/// them.
 pub async fn list_reviews(
     db: &DatabaseConnection,
     owner: &str,
@@ -273,7 +278,11 @@ pub async fn list_reviews(
         .await?
         .ok_or_else(|| crate::error::not_found("pull request"))?;
 
-    pr_review_ops::list_by_pr(db, pr.id).await
+    let reviews = pr_review_ops::list_by_pr(db, pr.id).await?;
+    crate::agent::trust::visible_to_run(db, &repo, reviews, |review| {
+        (review.reviewer_id, review.original_author.is_some())
+    })
+    .await
 }
 
 /// Get a single review by ID.
@@ -1077,6 +1086,10 @@ pub async fn get_thread_root(
 }
 
 /// List all review comments for a PR.
+///
+/// The same rule as [`list_reviews`]: an agent run sees only comments by
+/// people with write access, and none under a review imported from another
+/// platform.
 pub async fn list_review_comments(
     db: &DatabaseConnection,
     owner: &str,
@@ -1088,7 +1101,20 @@ pub async fn list_review_comments(
         .await?
         .ok_or_else(|| crate::error::not_found("pull request"))?;
 
-    review_comment_ops::list_by_pr(db, pr.id).await
+    let comments = review_comment_ops::list_by_pr(db, pr.id).await?;
+    if !crate::agent::trust::reading_for_a_run() {
+        return Ok(comments);
+    }
+    let imported: HashSet<i64> = pr_review_ops::list_by_pr(db, pr.id)
+        .await?
+        .into_iter()
+        .filter(|review| review.original_author.is_some())
+        .map(|review| review.id)
+        .collect();
+    crate::agent::trust::visible_to_run(db, &repo, comments, |comment| {
+        (comment.author_id, imported.contains(&comment.review_id))
+    })
+    .await
 }
 
 // `check_approval_status` used to live here: "does this PR have enough

@@ -921,6 +921,11 @@ pub async fn add_comment(
 }
 
 /// List comments for an issue.
+///
+/// An agent run reading with its token sees only the comments of people with
+/// write access, and none imported from another platform
+/// ([`crate::agent::trust::visible_to_run`]) — the rule its task file was
+/// written by. Every other reader sees all of them.
 pub async fn list_comments(
     db: &DatabaseConnection,
     owner: &str,
@@ -928,7 +933,17 @@ pub async fn list_comments(
     issue_number: i64,
 ) -> Result<Vec<Comment>> {
     let issue = get_issue(db, owner, repo_name, issue_number).await?;
-    issue_comment_ops::list_by_issue(db, issue.id).await
+    let comments = issue_comment_ops::list_by_issue(db, issue.id).await?;
+    if !crate::agent::trust::reading_for_a_run() {
+        return Ok(comments);
+    }
+    let repository = rg_db::ops::repo_ops::find_by_id(db, issue.repo_id)
+        .await?
+        .ok_or_else(|| crate::error::not_found("repository"))?;
+    crate::agent::trust::visible_to_run(db, &repository, comments, |comment| {
+        (comment.author_id, comment.original_author.is_some())
+    })
+    .await
 }
 
 // Editing and deleting a comment live in `super::moderation`, scoped by the

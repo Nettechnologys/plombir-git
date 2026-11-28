@@ -7,6 +7,11 @@
 //!   to say where it starts, and the job's checkout and task file read it from
 //!   there rather than from wherever the default branch is by then. `NULL` is
 //!   a run recorded before this column.
+//! - **`agent_runs.task`** — the task file the server wrote for the run when
+//!   it was assigned (ADR-0001 D7, card_dcf93bf54722). Kept, not rebuilt: an
+//!   edit of the issue after the assignment does not reach a run already under
+//!   way, and every attempt reads the same task. `NULL` is a run recorded
+//!   before this column.
 //! - **`agent_run_quotas`** — how many runs each bot started on one UTC day.
 //!   The daily limit is reserved by a conditional `UPDATE ... WHERE used <
 //!   limit` in the transaction that records the run, so two assignments racing
@@ -35,15 +40,20 @@ pub const QUOTA_DAY_CHARS: u32 = 10;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        if !manager.has_column("agent_runs", "commit_sha").await? {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(AgentRuns::Table)
-                        .add_column(ColumnDef::new(AgentRuns::CommitSha).text().null())
-                        .to_owned(),
-                )
-                .await?;
+        for (name, column) in [
+            ("commit_sha", AgentRuns::CommitSha),
+            ("task", AgentRuns::Task),
+        ] {
+            if !manager.has_column("agent_runs", name).await? {
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(AgentRuns::Table)
+                            .add_column(ColumnDef::new(column).text().null())
+                            .to_owned(),
+                    )
+                    .await?;
+            }
         }
         manager
             .create_table(
@@ -99,15 +109,20 @@ impl MigrationTrait for Migration {
                     .to_owned(),
             )
             .await?;
-        if manager.has_column("agent_runs", "commit_sha").await? {
-            manager
-                .alter_table(
-                    Table::alter()
-                        .table(AgentRuns::Table)
-                        .drop_column(AgentRuns::CommitSha)
-                        .to_owned(),
-                )
-                .await?;
+        for (name, column) in [
+            ("task", AgentRuns::Task),
+            ("commit_sha", AgentRuns::CommitSha),
+        ] {
+            if manager.has_column("agent_runs", name).await? {
+                manager
+                    .alter_table(
+                        Table::alter()
+                            .table(AgentRuns::Table)
+                            .drop_column(column)
+                            .to_owned(),
+                    )
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -117,6 +132,7 @@ impl MigrationTrait for Migration {
 enum AgentRuns {
     Table,
     CommitSha,
+    Task,
 }
 
 #[derive(DeriveIden)]

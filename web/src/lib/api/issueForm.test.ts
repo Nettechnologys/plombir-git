@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import IssuePage from '../../routes/[owner]/[repo]/issues/[number]/+page.svelte';
-import { buildIssueLinksPayload } from './issueForm';
+import { agentReadsUntrustedAuthor, buildIssueLinksPayload } from './issueForm';
 import { setTestPage } from '../test/app';
 import {
 	attachments,
@@ -80,5 +80,44 @@ describe('buildIssueLinksPayload', () => {
 			assignee_id: null,
 			milestone_id: null,
 		});
+	});
+});
+
+describe('the warning before an agent reads a stranger\'s issue', () => {
+	const bots = new Set([9]);
+
+	it('warns only for a new assignment of a bot to an issue whose author cannot write', () => {
+		const form = (assigneeId: string) => ({ assigneeId, milestoneId: '' });
+		expect(agentReadsUntrustedAuthor(form('9'), 7, bots, false)).toBe(true);
+		expect(agentReadsUntrustedAuthor(form('9'), 7, bots, true)).toBe(false);
+		expect(agentReadsUntrustedAuthor(form('9'), 7, bots, undefined)).toBe(false);
+		expect(agentReadsUntrustedAuthor(form('7'), null, bots, false)).toBe(false);
+		expect(agentReadsUntrustedAuthor(form('9'), 9, bots, false)).toBe(false);
+		expect(agentReadsUntrustedAuthor(form(''), 7, bots, false)).toBe(false);
+	});
+
+	it('shows on the page when a bot is chosen for a stranger\'s issue, and not before', async () => {
+		issues.get.mockResolvedValue({ ...issue, author_can_write: false });
+		collaborators.list.mockResolvedValue([
+			{ user_id: 7, username: 'bob', is_bot: false },
+			{ user_id: 9, username: 'alice-agent', is_bot: true },
+		]);
+		rendered = await renderComponent(IssuePage);
+		expect(rendered.container.querySelector('.agent-untrusted-author')).toBeNull();
+		const assignee = rendered.container.querySelector<HTMLSelectElement>('.issue-links select')!;
+		await change(assignee, '9');
+		expect(element(rendered.container, '.agent-untrusted-author').textContent).toContain(
+			'cannot write to this repository',
+		);
+		await change(assignee, '7');
+		expect(rendered.container.querySelector('.agent-untrusted-author')).toBeNull();
+	});
+
+	it('stays quiet when the author can write', async () => {
+		issues.get.mockResolvedValue({ ...issue, author_can_write: true });
+		collaborators.list.mockResolvedValue([{ user_id: 9, username: 'alice-agent', is_bot: true }]);
+		rendered = await renderComponent(IssuePage);
+		await change(rendered.container.querySelector<HTMLSelectElement>('.issue-links select')!, '9');
+		expect(rendered.container.querySelector('.agent-untrusted-author')).toBeNull();
 	});
 });

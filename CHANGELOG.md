@@ -22,6 +22,15 @@ This project records user-facing changes here. The format follows
   Unassigning the issue, switching the bot's profile off or taking the
   repository off the profile cancels a live run and deletes its token.
   `[agents] max_runs_per_day` and `max_timeout_secs` cap every profile.
+- The server writes an agent run's task when the issue is assigned and keeps
+  it on the run: a fixed instruction, the issue's title and body, and only
+  the comments of people with write access — none by bots, none imported.
+  Invisible and bidirectional-control characters and HTML comments are taken
+  out, and a task past 32 768 characters is cut with a note. A run's token
+  reading `list_reviews` or `list_review_comments` over MCP sees only the
+  reviews of people with write access; every other reader sees all of them.
+  The issue page warns before an issue whose author cannot write is assigned
+  to a bot.
 
 ### Fixed
 

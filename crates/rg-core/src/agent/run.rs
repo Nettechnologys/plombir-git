@@ -200,6 +200,9 @@ pub struct PlannedRun {
     commit_sha: String,
     default_branch: String,
     runs_per_day: i64,
+    /// The task file, written now: what the issue says at the assignment is
+    /// what the run works from (`super::trust`).
+    task: String,
 }
 
 /// What the checks read before the assignment is written made of it.
@@ -338,6 +341,22 @@ async fn try_plan_assignment(
             ),
         });
     };
+    let assigner = rg_db::ops::user_ops::find_by_id(read, actor_id)
+        .await?
+        .context("the assigner passed the checks and is gone")?;
+    let task = super::trust::write_task(
+        read,
+        super::trust::TaskSource {
+            repository: &repository,
+            owner: &speaker.owner,
+            name: &speaker.name,
+            issue,
+            bot: &speaker.bot,
+            assigner: &assigner,
+            commit_sha: &commit_sha,
+        },
+    )
+    .await?;
     Ok(AssignmentPlan::Start(Box::new(PlannedRun {
         speaker,
         repository_id: repository.id,
@@ -346,6 +365,7 @@ async fn try_plan_assignment(
         commit_sha,
         default_branch,
         runs_per_day,
+        task,
     })))
 }
 
@@ -453,6 +473,7 @@ async fn write_run(
         failure_reason: Set(None),
         write_ref_prefix: Set(Some(branch_prefix(&bot.username))),
         commit_sha: Set(Some(planned.commit_sha.clone())),
+        task: Set(Some(planned.task.clone())),
         created_at: Set(now),
         finished_at: Set(None),
         ..Default::default()
@@ -1116,6 +1137,8 @@ async fn recover_run(
         commit_sha,
         default_branch: repository.default_branch.clone(),
         runs_per_day: launcher.limits.runs_per_day(&saved),
+        // Already on the row; the queue does not read it.
+        task: String::new(),
     };
     tracing::info!(
         run_id = run.id,

@@ -138,6 +138,13 @@ pub struct IssueResponse {
     /// The issue's page in the web app, when `external_url` is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub html_url: Option<String>,
+    /// Whether the author is a person who can write to the repository — the
+    /// people whose text an agent run trusts (ADR-0001 D7). `false` for an
+    /// issue imported from another platform, whose real author is no local
+    /// account. Answered on the issue itself, left out of listings: the page
+    /// warns before an assignment hands a stranger's text to an agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author_can_write: Option<bool>,
 }
 
 /// A person an imported issue or pull request named on its source: a login on
@@ -452,11 +459,25 @@ pub async fn list_issues(
 pub async fn get_issue(
     State(state): State<AppState>,
     Path((owner, repo, number)): Path<(String, String, i64)>,
-    RepoRead { .. }: RepoRead,
+    RepoRead { repo: repository }: RepoRead,
 ) -> impl IntoResponse {
     match rg_core::issue::get_issue(&state.db, &owner, &repo, number).await {
         Ok(issue) => {
             let issue_id = issue.id;
+            let author_can_write = if issue.original_author.is_some() {
+                false
+            } else {
+                match rg_core::agent::trust::trusted_authors(
+                    &state.db,
+                    &repository,
+                    [issue.author_id],
+                )
+                .await
+                {
+                    Ok(trusted) => trusted.contains(&issue.author_id),
+                    Err(error) => return AppError::from(error).into_response(),
+                }
+            };
             let mut issue = match issue_with_author(&state.db, issue).await {
                 Ok(issue) => issue.linked(&crate::html_url::Links::new(&state, &owner, &repo)),
                 Err(error) => return error.into_response(),
@@ -470,6 +491,7 @@ pub async fn get_issue(
                 Ok((assignees, _)) => issue.original_assignees = assignees,
                 Err(error) => return error.into_response(),
             }
+            issue.author_can_write = Some(author_can_write);
             (StatusCode::OK, Json(issue)).into_response()
         }
         Err(e) => AppError::from(e).into_response(),
@@ -854,6 +876,7 @@ async fn issue_with_author(
         assignee,
         original_assignees: Vec::new(),
         html_url: None,
+        author_can_write: None,
     })
 }
 
@@ -884,6 +907,7 @@ async fn issues_with_authors(
             assignee,
             original_assignees: Vec::new(),
             html_url: None,
+            author_can_write: None,
         });
     }
     Ok(responses)

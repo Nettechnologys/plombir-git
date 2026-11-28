@@ -69,7 +69,7 @@ export {
   type ReleaseUpdatePayload
 } from './releaseForm';
 export { issues, type Issue, type IssueComment, type IssueUpdatePayload } from './issues';
-export { buildIssueLinksPayload, type IssueLinksFormState } from './issueForm';
+export { agentReadsUntrustedAuthor, buildIssueLinksPayload, type IssueLinksFormState } from './issueForm';
 export { pulls, reviews } from './pulls';
 export { pipelines } from './pipelines';
 export { artifacts, type CiArtifact } from './artifacts';
